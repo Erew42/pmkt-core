@@ -1,0 +1,18 @@
+{
+  "climate": "weather_climate",
+  "crypto": "crypto_economics",
+  "culture": "culture_entertainment",
+  "economics": "crypto_economics",
+  "economy": "crypto_economics",
+  "entertainment": "culture_entertainment",
+  "finance": "crypto_economics",
+  "financial": "crypto_economics",
+  "geopolitics": "geopolitics_news",
+  "news": "geopolitics_news",
+  "other": "other_unclear",
+  "science": "tech_science",
+  "tech": "tech_science",
+  "technology": "tech_science",
+  "unclear": "other_unclear",
+  "weather": "weather_climate"
+}

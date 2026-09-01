@@ -1,0 +1,64 @@
+{
+  "version": 1,
+  "paths": {
+    "/markets": {
+      "get": {
+        "params": {
+          "limit": {"required": false},
+          "offset": {"required": false},
+          "closed": {"required": false},
+          "tag_id": {"required": false},
+          "related_tags": {"required": false},
+          "exclude_tag_id": {"required": false}
+        }
+      }
+    },
+    "/events": {
+      "get": {
+        "params": {
+          "limit": {"required": false},
+          "offset": {"required": false},
+          "closed": {"required": false},
+          "tag_id": {"required": false},
+          "related_tags": {"required": false},
+          "exclude_tag_id": {"required": false},
+          "order": {"required": false},
+          "ascending": {"required": false}
+        }
+      }
+    },
+    "/book": {
+      "get": {
+        "params": {
+          "token_id": {"required": true}
+        }
+      }
+    },
+    "/price": {
+      "get": {
+        "params": {
+          "token_id": {"required": true},
+          "side": {"required": false}
+        }
+      }
+    },
+    "/midpoint": {
+      "get": {
+        "params": {
+          "token_id": {"required": true}
+        }
+      }
+    },
+    "/prices-history": {
+      "get": {
+        "params": {
+          "market": {"required": true},
+          "startTs": {"required": false},
+          "endTs": {"required": false},
+          "interval": {"required": false},
+          "fidelity": {"required": false}
+        }
+      }
+    }
+  }
+}

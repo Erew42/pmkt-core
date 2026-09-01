@@ -1,0 +1,241 @@
+{
+  "catalog_version": "pmkt.schema_lifecycle.v2",
+  "evidence_as_of": {
+    "date": "2026-08-20",
+    "source_commit": "8db6499",
+    "scope": "Tracked literal registered-version references include src, apps, scripts, tests, and docs as of source_commit. Artifact evidence retains the 2026-08-20 read-only inspection of data, generated, local_data, and a representative tmp sample. Semantic producer/reader evidence remains separately reviewed."
+  },
+  "generic_consumers": [
+    {
+      "path": "apps/dashboard/data/artifacts.py:_validate_manifest_candidate",
+      "kind": "runtime_schema_reader",
+      "mechanism": "Resolves schema versions supplied by discovered manifests through get_table_spec(schema_version).",
+      "scope": "Any registered schema version referenced by a dashboard-discovered manifest.",
+      "removal_effect": "A zero literal-reference count cannot establish zero production readers; each removal packet must review manifest compatibility and generic consumers."
+    }
+  ],
+  "status_definitions": {
+    "active_core": "A current producer, reader, or operational persistence contract depends on this schema.",
+    "active_experiment": "A research, paper, canary, or deferred subsystem owns this schema; absence from routine operation is not removal evidence.",
+    "compatibility_legacy": "Retained only to interpret or migrate an older contract; removal requires retained-data and external-consumer evidence.",
+    "provisional_unintegrated": "Registered but without a demonstrated end-to-end producer and reader.",
+    "removal_candidate": "Evidence currently favors retirement, but removal is forbidden until the catalog's stop conditions are cleared."
+  },
+  "groups": [
+    {
+      "id": "capture_matching_core",
+      "owner": "data-capture-matching",
+      "status": "active_core",
+      "summary": "Capture, venue ingestion, matching, tracking, and their persisted provenance contracts.",
+      "schemas": [
+        "book_tape_control.v1",
+        "book_tape_event.v1",
+        "book_tape_level.v1",
+        "capture_instrument_evidence.v1",
+        "contract_evidence.v1",
+        "depth.v1",
+        "feed_health.v1",
+        "kalshi_market_snapshot.v1",
+        "market_match.v2",
+        "market_resolution.v1",
+        "match_relation.v1",
+        "polymarket_market_snapshot.v1",
+        "run_manifest.v1",
+        "signal.v1",
+        "stream_lifecycle.v1",
+        "topbook.v1",
+        "topbook_capture_gap.v1",
+        "tracking_health.v1",
+        "tracking_match.v1",
+        "trade.v1"
+      ]
+    },
+    {
+      "id": "offline_research",
+      "owner": "matching-research",
+      "status": "active_experiment",
+      "summary": "Offline analysis and research sidecars; keep until each experiment is separately retired.",
+      "schemas": [
+        "arbitrage_candidate.v1",
+        "backtest_report.v1",
+        "co_resolution_observation.v1",
+        "co_resolution_score.v1",
+        "convergence_observation.v1",
+        "convergence_summary.v1",
+        "event_taxonomy_prediction.v1",
+        "historical_backfill_gap.v1",
+        "historical_price.v1",
+        "market_taxonomy_evidence.v1",
+        "passive_fill.v1",
+        "passive_markout.v1",
+        "passive_quote_evaluation.v1",
+        "venue_history_capability.v1"
+      ]
+    },
+    {
+      "id": "execution_deferred",
+      "owner": "execution-paper-canary",
+      "status": "active_experiment",
+      "summary": "Execution, paper, canary, and soak contracts are deliberately frozen in this phase rather than assessed for removal.",
+      "schemas": [
+        "basket_order_intent.v1",
+        "basket_paper_fill.v1",
+        "basket_paper_position.v1",
+        "canary_candidate.v1",
+        "canary_rejection.v1",
+        "execution_sizing_plan.v1",
+        "maker_quote_plan.v1",
+        "order_intent.v1",
+        "order_state.v1",
+        "paper_fill.v1",
+        "paper_position.v1",
+        "scan_cycle.v1",
+        "soak_run_plan.v1",
+        "soak_run_report.v1"
+      ]
+    },
+    {
+      "id": "match_compatibility",
+      "owner": "matching",
+      "status": "compatibility_legacy",
+      "summary": "Legacy match contract whose retained-data claim and reader behavior require characterization.",
+      "schemas": [
+        "market_match.v1"
+      ]
+    },
+    {
+      "id": "unintegrated_dimensions",
+      "owner": "data",
+      "status": "provisional_unintegrated",
+      "summary": "Proposed canonical dimensions with builders and tests but no demonstrated production producer or reader.",
+      "schemas": [
+        "event.v1",
+        "instrument.v1",
+        "market.v1"
+      ]
+    },
+    {
+      "id": "unused_snapshot_exports",
+      "owner": "data-ingest",
+      "status": "removal_candidate",
+      "summary": "Trimmed snapshot export contracts without a current writer or observed retained artifact.",
+      "schemas": [
+        "kalshi_market_snapshot.v2",
+        "polymarket_market_snapshot.v2"
+      ]
+    }
+  ],
+  "evidence_overrides": {
+    "event.v1": {
+      "producers": [
+        "src/pmkt/data/canonical.py:event_row (generic builder only)"
+      ],
+      "readers": [],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans; exhaustive tmp and external-root evidence remains required.",
+      "tests": [
+        "tests/test_canonical_schemas.py",
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Propose retirement after exhaustive zero-use evidence and external-consumer review."
+    },
+    "instrument.v1": {
+      "producers": [
+        "src/pmkt/data/canonical.py:instrument_row (generic builder only)"
+      ],
+      "readers": [],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans; active capture uses venue snapshots, topbook, and capture_instrument_evidence.v1 instead.",
+      "tests": [
+        "tests/test_canonical_schemas.py",
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Retire unless a separate proposal defines a real writer, identity/update semantics, persistence location, and consumer joins."
+    },
+    "kalshi_market_snapshot.v2": {
+      "producers": [
+        "src/pmkt/data/canonical.py:kalshi_market_snapshot_v2_row (generic builder only)"
+      ],
+      "readers": [
+        "src/pmkt/data/validation.py:coerce_snapshot_frame (projection/migration helper)"
+      ],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans; snapshot-v1 remains actively persisted.",
+      "tests": [
+        "tests/test_resolution.py",
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Retire the persisted-schema identity after exhaustive evidence; keep any useful trimming behavior as an explicitly non-authoritative projection.",
+      "semantic_review": "Reviewed direct producers/readers and the generic dashboard manifest reader; the generic row builder and compatibility projection do not establish an active persisted writer.",
+      "stop_conditions": [
+        "Any retained or external artifact, manifest, notebook, or script requires kalshi_market_snapshot.v2.",
+        "The compatibility projection remains necessary for a verified retained-data migration.",
+        "The generic dashboard reader can still discover a retained manifest naming this version."
+      ],
+      "rollback": "Revert the dedicated removal commit and restore the registry entry, builder/projection imports, tests, and documentation; retained artifacts remain untouched throughout."
+    },
+    "market.v1": {
+      "producers": [
+        "src/pmkt/data/canonical.py:market_row (generic builder only)"
+      ],
+      "readers": [],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans; venue-specific snapshot frames are the active market inputs.",
+      "tests": [
+        "tests/test_canonical_schemas.py",
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Propose retirement after exhaustive zero-use evidence and external-consumer review."
+    },
+    "market_match.v1": {
+      "producers": [],
+      "readers": [
+        "Registry validation only; no safe production v1 frame reader was found.",
+        "src/pmkt/matching/match_registry.py:_match_columns projects to v2 without mapping v1 keys and must not be treated as a compatibility reader."
+      ],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans, but docs/data_dictionary.md states that legacy persisted files exist.",
+      "tests": [
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Keep registered until retained roots and external notebooks are exhaustively checked; add a read-only provenance-preserving v1-to-v2 migration only if actual v1 data is found."
+    },
+    "market_taxonomy_evidence.v1": {
+      "producers": [
+        "src/pmkt/data/taxonomy_evidence.py:build_market_taxonomy_evidence_row",
+        "src/pmkt/data/taxonomy_evidence.py:market_taxonomy_evidence_frame"
+      ],
+      "readers": [],
+      "persistence": "Active retained research evidence: 17 main-root Parquet files and 19 files in the representative tmp scan, including a published 36,997-row hash-pinned artifact.",
+      "tests": [
+        "tests/test_taxonomy_evidence.py"
+      ],
+      "decision": "Retain as an active experiment; add a tracked producer/reader workflow and artifact-level schema, grain, key, and provenance declarations before calling it fully integrated."
+    },
+    "polymarket_market_snapshot.v2": {
+      "producers": [
+        "src/pmkt/data/canonical.py:polymarket_market_snapshot_v2_row (generic builder only)"
+      ],
+      "readers": [
+        "src/pmkt/data/validation.py:coerce_snapshot_frame (projection/migration helper)"
+      ],
+      "persistence": "No artifact observed in the 2026-08-20 main-root or representative tmp scans; snapshot-v1 remains actively persisted.",
+      "tests": [
+        "tests/test_resolution.py",
+        "tests/test_schema_registry_validation.py"
+      ],
+      "decision": "Retire the persisted-schema identity after exhaustive evidence; keep any useful trimming behavior as an explicitly non-authoritative projection.",
+      "semantic_review": "Reviewed direct producers/readers and the generic dashboard manifest reader; the generic row builder and compatibility projection do not establish an active persisted writer.",
+      "stop_conditions": [
+        "Any retained or external artifact, manifest, notebook, or script requires polymarket_market_snapshot.v2.",
+        "The compatibility projection remains necessary for a verified retained-data migration.",
+        "The generic dashboard reader can still discover a retained manifest naming this version."
+      ],
+      "rollback": "Revert the dedicated removal commit and restore the registry entry, builder/projection imports, tests, and documentation; retained artifacts remain untouched throughout."
+    }
+  },
+  "removal_stop_conditions": [
+    "Any production or script producer/reader reference remains.",
+    "Any retained artifact, manifest, journal, bundle, or downstream hash pin references the schema.",
+    "Any declared artifact root is missing, unreadable, malformed, or incompletely scanned.",
+    "External notebook or manual-script compatibility has not been decided by the maintainer.",
+    "Migration would change grain, primary-key semantics, schema meaning, or discard fields.",
+    "Removal would require moving, rewriting, or re-hashing retained data.",
+    "Focused or repository-wide verification is not green."
+  ]
+}

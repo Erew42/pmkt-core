@@ -1,0 +1,54 @@
+{
+  "user_agent": "pmkt-doc-sync/0.1",
+  "timeout_s": 20,
+  "sources": [
+    {
+      "name": "polymarket-api-overview",
+      "url": "https://docs.polymarket.com/market-data/overview"
+    },
+    {
+      "name": "gamma-fetching-markets",
+      "url": "https://docs.polymarket.com/market-data/fetching-markets"
+    },
+    {
+      "name": "api-reference-overview",
+      "url": "https://docs.polymarket.com/api-reference/introduction"
+    },
+    {
+      "name": "gamma-list-markets",
+      "url": "https://docs.polymarket.com/api-reference/markets/list-markets"
+    },
+    {
+      "name": "gamma-list-events",
+      "url": "https://docs.polymarket.com/api-reference/events/list-events"
+    },
+    {
+      "name": "clob-orderbook-guide",
+      "url": "https://docs.polymarket.com/trading/orderbook"
+    },
+    {
+      "name": "clob-get-order-book",
+      "url": "https://docs.polymarket.com/api-reference/market-data/get-order-book"
+    },
+    {
+      "name": "clob-get-midpoint",
+      "url": "https://docs.polymarket.com/api-reference/data/get-midpoint-price"
+    },
+    {
+      "name": "clob-get-market-price",
+      "url": "https://docs.polymarket.com/api-reference/market-data/get-market-price"
+    },
+    {
+      "name": "clob-get-prices-history",
+      "url": "https://docs.polymarket.com/api-reference/markets/get-prices-history"
+    },
+    {
+      "name": "clob-auth",
+      "url": "https://docs.polymarket.com/api-reference/authentication"
+    },
+    {
+      "name": "rate-limits",
+      "url": "https://docs.polymarket.com/api-reference/rate-limits"
+    }
+  ]
+}

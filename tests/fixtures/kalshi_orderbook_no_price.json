@@ -1,0 +1,47 @@
+{
+  "use_yes_price": false,
+  "messages": [
+    {
+      "type": "orderbook_snapshot",
+      "sid": 12,
+      "seq": 1,
+      "msg": {
+        "market_ticker": "KXTRANSCRIPT",
+        "market_id": "market-transcript",
+        "yes_dollars_fp": [["0.40", "10.00"]],
+        "no_dollars_fp": [["0.35", "5.00"]],
+        "ts_ms": 1767225600000
+      }
+    },
+    {
+      "type": "orderbook_delta",
+      "sid": 12,
+      "seq": 2,
+      "msg": {
+        "market_ticker": "KXTRANSCRIPT",
+        "side": "no",
+        "price_dollars": "0.38",
+        "delta_fp": "7.00",
+        "ts_ms": 1767225600100
+      }
+    }
+  ],
+  "expected": {
+    "YES": {
+      "best_bid_dollars": 0.40,
+      "best_ask_dollars": 0.62,
+      "bid_size_contracts": 10.0,
+      "ask_size_contracts": 7.0,
+      "best_bid_source": "direct",
+      "best_ask_source": "complement_derived"
+    },
+    "NO": {
+      "best_bid_dollars": 0.38,
+      "best_ask_dollars": 0.60,
+      "bid_size_contracts": 7.0,
+      "ask_size_contracts": 10.0,
+      "best_bid_source": "direct",
+      "best_ask_source": "complement_derived"
+    }
+  }
+}

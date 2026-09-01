@@ -1,0 +1,9 @@
+{
+  "business": "economics",
+  "crypto": "crypto",
+  "election": "politics",
+  "finance": "economics",
+  "politics": "politics",
+  "sports": "sports",
+  "weather": "weather"
+}

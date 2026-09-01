@@ -1,0 +1,43 @@
+name: drift-check
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 12 * * 1"
+
+jobs:
+  drift-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[data,streaming]"
+      - name: Snapshot upstream docs
+        run: python scripts/sync_upstream_docs.py
+      - name: Run contract checks
+        run: |
+          mkdir -p generated/drift
+          python scripts/contract_check.py --json > generated/drift/contract_check_report.json
+      - name: Refresh examples manifest
+        run: python scripts/update_openapi_examples.py
+      - name: Fail on tracked drift
+        run: git diff --exit-code
+      - name: Upload drift evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: drift-evidence
+          path: |
+            generated/drift
+            generated/openapi/examples
+            generated/upstream_snapshots
+          if-no-files-found: ignore
+          retention-days: 14

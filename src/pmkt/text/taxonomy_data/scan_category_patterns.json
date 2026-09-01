@@ -1,0 +1,30 @@
+[
+  {
+    "category": "politics",
+    "pattern": "\\b(election|electoral|nominee|nomination|president|presidential|governor|gubernatorial|senate|senator|senatorial|house|congress|congressional|mayor|mayoral|democrat|democratic|republican|trump|biden|harris|vance|desantis|newsom|kennedy|rfk|aoc|prime minister|parliament|approval)\\b"
+  },
+  {
+    "category": "sports",
+    "pattern": "\\b(sports?|nba|nfl|mlb|nhl|wnba|ufc|mma|boxing|fifa|uefa|champions league|premier league|laliga|serie a|bundesliga|ligue 1|world cup|super bowl|french open|wimbledon|tennis|golf|soccer|football|basketball|baseball|hockey|total bases|points scored|goalscorer|goal scorer|rebounds?|assists?|rbis?)\\b"
+  },
+  {
+    "category": "geopolitics_news",
+    "pattern": "\\b(ukraine|russia|gaza|israel|hamas|iran|china|taiwan|nato|ceasefire|war|invasion|invades|sanction|tariff|supreme court|united nations)\\b"
+  },
+  {
+    "category": "crypto_economics",
+    "pattern": "\\b(bitcoin|btc|ethereum|eth|solana|crypto|doge|xrp|fed|fomc|federal reserve|federal funds|inflation|cpi|interest rate|rates|recession|gdp|unemployment|jobless|nasdaq|stock|stocks|treasury|oil|gold|dollar|economy|economic)\\b"
+  },
+  {
+    "category": "culture_entertainment",
+    "pattern": "\\b(album|gta|movie|film|oscar|oscars|grammy|grammys|emmy|box office|netflix|disney|spotify|youtube|tiktok|music|song|nobel|peace prize|pope|celebrity|eurovision)\\b"
+  },
+  {
+    "category": "tech_science",
+    "pattern": "\\b(openai|chatgpt|ai|artificial intelligence|spacex|tesla|rocket|starship|apple|google|microsoft|nvidia|iphone|samsung|science|covid|vaccine|bird flu)\\b"
+  },
+  {
+    "category": "weather_climate",
+    "pattern": "\\b(weather|hurricane|storm|temperature|rain|snow|heat|cold|wildfire|earthquake|tornado|climate)\\b"
+  }
+]
