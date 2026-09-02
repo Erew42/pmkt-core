@@ -1465,6 +1465,16 @@ def test_validate_signal_rejects_bad_net_edge_accounting() -> None:
     assert any("gross-fees-slippage" in error for error in report.errors)
 
 
+def test_validate_maker_quote_plan_rejects_bad_net_edge_accounting() -> None:
+    row = _valid_schema_row(get_table_spec("maker_quote_plan.v1"))
+    row["net_edge"] = 0.0
+
+    report = validate_frame(pd.DataFrame([row]), "maker_quote_plan.v1")
+
+    assert not report.ok
+    assert any("gross-fees-slippage" in error for error in report.errors)
+
+
 def test_core_validation_leaves_live_risk_policy_to_private_consumer() -> None:
     row = order_intent_row(
         order_intent_id="intent-1",

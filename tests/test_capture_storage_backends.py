@@ -4,6 +4,7 @@ import json
 import sqlite3
 from pathlib import Path
 
+import pyarrow as pa
 import pytest
 
 import pmkt.streaming.durability as durability_module
@@ -46,6 +47,20 @@ def test_feed_health_stream_schema_is_the_canonical_registry_schema() -> None:
     expected = arrow_schema(get_table_spec(FEED_HEALTH_SCHEMA_VERSION))
 
     assert FEED_HEALTH_SCHEMA.equals(expected, check_metadata=True)
+    assert FEED_HEALTH_SCHEMA.field("quality_flags").type == pa.list_(pa.string())
+    assert FEED_HEALTH_SCHEMA.field("instrument_state_json").type == pa.string()
+    for column in (
+        "local_sequence",
+        "instrument_count",
+        "relation_count",
+        "reconnect_count",
+        "sequence_gap_count",
+        "resync_count",
+        "error_count",
+        "valid_book_count",
+        "invalid_book_count",
+    ):
+        assert FEED_HEALTH_SCHEMA.field(column).type == pa.int64()
 
 _UTC = "2026-08-25T10:00:00.000000Z"
 

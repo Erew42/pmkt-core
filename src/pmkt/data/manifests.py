@@ -191,8 +191,14 @@ def _source_project_root(start: Path, expected_name: str) -> Path | None:
         if not pyproject.is_file():
             continue
         name = _pyproject_name(pyproject)
-        if name == expected_name:
-            return candidate
+        if name != expected_name:
+            continue
+        source_package = candidate / "src" / expected_name.replace("-", "_")
+        try:
+            start.relative_to(source_package)
+        except ValueError:
+            continue
+        return candidate
     return None
 
 

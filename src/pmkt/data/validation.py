@@ -2384,6 +2384,37 @@ def _maker_quote_plan_invariant_errors(df: pd.DataFrame) -> list[str]:
             bad = ~sides.isin({"bid", "ask"})
             if bool(bad.any()):
                 errors.append(f"{column}: {int(bad.sum())} unsupported values")
+    ev_columns = {
+        "gross_edge",
+        "maker_fee_dollars",
+        "hedge_taker_fee_dollars",
+        "quote_size_contracts",
+        "slippage_allowance",
+        "net_edge",
+    }
+    if ev_columns.issubset(df.columns):
+        gross = pd.to_numeric(df["gross_edge"], errors="coerce")
+        maker_fee = pd.to_numeric(
+            df["maker_fee_dollars"], errors="coerce"
+        ).fillna(0.0)
+        hedge_fee = pd.to_numeric(
+            df["hedge_taker_fee_dollars"], errors="coerce"
+        ).fillna(0.0)
+        size = pd.to_numeric(df["quote_size_contracts"], errors="coerce")
+        slippage = pd.to_numeric(
+            df["slippage_allowance"], errors="coerce"
+        ).fillna(0.0)
+        net = pd.to_numeric(df["net_edge"], errors="coerce")
+        expected = gross - ((maker_fee + hedge_fee) / size) - slippage
+        mismatch = (
+            expected.notna()
+            & net.notna()
+            & ((expected - net).abs() > _PRICE_TOLERANCE)
+        )
+        if bool(mismatch.any()):
+            errors.append(
+                f"net_edge: {int(mismatch.sum())} rows do not equal gross-fees-slippage"
+            )
     return errors
 
 

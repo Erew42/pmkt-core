@@ -3,7 +3,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from pmkt.data.recorder import record_topbooks
+from pmkt.data.recorder import _relation_pairs, record_topbooks
 from pmkt.data.validation import validate_frame
 from pmkt.data.canonical import match_relation_row
 
@@ -15,6 +15,46 @@ def _read_segmented_parquet(path: Path) -> pd.DataFrame:
     files = sorted(path.rglob("*.parquet"))
     assert files
     return pd.concat([pd.read_parquet(file) for file in files], ignore_index=True)
+
+
+async def test_relation_pairs_do_not_turn_missing_ids_into_fetch_keys() -> None:
+    relations = pd.DataFrame(
+        [
+            {
+                "match_id": "pm-only",
+                "polymarket_token_id": "pm-token",
+                "kalshi_market_key": pd.NA,
+                "kalshi_instrument_key": float("nan"),
+            },
+            {
+                "match_id": "kalshi-only",
+                "polymarket_token_id": pd.NA,
+                "kalshi_market_key": "KXTEST",
+                "kalshi_instrument_key": pd.NA,
+            },
+            {
+                "match_id": "empty",
+                "polymarket_token_id": pd.NA,
+                "kalshi_market_key": float("nan"),
+                "kalshi_instrument_key": pd.NA,
+            },
+        ]
+    )
+
+    assert _relation_pairs(relations) == [
+        {
+            "match_id": "pm-only",
+            "polymarket_token_id": "pm-token",
+            "kalshi_market_key": "",
+            "kalshi_instrument_key": "",
+        },
+        {
+            "match_id": "kalshi-only",
+            "polymarket_token_id": "",
+            "kalshi_market_key": "KXTEST",
+            "kalshi_instrument_key": "KXTEST:YES",
+        },
+    ]
 
 
 async def test_record_topbooks_writes_partitioned_topbooks_and_gap_sidecar(tmp_path) -> None:

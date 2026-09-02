@@ -320,6 +320,8 @@ def _relation_pairs(relations: pd.DataFrame) -> list[dict[str, str]]:
         kalshi_market = _text(row.get("kalshi_market_key")) or kalshi_instrument.split(
             ":", 1
         )[0]
+        if not polymarket_token and not kalshi_market:
+            continue
         match_id = _text(row.get("match_id")) or "|".join(
             [polymarket_token, kalshi_instrument or kalshi_market]
         )
@@ -332,7 +334,8 @@ def _relation_pairs(relations: pd.DataFrame) -> list[dict[str, str]]:
                 "match_id": match_id,
                 "polymarket_token_id": polymarket_token,
                 "kalshi_market_key": kalshi_market,
-                "kalshi_instrument_key": kalshi_instrument or f"{kalshi_market}:YES",
+                "kalshi_instrument_key": kalshi_instrument
+                or (f"{kalshi_market}:YES" if kalshi_market else ""),
             }
         )
     return rows
@@ -704,6 +707,11 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _text(value: Any) -> str:
     if value is None:
         return ""
+    try:
+        if bool(pd.isna(value)):
+            return ""
+    except (TypeError, ValueError):
+        pass
     return str(value).strip()
 
 

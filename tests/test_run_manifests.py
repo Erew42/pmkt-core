@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 from typer.testing import CliRunner
 
+import pmkt.data.manifests as manifests_module
 from pmkt.cli.app import app
 from pmkt.data.canonical import POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION
 from pmkt.data.manifests import build_run_manifest, validate_run_manifest, write_manifest
@@ -31,6 +32,49 @@ def test_run_manifest_records_core_and_caller_provenance(tmp_path) -> None:
     assert manifest["caller_git_commit"] == "caller-commit"
     assert manifest["pmkt_core_version"] == "0.1.0"
     assert manifest["pmkt_core_commit"]
+
+
+def test_core_provenance_does_not_claim_an_enclosing_checkout(
+    tmp_path, monkeypatch
+) -> None:
+    checkout = tmp_path / "pmkt-core"
+    checkout.mkdir()
+    (checkout / "pyproject.toml").write_text(
+        '[project]\nname = "pmkt"\n', encoding="utf-8"
+    )
+    installed_module = (
+        checkout
+        / ".venv"
+        / "Lib"
+        / "site-packages"
+        / "pmkt"
+        / "data"
+        / "manifests.py"
+    )
+
+    class WheelDistribution:
+        version = "0.1.0"
+
+        @staticmethod
+        def read_text(name: str) -> None:
+            assert name == "direct_url.json"
+            return None
+
+    monkeypatch.setattr(manifests_module, "__file__", str(installed_module))
+    monkeypatch.setattr(
+        manifests_module.importlib.metadata,
+        "distribution",
+        lambda _name: WheelDistribution(),
+    )
+    monkeypatch.setattr(
+        manifests_module,
+        "current_git_commit",
+        lambda _root: pytest.fail("an enclosing checkout is not the installed wheel"),
+    )
+
+    assert manifests_module.core_implementation_provenance() == {
+        "pmkt_core_version": "0.1.0"
+    }
 
 
 def test_build_run_manifest_supports_success_partial_and_failed_statuses(tmp_path) -> None:
