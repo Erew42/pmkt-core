@@ -18,6 +18,7 @@ from pmkt.exchanges.kalshi.ws import (
     parse_kalshi_ticker_update,
     parse_kalshi_websocket_error,
 )
+from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
 
 
 class FakeReadAuth:
@@ -82,6 +83,8 @@ def test_kalshi_public_observation_channels_are_explicit_opt_in() -> None:
     ]
     with pytest.raises(ValueError, match="unsupported"):
         kalshi_orderbook_subscription_payload(["KXONE"], channels=("mve_lifecycle",))
+    with pytest.raises(ValueError, match="unsupported"):
+        kalshi_public_subscription_payload(["KXONE"], channels=("fill",))
 
 
 def test_kalshi_ticker_subscription_omits_orderbook_only_fields() -> None:
@@ -549,6 +552,26 @@ async def test_kalshi_websocket_client_sends_auth_headers_and_subscription() -> 
         "use_yes_price": True,
     }
     assert fake.closed is True
+
+
+@pytest.mark.asyncio
+async def test_kalshi_websocket_requires_auth_before_connecting() -> None:
+    connect_calls: list[str] = []
+
+    async def connect_factory(url: str, headers: dict[str, str]) -> FakeWebSocket:
+        connect_calls.append(url)
+        return FakeWebSocket()
+
+    client = AsyncKalshiWebSocketClient(
+        ["KXTEST"],
+        ws_url="wss://example.com/trade-api/ws/v2",
+        connect_factory=connect_factory,
+    )
+
+    with pytest.raises(ReadAuthenticationRequiredError):
+        await client.connect()
+
+    assert connect_calls == []
 
 
 @pytest.mark.asyncio

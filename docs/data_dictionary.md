@@ -1537,7 +1537,7 @@ A reproducibility record for collection and analysis runs.
 | `ended_at_utc` | Run end timestamp. |
 | `status` | success, partial, or failed. |
 | `command` | CLI command or script invocation. |
-| `git_commit` | Source commit when available. |
+| `git_commit` | Backward-compatible caller-checkout commit when available. |
 | `dataset_paths` | Input/output dataset paths. |
 | `schema_versions` | Schema versions written or read. |
 | `row_counts` | Row counts by dataset. |
@@ -1551,8 +1551,11 @@ A reproducibility record for collection and analysis runs.
 | `error_message` | Failure message when status is failed or partial. |
 | `notes` | Free-form notes. |
 
-JSON manifests produced by `build_run_manifest()` also include a non-registry
-extension field, `run_dir`, pointing to the run output directory.
+JSON manifests produced by `build_run_manifest()` also include non-registry
+extension fields: `run_dir`, `pmkt_core_version`, `pmkt_core_commit` when the
+installed/source provenance can be resolved, `caller_git_commit`, and
+`pmkt_trading_commit` when the caller is the private checkout. These fields keep
+the two implementations distinguishable after the repository split.
 
 ## Migration guidance
 

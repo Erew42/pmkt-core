@@ -13,10 +13,16 @@ from pmkt.data.registry import (
     BOOK_TAPE_CONTROL_SCHEMA_VERSION,
     FEED_HEALTH_SCHEMA_VERSION,
     TOPBOOK_SCHEMA_VERSION,
+    arrow_schema,
+    get_table_spec,
 )
 from pmkt.data.schemas import topbook_evidence_id, topbook_row
 from pmkt.exchanges.polymarket.order_book_stream import STREAM_DATASETS
-from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
+from pmkt.streaming.supervisor import (
+    FEED_HEALTH_SCHEMA,
+    FeedShardHealth,
+    LiveFeedSupervisor,
+)
 from pmkt.streaming.datasets import merge_profile_dataset_specs
 from pmkt.streaming.durability import RUN_STATE_NAME, DurableCaptureCoordinator
 from pmkt.streaming.durability_settings import CaptureDurabilitySettings
@@ -34,6 +40,12 @@ from pmkt.streaming.storage_backends import (
     CaptureStorageBackend,
     CaptureStorageSettings,
 )
+
+
+def test_feed_health_stream_schema_is_the_canonical_registry_schema() -> None:
+    expected = arrow_schema(get_table_spec(FEED_HEALTH_SCHEMA_VERSION))
+
+    assert FEED_HEALTH_SCHEMA.equals(expected, check_metadata=True)
 
 _UTC = "2026-08-25T10:00:00.000000Z"
 

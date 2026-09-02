@@ -218,6 +218,11 @@ class KalshiHttpClient(HttpClient):
                 json=json,
                 headers=headers,
             )
+        parsed_path = urlparse(path)
+        if parsed_path.scheme or parsed_path.netloc:
+            raise ReadOnlyRequestError(
+                "authenticated Kalshi reads require a relative endpoint path"
+            )
 
         auth_headers = headers_for_read(
             self.header_provider,

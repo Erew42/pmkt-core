@@ -18,7 +18,7 @@ from pmkt.data.registry import arrow_schema, get_table_spec
 from pmkt.data.schemas import depth_row
 from pmkt.data.time import parse_utc_timestamp
 from pmkt.data.time import utc_now_iso
-from pmkt.data.types import parse_bool, parse_float
+from pmkt.data.types import parse_float
 from pmkt.data.validation import coerce_frame, validate_frame
 
 
@@ -313,13 +313,13 @@ def _relation_pairs(relations: pd.DataFrame) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     seen: set[tuple[str, str, str]] = set()
     for _, row in relations.iterrows():
-        if "is_tracking_useful" in relations.columns and parse_bool(row.get("is_tracking_useful")) is False:
-            continue
         polymarket_token = _text(row.get("polymarket_token_id")) or _text(
             row.get("polymarket_instrument_key")
         )
         kalshi_instrument = _text(row.get("kalshi_instrument_key"))
-        kalshi_market = _text(row.get("kalshi_market_key")) or kalshi_instrument.split(":", 1)[0]
+        kalshi_market = _text(row.get("kalshi_market_key")) or kalshi_instrument.split(
+            ":", 1
+        )[0]
         match_id = _text(row.get("match_id")) or "|".join(
             [polymarket_token, kalshi_instrument or kalshi_market]
         )

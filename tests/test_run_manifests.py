@@ -14,6 +14,25 @@ from pmkt.data.schemas import topbook_row
 from pmkt.data.validation import validate_frame
 
 
+def test_run_manifest_records_core_and_caller_provenance(tmp_path) -> None:
+    manifest = build_run_manifest(
+        run_id="run-provenance",
+        run_dir=tmp_path,
+        started_at_utc="2026-05-26T00:00:00Z",
+        ended_at_utc="2026-05-26T00:01:00Z",
+        status="success",
+        command="pmkt collect-books",
+        dataset_paths={},
+        schema_versions={},
+        row_counts={},
+        git_commit="caller-commit",
+    )
+
+    assert manifest["caller_git_commit"] == "caller-commit"
+    assert manifest["pmkt_core_version"] == "0.1.0"
+    assert manifest["pmkt_core_commit"]
+
+
 def test_build_run_manifest_supports_success_partial_and_failed_statuses(tmp_path) -> None:
     rows = []
     for status in ("success", "partial", "failed"):

@@ -59,4 +59,8 @@ repository verifies only its own side of the interface.
 A new tracked path not covered above is private until this manifest and the
 automated boundary tests are deliberately updated. Canonical data schemas may
 remain in core even when private trading consumes them; semantic policy and
-decision logic do not.
+decision logic do not. Core validation is limited to physical types, required
+fields, identifiers, enumerated representations, arithmetic consistency, and
+other policy-neutral artifact integrity. Approval, tracking eligibility,
+execution permission, risk gates, strategy compatibility, and allowed-consumer
+decisions are applied by `pmkt_trading.data.validation`.

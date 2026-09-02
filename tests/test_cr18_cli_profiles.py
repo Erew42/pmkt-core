@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import re
 from typing import Any
 
+import pytest
+import typer
 from typer.testing import CliRunner
 import typer.main
 
@@ -83,50 +84,9 @@ def test_stream_books_passes_default_full_profile(monkeypatch, tmp_path: Path) -
     assert captured["websocket_max_queue_frames"] == WS_MAX_QUEUE_FRAMES
 
 
-def test_subscription_metadata_uses_source_validation_timestamps(
-    tmp_path: Path,
-) -> None:
-    plan_path = tmp_path / "plan.json"
-    plan = {
-        "schema_version": "subscription_plan.v1",
-        "plan_id": "plan-1",
-        "created_at_utc": "2026-07-27T10:00:00+00:00",
-        "polymarket": {"assets_ids": ["token-active", "token-inactive"]},
-        "kalshi": {"market_tickers": ["KXACTIVE"]},
-        "polymarket_assets": [
-            {
-                "asset_id": "token-active",
-                "active": True,
-                "validated_at_utc": "2026-07-27T10:01:00+00:00",
-            },
-            {
-                "asset_id": "token-inactive",
-                "active": False,
-                "validated_at_utc": "2026-07-27T10:02:00+00:00",
-            },
-        ],
-        "kalshi_market_tickers": [
-            {
-                "market_ticker": "KXACTIVE",
-                "active": True,
-                "validated_at_utc": "2026-07-27T10:03:00+00:00",
-            }
-        ],
-    }
-    plan_path.write_text(json.dumps(plan), encoding="utf-8")
-
-    metadata = streaming_cli._subscription_plan_metadata(plan_path, plan)
-    polymarket = metadata["instrument_eligibility"]["polymarket"]
-    kalshi = metadata["instrument_eligibility"]["kalshi"]
-    assert polymarket["token-active"]["observed_at_utc"] == (
-        "2026-07-27T10:01:00+00:00"
-    )
-    assert polymarket["token-inactive"]["observed_at_utc"] == (
-        "2026-07-27T10:02:00+00:00"
-    )
-    assert polymarket["token-inactive"]["status"] == "ineligible"
-    assert polymarket["token-inactive"]["reason"] == "source_inactive"
-    assert kalshi["KXACTIVE"]["observed_at_utc"] == "2026-07-27T10:03:00+00:00"
+def test_read_auth_provider_loader_rejects_invalid_factory_shape() -> None:
+    with pytest.raises(typer.BadParameter, match="could not initialize"):
+        streaming_cli._load_read_auth_header_provider("json:dumps")
 
 
 def test_experimental_profile_additive_overrides_are_passed(

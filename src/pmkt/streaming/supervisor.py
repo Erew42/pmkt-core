@@ -12,36 +12,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pmkt.data.canonical import FEED_HEALTH_COLUMNS, FEED_HEALTH_SCHEMA_VERSION
+from pmkt.data.registry import arrow_schema, get_table_spec
 
 
-FEED_HEALTH_SCHEMA = pa.schema(
-    [
-        ("schema_version", pa.string()),
-        ("observed_at_utc", pa.string()),
-        ("local_sequence", pa.int64()),
-        ("venue", pa.string()),
-        ("shard_id", pa.string()),
-        ("connection_state", pa.string()),
-        ("instrument_count", pa.int64()),
-        ("relation_count", pa.int64()),
-        ("reconnect_count", pa.int64()),
-        ("sequence_gap_count", pa.int64()),
-        ("resync_count", pa.int64()),
-        ("error_count", pa.int64()),
-        ("last_message_age_ms", pa.int64()),
-        ("last_valid_book_age_ms", pa.int64()),
-        ("valid_book_count", pa.int64()),
-        ("invalid_book_count", pa.int64()),
-        ("valid_instrument_count", pa.int64()),
-        ("invalid_instrument_count", pa.int64()),
-        ("stale_instrument_count", pa.int64()),
-        ("missing_instrument_count", pa.int64()),
-        ("instrument_state_json", pa.string()),
-        # Must match the canonical registry type (list[string]); a competing
-        # pa.string() here was a second, conflicting physical definition.
-        ("quality_flags", pa.list_(pa.string())),
-    ]
-)
+FEED_HEALTH_SCHEMA = arrow_schema(get_table_spec(FEED_HEALTH_SCHEMA_VERSION))
 BOOK_INTEGRITY_QUALITY_FLAGS = {
     "hash_mismatch",
     "seq_gap",

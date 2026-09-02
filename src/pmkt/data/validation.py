@@ -1839,26 +1839,6 @@ def _co_resolution_score_invariant_errors(df: pd.DataFrame) -> list[str]:
         )
     )
 
-    if "research_only" in df.columns:
-        research_only = _nullable_bool_column(df, "research_only").fillna(False)
-        if bool((~research_only).any()):
-            errors.append(
-                f"research_only: {int((~research_only).sum())} rows are false"
-            )
-    if "allowed_consumers_json" in df.columns:
-        blocked = {"live", "paper", "paper_trading", "signal", "signals", "oms"}
-        bad_rows = 0
-        for value in df["allowed_consumers_json"].tolist():
-            consumers = _json_or_list(value)
-            lowered = {str(item).strip().lower() for item in consumers}
-            if lowered & blocked:
-                bad_rows += 1
-        if bad_rows:
-            errors.append(
-                "allowed_consumers_json: "
-                f"{bad_rows} rows include live/paper/signal/OMS consumers"
-            )
-
     required_flag = "binary_complement_incoherent"
     if {
         "score_semantics",
@@ -2019,67 +1999,6 @@ def _match_relation_invariant_errors(df: pd.DataFrame) -> list[str]:
         bad = present & ~confidence.between(0, 1)
         if bool(bad.any()):
             errors.append(f"confidence_score: {int(bad.sum())} values outside [0, 1]")
-    if "is_trade_equivalent" in df.columns:
-        trade_equivalent = _parsed_bool_mask(df["is_trade_equivalent"])
-        non_tradable = trade_equivalent & ~labels.isin(
-            {"exact_equivalent", "inverse_equivalent"}
-        )
-        if bool(non_tradable.any()):
-            errors.append(
-                "is_trade_equivalent: "
-                f"{int(non_tradable.sum())} rows have non-tradable relation_label"
-            )
-        same_event = trade_equivalent & labels.str.startswith("same_event_")
-        if bool(same_event.any()):
-            errors.append(
-                "is_trade_equivalent: "
-                f"{int(same_event.sum())} same_event rows cannot be trade-equivalent"
-            )
-        if "is_tracking_useful" in df.columns:
-            tracking_useful = _parsed_bool_mask(df["is_tracking_useful"])
-            bad_tracking = trade_equivalent & ~tracking_useful
-            if bool(bad_tracking.any()):
-                errors.append(
-                    "is_trade_equivalent: "
-                    f"{int(bad_tracking.sum())} rows are not tracking-useful"
-                )
-        if "is_inverse" in df.columns and "review_status" in df.columns:
-            inverse = _parsed_bool_mask(df["is_inverse"])
-            review_status = (
-                df["review_status"].fillna("").astype(str).str.strip().str.lower()
-            )
-            inverse_trade = trade_equivalent & (labels == "inverse_equivalent")
-            not_marked_inverse = inverse_trade & ~inverse
-            if bool(not_marked_inverse.any()):
-                errors.append(
-                    "is_trade_equivalent: "
-                    f"{int(not_marked_inverse.sum())} inverse_equivalent rows are not marked inverse"
-                )
-            unapproved_inverse = inverse_trade & ~review_status.isin(
-                {"approved", "manual_approved", "reviewed_approved"}
-            )
-            if bool(unapproved_inverse.any()):
-                errors.append(
-                    "is_trade_equivalent: "
-                    f"{int(unapproved_inverse.sum())} inverse_equivalent rows are not approved"
-                )
-    if "is_inverse" in df.columns:
-        inverse = _parsed_bool_mask(df["is_inverse"])
-        bad_inverse = inverse & (labels != "inverse_equivalent")
-        if bool(bad_inverse.any()):
-            errors.append(
-                f"is_inverse: {int(bad_inverse.sum())} rows are not inverse_equivalent"
-            )
-    if "is_tracking_useful" in df.columns:
-        tracking_useful = _parsed_bool_mask(df["is_tracking_useful"])
-        unrelated_tracking = tracking_useful & labels.isin(
-            {"unrelated", "parlay_or_composite"}
-        )
-        if bool(unrelated_tracking.any()):
-            errors.append(
-                "is_tracking_useful: "
-                f"{int(unrelated_tracking.sum())} unrelated/parlay rows are tracking-useful"
-            )
     if "polymarket_token_id" in df.columns:
         token_values = df["polymarket_token_id"].dropna().astype(str)
         stripped = token_values.str.strip()
@@ -2103,57 +2022,22 @@ def _match_relation_invariant_errors(df: pd.DataFrame) -> list[str]:
             )
     if "evidence_json" in df.columns:
         bad_evidence = 0
-        parsed_evidence: list[Mapping[str, Any] | None] = []
         for value in df["evidence_json"].tolist():
             if value is None:
                 bad_evidence += 1
-                parsed_evidence.append(None)
                 continue
             if isinstance(value, str):
                 try:
                     parsed = json.loads(value)
                 except json.JSONDecodeError:
                     bad_evidence += 1
-                    parsed_evidence.append(None)
                     continue
                 if not isinstance(parsed, dict):
                     bad_evidence += 1
-                    parsed_evidence.append(None)
-                else:
-                    parsed_evidence.append(parsed)
             elif not isinstance(value, Mapping):
                 bad_evidence += 1
-                parsed_evidence.append(None)
-            else:
-                parsed_evidence.append(value)
         if bad_evidence:
             errors.append(f"evidence_json: {bad_evidence} rows are not JSON objects")
-        useful = (
-            _parsed_bool_mask(df["is_tracking_useful"])
-            if "is_tracking_useful" in df.columns
-            else pd.Series(False, index=df.index)
-        )
-        trade = (
-            _parsed_bool_mask(df["is_trade_equivalent"])
-            if "is_trade_equivalent" in df.columns
-            else pd.Series(False, index=df.index)
-        )
-        needs_provenance = useful | trade
-        missing_provenance = sum(
-            1
-            for needs_row, evidence in zip(
-                needs_provenance.tolist(),
-                parsed_evidence,
-                strict=False,
-            )
-            if needs_row and not _evidence_has_source_provenance(evidence)
-        )
-        if missing_provenance:
-            errors.append(
-                "evidence_json: "
-                f"{missing_provenance} useful/tradable rows lack source hashes or contract fields"
-            )
-
     return errors
 
 
@@ -2231,25 +2115,6 @@ def _tracking_match_invariant_errors(df: pd.DataFrame) -> list[str]:
     return errors
 
 
-def _evidence_has_source_provenance(evidence: Mapping[str, Any] | None) -> bool:
-    if evidence is None:
-        return False
-    source_hashes = evidence.get("source_row_hashes")
-    contract_fields = evidence.get("contract_fields")
-    if not isinstance(source_hashes, Mapping) or not isinstance(
-        contract_fields, Mapping
-    ):
-        return False
-    for venue in ("polymarket", "kalshi"):
-        source_hash = source_hashes.get(venue)
-        venue_fields = contract_fields.get(venue)
-        if not isinstance(source_hash, str) or not source_hash.strip():
-            return False
-        if not isinstance(venue_fields, Mapping) or not venue_fields:
-            return False
-    return True
-
-
 def _tracking_health_invariant_errors(df: pd.DataFrame) -> list[str]:
     errors: list[str] = []
     for column in (
@@ -2275,22 +2140,6 @@ def _tracking_health_invariant_errors(df: pd.DataFrame) -> list[str]:
         bad = ~statuses.isin(allowed)
         if bool(bad.any()):
             errors.append(f"health_status: {int(bad.sum())} unsupported values")
-    if {"tracking_ready", "health_status", "health_flags"}.issubset(df.columns):
-        ready = _parsed_bool_mask(df["tracking_ready"])
-        statuses = df["health_status"].fillna("").astype(str).str.strip().str.lower()
-        has_flags = df["health_flags"].fillna("").astype(str).str.strip() != ""
-        ready_mismatch = ready & ((statuses != "ready") | has_flags)
-        if bool(ready_mismatch.any()):
-            errors.append(
-                "tracking_ready: "
-                f"{int(ready_mismatch.sum())} ready rows have non-ready status or flags"
-            )
-        status_mismatch = (statuses == "ready") & (~ready | has_flags)
-        if bool(status_mismatch.any()):
-            errors.append(
-                "health_status: "
-                f"{int(status_mismatch.sum())} ready statuses lack tracking_ready or have flags"
-            )
     return errors
 
 
@@ -2423,50 +2272,6 @@ def _signal_invariant_errors(df: pd.DataFrame) -> list[str]:
             errors.append(
                 f"net_edge: {int(mismatch.sum())} rows do not equal gross-fees-slippage"
             )
-    if "execution_allowed" in df.columns:
-        allowed = _parsed_bool_mask(df["execution_allowed"])
-        if "relation_label" in df.columns:
-            labels = df["relation_label"].fillna("").astype(str).str.strip().str.lower()
-            bad_label = allowed & ~labels.isin(
-                {"exact_equivalent", "inverse_equivalent"}
-            )
-            if bool(bad_label.any()):
-                errors.append(
-                    "execution_allowed: "
-                    f"{int(bad_label.sum())} rows have non-strict relation_label"
-                )
-        if "net_edge" in df.columns:
-            net = pd.to_numeric(df["net_edge"], errors="coerce")
-            bad_edge = allowed & ~(net > 0)
-            if bool(bad_edge.any()):
-                errors.append(
-                    "execution_allowed: "
-                    f"{int(bad_edge.sum())} rows do not have positive net_edge"
-                )
-        if "executable_size" in df.columns:
-            size = pd.to_numeric(df["executable_size"], errors="coerce")
-            bad_size = allowed & ~(size > 0)
-            if bool(bad_size.any()):
-                errors.append(
-                    "execution_allowed: "
-                    f"{int(bad_size.sum())} rows do not have positive executable_size"
-                )
-        if "risk_flags" in df.columns:
-            has_flags = df["risk_flags"].fillna("").astype(str).str.strip() != ""
-            bad_flags = allowed & has_flags
-            if bool(bad_flags.any()):
-                errors.append(
-                    "execution_allowed: "
-                    f"{int(bad_flags.sum())} rows have blocking risk_flags"
-                )
-        if "decision" in df.columns:
-            decisions = df["decision"].fillna("").astype(str).str.strip().str.lower()
-            bad_decision = allowed & (decisions != "allow")
-            if bool(bad_decision.any()):
-                errors.append(
-                    "execution_allowed: "
-                    f"{int(bad_decision.sum())} rows do not have decision=allow"
-                )
     return errors
 
 
@@ -2493,15 +2298,6 @@ def _order_intent_invariant_errors(df: pd.DataFrame) -> list[str]:
         bad = ~sides.isin({"bid", "ask"})
         if bool(bad.any()):
             errors.append(f"book_side: {int(bad.sum())} unsupported values")
-    if {"mode", "risk_check_status"}.issubset(df.columns):
-        live = df["mode"].fillna("").astype(str).str.strip().str.lower() == "live"
-        status = df["risk_check_status"].fillna("").astype(str).str.strip().str.lower()
-        bad = live & (status != "passed")
-        if bool(bad.any()):
-            errors.append(
-                "risk_check_status: "
-                f"{int(bad.sum())} live rows did not pass risk checks"
-            )
     if "client_order_id" in df.columns:
         payload_columns = [
             column
@@ -2556,20 +2352,6 @@ def _maker_quote_plan_invariant_errors(df: pd.DataFrame) -> list[str]:
             "match_id",
         )
     )
-    execution_identity_columns = (
-        "side_plan",
-        "quote_venue",
-        "quote_instrument_id",
-        "hedge_venue",
-        "hedge_instrument_id",
-    )
-    if "execution_allowed" in df.columns:
-        require_nonempty(
-            execution_identity_columns,
-            mask=_parsed_bool_mask(df["execution_allowed"]),
-        )
-    else:
-        require_nonempty(execution_identity_columns)
     errors.extend(
         _nonnegative_errors(
             df,
@@ -2602,92 +2384,6 @@ def _maker_quote_plan_invariant_errors(df: pd.DataFrame) -> list[str]:
             bad = ~sides.isin({"bid", "ask"})
             if bool(bad.any()):
                 errors.append(f"{column}: {int(bad.sum())} unsupported values")
-    if "execution_allowed" not in df.columns:
-        return errors
-    allowed = _parsed_bool_mask(df["execution_allowed"])
-    if "post_only" in df.columns:
-        post_only = _parsed_bool_mask(df["post_only"])
-        bad = allowed & ~post_only
-        if bool(bad.any()):
-            errors.append(
-                f"post_only: {int(bad.sum())} executable quote plans are not post-only"
-            )
-    if "risk_flags" in df.columns:
-        has_flags = df["risk_flags"].fillna("").astype(str).str.strip() != ""
-        bad = allowed & has_flags
-        if bool(bad.any()):
-            errors.append(
-                f"execution_allowed: {int(bad.sum())} rows have blocking risk_flags"
-            )
-    for column in ("quote_size_contracts", "hedge_size_contracts", "net_edge"):
-        if column in df.columns:
-            values = pd.to_numeric(df[column], errors="coerce")
-            bad = allowed & ~(values > 0)
-            if bool(bad.any()):
-                errors.append(
-                    f"{column}: {int(bad.sum())} executable rows are not positive"
-                )
-    required_post_only = {
-        "quote_action",
-        "quote_price",
-        "quote_top_bid",
-        "quote_top_ask",
-    }
-    if required_post_only.issubset(df.columns):
-        actions = df["quote_action"].fillna("").astype(str).str.strip().str.lower()
-        price = pd.to_numeric(df["quote_price"], errors="coerce")
-        top_bid = pd.to_numeric(df["quote_top_bid"], errors="coerce")
-        top_ask = pd.to_numeric(df["quote_top_ask"], errors="coerce")
-        buy_cross = (
-            allowed
-            & (actions == "buy")
-            & price.notna()
-            & top_ask.notna()
-            & (price >= top_ask)
-        )
-        sell_cross = (
-            allowed
-            & (actions == "sell")
-            & price.notna()
-            & top_bid.notna()
-            & (price <= top_bid)
-        )
-        if bool(buy_cross.any()):
-            errors.append(
-                f"quote_price: {int(buy_cross.sum())} executable buy quotes cross the ask"
-            )
-        if bool(sell_cross.any()):
-            errors.append(
-                f"quote_price: {int(sell_cross.sum())} executable sell quotes cross the bid"
-            )
-    ev_columns = {
-        "gross_edge",
-        "maker_fee_dollars",
-        "hedge_taker_fee_dollars",
-        "quote_size_contracts",
-        "slippage_allowance",
-        "net_edge",
-    }
-    if ev_columns.issubset(df.columns):
-        gross = pd.to_numeric(df["gross_edge"], errors="coerce")
-        maker_fee = pd.to_numeric(df["maker_fee_dollars"], errors="coerce").fillna(0.0)
-        hedge_fee = pd.to_numeric(
-            df["hedge_taker_fee_dollars"], errors="coerce"
-        ).fillna(0.0)
-        size = pd.to_numeric(df["quote_size_contracts"], errors="coerce")
-        slippage = pd.to_numeric(df["slippage_allowance"], errors="coerce").fillna(0.0)
-        net = pd.to_numeric(df["net_edge"], errors="coerce")
-        expected = gross - ((maker_fee + hedge_fee) / size) - slippage
-        mismatch = (
-            allowed
-            & expected.notna()
-            & net.notna()
-            & ((expected - net).abs() > _PRICE_TOLERANCE)
-        )
-        if bool(mismatch.any()):
-            errors.append(
-                f"net_edge: {int(mismatch.sum())} rows do not equal gross-fees-slippage"
-            )
     return errors
 
 
@@ -2961,38 +2657,6 @@ def _backtest_report_invariant_errors(df: pd.DataFrame) -> list[str]:
         bad = ~values.isin(allowed)
         if bool(bad.any()):
             errors.append(f"{column}: unsupported values {sorted(set(values[bad]))}")
-    if {"strategy_family", "fill_model"}.issubset(df.columns):
-        family = df["strategy_family"].fillna("").astype(str).str.strip().str.lower()
-        model = df["fill_model"].fillna("").astype(str).str.strip().str.lower()
-        bad_taker = (family == "taker") & ~model.isin(
-            {"optimistic", "pessimistic_queue"}
-        )
-        if bool(bad_taker.any()):
-            errors.append(
-                f"fill_model: {int(bad_taker.sum())} taker rows use maker-only fill model"
-            )
-        bad_maker = (family == "maker") & ~model.isin(
-            {"topbook_cross", "pessimistic_queue"}
-        )
-        if bool(bad_maker.any()):
-            errors.append(
-                f"fill_model: {int(bad_maker.sum())} maker rows use taker-only fill model"
-            )
-    if {"strategy_family", "source_kind"}.issubset(df.columns):
-        family = df["strategy_family"].fillna("").astype(str).str.strip().str.lower()
-        source = df["source_kind"].fillna("").astype(str).str.strip().str.lower()
-        bad_taker_source = (family == "taker") & ~source.isin(
-            {"taker_batch", "taker_two_leg"}
-        )
-        if bool(bad_taker_source.any()):
-            errors.append(
-                f"source_kind: {int(bad_taker_source.sum())} taker rows use non-taker source kind"
-            )
-        bad_maker_source = (family == "maker") & (source != "maker_passive")
-        if bool(bad_maker_source.any()):
-            errors.append(
-                f"source_kind: {int(bad_maker_source.sum())} maker rows use non-maker source kind"
-            )
     errors.extend(
         _nonnegative_errors(
             df,

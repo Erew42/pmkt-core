@@ -147,7 +147,7 @@ jobs:
         run: |
           cd "${RUNNER_TEMP}"
           python -m pip install --force-reinstall "${GITHUB_WORKSPACE}"/dist/*.whl
-          python -c "import pmkt, pmkt.data.canonical, pmkt.streaming, pmkt.resolution"
+          python -c "import pmkt, pmkt.data.canonical, pmkt.streaming, pmkt.resolution, pmkt.text.taxonomy"
           python -c "import importlib.util; assert importlib.util.find_spec('pmkt.execution') is None; assert importlib.util.find_spec('pmkt_trading') is None"
           pmkt --help
       - name: Inspect distribution boundary

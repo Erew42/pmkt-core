@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -56,7 +56,6 @@ from pmkt.streaming.connection_partitions import (
     build_connection_partitions,
     subscription_plan_relation_ids_by_instrument,
 )
-from pmkt.streaming.durability import file_sha256
 from pmkt.streaming.durability_settings import MAX_SEGMENT_SECONDS
 from pmkt.streaming.profiles import (
     ContractStatus,
@@ -342,102 +341,6 @@ def _tickers_from_kalshi_markets_parquet(markets_path: Path) -> list[str]:
     return unique_nonempty_strings(markets_df[ticker_col])
 
 
-def _tokens_from_subscription_plan_payload(plan: dict[str, Any]) -> list[str]:
-    polymarket = plan.get("polymarket")
-    if isinstance(polymarket, dict):
-        values = polymarket.get("assets_ids", polymarket.get("asset_ids", []))
-        return _unique_plan_texts(values)
-    return _unique_plan_texts(
-        item.get("asset_id")
-        for item in plan.get("polymarket_assets", [])
-        if isinstance(item, dict)
-    )
-
-
-def _tickers_from_subscription_plan_payload(plan: dict[str, Any]) -> list[str]:
-    kalshi = plan.get("kalshi")
-    if isinstance(kalshi, dict):
-        values = kalshi.get("market_tickers", kalshi.get("tickers", []))
-        return _unique_plan_texts(values)
-    return _unique_plan_texts(
-        item.get("market_ticker")
-        for item in plan.get("kalshi_market_tickers", [])
-        if isinstance(item, dict)
-    )
-
-
-def _subscription_plan_metadata(
-    plan_path: Path, plan: Mapping[str, Any]
-) -> dict[str, Any]:
-    plan_hash = file_sha256(plan_path)
-    source_reference = str(plan_path.resolve())
-
-    def evidence(
-        instrument_ids: Iterable[str],
-        *,
-        item_key: str,
-        plan_items_key: str,
-    ) -> dict[str, dict[str, Any]]:
-        raw_items = plan.get(plan_items_key)
-        items = (
-            {
-                str(item.get(item_key)): item
-                for item in raw_items
-                if isinstance(item, Mapping) and str(item.get(item_key) or "").strip()
-            }
-            if isinstance(raw_items, list)
-            else {}
-        )
-        result: dict[str, dict[str, Any]] = {}
-        for instrument_id in instrument_ids:
-            item = items.get(instrument_id, {})
-            active = item.get("active")
-            eligible = active is not False
-            result[instrument_id] = {
-                "status": "eligible" if eligible else "ineligible",
-                "reason": "source_active" if eligible else "source_inactive",
-                "source_identity": "validated_subscription_plan.v1",
-                "source_reference": source_reference,
-                "source_sha256": plan_hash,
-                "observed_at_utc": (
-                    item.get("validated_at_utc") or plan.get("created_at_utc")
-                ),
-            }
-        return result
-
-    return {
-        "schema_version": plan.get("schema_version"),
-        "plan_id": plan.get("plan_id"),
-        "path": str(plan_path),
-        "sha256": plan_hash,
-        "source_market_registry_path": plan.get("source_market_registry_path"),
-        "instrument_eligibility": {
-            "polymarket": evidence(
-                _tokens_from_subscription_plan_payload(dict(plan)),
-                item_key="asset_id",
-                plan_items_key="polymarket_assets",
-            ),
-            "kalshi": evidence(
-                _tickers_from_subscription_plan_payload(dict(plan)),
-                item_key="market_ticker",
-                plan_items_key="kalshi_market_tickers",
-            ),
-        },
-    }
-
-
-def _unique_plan_texts(values: Any) -> list[str]:
-    if values is None:
-        return []
-    if isinstance(values, (str, bytes)):
-        iterable: Iterable[Any] = [values]
-    elif isinstance(values, Iterable):
-        iterable = values
-    else:
-        iterable = [values]
-    return unique_nonempty_strings(str(value).strip() for value in iterable)
-
-
 def _current_command() -> str:
     return " ".join(str(arg) for arg in sys.argv if str(arg).strip())
 
@@ -461,11 +364,17 @@ def _load_read_auth_header_provider(spec: str | None) -> ReadAuthHeaderProvider:
             f"could not import read-auth header provider {spec!r}: {exc}",
             param_hint="--header-provider",
         ) from exc
-    provider = (
-        candidate()
-        if callable(candidate) and not hasattr(candidate, "headers_for_get")
-        else candidate
-    )
+    try:
+        provider = (
+            candidate()
+            if callable(candidate) and not hasattr(candidate, "headers_for_get")
+            else candidate
+        )
+    except Exception as exc:
+        raise typer.BadParameter(
+            f"could not initialize read-auth header provider {spec!r}: {exc}",
+            param_hint="--header-provider",
+        ) from exc
     if not callable(getattr(provider, "headers_for_get", None)):
         raise typer.BadParameter(
             f"{spec!r} does not provide a headers_for_get(path) method",

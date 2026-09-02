@@ -151,6 +151,35 @@ async def test_kalshi_transport_rejects_writes_before_auth_or_network() -> None:
     assert network_calls == []
 
 
+@pytest.mark.asyncio
+async def test_authenticated_kalshi_transport_rejects_absolute_urls_before_auth() -> None:
+    auth_calls: list[str] = []
+    network_calls: list[httpx.Request] = []
+
+    class Provider:
+        def headers_for_get(self, path: str) -> dict[str, str]:
+            auth_calls.append(path)
+            return {"X-Read-Auth": "test-only"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        network_calls.append(request)
+        return httpx.Response(200, json={})
+
+    client = KalshiHttpClient(
+        base_url="https://example.test/trade-api/v2",
+        auth=Provider(),
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(ReadOnlyRequestError, match="relative endpoint"):
+            await client.request_json("GET", "https://elsewhere.invalid/markets")
+    finally:
+        await client.close()
+
+    assert auth_calls == []
+    assert network_calls == []
+
+
 def test_core_source_does_not_read_private_credential_environment_variables() -> None:
     forbidden_names = {
         "PMKT_KALSHI_API_KEY_ID",
@@ -167,3 +196,17 @@ def test_core_source_does_not_read_private_credential_environment_variables() ->
     )
 
     assert sorted(name for name in forbidden_names if name in source) == []
+
+
+def test_core_validation_excludes_private_decision_policy() -> None:
+    source = (SOURCE_ROOT / "data" / "validation.py").read_text(encoding="utf-8")
+    private_policy_markers = {
+        "same_event rows cannot be trade-equivalent",
+        "rows have non-strict relation_label",
+        "live rows did not pass risk checks",
+        "executable quote plans are not post-only",
+        "taker rows use maker-only fill model",
+        "rows include live/paper/signal/OMS consumers",
+    }
+
+    assert sorted(marker for marker in private_policy_markers if marker in source) == []

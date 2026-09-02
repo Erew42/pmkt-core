@@ -50,9 +50,9 @@ async def test_record_topbooks_writes_partitioned_topbooks_and_gap_sidecar(tmp_p
                 kalshi_market_key="KXTEST",
                 kalshi_instrument_key="KXTEST:YES",
                 relation_label="exact_equivalent",
-                is_trade_equivalent=True,
-                is_tracking_useful=True,
-                review_status="approved",
+                is_trade_equivalent=False,
+                is_tracking_useful=False,
+                review_status="candidate",
                 evidence_json={"source": "test", "semantic_match_status": "compatible"},
             )
         ]

@@ -1335,7 +1335,7 @@ def test_validate_market_match_rejects_out_of_range_probability_prices() -> None
     assert "kalshi_ask: 1 prices outside [0, 1]" in report.errors
 
 
-def test_validate_match_relation_rejects_event_related_trade_equivalence() -> None:
+def test_core_validation_leaves_trade_equivalence_policy_to_private_consumer() -> None:
     row = _valid_schema_row(get_table_spec("match_relation.v1"))
     row.update(
         {
@@ -1346,10 +1346,7 @@ def test_validate_match_relation_rejects_event_related_trade_equivalence() -> No
 
     report = validate_frame(pd.DataFrame([row]), "match_relation.v1")
 
-    assert not report.ok
-    assert any(
-        "same_event rows cannot be trade-equivalent" in error for error in report.errors
-    )
+    assert report.ok
 
 
 def test_validate_empty_match_relation_frame() -> None:
@@ -1394,16 +1391,13 @@ def test_validate_match_relation_requires_instrument_keys() -> None:
     assert any("polymarket_instrument_key" in error for error in report.errors)
 
 
-def test_validate_match_relation_requires_provenance_for_tracking_rows() -> None:
+def test_core_validation_treats_matching_provenance_as_private_policy() -> None:
     row = _valid_schema_row(get_table_spec("match_relation.v1"))
     row["evidence_json"] = {"source_row_hashes": {"polymarket": "pm-source"}}
 
     report = validate_frame(pd.DataFrame([row]), "match_relation.v1")
 
-    assert not report.ok
-    assert any(
-        "lack source hashes or contract fields" in error for error in report.errors
-    )
+    assert report.ok
 
 
 def test_validate_tracking_match_rejects_inconsistent_pair_id() -> None:
@@ -1424,7 +1418,7 @@ def test_validate_tracking_match_rejects_inconsistent_pair_id() -> None:
     assert any("do not match venue market keys" in error for error in report.errors)
 
 
-def test_validate_signal_rejects_allowed_non_strict_relation() -> None:
+def test_core_validation_leaves_signal_execution_policy_to_private_consumer() -> None:
     row = signal_row(
         signal_id="signal-1",
         match_id="match-1",
@@ -1444,8 +1438,7 @@ def test_validate_signal_rejects_allowed_non_strict_relation() -> None:
 
     report = validate_frame(pd.DataFrame([row]), "signal.v1")
 
-    assert not report.ok
-    assert any("non-strict relation_label" in error for error in report.errors)
+    assert report.ok
 
 
 def test_validate_signal_rejects_bad_net_edge_accounting() -> None:
@@ -1472,7 +1465,7 @@ def test_validate_signal_rejects_bad_net_edge_accounting() -> None:
     assert any("gross-fees-slippage" in error for error in report.errors)
 
 
-def test_validate_order_intent_rejects_live_without_passed_risk() -> None:
+def test_core_validation_leaves_live_risk_policy_to_private_consumer() -> None:
     row = order_intent_row(
         order_intent_id="intent-1",
         signal_id="signal-1",
@@ -1490,8 +1483,7 @@ def test_validate_order_intent_rejects_live_without_passed_risk() -> None:
 
     report = validate_frame(pd.DataFrame([row]), "order_intent.v1")
 
-    assert not report.ok
-    assert any("live rows did not pass risk checks" in error for error in report.errors)
+    assert report.ok
 
 
 def test_validate_order_intent_rejects_conflicting_client_order_id() -> None:
@@ -1878,13 +1870,9 @@ def test_validate_match_relation_accepts_settlement_scope_tracking_label() -> No
     assert report.ok
     row["is_trade_equivalent"] = True
 
-    rejected = validate_frame(pd.DataFrame([row]), "match_relation.v1")
+    still_structurally_valid = validate_frame(pd.DataFrame([row]), "match_relation.v1")
 
-    assert not rejected.ok
-    assert any(
-        "same_event rows cannot be trade-equivalent" in error
-        for error in rejected.errors
-    )
+    assert still_structurally_valid.ok
 
 
 

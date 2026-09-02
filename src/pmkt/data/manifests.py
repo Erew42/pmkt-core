@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.metadata
 import json
 import re
 import subprocess
@@ -84,6 +85,34 @@ def current_git_commit(cwd: Path | None = None) -> str | None:
     return commit or None
 
 
+def core_implementation_provenance() -> dict[str, str]:
+    """Return the installed core version and immutable source commit when known."""
+    provenance: dict[str, str] = {}
+    try:
+        distribution = importlib.metadata.distribution("pmkt")
+    except importlib.metadata.PackageNotFoundError:
+        distribution = None
+    if distribution is not None:
+        provenance["pmkt_core_version"] = distribution.version
+        raw_direct_url = distribution.read_text("direct_url.json")
+        if raw_direct_url:
+            try:
+                direct_url = json.loads(raw_direct_url)
+            except json.JSONDecodeError:
+                direct_url = {}
+            vcs_info = direct_url.get("vcs_info")
+            if isinstance(vcs_info, Mapping):
+                commit = vcs_info.get("commit_id")
+                if isinstance(commit, str) and commit.strip():
+                    provenance["pmkt_core_commit"] = commit.strip()
+    source_root = _source_project_root(Path(__file__).resolve(), "pmkt")
+    if "pmkt_core_commit" not in provenance and source_root is not None:
+        commit = current_git_commit(source_root)
+        if commit:
+            provenance["pmkt_core_commit"] = commit
+    return provenance
+
+
 def count_quality_flags(rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
     counter: Counter[str] = Counter()
     for row in rows:
@@ -148,7 +177,53 @@ def build_run_manifest(
     manifest["run_dir"] = str(run_dir)
     if extra:
         manifest.update(dict(extra))
+    for key, value in core_implementation_provenance().items():
+        manifest.setdefault(key, value)
+    if git_commit:
+        manifest.setdefault("caller_git_commit", git_commit)
+        if _current_project_name(Path.cwd()) == "pmkt-trading":
+            manifest.setdefault("pmkt_trading_commit", git_commit)
     return manifest
+
+
+def _current_project_name(cwd: Path) -> str | None:
+    root = _source_project_root(cwd, None)
+    if root is None:
+        return None
+    return _pyproject_name(root / "pyproject.toml")
+
+
+def _source_project_root(start: Path, expected_name: str | None) -> Path | None:
+    current = start if start.is_dir() else start.parent
+    for candidate in (current, *current.parents):
+        pyproject = candidate / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        name = _pyproject_name(pyproject)
+        if expected_name is None or name == expected_name:
+            return candidate
+    return None
+
+
+def _pyproject_name(path: Path) -> str | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    in_project = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            in_project = line == "[project]"
+            continue
+        if not in_project:
+            continue
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "name":
+            return value.strip().strip("\"'")
+    return None
 
 
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> Path:
@@ -1769,6 +1844,7 @@ __all__ = [
     "ManifestValidationReport",
     "RUN_MANIFEST_SCHEMA_VERSION",
     "build_run_manifest",
+    "core_implementation_provenance",
     "count_quality_flags",
     "current_git_commit",
     "validate_run_manifest",
