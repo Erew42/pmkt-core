@@ -181,26 +181,17 @@ def build_run_manifest(
         manifest.setdefault(key, value)
     if git_commit:
         manifest.setdefault("caller_git_commit", git_commit)
-        if _current_project_name(Path.cwd()) == "pmkt-trading":
-            manifest.setdefault("pmkt_trading_commit", git_commit)
     return manifest
 
 
-def _current_project_name(cwd: Path) -> str | None:
-    root = _source_project_root(cwd, None)
-    if root is None:
-        return None
-    return _pyproject_name(root / "pyproject.toml")
-
-
-def _source_project_root(start: Path, expected_name: str | None) -> Path | None:
+def _source_project_root(start: Path, expected_name: str) -> Path | None:
     current = start if start.is_dir() else start.parent
     for candidate in (current, *current.parents):
         pyproject = candidate / "pyproject.toml"
         if not pyproject.is_file():
             continue
         name = _pyproject_name(pyproject)
-        if expected_name is None or name == expected_name:
+        if name == expected_name:
             return candidate
     return None
 

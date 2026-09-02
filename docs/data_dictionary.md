@@ -1553,9 +1553,10 @@ A reproducibility record for collection and analysis runs.
 
 JSON manifests produced by `build_run_manifest()` also include non-registry
 extension fields: `run_dir`, `pmkt_core_version`, `pmkt_core_commit` when the
-installed/source provenance can be resolved, `caller_git_commit`, and
-`pmkt_trading_commit` when the caller is the private checkout. These fields keep
-the two implementations distinguishable after the repository split.
+installed/source provenance can be resolved, and `caller_git_commit`. A consumer
+may add its own implementation provenance; the private trading package adds its
+commit and recovers the exact core commit from its pinned dependency when a plain
+wheel install does not carry VCS metadata.
 
 ## Migration guidance
 
