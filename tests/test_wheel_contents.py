@@ -117,7 +117,8 @@ output = write_manifest("offline-manifest.json", manifest)
 assert validate_run_manifest(output).ok
 assert json.loads(output.read_text())["pmkt_core_commit"] == identity.commit
 '''
-    subprocess.run(
+    result = subprocess.run(
         [sys.executable, "-I", "-c", smoke, str(installed), expected["commit"]],
-        cwd=tmp_path, check=True, capture_output=True, text=True,
+        cwd=tmp_path, capture_output=True, text=True,
     )
+    assert result.returncode == 0, result.stderr
