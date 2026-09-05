@@ -1076,6 +1076,32 @@ def test_exact_manifest_run_dir_must_be_its_own_directory(tmp_path) -> None:
     assert any("directory containing" in error for error in report.all_errors)
 
 
+@pytest.mark.parametrize("invalid", [None, "escape", "run_binding"])
+def test_exact_run_directory_hook_does_not_relax_artifact_authority(tmp_path, invalid) -> None:
+    manifest, manifest_path = _write_complete_profile_manifest(tmp_path)
+    old = tmp_path / "absent-original-directory"
+    manifest["run_dir"] = str(old)
+    if invalid == "escape":
+        manifest["dataset_artifacts"]["health"]["path"] = "../health.parquet"
+    elif invalid == "run_binding":
+        pd.DataFrame([_trade()]).to_parquet(tmp_path / "trade.parquet", index=False)
+        manifest["dataset_artifacts"]["trade"]["row_count"] = 1
+        _refresh_artifact_segment_manifest(manifest["dataset_artifacts"], tmp_path, "trade")
+        manifest["run_id"] = "foreign-run"
+    write_manifest(manifest_path, manifest)
+    before = manifest_path.read_bytes()
+    observed = []
+
+    def resolve(value):
+        observed.append(value)
+        return tmp_path if value == old else value
+
+    report = validate_run_manifest(manifest_path, path_resolver=resolve)
+    assert report.ok == (invalid is None), report.all_errors
+    assert all(value == old for value in observed)
+    assert manifest_path.read_bytes() == before
+
+
 def test_profile_artifacts_bind_run_id_and_keep_topbook_roles_disjoint(
     tmp_path,
 ) -> None:

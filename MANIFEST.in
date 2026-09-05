@@ -1,0 +1,3 @@
+include build_support.py
+include setup.py
+recursive-include src/pmkt _build_info.json

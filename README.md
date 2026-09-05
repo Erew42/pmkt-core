@@ -48,8 +48,14 @@ Generated data and local credentials belong in ignored directories such as
 
 ## Development
 
+Create a repository-local virtual environment without system-site packages and
+use its interpreter for installation and checks (`.venv/Scripts/python.exe` on
+Windows; `.venv/bin/python` on POSIX). Existing global installations need not
+be changed.
+
 ```bash
-python -m pip install -e ".[test]"
+python -m venv .venv
+.venv/bin/python -m pip install -e ".[test]"
 python scripts/check_repo_hygiene.py
 python scripts/check_pytest_lane_coverage.py .github/workflows/tests.yml tests
 python -m ruff check .
@@ -57,5 +63,25 @@ python -m mypy src
 python -m pytest -q
 ```
 
-The repository has a clean initial history. Historical trading implementation
-and operational artifacts are intentionally not part of it.
+Public Git history is retained. The current package contains only the public
+read-side implementation.
+
+## Implementation and artifact identity
+
+`pmkt.provenance.implementation_identity` observes the loaded package, independently
+of the caller's directory. Source installations report their own Git commit,
+version, and dirty state. Wheels and source distributions embed the same fields;
+rebuilding a wheel from an sdist preserves them without consulting enclosing Git
+repositories. An unidentified source archive stays unidentified. Conflicting
+embedded, source, or applicable distribution metadata is an error.
+
+Run manifests preserve their existing identity fields and add `pmkt_core_dirty`
+and `pmkt_core_provenance_source`. Caller metadata cannot override observed core
+identity. Dataset schema versions are unchanged.
+
+`validate_run_manifest(path, *, path_resolver=None)` optionally accepts a
+`Callable[[Path], Path]` for legacy dataset references and declared run directories.
+The caller owns any relocation policy. Exact artifact paths must still be
+canonical and contained within the authoritative manifest directory; hashes,
+schemas, counts, and journal bindings are always validated after resolution.
+With no callback, existing path behavior is unchanged.

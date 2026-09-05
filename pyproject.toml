@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pmkt"
-version = "0.1.0"
+version = "0.1.1"
 description = "Read-only prediction-market data infrastructure for Polymarket and Kalshi"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -90,6 +90,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 pmkt = [
+  "_build_info.json",
   "py.typed",
   "text/taxonomy_data/*.json",
 ]
