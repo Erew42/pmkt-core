@@ -2,7 +2,8 @@
 
 ## Repository boundary
 
-This repository builds the public `pmkt` distribution from `src/pmkt`. It is a
+This is the `pmkt-core` Git root. Run Git, tests, and repository scripts here.
+It builds the public `pmkt` distribution from `src/pmkt`. It is a
 read-only prediction-market data plane. Keep venue REST/WebSocket reads,
 canonical schemas, storage, capture, reconstruction, market structure, and
 resolution here.
@@ -16,6 +17,22 @@ Those belong to the private `pmkt-trading` consumer. Core must never import
 The workspace parent and sibling repositories are not part of this Git root.
 Never copy their ignored `data`, `generated`, `tmp`, environments, credentials,
 or workspace artifacts into this repository.
+
+## Design and complexity
+
+Prefer straightforward implementations with explicit data flow and interfaces.
+Add abstractions, configuration, or dependencies when they solve a current
+problem or simplify actual reuse; avoid frameworks for hypothetical consumers.
+Treat complexity as a maintenance cost, not a line-count target. Preserve
+required validation, provenance, compatibility, and the read-only boundary when
+simplifying. Reusable library infrastructure can justify more structure than a
+single research script.
+
+When asked to grill an idea or review a design, focus on public API and schema
+contracts, data grain and time semantics, provenance, and consumer compatibility.
+Check whether the proposed behavior belongs in core before discussing its
+implementation. Apply these priorities to the affected surface; a local helper
+change does not require reviewing every package contract.
 
 ## Compatibility and contracts
 
