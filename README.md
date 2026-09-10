@@ -35,6 +35,30 @@ pmkt resolve-market-resolutions --help
 See [CLI_COMMANDS.md](CLI_COMMANDS.md) for the supported command surface and
 [docs/data_dictionary.md](docs/data_dictionary.md) for canonical datasets.
 
+## Capture recovery
+
+Each venue collector uses one retry budget across initial connection failures,
+receive failures, clean closes, and supervisor-requested replacement connections.
+The initial attempt is free; each retry is charged once. Successful connections
+and replacement message iterators do not reset the budget. Existing capture
+limits remain unchanged. Transport retries retain linear backoff; the first
+supervisor-requested attempt remains immediate.
+
+Connection and backoff waits respect the capture deadline. Expiry during recovery
+raises `WebSocketDeadlineExceeded` and persists the existing completeness result
+with a `deadline_reached` reason; it does not turn incomplete books into accepted
+data. Failed subscription setup closes the new socket. DNS exhaustion retains
+the original exception and is classified as a stream error, not a storage error.
+
+Direct client users can supply a `WebSocketRetryBudget` to share accounting across
+context entry and iterator generations. When supplied, it owns the limit, backoff,
+and retry callback instead of the iterator's per-call settings. Without one,
+context entry remains a single attempt and `iter_messages` uses its existing
+retry arguments. `reconnect=False` disables retries in that iterator.
+
+These changes do not alter quiet-market recovery policy, heartbeat settings,
+book-validation rules, or causal reconstruction ordering.
+
 ## Safety boundary
 
 Core transports are public/read-only. In particular, the package does not ship
