@@ -18,6 +18,7 @@ from pmkt.data.registry import (
     TRADE_SCHEMA_VERSION,
     arrow_schema,
     get_table_spec,
+    INTEGRITY_SCHEMA_VERSIONS,
 )
 
 from pmkt.streaming.collector import StreamDatasetSpec
@@ -321,7 +322,7 @@ def _schema_authority(
     return MappingProxyType({role: _ROLE_SCHEMA_VERSIONS[role] for role in roles})
 
 
-_PROFILE_DEFINITION_VALUES = (
+_PROFILE_DEFINITION_VALUES: tuple[StorageProfileDefinition, ...] = (
     StorageProfileDefinition(
         name="full",
         profile_version="1",
@@ -434,6 +435,20 @@ _PROFILE_DEFINITION_VALUES = (
         feed_health_interval_seconds=10.0,
         raw_event_policy=RawEventPolicy.NONE,
     ),
+)
+
+_PROFILE_DEFINITION_VALUES += tuple(
+    replace(
+        definition, profile_version="3", tape_encoding_version="book-tape.v2",
+        change_trigger_version="topbook-change.v2",
+        health_fingerprint_version="feed-health-fingerprint.v2",
+        role_schema_versions={
+            role: frozenset(INTEGRITY_SCHEMA_VERSIONS.get(version, version) for version in versions)
+            for role, versions in definition.role_schema_versions.items()
+        },
+    )
+    for definition in _PROFILE_DEFINITION_VALUES
+    if definition.profile_version == "2" and definition.name in {"full", "book-tape"}
 )
 
 PROFILE_DEFINITIONS_BY_VERSION: Mapping[tuple[str, str], StorageProfileDefinition] = (
@@ -586,6 +601,29 @@ def select_storage_profile(
         enabled_roles=enabled_roles,
         experimental_profile_acknowledged=bool(experimental_profile_acknowledged),
     )
+
+
+def integrity_dataset_specs(
+    selection: StorageProfileSelection, specs: Sequence[StreamDatasetSpec],
+) -> tuple[StreamDatasetSpec, ...]:
+    """Choose the explicitly requested v3 physical schemas before resolution."""
+    if selection.definition.profile_version != "3":
+        return tuple(specs)
+    return tuple(
+        replace(spec, schema_version=INTEGRITY_SCHEMA_VERSIONS[spec.schema_version],
+                schema=arrow_schema(get_table_spec(INTEGRITY_SCHEMA_VERSIONS[spec.schema_version])))
+        if spec.schema_version in INTEGRITY_SCHEMA_VERSIONS else spec
+        for spec in specs
+    )
+
+
+def add_book_integrity(
+    row: dict[str, Any], *, integrity: bool, selection: StorageProfileSelection | None,
+) -> dict[str, Any]:
+    if selection is not None and selection.definition.profile_version == "3":
+        return {**row, "schema_version": INTEGRITY_SCHEMA_VERSIONS[str(row["schema_version"])],
+                "book_integrity_valid": integrity}
+    return row
 
 
 def resolve_dataset_specs(

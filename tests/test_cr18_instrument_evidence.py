@@ -27,6 +27,44 @@ _NOW = datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)
 _SHA = "a" * 64
 
 
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_integrity_evidence_separates_receipt_quote_validity_and_latest_attempt(venue):
+    tracker = CaptureInstrumentEvidenceTracker(collector_run_id="v3", venue=venue,
+        shard_id="s", instrument_ids=["one"], integrity_evidence=True,
+        now_utc=lambda: _NOW, eligibility_evidence={"one": _evidence("eligible")})
+    tracker.begin_subscription_attempt()
+    tracker.mark_subscription_established(established_at_utc=_NOW.isoformat())
+    tracker.record_book("one", observed_at_utc=(_NOW + timedelta(seconds=1)).isoformat(),
+        snapshot_received=True, book_integrity_valid=False)
+    tracker.record_book("one", observed_at_utc=(_NOW + timedelta(seconds=2)).isoformat(),
+        snapshot_received=True, book_integrity_valid=True)
+    row = tracker.terminal_rows("deadline_reached")[0]
+    assert row["first_valid_snapshot_at_utc"] is None
+    assert row["first_snapshot_received_at_utc"] == (_NOW + timedelta(seconds=1)).isoformat()
+    assert row["first_integrity_valid_book_at_utc"] == (_NOW + timedelta(seconds=2)).isoformat()
+    assert row["initial_snapshot_latency_ms"] is None
+    assert row["first_integrity_valid_book_latency_ms"] == 2000
+    assert row["terminal_outcome"] == "observed_intact"
+    assert validate_frame(pd.DataFrame([row]), "capture_instrument_evidence.v2", strict=True).ok
+    summary = tracker.summary("deadline_reached")
+    assert summary.initial_snapshot_count == 1
+    report = evaluate_capture_completeness(venue=venue, instruments_with_snapshots=0,
+        event_count=2, reconnect_count=0, duration_seconds_actual=60, duration_seconds_requested=60,
+        instrument_evidence_summary=summary, evidence_policy_status="provisional",
+        evidence_artifact_role=CAPTURE_INSTRUMENT_EVIDENCE_ROLE, evidence_artifact_hash="b" * 64,
+        evidence_artifact_reconciled=True, acceptance_evidence_eligible=True)
+    assert report.capture_status is CaptureStatus.COMPLETE
+    assert report.policy_version == "capture_completeness.v3"
+    assert not report.acceptance_eligible
+    tracker.begin_subscription_attempt()
+    tracker.mark_subscription_established(established_at_utc=_NOW.isoformat())
+    rows = tracker.terminal_rows("deadline_reached")
+    assert rows[0] == row
+    assert len(rows) == 2
+    assert tracker.summary("deadline_reached").initial_snapshot_count == 0
+    assert summarize_capture_instrument_evidence(rows).initial_snapshot_count == 0
+
+
 def _evidence(status: str, *, observed_at: datetime = _NOW) -> dict[str, object]:
     return {
         "status": status,

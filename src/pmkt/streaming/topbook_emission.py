@@ -41,6 +41,9 @@ def topbook_state_fingerprint(row: Mapping[str, Any]) -> str:
         "best_ask_source": _text_or_none(row.get("best_ask_source")),
         "quality_flags": flags,
     }
+    if row.get("schema_version") == "topbook.v2":
+        projection["version"] = "topbook-change.v2"
+        projection["book_integrity_valid"] = row.get("book_integrity_valid")
     return semantic_hash(projection)
 
 

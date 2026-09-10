@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import zipfile
 from collections import deque
 from itertools import count
@@ -1287,9 +1288,24 @@ async def test_stream_order_book_data_marks_silent_feed_stale(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_stream_order_book_data_recovers_silent_feed_with_reconnect(
+@pytest.mark.parametrize("connect_failures", [0, 2])
+async def test_stream_order_book_data_recovers_missing_initialization_with_shared_budget(
     tmp_path,
+    monkeypatch,
+    connect_failures,
 ) -> None:
+    import pmkt.exchanges.polymarket.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
+
+    delays = []
+
+    async def no_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
+    )
     first = SilentWebSocket()
     second = FakeWebSocket(
         [
@@ -1305,10 +1321,16 @@ async def test_stream_order_book_data_recovers_silent_feed_with_reconnect(
             )
         ]
     )
-    sockets = deque([first, second])
+    sockets = deque([first, *[socket.gaierror(11001, "DNS failed")] * connect_failures, second])
+    calls = 0
 
     async def connect_factory(_: str) -> FakeWebSocket:
-        return sockets.popleft()
+        nonlocal calls
+        calls += 1
+        result = sockets.popleft()
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     supervisor = LiveFeedSupervisor(
         [
@@ -1322,6 +1344,8 @@ async def test_stream_order_book_data_recovers_silent_feed_with_reconnect(
         max_valid_book_age_ms=20,
     )
 
+    supervisor.initialization_sla_ms = 20  # Short deterministic test SLA; production remains 30 seconds.
+
     manifest = await stream_order_book_data(
         ["token-1"],
         output_root=tmp_path,
@@ -1330,7 +1354,7 @@ async def test_stream_order_book_data_recovers_silent_feed_with_reconnect(
         max_messages=1,
         capture_intent="smoke",
         heartbeat_interval=None,
-        max_reconnects=2,
+        max_reconnects=3,
         connect_factory=connect_factory,
         feed_supervisor=supervisor,
     )
@@ -1342,7 +1366,9 @@ async def test_stream_order_book_data_recovers_silent_feed_with_reconnect(
     assert first.closed is True
     assert json.loads(second.sent[0])["assets_ids"] == ["token-1"]
     assert manifest["row_counts"]["events"] == 1
-    assert manifest["reconnect_count"] == 1
+    assert manifest["reconnect_count"] == 1 + connect_failures
+    assert calls == 2 + connect_failures
+    assert delays == ([1.0, 1.5] if connect_failures else [])
     assert manifest["socket_recovery_count"] == 1
     assert topbook["valid_state"].tolist() == [True]
     assert "stale" in health["connection_state"].tolist()
@@ -1519,7 +1545,7 @@ async def test_stream_order_book_data_emits_complete_same_shard_stale_transition
 
 
 @pytest.mark.asyncio
-async def test_stream_order_book_data_recovers_idle_shard_while_peer_is_active(
+async def test_stream_order_book_data_does_not_recover_for_quietness_while_peer_is_active(
     tmp_path,
 ) -> None:
     first = DelayedFakeWebSocket(
@@ -1632,7 +1658,7 @@ async def test_stream_order_book_data_recovers_idle_shard_while_peer_is_active(
     assert first.closed is True
     assert json.loads(second.sent[0])["assets_ids"] == ["token-1", "token-2"]
     assert manifest["row_counts"]["events"] >= 2
-    assert 1 <= manifest["socket_recovery_count"] <= 2
+    assert manifest["socket_recovery_count"] == 0
     assert 1 <= manifest["reconnect_count"] <= 2
     assert "token-2" in set(topbook["instrument_id"])
     latest_token_2 = topbook[topbook["instrument_id"] == "token-2"].iloc[-1]
@@ -1816,6 +1842,71 @@ async def test_stream_order_book_data_writes_partial_manifest_on_failure(
     assert manifest["row_counts"]["topbook"] == 1
     assert health["error_count"].tolist()[-1] == 1
     assert "error:RuntimeError" in health["quality_flags"].tolist()[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_reconnects", [0, 2])
+async def test_startup_dns_exhaustion_is_classified_as_transport(
+    tmp_path, monkeypatch, max_reconnects,
+) -> None:
+    import pmkt.exchanges.polymarket.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
+
+    calls = 0
+
+    async def no_sleep(delay):
+        pass
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
+    )
+
+    async def factory(*args):
+        nonlocal calls
+        calls += 1
+        raise socket.gaierror(11001, "DNS failed")
+
+    with pytest.raises(socket.gaierror):
+        await stream_order_book_data(
+            ["token-1"], output_root=tmp_path, run_name="dns",
+            duration_s=10, capture_intent="smoke", max_reconnects=max_reconnects,
+            storage_profile=select_storage_profile("full"),
+            connect_factory=factory, heartbeat_interval=None,
+        )
+    manifest = json.loads((tmp_path / "dns" / "manifest.json").read_text())
+    assert calls == 1 + max_reconnects
+    assert manifest["reconnect_count"] == max_reconnects
+    assert manifest["capture_completeness"]["terminal_reason"] == "stream_error"
+    assert manifest["error_type"] == "gaierror"
+    assert validate_run_manifest(tmp_path / "dns" / "manifest.json").ok
+
+
+@pytest.mark.asyncio
+async def test_deadline_before_initialization_preserves_incomplete_capture(
+    tmp_path, monkeypatch,
+) -> None:
+    import pmkt.exchanges.polymarket.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketDeadlineExceeded, WebSocketRetryBudget
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, **{**kwargs, "deadline": -1}),
+    )
+
+    async def factory(*args):
+        pytest.fail("connection must not start after deadline")
+
+    with pytest.raises(WebSocketDeadlineExceeded):
+        await stream_order_book_data(
+            ["token-1"], output_root=tmp_path, run_name="expired",
+            duration_s=10, capture_intent="smoke", connect_factory=factory,
+            heartbeat_interval=None,
+        )
+    manifest = json.loads((tmp_path / "expired" / "manifest.json").read_text())
+    assert manifest["status"] in {"failed", "partial"}
+    assert manifest["capture_completeness"]["terminal_reason"] == "deadline_reached"
+    assert manifest["capture_completeness"]["instruments_with_snapshots"] == 0
 
 
 @pytest.mark.asyncio

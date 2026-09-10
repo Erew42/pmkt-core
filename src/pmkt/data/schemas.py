@@ -9,9 +9,9 @@ from typing import Any
 
 from pmkt.data.canonical import canonical_fixed_decimal
 from pmkt.data.registry import (
-    DEPTH_COLUMNS,
+    TOPBOOK_COLUMNS as TOPBOOK_COLUMNS,
+    DEPTH_COLUMNS as DEPTH_COLUMNS,
     DEPTH_SCHEMA_VERSION,
-    TOPBOOK_COLUMNS,
     TOPBOOK_SCHEMA_VERSION,
     get_table_spec,
 )
@@ -23,8 +23,11 @@ _TOPBOOK_FIELD_DTYPES = {
 
 
 def topbook_row(**values: Any) -> dict[str, Any]:
-    row: dict[str, Any] = {column: None for column in TOPBOOK_COLUMNS}
-    row["schema_version"] = TOPBOOK_SCHEMA_VERSION
+    version = values.pop("schema_version", TOPBOOK_SCHEMA_VERSION)
+    if version not in {TOPBOOK_SCHEMA_VERSION, "topbook.v2"}:
+        raise ValueError(f"unsupported topbook schema {version!r}")
+    row: dict[str, Any] = {column: None for column in get_table_spec(version).columns}
+    row["schema_version"] = version
     row["collector_run_id"] = ""
     row["valid_state"] = False
     row["quality_flags"] = []
@@ -44,11 +47,12 @@ def topbook_evidence_id(row: Mapping[str, Any]) -> str:
     in particular Decimal-to-float64 conversion, rather than identify an
     arbitrary producer-side Python representation.
     """
+    spec = get_table_spec(str(row.get("schema_version") or TOPBOOK_SCHEMA_VERSION))
     projection = {
-        column: _canonical_topbook_field_value(
-            row.get(column), dtype=_TOPBOOK_FIELD_DTYPES[column]
+        field.name: _canonical_topbook_field_value(
+            row.get(field.name), dtype=field.dtype
         )
-        for column in TOPBOOK_COLUMNS
+        for field in spec.fields
     }
     payload = json.dumps(
         projection,
@@ -119,8 +123,11 @@ def _canonical_evidence_value(value: Any) -> Any:
 
 
 def depth_row(**values: Any) -> dict[str, Any]:
-    row: dict[str, Any] = {column: None for column in DEPTH_COLUMNS}
-    row["schema_version"] = DEPTH_SCHEMA_VERSION
+    version = values.pop("schema_version", DEPTH_SCHEMA_VERSION)
+    if version not in {DEPTH_SCHEMA_VERSION, "depth.v2"}:
+        raise ValueError(f"unsupported depth schema {version!r}")
+    row: dict[str, Any] = {column: None for column in get_table_spec(version).columns}
+    row["schema_version"] = version
     row["collector_run_id"] = ""
     row["valid_state"] = False
     row["quality_flags"] = []

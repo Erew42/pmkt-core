@@ -233,7 +233,7 @@ def _valid_field_value(field: FieldSpec, spec: TableSpec):
 
 def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
     row = {field.name: _valid_field_value(field, spec) for field in spec.fields}
-    if spec.version == "topbook.v1":
+    if spec.version in {"topbook.v1", "topbook.v2"}:
         row.update(
             {
                 "best_bid_dollars": 0.4,
@@ -243,7 +243,7 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "quality_flags": [],
             }
         )
-    if spec.version == "depth.v1":
+    if spec.version in {"depth.v1", "depth.v2"}:
         row.update(
             {
                 "price_dollars": 0.4,
@@ -473,7 +473,7 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "subsequence": 0,
             }
         )
-    if spec.version == "book_tape_event.v1":
+    if spec.version in {"book_tape_event.v1", "book_tape_event.v2"}:
         row.update(
             {
                 "collector_run_id": "run-1",
@@ -516,7 +516,7 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "level_ordinal": 0,
             }
         )
-    if spec.version == "book_tape_control.v1":
+    if spec.version in {"book_tape_control.v1", "book_tape_control.v2"}:
         row.update(
             {
                 "collector_run_id": "run-1",
@@ -780,6 +780,10 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "allowed_consumers_json": ["research_report", "manual_review"],
             }
         )
+    if spec.version == "book_tape_event.v2":
+        row["book_integrity_valid"] = row["reconstructible"]
+    if spec.version == "book_tape_control.v2":
+        row["book_integrity_after"] = row["valid_after"]
     return row
 
 

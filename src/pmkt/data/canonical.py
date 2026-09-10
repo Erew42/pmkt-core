@@ -222,7 +222,7 @@ def trade_row(**values: Any) -> dict[str, Any]:
 
 
 def book_tape_event_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BOOK_TAPE_EVENT_SCHEMA_VERSION, **values)
+    return canonical_row(values.pop("schema_version", BOOK_TAPE_EVENT_SCHEMA_VERSION), **values)
 
 
 def book_tape_level_row(**values: Any) -> dict[str, Any]:
@@ -230,7 +230,7 @@ def book_tape_level_row(**values: Any) -> dict[str, Any]:
 
 
 def book_tape_control_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BOOK_TAPE_CONTROL_SCHEMA_VERSION, **values)
+    return canonical_row(values.pop("schema_version", BOOK_TAPE_CONTROL_SCHEMA_VERSION), **values)
 
 
 def stream_lifecycle_row(**values: Any) -> dict[str, Any]:

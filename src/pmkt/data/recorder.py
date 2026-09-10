@@ -19,7 +19,7 @@ from pmkt.data.schemas import depth_row
 from pmkt.data.time import parse_utc_timestamp
 from pmkt.data.time import utc_now_iso
 from pmkt.data.types import parse_float
-from pmkt.data.validation import coerce_frame, validate_frame
+from pmkt.data.validation import coerce_frame, validate_frame, resolve_evidence_schema
 
 
 @dataclass(frozen=True)
@@ -572,9 +572,10 @@ def _write_topbook_segments(rows: Sequence[dict[str, Any]], out_dir: Path) -> in
     if not rows:
         return 0
     written = 0
-    topbook_spec = get_table_spec("topbook.v1")
+    version = resolve_evidence_schema(pd.DataFrame(rows), "topbook.v1")
+    topbook_spec = get_table_spec(version)
     schema = arrow_schema(topbook_spec)
-    frame = _strict_frame(rows, "topbook.v1")
+    frame = _strict_frame(rows, version)
     for (exchange, date), group in frame.groupby(
         ["exchange", frame["received_at_utc"].astype(str).str.slice(0, 10)],
         dropna=False,
@@ -589,9 +590,10 @@ def _write_topbook_segments(rows: Sequence[dict[str, Any]], out_dir: Path) -> in
 def _write_depth_segments(rows: Sequence[dict[str, Any]], out_dir: Path) -> int:
     if not rows:
         return 0
-    depth_spec = get_table_spec("depth.v1")
+    version = resolve_evidence_schema(pd.DataFrame(rows), "depth.v1")
+    depth_spec = get_table_spec(version)
     schema = arrow_schema(depth_spec)
-    frame = _strict_frame(rows, "depth.v1")
+    frame = _strict_frame(rows, version)
     written = 0
     for (exchange, date), group in frame.groupby(
         ["exchange", frame["received_at_utc"].astype(str).str.slice(0, 10)],
