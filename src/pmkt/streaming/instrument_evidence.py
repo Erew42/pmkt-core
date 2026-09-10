@@ -324,6 +324,7 @@ class CaptureInstrumentEvidenceTracker:
         if not self._attempts:
             return CaptureInstrumentEvidenceSummary(
                 row_count=0,
+                integrity_evidence=self.integrity_evidence,
                 requested_instrument_count=0,
                 eligible_instrument_count=0,
                 excluded_instrument_count=0,

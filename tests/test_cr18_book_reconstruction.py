@@ -253,7 +253,8 @@ class _FakeWebSocket:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue) -> None:
+@pytest.mark.parametrize("profile_name", ["full", "book-tape"])
+async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue, profile_name) -> None:
     if venue == "polymarket":
         messages = [{"event_type": "book", "asset_id": "token-1", "market": "market-1",
                      "bids": [], "asks": [{"price": "0.6", "size": "5"}]}]
@@ -272,13 +273,25 @@ async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue) 
         return fake
 
     kwargs = dict(output_root=tmp_path, run_name="intact", max_messages=len(messages), capture_intent="smoke",
+                  instrument_eligibility_evidence=_eligibility_evidence("token-1" if venue == "polymarket" else "KXTEST"),
                   max_reconnects=0, connect_factory=connect_factory,
-                  storage_profile=select_storage_profile("full", profile_version="3"))
+                  storage_profile=select_storage_profile(profile_name, profile_version="3"))
     if venue == "polymarket":
         await stream_order_book_data(["token-1"], **kwargs)
     else:
         await stream_kalshi_order_book_data(["KXTEST"], auth=FakeReadAuth(), **kwargs)
     manifest_path = tmp_path / "intact" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    completeness = manifest["capture_completeness"]
+    assert completeness["policy_version"] == "capture_completeness.v3"
+    assert completeness["evidence_artifact_reconciled"] is True
+    assert completeness["initial_snapshot_count"] == 1
+    assert completeness["evidence_row_count"] == 1
+    evidence = pd.read_parquet(manifest_path.parent / manifest["dataset_artifacts"]["instrument_evidence"]["path"])
+    assert evidence["first_snapshot_received_at_utc"].notna().all()
+    assert evidence["first_integrity_valid_book_at_utc"].notna().all()
+    assert evidence["first_valid_snapshot_at_utc"].notna().all()
+    assert evidence["book_integrity_valid"].all()
     for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
         result = reconstruct(manifest_path)
         assert result.report["status"] == "success"
@@ -286,6 +299,12 @@ async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue) 
         assert (~result.topbooks["valid_state"]).any()
         assert (result.topbooks["best_bid_dollars"].isna() & result.topbooks["best_ask_dollars"].isna()).any()
         assert set(result.topbooks["schema_version"]) == {"topbook.v2"}
+    from pmkt.data.manifests import validate_run_manifest
+    manifest["capture_completeness"]["evidence_artifact_role"] = None
+    manifest_path.write_text(json.dumps(manifest))
+    validation = validate_run_manifest(manifest_path)
+    assert not validation.ok
+    assert any("evidence_artifact_role" in error for error in validation.all_errors)
 
 
 def test_timestamp_inversion_preserves_sequence_across_journal_groups():

@@ -1011,7 +1011,7 @@ async def stream_kalshi_order_book_data(
             interval_seconds=storage_profile.definition.feed_health_interval_seconds
         )
         if (
-            storage_profile.definition.profile_version == "2"
+            storage_profile.definition.profile_version in {"2", "3"}
             and DatasetRole.INSTRUMENT_EVIDENCE in storage_profile.enabled_roles
         ):
             instrument_evidence_tracker = CaptureInstrumentEvidenceTracker(

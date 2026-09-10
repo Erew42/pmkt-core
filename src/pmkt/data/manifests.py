@@ -903,7 +903,7 @@ def _capture_instrument_evidence_errors(
     datasets: Iterable[ManifestDatasetValidation],
 ) -> list[str]:
     profile = payload.get("storage_profile")
-    if not isinstance(profile, Mapping) or profile.get("profile_version") != "2":
+    if not isinstance(profile, Mapping) or profile.get("profile_version") not in {"2", "3"}:
         return []
     from pmkt.streaming.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
@@ -912,6 +912,9 @@ def _capture_instrument_evidence_errors(
 
     errors: list[str] = []
     completeness = payload.get("capture_completeness")
+    if profile.get("profile_version") == "3" and isinstance(completeness, Mapping):
+        if completeness.get("policy_version") != "capture_completeness.v3":
+            errors.append("profile v3 requires capture_completeness.v3")
     if not isinstance(completeness, Mapping):
         return ["capture_completeness must be an object for storage profile v2"]
     artifact = artifacts.get(CAPTURE_INSTRUMENT_EVIDENCE_ROLE)

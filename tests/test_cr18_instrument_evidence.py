@@ -32,6 +32,7 @@ def test_integrity_evidence_separates_receipt_quote_validity_and_latest_attempt(
     tracker = CaptureInstrumentEvidenceTracker(collector_run_id="v3", venue=venue,
         shard_id="s", instrument_ids=["one"], integrity_evidence=True,
         now_utc=lambda: _NOW, eligibility_evidence={"one": _evidence("eligible")})
+    assert tracker.summary("stream_error").integrity_evidence
     tracker.begin_subscription_attempt()
     tracker.mark_subscription_established(established_at_utc=_NOW.isoformat())
     tracker.record_book("one", observed_at_utc=(_NOW + timedelta(seconds=1)).isoformat(),
@@ -74,6 +75,27 @@ def _evidence(status: str, *, observed_at: datetime = _NOW) -> dict[str, object]
         "source_sha256": _SHA,
         "observed_at_utc": observed_at.isoformat(),
     }
+
+
+def test_v3_recovered_evidence_stays_partial_and_provisional(tmp_path):
+    from types import SimpleNamespace
+    from pmkt.streaming.recovery import _recovered_capture_completeness
+
+    tracker = CaptureInstrumentEvidenceTracker(collector_run_id="v3", venue="kalshi",
+        shard_id="s", instrument_ids=["one"], integrity_evidence=True,
+        now_utc=lambda: _NOW, eligibility_evidence={"one": _evidence("eligible")})
+    tracker.begin_subscription_attempt()
+    tracker.mark_subscription_established(established_at_utc=_NOW.isoformat())
+    tracker.record_book("one", observed_at_utc=_NOW.isoformat(),
+        snapshot_received=True, book_integrity_valid=True)
+    pd.DataFrame(tracker.terminal_rows("stream_error")).to_parquet(tmp_path / "evidence.parquet")
+    report = _recovered_capture_completeness(tmp_path, SimpleNamespace(profile_version="3"),
+        {CAPTURE_INSTRUMENT_EVIDENCE_ROLE: {"path": "evidence.parquet", "segment_manifest_hash": _SHA}})
+    assert report["policy_version"] == "capture_completeness.v3"
+    assert report["initial_snapshot_count"] == 1
+    assert report["capture_status"] == "partial"
+    assert report["policy_status"] == "provisional"
+    assert not report["acceptance_eligible"]
 
 
 def _tracker(
