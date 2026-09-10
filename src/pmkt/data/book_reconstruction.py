@@ -24,6 +24,7 @@ from pmkt.data.normalize_books import (
 from pmkt.data.registry import DEPTH_COLUMNS, TOPBOOK_COLUMNS, get_table_spec
 from pmkt.data.schemas import depth_row
 from pmkt.data.validation import (
+    resolve_evidence_schema,
     validate_book_control_evidence,
     validate_book_tape_bundle,
 )
@@ -180,8 +181,8 @@ def reconstruct_book_tape(
             else pd.DataFrame(columns=DEPTH_COLUMNS)
         )
         return BookTapeReconstructionResult(
-            topbooks.loc[:, TOPBOOK_COLUMNS].reset_index(drop=True),
-            depths.loc[:, DEPTH_COLUMNS].reset_index(drop=True),
+            topbooks.reset_index(drop=True),
+            depths.reset_index(drop=True),
             stream.report,
         )
     finally:
@@ -245,7 +246,7 @@ def _reconstruct_book_tape_legacy(
     last_venue_sid: dict[tuple[str, str, str], str] = {}
     last_book_coordinate: dict[
         tuple[str, str, str],
-        tuple[pd.Timestamp, int, int, int, str],
+        tuple[int, int, int],
     ] = {}
     epoch_reports: dict[tuple[str, str, str, str], dict[str, Any]] = {}
     levels_by_event = {
@@ -259,7 +260,7 @@ def _reconstruct_book_tape_legacy(
         )
     }
 
-    causal_items = _causal_items(events, controls)
+    causal_items = _causal_items(events, controls, shard_by_book=shard_by_book)
     for item_index, (family, row, coordinate) in enumerate(causal_items):
         key = (
             _text(row.get("collector_run_id")),
@@ -275,7 +276,8 @@ def _reconstruct_book_tape_legacy(
                 f"no exact shard mapping for {key[1]}:{key[2]}"
             )
         previous = last_book_coordinate.get(key)
-        if previous is not None and coordinate <= previous:
+        progress = _causal_progress(row, family=family)
+        if previous is not None and progress <= previous:
             raise BookTapeReconstructionError(
                 f"non-continuous {family} coordinate for {key[1]}:{key[2]}"
             )
@@ -284,7 +286,7 @@ def _reconstruct_book_tape_legacy(
                 f"{family} evidence occurs after terminal boundary for "
                 f"{key[1]}:{key[2]}"
             )
-        last_book_coordinate[key] = coordinate
+        last_book_coordinate[key] = progress
 
         if family == "control":
             control_type = _text(row.get("control_type"))
@@ -521,13 +523,19 @@ def _reconstruct_book_tape_legacy(
             f"reconstruction lacks terminal coverage for {missing_terminal}"
         )
 
+    output_topbook_columns = list(get_table_spec(
+        "topbook.v2" if "book_integrity_valid" in events.columns else "topbook.v1"
+    ).columns)
+    output_depth_columns = list(get_table_spec(
+        "depth.v2" if "book_integrity_valid" in events.columns else "depth.v1"
+    ).columns)
     internal_topbooks = pd.DataFrame(
         reconstructed_topbooks,
-        columns=[*TOPBOOK_COLUMNS, *_RECONSTRUCTION_COLUMNS],
+        columns=[*output_topbook_columns, *_RECONSTRUCTION_COLUMNS],
     )
     internal_depths = pd.DataFrame(
         reconstructed_depths,
-        columns=[*DEPTH_COLUMNS, *_RECONSTRUCTION_COLUMNS],
+        columns=[*output_depth_columns, *_RECONSTRUCTION_COLUMNS],
     )
     selected_event_count = int(len(events))
     if requested_book is not None:
@@ -552,10 +560,10 @@ def _reconstruct_book_tape_legacy(
         )
 
     parity_source_topbooks = source_topbooks[
-        source_topbooks["valid_state"].fillna(False).astype(bool)
+        _intact_source_mask(source_topbooks)
     ].reset_index(drop=True)
     parity_source_depths = source_depths[
-        source_depths["valid_state"].fillna(False).astype(bool)
+        _intact_source_mask(source_depths)
     ].reset_index(drop=True)
     topbook_comparison = {
         **_compare_topbooks(
@@ -576,8 +584,8 @@ def _reconstruct_book_tape_legacy(
             len(source_depths) - len(parity_source_depths)
         ),
     }
-    topbooks = internal_topbooks.loc[:, TOPBOOK_COLUMNS].reset_index(drop=True)
-    depths = internal_depths.loc[:, DEPTH_COLUMNS].reset_index(drop=True)
+    topbooks = internal_topbooks.loc[:, output_topbook_columns].reset_index(drop=True)
+    depths = internal_depths.loc[:, output_depth_columns].reset_index(drop=True)
     output_hashes = {
         "topbook_rows": _frame_semantic_hash(topbooks),
         "depth_rows": _frame_semantic_hash(depths),
@@ -761,6 +769,11 @@ def _load_committed_run_evidence(
             for role, schema in _COMPARISON_SCHEMAS.items()
             if role in artifacts
         },
+    }
+    selected_schemas = {
+        role: next(iter(definition.role_schema_versions[DatasetRole(role)]))
+        if DatasetRole(role) in definition.role_schema_versions else version
+        for role, version in selected_schemas.items()
     }
     if "topbook_main" not in selected_schemas:
         raise BookTapeReconstructionError(
@@ -961,7 +974,7 @@ def _load_committed_run_evidence(
 
 
 def _schema_frame(frame: pd.DataFrame, schema_version: str) -> pd.DataFrame:
-    return frame.loc[:, list(get_table_spec(schema_version).columns)].copy()
+    return frame.loc[:, list(get_table_spec(resolve_evidence_schema(frame, schema_version)).columns)].copy()
 
 
 def _require_committed_artifact_hash(
@@ -1099,7 +1112,7 @@ def _normalize_native_book(
             asks=asks,
             quality_flags=quality_flags,
         )
-        return topbooks, depths
+        return _integrity_outputs(event, topbooks, depths)
     if venue != "kalshi":
         raise BookTapeReconstructionError(f"unsupported tape venue {venue!r}")
     yes_bids = _side_map(book, "yes")
@@ -1137,7 +1150,7 @@ def _normalize_native_book(
         local_sequence=sequence,
         raw_event_ref=_text(event.get("event_id")),
     )
-    return topbooks, _kalshi_depth(
+    depths = _kalshi_depth(
         event,
         market_id=market_id,
         book_id=book_id,
@@ -1145,6 +1158,17 @@ def _normalize_native_book(
         no_bids=no_bids,
         quality_flags=quality_flags,
     )
+    return _integrity_outputs(event, topbooks, depths)
+
+
+def _integrity_outputs(
+    event: Mapping[str, Any], topbooks: list[dict[str, Any]], depths: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if event.get("schema_version") == "book_tape_event.v2":
+        for row in topbooks + depths:
+            row["schema_version"] = str(row["schema_version"]).replace(".v1", ".v2")
+            row["book_integrity_valid"] = _bool(event.get("book_integrity_valid"))
+    return topbooks, depths
 
 
 def _polymarket_depth(
@@ -1306,6 +1330,7 @@ def _validate_venue_order(
 def _causal_items(
     events: pd.DataFrame,
     controls: pd.DataFrame,
+    *, shard_by_book: Mapping[tuple[str, str], str] | None = None,
 ) -> list[
     tuple[
         str,
@@ -1338,9 +1363,25 @@ def _causal_items(
             if family == "event"
             else 2
         )
-        return (*coordinate[:4], priority, coordinate[4])
+        return (
+            _text(row.get("collector_run_id")),
+            (shard_by_book or {}).get((_text(row.get("venue")), _text(row.get("venue_book_id"))), ""),
+            coordinate[2], coordinate[3], priority, coordinate[4],
+        )
 
     return sorted(items, key=sort_key)
+
+
+def _causal_progress(row: Mapping[str, Any], *, family: str) -> tuple[int, int, int]:
+    priority = (0 if family == "control" and row.get("control_type") in
+                {"book_invalidated", "stream_ended"} else 1 if family == "event" else 2)
+    return int(row["local_sequence"]), int(row.get("subsequence") or 0), priority
+
+
+def _intact_source_mask(frame: pd.DataFrame) -> pd.Series:
+    # Never manufacture integrity evidence for historical rows.
+    field = "book_integrity_valid" if "book_integrity_valid" in frame.columns else "valid_state"
+    return frame[field].fillna(False).astype(bool)
 
 
 def _source_message_ownership(row: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -1489,6 +1530,8 @@ def _compare_topbooks(
         "valid_state",
         "quality_flags",
     ]
+    if "book_integrity_valid" in source.columns:
+        fields.append("book_integrity_valid")
     histories: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     history_positions: dict[
         tuple[str, str, str],
@@ -1719,6 +1762,8 @@ def _compare_depths(
         "valid_state",
         "quality_flags",
     ]
+    if "book_integrity_valid" in source.columns:
+        fields.append("book_integrity_valid")
     reconstructed_rows = reconstructed.to_dict("records")
     source_rows = source.to_dict("records")
     reconstructed_by_key = _unique_parity_rows(
