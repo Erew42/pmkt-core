@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from decimal import Decimal, InvalidOperation
 import inspect
 import json
@@ -22,10 +23,12 @@ from urllib.parse import urlparse
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from pmkt.exchanges.book_integrity import finite_number, well_formed_levels, snapshot_ladder
 from pmkt.config import get_config
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
+    WebSocketRetryBudget,
     is_transport_teardown_race,
 )
 from pmkt.data.kalshi_quotes import (
@@ -383,6 +386,7 @@ class KalshiBookSnapshot:
     yes_bid_depth: int = 0
     no_bid_depth: int = 0
     valid_state: bool = False
+    book_integrity_valid: bool = False
     quality_flags: tuple[str, ...] = ()
     initial_snapshot_received: bool = False
 
@@ -437,6 +441,7 @@ class KalshiBookSnapshot:
             "yes_bid_depth": self.yes_bid_depth,
             "no_bid_depth": self.no_bid_depth,
             "valid_state": self.valid_state,
+            "book_integrity_valid": self.book_integrity_valid,
             "quality_flags": list(self.quality_flags),
             "initial_snapshot_received": self.initial_snapshot_received,
         }
@@ -465,7 +470,13 @@ class KalshiOrderBookState:
         self.no_bids.clear()
         self.initial_snapshot_received = False
         self.valid_state = False
-        self.quality_flags.update({"reconnect", "no_initial_snapshot"})
+        self.quality_flags = {"reconnect", "no_initial_snapshot"}
+
+    @property
+    def book_integrity_valid(self) -> bool:
+        return self.initial_snapshot_received and not (
+            self.quality_flags - {"empty_bid", "empty_ask"}
+        )
 
     def snapshot(self, *, event_type: str | None = None) -> KalshiBookSnapshot:
         yes_bid = max(self.yes_bids) if self.yes_bids else None
@@ -497,6 +508,7 @@ class KalshiOrderBookState:
             yes_bid_depth=len(self.yes_bids),
             no_bid_depth=len(self.no_bids),
             valid_state=self.valid_state,
+            book_integrity_valid=self.book_integrity_valid,
             quality_flags=tuple(sorted(self.quality_flags)),
             initial_snapshot_received=self.initial_snapshot_received,
         )
@@ -511,19 +523,20 @@ class KalshiOrderBookState:
         self.timestamp = (
             msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
         )
-        self.yes_bids = _levels_to_map(
-            msg.get("yes_dollars_fp") or msg.get("yes_dollars") or msg.get("yes") or []
-        )
-        self.no_bids = _levels_to_map(
-            msg.get("no_dollars_fp") or msg.get("no_dollars") or msg.get("no") or []
-        )
+        yes = snapshot_ladder(msg, "yes_dollars_fp", "yes_dollars", "yes")
+        no = snapshot_ladder(msg, "no_dollars_fp", "no_dollars", "no")
+        self.yes_bids = _levels_to_map(yes)
+        self.no_bids = _levels_to_map(no)
         self.initial_snapshot_received = True
         self.valid_state = True
         self.quality_flags.clear()
         self.sid = None
         self.last_seq = None
         self._apply_sequence(message.get("sid"), message.get("seq"))
-        self._refresh_validity(preserve=self._sequence_flags())
+        flags = self._sequence_flags()
+        if not all(well_formed_levels(side, allow_missing=True) for side in (yes, no)):
+            flags.add("malformed_book")
+        self._refresh_validity(preserve=flags)
         self.last_event_type = "orderbook_snapshot"
         return self.snapshot(event_type="orderbook_snapshot")
 
@@ -542,13 +555,16 @@ class KalshiOrderBookState:
             self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
         self._apply_sequence(message.get("sid"), message.get("seq"))
         side = str(msg.get("side") or "").lower()
-        price = _first_parsed_float(msg.get("price_dollars"), msg.get("price"))
-        delta = _first_parsed_float(
-            msg.get("delta_fp"), msg.get("delta"), msg.get("size_delta")
-        )
-        if side in {"yes", "no"} and price is not None and delta is not None:
+        price = finite_number(next((msg[key] for key in ("price_dollars", "price") if key in msg), None))
+        delta = finite_number(next((msg[key] for key in ("delta_fp", "delta", "size_delta") if key in msg), None))
+        if (side not in {"yes", "no"} or price is None or delta is None or finite_number(price) is None
+                or finite_number(delta) is None or not 0 <= price <= 1):
+            self.quality_flags.add("malformed_book")
+        else:
             levels = self.yes_bids if side == "yes" else self.no_bids
             next_size = levels.get(price, 0.0) + delta
+            if next_size < -1e-9:
+                self.quality_flags.add("malformed_book")
             if next_size <= 0:
                 levels.pop(price, None)
             else:
@@ -593,6 +609,7 @@ class KalshiOrderBookState:
     def _persistent_flags(self) -> set[str]:
         return self.quality_flags.intersection(
             {
+                "malformed_book",
                 "delta_before_snapshot",
                 "missing_sequence",
                 "no_initial_snapshot",
@@ -700,6 +717,7 @@ class AsyncKalshiWebSocketClient:
         connect_factory: KalshiConnectFactory | None = None,
         transport_settings: WebSocketTransportSettings | None = None,
         sleep: SleepFunc = asyncio.sleep,
+        retry_budget: WebSocketRetryBudget | None = None,
         use_yes_price: bool = True,
         public_channels: Sequence[str] = ("orderbook_delta",),
         on_subscription_start: Callable[[], None] | None = None,
@@ -719,6 +737,7 @@ class AsyncKalshiWebSocketClient:
             )
         )
         self._sleep = sleep
+        self._retry_budget = retry_budget
         self._on_subscription_start = on_subscription_start
         self._on_subscription_established = on_subscription_established
         self._ws: Any | None = None
@@ -742,6 +761,15 @@ class AsyncKalshiWebSocketClient:
     async def connect(self) -> None:
         if self.is_connected:
             return
+        try:
+            await self._connect_once()
+        except BaseException:
+            # __aexit__ isn't called when connection/subscription setup fails.
+            with contextlib.suppress(Exception):
+                await self.close()
+            raise
+
+    async def _connect_once(self) -> None:
         headers = self.auth_headers()
         maybe_ws = self._connect_factory(self.ws_url, headers)
         self._ws = await maybe_ws if inspect.isawaitable(maybe_ws) else maybe_ws
@@ -752,16 +780,19 @@ class AsyncKalshiWebSocketClient:
         logger.info("Connected to Kalshi websocket at %s", self.ws_url)
 
     async def close(self) -> None:
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            await ws.close()
 
     async def reconnect(self) -> None:
         await self.close()
         await self.connect()
 
     async def __aenter__(self) -> "AsyncKalshiWebSocketClient":
-        await self.connect()
+        if self._retry_budget is None:
+            await self.connect()
+        else:
+            await self._retry_budget.run(self.connect)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -881,9 +912,13 @@ class AsyncKalshiWebSocketClient:
         on_raw_frame: RawFrameCallback | None = None,
         fail_on_clean_close_exhausted: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
-        if not self.is_connected:
-            await self.connect()
-        reconnects = 0
+        budget = self._retry_budget or WebSocketRetryBudget(
+            max_reconnects if reconnect else 0,
+            backoff=reconnect_backoff,
+            on_reconnect=on_reconnect,
+            sleep=self._sleep,
+        )
+        await budget.run(self.connect, allow_retry=reconnect)
         while self.is_connected:
             ws = self._ws
             if ws is None:
@@ -898,45 +933,27 @@ class AsyncKalshiWebSocketClient:
                         raw, on_decode_error=on_decode_error
                     ):
                         yield message
-                # A clean remote close is still a lost operational feed.  Keep
-                # reconnecting within the caller's explicit budget rather than
-                # reporting iterator exhaustion as a completed capture.
+            except (ConnectionClosed, OSError, asyncio.TimeoutError, AttributeError) as exc:
+                if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
+                    raise
+                budget.last_error = exc
+                with contextlib.suppress(Exception):
+                    await self.close()
+                if not reconnect or not budget.available:
+                    raise
+            else:
+                with contextlib.suppress(ConnectionClosed, OSError, asyncio.TimeoutError):
+                    await self.close()
                 if not reconnect:
                     return
-                if reconnects >= max_reconnects:
+                if not budget.available:
                     if fail_on_clean_close_exhausted:
                         raise ConnectionError(
                             "Kalshi websocket closed cleanly and exhausted the "
                             "reconnect budget"
                         )
                     return
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
-            except (ConnectionClosed, OSError, asyncio.TimeoutError):
-                if not reconnect or reconnects >= max_reconnects:
-                    raise
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
-            except AttributeError as exc:
-                # asyncio's SSL transport can race teardown against receive
-                # flow control (pause_reading/resume_reading). Treat only that
-                # structural failure as a disconnect; unrelated AttributeErrors
-                # remain programming errors and must fail closed.
-                if not is_transport_teardown_race(exc):
-                    raise
-                if not reconnect or reconnects >= max_reconnects:
-                    raise
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
+            await budget.run(self.reconnect, retry_first=True)
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if not self.is_connected:

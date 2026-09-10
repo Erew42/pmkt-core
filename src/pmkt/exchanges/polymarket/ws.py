@@ -21,10 +21,12 @@ from typing import (
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from pmkt.exchanges.book_integrity import finite_number, well_formed_levels
 from pmkt.config import get_config
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
+    WebSocketRetryBudget,
     is_transport_teardown_race,
 )
 from pmkt.data.time import isoformat_source_timestamp
@@ -189,6 +191,7 @@ class MarketStreamSnapshot:
     last_trade_side: str | None = None
     tick_size: float | None = None
     valid_state: bool = False
+    book_integrity_valid: bool = False
     quality_flags: tuple[str, ...] = ()
     initial_snapshot_received: bool = False
     last_book_hash: str | None = None
@@ -238,6 +241,7 @@ class MarketStreamSnapshot:
             "last_trade_side": self.last_trade_side,
             "tick_size": self.tick_size,
             "valid_state": self.valid_state,
+            "book_integrity_valid": self.book_integrity_valid,
             "quality_flags": list(self.quality_flags),
             "initial_snapshot_received": self.initial_snapshot_received,
             "last_book_hash": self.last_book_hash,
@@ -269,6 +273,12 @@ class MarketBookState:
     last_received_at_monotonic_ns: int | None = None
     reconnect_count: int = 0
 
+    @property
+    def book_integrity_valid(self) -> bool:
+        return self.initial_snapshot_received and not (
+            self.quality_flags - {"empty_bid", "empty_ask", "new_market", "market_resolved"}
+        )
+
     def snapshot(self, *, event_type: str | None = None) -> MarketStreamSnapshot:
         quote_age_ms = None
         if self.last_received_at_monotonic_ns is not None:
@@ -295,6 +305,7 @@ class MarketBookState:
             last_trade_side=self.last_trade_side,
             tick_size=self.tick_size,
             valid_state=self.valid_state,
+            book_integrity_valid=self.book_integrity_valid,
             quality_flags=tuple(sorted(self.quality_flags)),
             initial_snapshot_received=self.initial_snapshot_received,
             last_book_hash=self.last_hash,
@@ -314,7 +325,8 @@ class MarketBookState:
         self.initial_snapshot_received = True
         self.last_event_type = "book"
         self._recompute_best_prices()
-        self._refresh_validity()
+        malformed = not all(well_formed_levels(message.get(side)) for side in ("bids", "asks"))
+        self._refresh_validity(preserve={"malformed_book"} if malformed else set())
         return self.snapshot(event_type="book")
 
     def apply_price_change(
@@ -334,9 +346,14 @@ class MarketBookState:
             self.valid_state = False
             self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
         side = str(change.get("side") or "").upper()
-        price = _parse_float(change.get("price"))
-        size = _parse_float(change.get("size"))
-        if price is not None and size is not None:
+        price = finite_number(change.get("price"))
+        size = finite_number(change.get("size"))
+        if (side not in {"BUY", "BID", "BIDS", "SELL", "ASK", "ASKS"}
+                or price is None or size is None
+                or finite_number(price) is None or finite_number(size) is None
+                or not 0 <= price <= 1 or size < 0):
+            self.quality_flags.add("malformed_book")
+        else:
             self._set_level(side, price, size)
         previous_hash = _previous_hash(change, parent)
         if (
@@ -404,7 +421,10 @@ class MarketBookState:
         self.best_ask = None
         self.valid_state = False
         self.initial_snapshot_received = False
-        self.quality_flags.update({"reconnect", "no_initial_snapshot"})
+        self.quality_flags = {"reconnect", "no_initial_snapshot"}
+        self.last_received_at_monotonic_ns = None
+        self.last_hash = None
+        self.last_book_hash = None
 
     def _set_level(self, side: str, price: float, size: float) -> None:
         if side in {"BUY", "BID", "BIDS"}:
@@ -433,6 +453,7 @@ class MarketBookState:
 
     def _persistent_flags(self) -> set[str]:
         persistent = {
+            "malformed_book",
             "delta_before_snapshot",
             "hash_mismatch",
             "market_resolved",
@@ -545,9 +566,12 @@ class AsyncMarketWebSocketClient:
         ws_url: str | None = None,
         custom_feature_enabled: bool = True,
         heartbeat_interval: float | None = DEFAULT_HEARTBEAT_SECONDS,
+        pong_timeout_seconds: float = 20.0,
+        heartbeat_clock: Callable[[], float] = time.monotonic,
         connect_factory: ConnectFactory | None = None,
         transport_settings: WebSocketTransportSettings | None = None,
         sleep: SleepFunc = asyncio.sleep,
+        retry_budget: WebSocketRetryBudget | None = None,
         on_subscription_start: Callable[[], None] | None = None,
         on_subscription_established: Callable[[str, str], None] | None = None,
     ) -> None:
@@ -555,6 +579,11 @@ class AsyncMarketWebSocketClient:
         self.asset_ids = _normalize_asset_ids(asset_ids) if asset_ids else []
         self.custom_feature_enabled = bool(custom_feature_enabled)
         self.heartbeat_interval = heartbeat_interval
+        if pong_timeout_seconds <= 0:
+            raise ValueError("pong_timeout_seconds must be positive")
+        self.pong_timeout_seconds = pong_timeout_seconds
+        self._heartbeat_clock = heartbeat_clock
+        self._pending_ping_since: float | None = None
         self.transport_settings = transport_settings or WebSocketTransportSettings()
         self._connect_factory = connect_factory or (
             lambda url: _connect_market_websocket(
@@ -562,6 +591,7 @@ class AsyncMarketWebSocketClient:
             )
         )
         self._sleep = sleep
+        self._retry_budget = retry_budget
         self._on_subscription_start = on_subscription_start
         self._on_subscription_established = on_subscription_established
         # Application-dequeue telemetry. These describe when the websocket
@@ -585,9 +615,19 @@ class AsyncMarketWebSocketClient:
     async def connect(self) -> None:
         if self.is_connected:
             return
+        try:
+            await self._connect_once()
+        except BaseException:
+            # __aexit__ isn't called when connection/subscription setup fails.
+            with contextlib.suppress(Exception):
+                await self.close()
+            raise
+
+    async def _connect_once(self) -> None:
         maybe_ws = self._connect_factory(self.ws_url)
         self._ws = await maybe_ws if inspect.isawaitable(maybe_ws) else maybe_ws
         self._heartbeat_error = None
+        self._pending_ping_since = None
         if self.asset_ids:
             if self._on_subscription_start is not None:
                 self._on_subscription_start()
@@ -611,16 +651,20 @@ class AsyncMarketWebSocketClient:
 
     async def close(self) -> None:
         await self._stop_heartbeat()
-        if self._ws is not None:
-            await self._ws.close()
-            self._ws = None
+        self._pending_ping_since = None
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            await ws.close()
 
     async def reconnect(self) -> None:
         await self.close()
         await self.connect()
 
     async def __aenter__(self) -> "AsyncMarketWebSocketClient":
-        await self.connect()
+        if self._retry_budget is None:
+            await self.connect()
+        else:
+            await self._retry_budget.run(self.connect)
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
@@ -665,6 +709,8 @@ class AsyncMarketWebSocketClient:
         ws = self._ws
         if ws is None:
             raise RuntimeError("WebSocket is not connected.")
+        if self._pending_ping_since is None:
+            self._pending_ping_since = self._heartbeat_clock()
         await ws.send("PING")
 
     async def iter_messages(
@@ -676,28 +722,30 @@ class AsyncMarketWebSocketClient:
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
-        if not self.is_connected:
-            await self.connect()
-        reconnects = 0
+        # A capture supplies one budget for startup and all iterator generations.
+        budget = self._retry_budget or WebSocketRetryBudget(
+            max_reconnects if reconnect else 0,
+            backoff=reconnect_backoff,
+            on_reconnect=on_reconnect,
+            sleep=self._sleep,
+        )
+        await budget.run(self.connect, allow_retry=reconnect)
         while True:
-            if not self.is_connected:
-                if self._heartbeat_error is None:
-                    return
-                if not reconnect or reconnects >= max_reconnects:
-                    error = self._heartbeat_error
-                    self._heartbeat_error = None
-                    raise error
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
-                continue
             ws = self._ws
-            if ws is None:
+            if ws is None and self._heartbeat_error is None:
                 return
             try:
+                if self._heartbeat_error is not None:
+                    error, self._heartbeat_error = self._heartbeat_error, None
+                    raise error
+                if ws is None:
+                    return
                 async for raw in ws:
+                    if self._heartbeat_error is not None:
+                        raise self._heartbeat_error
+                    self._check_pong_deadline()
+                    if raw in ("PONG", b"PONG") and ws is self._ws:
+                        self._pending_ping_since = None
                     # Stamp application dequeue BEFORE decoding. Messages 2..N
                     # of a frame would otherwise inherit processing time spent
                     # on their predecessors, including synchronous commits.
@@ -711,57 +759,30 @@ class AsyncMarketWebSocketClient:
                         self.last_message_index_in_frame = index
                         yield message
                 if self._heartbeat_error is not None:
-                    if not reconnect or reconnects >= max_reconnects:
-                        error = self._heartbeat_error
-                        self._heartbeat_error = None
-                        raise error
-                    reconnects += 1
-                    if on_reconnect is not None:
-                        on_reconnect()
-                    await self._sleep(reconnect_backoff * reconnects)
-                    await self.reconnect()
-                    continue
-                # A remote peer may finish the iterator with a normal close
-                # frame.  For an operational stream that is still a transport
-                # disconnect, not a successful capture boundary.  Retry it
-                # under the same explicit reconnect budget used for errors.
+                    error, self._heartbeat_error = self._heartbeat_error, None
+                    raise error
+            except (ConnectionClosed, OSError, asyncio.TimeoutError, AttributeError) as exc:
+                if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
+                    raise
+                budget.last_error = exc
+                with contextlib.suppress(Exception):
+                    await self.close()
+                if not reconnect or not budget.available:
+                    raise
+            else:
+                with contextlib.suppress(ConnectionClosed, OSError, asyncio.TimeoutError):
+                    await self.close()
                 if not reconnect:
                     return
-                if reconnects >= max_reconnects:
+                if not budget.available:
                     if fail_on_clean_close_exhausted:
                         raise ConnectionError(
                             "Polymarket websocket closed cleanly and exhausted the "
                             "reconnect budget"
                         )
                     return
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
-                continue
-            except (ConnectionClosed, OSError, asyncio.TimeoutError):
-                if not reconnect or reconnects >= max_reconnects:
-                    raise
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
-            except AttributeError as exc:
-                # asyncio's SSL transport can race teardown against receive
-                # flow control (pause_reading/resume_reading). Treat only that
-                # structural failure as a disconnect; unrelated AttributeErrors
-                # remain programming errors and must fail closed.
-                if not is_transport_teardown_race(exc):
-                    raise
-                if not reconnect or reconnects >= max_reconnects:
-                    raise
-                reconnects += 1
-                if on_reconnect is not None:
-                    on_reconnect()
-                await self._sleep(reconnect_backoff * reconnects)
-                await self.reconnect()
+            # Recovery failures stay inside the same budget, not an except arm.
+            await budget.run(self.reconnect, retry_first=True)
 
     async def _send_json(self, payload: dict[str, Any]) -> None:
         if not self.is_connected:
@@ -787,13 +808,23 @@ class AsyncMarketWebSocketClient:
         with contextlib.suppress(asyncio.CancelledError):
             await task
 
+    def _check_pong_deadline(self) -> None:
+        if (self._pending_ping_since is not None
+                and self._heartbeat_clock() - self._pending_ping_since >= self.pong_timeout_seconds):
+            raise asyncio.TimeoutError("Polymarket application PONG response deadline exceeded")
+
     async def _heartbeat_loop(self) -> None:
         interval = self.heartbeat_interval
         if interval is None or interval <= 0:
             return
         try:
             while self.is_connected:
-                await self._sleep(float(interval))
+                wait = float(interval)
+                if self._pending_ping_since is not None:
+                    wait = min(wait, max(0.0, self.pong_timeout_seconds -
+                        (self._heartbeat_clock() - self._pending_ping_since)))
+                await self._sleep(wait)
+                self._check_pong_deadline()
                 if self.is_connected:
                     await self.ping()
         except asyncio.CancelledError:
