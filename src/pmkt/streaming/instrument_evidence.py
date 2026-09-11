@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, Sequence
@@ -49,6 +49,8 @@ class InstrumentTerminalOutcome(str, Enum):
     MISSING = "missing"
     INELIGIBLE = "ineligible"
     NOT_ESTABLISHED = "not_established"
+    INTEGRITY_FAILED = "integrity_failed"
+    OBSERVED_INTACT = "observed_intact"
 
 
 @dataclass(frozen=True)
@@ -90,6 +92,10 @@ class CaptureInstrumentEvidencePolicy:
     def as_manifest_mapping(self, *, venue: str) -> dict[str, Any]:
         return {
             "policy_version": self.policy_version,
+            "completeness_scope": "latest_subscription_attempt",
+            "initialization_basis": (
+                "initialized_intact_book" if self.policy_version.endswith(".v2") else "conservative_valid_book"
+            ),
             "policy_status": self.policy_status.value,
             "initialization_sla_seconds": self.initialization_sla_seconds,
             "eligibility_max_age_seconds": self.eligibility_max_age_seconds,
@@ -117,6 +123,7 @@ class CaptureInstrumentEvidenceSummary:
     established_subscription_attempt_count: int
     eligible_established_instrument_count: int
     eligible_initial_snapshot_count: int
+    integrity_evidence: bool = False
 
     @property
     def all_requested_ineligible(self) -> bool:
@@ -160,6 +167,9 @@ class _SubscriptionAttemptState:
     subscription_sent_at_utc: str | None = None
     subscription_established_at_utc: str | None = None
     first_valid_snapshot_at_utc: list[datetime | None] = field(default_factory=list)
+    first_snapshot_received_at_utc: list[datetime | None] = field(default_factory=list)
+    first_integrity_valid_book_at_utc: list[datetime | None] = field(default_factory=list)
+    book_integrity_valid: list[bool] = field(default_factory=list)
 
 
 class CaptureInstrumentEvidenceTracker:
@@ -178,6 +188,7 @@ class CaptureInstrumentEvidenceTracker:
         | None = None,
         policy: CaptureInstrumentEvidencePolicy | None = None,
         now_utc: Callable[[], datetime] | None = None,
+        integrity_evidence: bool = False,
     ) -> None:
         instruments = tuple(
             dict.fromkeys(str(value).strip() for value in instrument_ids)
@@ -194,7 +205,10 @@ class CaptureInstrumentEvidenceTracker:
         self.venue = venue
         self.shard_id = shard_id
         self.instrument_ids = instruments
+        self.integrity_evidence = integrity_evidence
         self.policy = policy or CaptureInstrumentEvidencePolicy()
+        if integrity_evidence:
+            self.policy = replace(self.policy, policy_version="capture-instrument-evidence-policy.v2")
         # Freeze caller-owned mappings without eagerly changing validation
         # timing.  Historical attempt rows are derived later from each
         # attempt's fixed checked-at timestamp, so mutable input must not be
@@ -229,6 +243,9 @@ class CaptureInstrumentEvidenceTracker:
                 subscription_attempt_id=attempt_id,
                 eligibility_checked_at_utc=checked_at.isoformat(),
                 first_valid_snapshot_at_utc=[None] * len(self.instrument_ids),
+                first_snapshot_received_at_utc=[None] * len(self.instrument_ids),
+                first_integrity_valid_book_at_utc=[None] * len(self.instrument_ids),
+                book_integrity_valid=[False] * len(self.instrument_ids),
             )
         )
         return attempt_id
@@ -258,6 +275,23 @@ class CaptureInstrumentEvidenceTracker:
             raise ValueError("subscription establishment cannot precede send")
         attempt.subscription_sent_at_utc = sent.isoformat()
         attempt.subscription_established_at_utc = established.isoformat()
+
+    def record_book(
+        self, instrument_id: str, *, observed_at_utc: str,
+        snapshot_received: bool, book_integrity_valid: bool,
+    ) -> None:
+        attempt = self._current_attempt()
+        index = self._instrument_index.get(instrument_id)
+        if index is None:
+            return
+        observed = parse_utc_timestamp(observed_at_utc)
+        if observed is None:
+            raise ValueError("observed_at_utc must be a valid UTC timestamp")
+        if snapshot_received and attempt.first_snapshot_received_at_utc[index] is None:
+            attempt.first_snapshot_received_at_utc[index] = observed
+        if book_integrity_valid and attempt.first_integrity_valid_book_at_utc[index] is None:
+            attempt.first_integrity_valid_book_at_utc[index] = observed
+        attempt.book_integrity_valid[index] = book_integrity_valid
 
     def record_valid_snapshot(
         self, instrument_id: str, *, observed_at_utc: str
@@ -290,6 +324,7 @@ class CaptureInstrumentEvidenceTracker:
         if not self._attempts:
             return CaptureInstrumentEvidenceSummary(
                 row_count=0,
+                integrity_evidence=self.integrity_evidence,
                 requested_instrument_count=0,
                 eligible_instrument_count=0,
                 excluded_instrument_count=0,
@@ -317,7 +352,7 @@ class CaptureInstrumentEvidenceTracker:
         eligible_snapshots = 0
         for row in latest_rows:
             status = row["eligibility_status"]
-            has_snapshot = bool(row["first_valid_snapshot_at_utc"])
+            has_snapshot = _has_initial_book(row)
             if status == EligibilityStatus.ELIGIBLE.value:
                 eligible += 1
                 eligible_established += bool(row["subscription_established_at_utc"])
@@ -333,6 +368,7 @@ class CaptureInstrumentEvidenceTracker:
             ] in {
                 InstrumentTerminalOutcome.MISSING.value,
                 InstrumentTerminalOutcome.NOT_ESTABLISHED.value,
+                InstrumentTerminalOutcome.INTEGRITY_FAILED.value,
             }
 
         attempt_count = len(self._attempts)
@@ -354,6 +390,7 @@ class CaptureInstrumentEvidenceTracker:
             ),
             eligible_established_instrument_count=eligible_established,
             eligible_initial_snapshot_count=eligible_snapshots,
+            integrity_evidence=self.integrity_evidence,
         )
 
     def _current_attempt(self) -> _SubscriptionAttemptState:
@@ -465,6 +502,14 @@ class CaptureInstrumentEvidenceTracker:
         first_valid_snapshot_at_utc: datetime | None,
         terminal_reason: str,
     ) -> dict[str, Any]:
+        index = self._instrument_index[instrument_id]
+        receipt = attempt.first_snapshot_received_at_utc[index]
+        intact_at = attempt.first_integrity_valid_book_at_utc[index]
+        integrity_latency_ms = None
+        if intact_at is not None and attempt.subscription_established_at_utc is not None:
+            established = parse_utc_timestamp(attempt.subscription_established_at_utc)
+            assert established is not None
+            integrity_latency_ms = max(0.0, (intact_at - established).total_seconds() * 1000)
         latency_ms: float | None = None
         if (
             attempt.subscription_established_at_utc is not None
@@ -477,24 +522,32 @@ class CaptureInstrumentEvidenceTracker:
                 (first_valid_snapshot_at_utc - established).total_seconds() * 1000,
             )
 
+        initialization_at = intact_at if self.integrity_evidence else first_valid_snapshot_at_utc
+        initialization_latency = integrity_latency_ms if self.integrity_evidence else latency_ms
         if evidence.status is EligibilityStatus.INELIGIBLE:
             verdict = InitializationVerdict.NOT_REQUIRED
             outcome = InstrumentTerminalOutcome.INELIGIBLE
         elif attempt.subscription_established_at_utc is None:
             verdict = InitializationVerdict.MISSING
             outcome = InstrumentTerminalOutcome.NOT_ESTABLISHED
-        elif first_valid_snapshot_at_utc is None:
+        elif initialization_at is None:
             verdict = InitializationVerdict.MISSING
             outcome = InstrumentTerminalOutcome.MISSING
         elif (
-            latency_ms is not None
-            and latency_ms > self.policy.initialization_sla_seconds * 1000
+            initialization_latency is not None
+            and initialization_latency > self.policy.initialization_sla_seconds * 1000
         ):
             verdict = InitializationVerdict.LATE
             outcome = InstrumentTerminalOutcome.LATE
         else:
             verdict = InitializationVerdict.ON_TIME
             outcome = InstrumentTerminalOutcome.OBSERVED_VALID
+
+        if self.integrity_evidence and initialization_at is not None:
+            if not attempt.book_integrity_valid[index]:
+                outcome = InstrumentTerminalOutcome.INTEGRITY_FAILED
+            elif outcome is InstrumentTerminalOutcome.OBSERVED_VALID:
+                outcome = InstrumentTerminalOutcome.OBSERVED_INTACT
 
         checked_at = parse_utc_timestamp(attempt.eligibility_checked_at_utc)
         observed_at = parse_utc_timestamp(evidence.observed_at_utc)
@@ -506,7 +559,13 @@ class CaptureInstrumentEvidenceTracker:
         )
 
         return {
-            "schema_version": CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION,
+            "schema_version": "capture_instrument_evidence.v2" if self.integrity_evidence else CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION,
+            **({
+                "first_snapshot_received_at_utc": receipt.isoformat() if receipt else None,
+                "first_integrity_valid_book_at_utc": intact_at.isoformat() if intact_at else None,
+                "first_integrity_valid_book_latency_ms": integrity_latency_ms,
+                "book_integrity_valid": attempt.book_integrity_valid[index],
+            } if self.integrity_evidence else {}),
             "collector_run_id": self.collector_run_id,
             "venue": self.venue,
             "shard_id": self.shard_id,
@@ -572,6 +631,12 @@ def eligibility_evidence_from_subscription_metadata(
     return {}
 
 
+def _has_initial_book(row: Mapping[str, Any]) -> bool:
+    if row.get("schema_version") == "capture_instrument_evidence.v2":
+        return bool(row.get("first_integrity_valid_book_at_utc")) and row.get("book_integrity_valid") is True
+    return bool(row.get("first_valid_snapshot_at_utc"))
+
+
 def summarize_capture_instrument_evidence(
     rows: Iterable[Mapping[str, Any]],
 ) -> CaptureInstrumentEvidenceSummary:
@@ -619,7 +684,7 @@ def summarize_capture_instrument_evidence(
         if row.get("eligibility_status") == EligibilityStatus.UNKNOWN.value
     ]
     snapshots = [
-        row for row in requested if bool(row.get("first_valid_snapshot_at_utc"))
+        row for row in requested if _has_initial_book(row)
     ]
     late = [
         row
@@ -634,10 +699,14 @@ def summarize_capture_instrument_evidence(
         in {
             InstrumentTerminalOutcome.MISSING.value,
             InstrumentTerminalOutcome.NOT_ESTABLISHED.value,
+            InstrumentTerminalOutcome.INTEGRITY_FAILED.value,
         }
     ]
     return CaptureInstrumentEvidenceSummary(
         row_count=len(materialized),
+        integrity_evidence=bool(materialized) and all(
+            row.get("schema_version") == "capture_instrument_evidence.v2" for row in materialized
+        ),
         requested_instrument_count=len(requested),
         eligible_instrument_count=len(eligible),
         excluded_instrument_count=len(excluded),
@@ -652,7 +721,7 @@ def summarize_capture_instrument_evidence(
             bool(row.get("subscription_established_at_utc")) for row in eligible
         ),
         eligible_initial_snapshot_count=sum(
-            bool(row.get("first_valid_snapshot_at_utc")) for row in eligible
+            _has_initial_book(row) for row in eligible
         ),
     )
 

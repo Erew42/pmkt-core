@@ -679,7 +679,7 @@ class DurableCaptureCoordinator:
                 )
 
         if event_rows is not None or level_rows is not None:
-            event_columns = get_table_spec("book_tape_event.v1").columns
+            event_columns = get_table_spec(self.role_schema_versions["tape_event"]).columns
             level_columns = get_table_spec("book_tape_level.v1").columns
             bundle = validate_book_tape_bundle(
                 pd.DataFrame(event_rows or [], columns=event_columns),
@@ -689,7 +689,7 @@ class DurableCaptureCoordinator:
                 raise ValueError(f"invalid tape group: {'; '.join(bundle.errors)}")
 
         if raw_controls is not None:
-            control_columns = get_table_spec("book_tape_control.v1").columns
+            control_columns = get_table_spec(self.role_schema_versions["tape_control"]).columns
             evidence_report = validate_book_control_evidence(
                 pd.DataFrame(raw_controls, columns=control_columns),
                 tape_events=frames.get("tape_event"),

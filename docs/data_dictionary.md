@@ -1,21 +1,10 @@
 # Canonical Data Dictionary
 
-## Account reservation v2
-
-`runtime_account_reservations` binds each reservation to an authoritative
-`account_id`, venue, and caller idempotency key. `reservation_id` includes the
-account scope. Caller metadata is nested and may not reuse authoritative field
-names. `runtime_account_reservation_aggregates` is updated in the same database
-transaction at account, account/venue, account/event, and account/match grains.
-
-## Run and restart authority v2
-
-`runtime_live_run_account_locks_v2` is the database-unique account-scoped
-live-run authority; `runtime_live_run_claims_v2` retains claim history.
-`runtime_unmatched_exposure_legs_v2` retains per-run legs so risk totals span
-all persisted runs. `runtime_restart_evidence_v2` binds a complete,
-unblocked `run_manifest.v2` to exact artifact IDs, SHA-256 hashes, and explicit
-UTC timestamps. Maker-rebate credit is zero until separate authority exists.
+This public dictionary covers canonical interchange contracts owned by
+`pmkt-core`. Trading runtime account reservations, run authority, and policy
+belong to `pmkt-trading`. Retained trading-facing schema registrations describe
+physical interchange formats, not permission to trade or public execution APIs.
+See [schema ownership and lifecycle](schema_lifecycle.md).
 
 This document defines the first stable normalized schemas for prediction-market
 research in `pmkt`. The raw exchange clients may expose venue-specific payloads,
@@ -39,6 +28,17 @@ Freshness pass: 2026-06-02.
 - Separate markets/contracts from tradable instruments/outcomes.
 - Treat cross-venue matches and arbitrage candidates as review artifacts, not
   facts or executable trade instructions.
+
+## Canonical floating-point conversion
+
+Float64 coercion and strict validation use Python's `float()` conversion to
+binary64. Canonical decimal strings therefore round once using the same parser
+as SQLite journal restoration. Booleans, non-finite values, and malformed
+numbers are rejected by strict conversion and become null in permissive
+coercion. Existing finite float values preserve their bits, including signed
+zero, through conversion and Parquet round trips. This does not change schema
+versions or promise exact decimal arithmetic. Previously written artifacts are
+not rewritten; their recorded hashes remain authoritative.
 
 ## Canonical timestamp-ingestion policy
 
@@ -929,6 +929,50 @@ with the plan id, plan path, SHA-256 hash, source relation path, source market
 paths, tracking relation count, and relation counts. This lets later
 `tracking_health.v1` reports be traced back to the exact match set used to open
 the websockets.
+
+## Integrity evidence contracts: profile version 3
+
+`full@3` and `book-tape@3` explicitly select the following schemas. Version 1
+and 2 profiles, and `mm-compact@2`, retain their original contracts. Profile
+selection remains explicit; historical captures are never rewritten.
+
+| Schema | Added evidence and meaning |
+|---|---|
+| `topbook.v2` | `book_integrity_valid`: an initialized, structurally intact book in the current connection, independent of side availability or age. |
+| `depth.v2` | The same integrity field on available native depth levels. An empty side produces no invented level. |
+| `feed_health.v2` | `book_integrity_valid` is true only when every subscribed instrument has current initialized, intact evidence. Detailed instrument state carries initialization, integrity, quote validity, age and side-quality flags separately. |
+| `capture_instrument_evidence.v2` | Adds current `book_integrity_valid`, `first_snapshot_received_at_utc`, `first_integrity_valid_book_at_utc`, and `first_integrity_valid_book_latency_ms`. Existing first-valid-snapshot time and latency still refer to conservative quote validity. |
+| `book_tape_event.v2` | Adds `book_integrity_valid`; `reconstructible` represents intact evidence, including one-sided and empty initialized books. `valid_state` retains conservative quote semantics. Encoding is `book-tape.v2`. |
+| `book_tape_control.v2` | Adds `book_integrity_after`. A recovery can open an intact epoch with `valid_after=false` when quotes are one-sided. Evidence references and hashes remain mandatory. |
+
+New fields are required in the new physical schemas. Their absence in an old
+capture means unavailable evidence: old invalid rows must not be inferred intact.
+Side availability is derived from nullable quotes, depth and existing empty-side
+flags. Missing quotes remain null. No integrity field grants execution eligibility.
+
+The provisional `capture-instrument-evidence-policy.v2` and
+`capture_completeness.v3` evaluate initialized intact books in the **latest
+subscription attempt**. Every earlier attempt remains persisted. A successful
+capture does not calibrate or approve thesis data. Current integrity failure is
+reported as `integrity_failed`; successful intact initialization is
+`observed_intact`, independently of first-valid-quote evidence. Terminal
+completeness is not a claim of continuous coverage.
+
+Reconstruction orders each collector-run/shard stream by local sequence and
+subsequence, with invalidation, event and recovery precedence at identical
+coordinates. UTC is observation time, not an override of causal sequence. Both
+readers preserve hash/journal checks, epoch ownership and conflicting-coordinate
+rejection. Independent streams do not share a local-sequence clock.
+
+Ordinary age and empty sides remain observable but do not trigger socket
+recovery. Initialization has a 30-second SLA. Kalshi refreshes have one pending
+request per connection generation and instrument, batched by subscription ID,
+with a fixed 30-second response deadline. Only a matching intact snapshot clears
+its request. Counts distinguish batch sends, instrument targets, responses,
+successful responses, timeouts and shared-budget reconnect attempts.
+Polymarket sends application PING every 10 seconds and requires a PONG within
+20 seconds of the oldest outstanding PING. Data and later PINGs cannot extend
+that deadline. Kalshi retains its control-frame keepalive.
 
 ## Feed health schema: `feed_health.v1`
 

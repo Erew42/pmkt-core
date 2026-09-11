@@ -27,8 +27,115 @@ reviewed default and may be raised only through explicit capture configuration.
 
 from __future__ import annotations
 
+import asyncio
+import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Awaitable, Callable
+
+
+class WebSocketDeadlineExceeded(ConnectionError):
+    """The capture deadline expired before transport recovery completed."""
+
+
+class WebSocketRetryBudget:
+    """One attempt counter shared by startup, receive, and requested recovery.
+
+    The initial connection is free; each replacement attempt consumes one retry.
+    Successful connections don't reset the capture's budget.
+    """
+
+    def __init__(
+        self,
+        max_reconnects: int = 3,
+        *,
+        backoff: float = 0.5,
+        on_reconnect: Callable[[], None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        deadline: float | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_reconnects = max_reconnects
+        self.backoff = backoff
+        self.on_reconnect = on_reconnect
+        self.sleep = sleep
+        self.deadline = deadline
+        self.clock = clock
+        self.used = 0
+        self.last_error: BaseException | None = None
+
+    @property
+    def available(self) -> bool:
+        return self.used < self.max_reconnects
+
+    def check_deadline(self) -> None:
+        if self.deadline is not None and self.clock() >= self.deadline:
+            raise WebSocketDeadlineExceeded("capture deadline reached during recovery")
+
+    async def _bounded(self, operation: Callable[[], Awaitable[None]]) -> None:
+        self.check_deadline()
+        if self.deadline is None:
+            await operation()
+            return
+        async def start_before_deadline() -> None:
+            self.check_deadline()
+            await operation()
+
+        task = asyncio.ensure_future(start_before_deadline())
+        try:
+            # asyncio.wait_for can lose outer cancellation when its child finishes
+            # concurrently on Python 3.10. wait keeps cancellation on this task.
+            done, _ = await asyncio.wait(
+                {task}, timeout=max(0.0, self.deadline - self.clock())
+            )
+            if not done:
+                raise WebSocketDeadlineExceeded(
+                    "capture deadline reached during recovery"
+                )
+            task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+            # Retrieve child failures while preserving a new outer cancellation
+            # that arrives during timeout/cancellation cleanup.
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def run(
+        self,
+        operation: Callable[[], Awaitable[None]],
+        *,
+        retry_first: bool = False,
+        immediate_first: bool = False,
+        allow_retry: bool = True,
+    ) -> None:
+        from websockets.exceptions import ConnectionClosed
+
+        needs_retry = retry_first
+        while True:
+            self.check_deadline()
+            if needs_retry:
+                if not self.available:
+                    raise ConnectionError("websocket reconnect budget exhausted")
+                self.used += 1
+                if self.on_reconnect is not None:
+                    self.on_reconnect()
+                if not immediate_first:
+                    await self._bounded(lambda: self.sleep(self.backoff * self.used))
+                immediate_first = False
+                self.check_deadline()
+            try:
+                await self._bounded(operation)
+                self.last_error = None
+                return
+            except WebSocketDeadlineExceeded:
+                raise
+            except (ConnectionClosed, OSError, asyncio.TimeoutError, AttributeError) as exc:
+                if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
+                    raise
+                self.last_error = exc
+                if not allow_retry or not self.available:
+                    raise
+                needs_retry = True
+
 
 # Bounded defaults sized above the observed 1.45 MiB / 600-instrument snapshot
 # while avoiding the much larger per-connection memory exposure of the
@@ -162,6 +269,8 @@ def is_transport_teardown_race(exc: BaseException) -> bool:
 
 
 __all__ = [
+    "WebSocketDeadlineExceeded",
+    "WebSocketRetryBudget",
     "WS_MAX_QUEUE_FRAMES",
     "WS_MAX_SIZE_BYTES",
     "WS_TRANSPORT_LIMITS",

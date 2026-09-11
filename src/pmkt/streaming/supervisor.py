@@ -17,6 +17,9 @@ from pmkt.data.registry import arrow_schema, get_table_spec
 
 FEED_HEALTH_SCHEMA = arrow_schema(get_table_spec(FEED_HEALTH_SCHEMA_VERSION))
 BOOK_INTEGRITY_QUALITY_FLAGS = {
+    "malformed_book",
+    "missing_sequence",
+    "sid_changed",
     "hash_mismatch",
     "seq_gap",
     "sequence_gap",
@@ -108,7 +111,10 @@ class InstrumentFeedHealth:
     instrument: str
     last_message_monotonic_ns: int | None = None
     last_valid_book_monotonic_ns: int | None = None
+    last_book_monotonic_ns: int | None = None
     valid_state: bool = False
+    book_integrity_valid: bool = False
+    initial_snapshot_received: bool = False
     valid_book_count: int = 0
     invalid_book_count: int = 0
     quality_flags: set[str] = field(default_factory=set)
@@ -123,10 +129,18 @@ class InstrumentFeedHealth:
         valid_state: bool,
         now_monotonic_ns: int,
         quality_flags: Iterable[str] = (),
+        book_integrity_valid: bool | None = None,
+        initial_snapshot_received: bool | None = None,
     ) -> None:
         self.record_message(now_monotonic_ns=now_monotonic_ns)
         incoming_flags = _quality_flags(quality_flags)
+        self.last_book_monotonic_ns = now_monotonic_ns
         self.valid_state = bool(valid_state)
+        self.book_integrity_valid = bool(valid_state) if book_integrity_valid is None else book_integrity_valid
+        self.initial_snapshot_received = (
+            self.initial_snapshot_received or bool(valid_state)
+            if initial_snapshot_received is None else initial_snapshot_received
+        )
         # Current-book flags describe the latest authoritative book, so they are
         # REPLACED wholesale on every update.  Previously they were only
         # partially discarded on a valid book, so crossed_book/negative_spread/
@@ -136,6 +150,9 @@ class InstrumentFeedHealth:
         self.quality_flags.update(incoming_flags & CURRENT_BOOK_QUALITY_FLAGS)
         # Integrity flags persist until their explicit resync/snapshot event.
         self.quality_flags.update(incoming_flags & BOOK_INTEGRITY_QUALITY_FLAGS)
+        if self.book_integrity_valid:
+            self.quality_flags.discard("reconnect")
+            self.quality_flags.difference_update(BOOK_INTEGRITY_QUALITY_FLAGS)
         if valid_state:
             self.valid_book_count += 1
             self.last_valid_book_monotonic_ns = now_monotonic_ns
@@ -150,10 +167,16 @@ class InstrumentFeedHealth:
 
     def mark_reconnect(self) -> None:
         self.valid_state = False
-        self.quality_flags.add("reconnect")
+        self.book_integrity_valid = False
+        self.initial_snapshot_received = False
+        self.last_message_monotonic_ns = None
+        self.last_valid_book_monotonic_ns = None
+        self.last_book_monotonic_ns = None
+        self.quality_flags = {"reconnect", "no_initial_snapshot"}
 
     def record_sequence_gap(self) -> None:
         self.valid_state = False
+        self.book_integrity_valid = False
         self.quality_flags.add("sequence_gap")
 
     def record_resync(self, *, now_monotonic_ns: int | None = None) -> None:
@@ -221,6 +244,12 @@ class InstrumentFeedHealth:
         return {
             "instrument": self.instrument,
             "valid_state": self.valid_state,
+            "book_integrity_valid": self.book_integrity_valid,
+            "initial_snapshot_received": self.initial_snapshot_received,
+            "last_book_age_ms": (
+                max(0, (now_monotonic_ns - self.last_book_monotonic_ns) // 1_000_000)
+                if self.last_book_monotonic_ns is not None else None
+            ),
             "last_message_age_ms": self.last_message_age_ms(
                 now_monotonic_ns=now_monotonic_ns
             ),
@@ -320,7 +349,9 @@ class FeedShardHealth:
         before = self._compact_semantic_signature()
         self.reconnect_count += 1
         self.connection_state = "reconnecting"
-        self.quality_flags.add("reconnect")
+        self.quality_flags = {"reconnect"}
+        self.last_message_monotonic_ns = None
+        self.last_valid_book_monotonic_ns = None
         self.valid_book_count = 0
         self.invalid_book_count = self.instrument_count
         self.connected_monotonic_ns = None
@@ -373,6 +404,8 @@ class FeedShardHealth:
         now_monotonic_ns: int,
         instrument: str | None = None,
         quality_flags: Iterable[str] = (),
+        book_integrity_valid: bool | None = None,
+        initial_snapshot_received: bool | None = None,
     ) -> bool:
         before = self._compact_semantic_signature()
         self._record_message(now_monotonic_ns=now_monotonic_ns, instrument=instrument)
@@ -384,6 +417,8 @@ class FeedShardHealth:
                 valid_state=valid_state,
                 now_monotonic_ns=now_monotonic_ns,
                 quality_flags=incoming_flags,
+                book_integrity_valid=book_integrity_valid,
+                initial_snapshot_received=initial_snapshot_received,
             )
             self._apply_instrument_projection_change(
                 before=state_before,
@@ -740,7 +775,7 @@ class FeedShardHealth:
                 else frozenset()
             ),
             frozenset(state.quality_flags & BOOK_INTEGRITY_QUALITY_FLAGS),
-            not (state.valid_state and "reconnect" not in state.quality_flags),
+            not (state.book_integrity_valid and "reconnect" not in state.quality_flags),
         )
 
     def _apply_instrument_projection_change(
@@ -850,6 +885,7 @@ class LiveFeedSupervisor:
         max_message_age_ms: int = 5_000,
         max_valid_book_age_ms: int = 5_000,
     ) -> None:
+        self.integrity_evidence = False
         self.shards: dict[tuple[str, str], FeedShardHealth] = {}
         self._instrument_shards: dict[tuple[str, str], FeedShardHealth] = {}
         for shard in shards:
@@ -872,6 +908,7 @@ class LiveFeedSupervisor:
         self.preflight_report = preflight_report or FeedPreflightReport(ok=True)
         self.max_message_age_ms = max_message_age_ms
         self.max_valid_book_age_ms = max_valid_book_age_ms
+        self.initialization_sla_ms = 30_000
         self._stale_deadline_heaps: dict[str, list[tuple[int, int, str, str, str]]] = {}
         self._stale_deadline_generations: dict[tuple[str, str, str, str], int] = {}
         self._stale_deadline_values: dict[tuple[str, str, str, str], int] = {}
@@ -1024,7 +1061,7 @@ class LiveFeedSupervisor:
                         (selected_venue, shard_id)
                     ]
                     if (
-                        instrument not in shard.instrument_health
+                        not (shard.instrument_health.get(instrument) and shard.instrument_health[instrument].initial_snapshot_received)
                         and shard.connected_monotonic_ns is not None
                         and instrument not in overdue
                     ):
@@ -1095,7 +1132,7 @@ class LiveFeedSupervisor:
         self, shard: FeedShardHealth, instrument: str
     ) -> None:
         state = shard.instrument_health.get(instrument)
-        if state is None:
+        if state is None or not state.initial_snapshot_received:
             if shard.connected_monotonic_ns is None:
                 self._cancel_stale_deadline(
                     shard, instrument=instrument, kind="initial_book"
@@ -1109,7 +1146,7 @@ class LiveFeedSupervisor:
                 instrument=instrument,
                 kind="initial_book",
                 source_monotonic_ns=shard.connected_monotonic_ns,
-                max_age_ms=self.max_valid_book_age_ms,
+                max_age_ms=self.initialization_sla_ms,
             )
             return
         self._cancel_stale_deadline(shard, instrument=instrument, kind="initial_book")
@@ -1205,29 +1242,20 @@ class LiveFeedSupervisor:
             reasons = _socket_recovery_reasons(shard)
             instruments: tuple[str, ...] = ()
             if not reasons:
-                stale_states = {
+                broken = {
                     instrument: state
                     for instrument, state in shard.instrument_health.items()
-                    if any(flag.startswith("stale_") for flag in state.quality_flags)
+                    if state.initial_snapshot_received and not state.book_integrity_valid
+                    and "reconnect" not in state.quality_flags
                 }
-                missing = self._overdue_initial_instruments[
-                    (shard.venue, shard.shard_id)
-                ]
+                missing = self._overdue_initial_instruments[(shard.venue, shard.shard_id)]
                 instrument_reasons: list[str] = []
-                if any(
-                    "stale_messages" in state.quality_flags
-                    for state in stale_states.values()
-                ):
-                    instrument_reasons.append("stale_messages")
-                if any(
-                    "stale_books" in state.quality_flags
-                    for state in stale_states.values()
-                ):
-                    instrument_reasons.append("stale_books")
+                if broken:
+                    instrument_reasons.append("book_integrity")
                 if missing:
                     instrument_reasons.append("missing_instrument_books")
                 reasons = tuple(instrument_reasons)
-                instruments = tuple(sorted(set(stale_states) | missing))
+                instruments = tuple(sorted(set(broken) | missing))
             if not reasons:
                 continue
             actions.append(
@@ -1285,7 +1313,12 @@ class LiveFeedSupervisor:
         ):
             rows.append(
                 {
-                    "schema_version": FEED_HEALTH_SCHEMA_VERSION,
+                    "schema_version": "feed_health.v2" if self.integrity_evidence else FEED_HEALTH_SCHEMA_VERSION,
+                    **({"book_integrity_valid": all(
+                        self.shard(str(row["venue"]), str(row["shard_id"])).instrument_health.get(instrument) is not None
+                        and self.shard(str(row["venue"]), str(row["shard_id"])).instrument_health[instrument].book_integrity_valid
+                        for instrument in self.shard(str(row["venue"]), str(row["shard_id"])).subscribed_instruments
+                    )} if self.integrity_evidence else {}),
                     "observed_at_utc": observed_at_utc,
                     "local_sequence": int(local_sequence),
                     **row,
@@ -1608,14 +1641,8 @@ def _relation_ids(items: Iterable[dict[str, Any]]) -> tuple[str, ...]:
 
 def _socket_recovery_reasons(shard: FeedShardHealth) -> tuple[str, ...]:
     reasons: list[str] = []
-    if shard.connection_state == "stale":
-        reasons.append("connection_stale")
     if shard.connection_state == "disconnected":
         reasons.append("connection_disconnected")
-    if "stale_messages" in shard.quality_flags:
-        reasons.append("stale_messages")
-    if "stale_books" in shard.quality_flags and "reconnect" not in shard.quality_flags:
-        reasons.append("stale_books")
     if "hash_mismatch" in shard.quality_flags:
         reasons.append("hash_mismatch")
         reasons.append("book_integrity")

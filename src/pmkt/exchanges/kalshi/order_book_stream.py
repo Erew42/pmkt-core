@@ -65,7 +65,11 @@ from pmkt.streaming.capture_completeness import (
     CaptureIntent,
     CaptureTerminationReason,
 )
-from pmkt.exchanges.ws_transport import WebSocketTransportSettings
+from pmkt.exchanges.ws_transport import (
+    WebSocketDeadlineExceeded,
+    WebSocketRetryBudget,
+    WebSocketTransportSettings,
+)
 from pmkt.streaming.profile_runtime import ProfileCaptureRuntime, create_profile_runtime
 from pmkt.streaming.storage_backends import CaptureStorageBackend
 from pmkt.streaming.profiles import (
@@ -73,6 +77,8 @@ from pmkt.streaming.profiles import (
     StorageProfileSelection,
     TopbookEmissionMode,
     resolve_dataset_specs,
+    integrity_dataset_specs,
+    add_book_integrity,
 )
 from pmkt.streaming.tape import CaptureCoordinate, canonical_utc
 from pmkt.streaming.tape_producers import CompactValidityProducer, KalshiTapeProducer
@@ -499,12 +505,20 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
     targeted_snapshot_refresh_failure_count: int = 0
     targeted_snapshot_refresh_exhausted_count: int = 0
     targeted_snapshot_market_count: int = 0
+    targeted_snapshot_response_count: int = 0
+    targeted_snapshot_response_success_count: int = 0
+    targeted_snapshot_response_timeout_count: int = 0
+    orderbook_subscription_sid: int | None = None
+    # instrument -> (connection generation, subscription ID, response deadline)
+    pending_snapshot_requests: dict[str, tuple[int, int, int]] = field(default_factory=dict)
     quality_counter: Counter[str] = field(default_factory=Counter)
     instrument_counter: Counter[str] = field(default_factory=Counter)
     last_sequence_by_sid: dict[int, int] = field(default_factory=dict)
 
     def mark_reconnect(self) -> None:
         self.reconnect_count += 1
+        self.pending_snapshot_requests.clear()
+        self.orderbook_subscription_sid = None
         if self.storage_profile is not None:
             self.sequence += 1
         now = self.monotonic_ns()
@@ -541,6 +555,19 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
             now_monotonic_ns=now + 1,
         )
         self.last_sequence_by_sid.clear()
+
+    def observe_snapshot_response(self, snapshot: Any, *, now_monotonic_ns: int) -> None:
+        pending = self.pending_snapshot_requests.get(snapshot.market_ticker)
+        if (
+            pending is not None
+            and pending[0] == self.reconnect_count
+            and pending[1] == snapshot.sid
+            and snapshot.event_type == "orderbook_snapshot"
+        ):
+            self.targeted_snapshot_response_count += 1
+            if snapshot.book_integrity_valid and now_monotonic_ns < pending[2]:
+                del self.pending_snapshot_requests[snapshot.market_ticker]
+                self.targeted_snapshot_response_success_count += 1
 
     def subscription_sequence_gap_sid(self, message: Mapping[str, Any]) -> int | None:
         if str(message.get("type") or "") not in {
@@ -762,6 +789,10 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
                         self.targeted_snapshot_refresh_exhausted_count
                     ),
                     "targeted_snapshot_market_count": self.targeted_snapshot_market_count,
+                    "targeted_snapshot_response_count": self.targeted_snapshot_response_count,
+                    "targeted_snapshot_response_success_count": self.targeted_snapshot_response_success_count,
+                    "targeted_snapshot_response_timeout_count": self.targeted_snapshot_response_timeout_count,
+                    "pending_snapshot_request_count": len(self.pending_snapshot_requests),
                 },
                 "subscription_plan": (
                     dict(self.subscription_plan_metadata)
@@ -781,13 +812,9 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
                     scheduler=self.feed_control_scheduler,
                     interval_ns=self.configured_feed_control_interval_ns,
                     suppression_reason=(
-                        "runtime_projection_recorder_attached"
-                        if self.runtime_projection_recorder is not None
-                        else (
-                            "slim_health_emitter_inactive"
-                            if self.health_emitter is None
-                            else None
-                        )
+                        "slim_health_emitter_inactive"
+                        if self.health_emitter is None
+                        else None
                     ),
                 ),
                 "instrument_evidence_policy": (
@@ -865,7 +892,7 @@ async def stream_kalshi_order_book_data(
     if storage_profile is not None:
         profile_specs = resolve_dataset_specs(
             storage_profile,
-            merge_profile_dataset_specs(STREAM_DATASETS),
+            integrity_dataset_specs(storage_profile, merge_profile_dataset_specs(STREAM_DATASETS)),
         )
 
     root = Path(output_root).resolve()
@@ -906,6 +933,8 @@ async def stream_kalshi_order_book_data(
             )
         ]
     )
+    integrity_evidence = storage_profile is not None and storage_profile.definition.profile_version == "3"
+    supervisor.integrity_evidence = integrity_evidence
     supervisor.require_preflight_ok()
     health_shards = supervisor.venue_shards("kalshi")
     if not health_shards:
@@ -921,7 +950,6 @@ async def stream_kalshi_order_book_data(
             "Kalshi collector instruments must exactly match its feed shard"
         )
     capture_shard_id = capture_shard.shard_id
-    last_targeted_recovery_ns_by_shard: dict[tuple[str, str], int] = {}
     active_sequence_gap_markets: set[str] = set()
     startup_boundary_pending = True
     terminal_control_staged = False
@@ -958,6 +986,7 @@ async def stream_kalshi_order_book_data(
         )
         if DatasetRole.TAPE_EVENT in storage_profile.enabled_roles:
             tape_producer = KalshiTapeProducer(
+            integrity_evidence=integrity_evidence,
                 collector_run_id=run_dir.name,
                 shard_id=capture_shard_id,
                 use_yes_price=use_yes_price,
@@ -982,10 +1011,11 @@ async def stream_kalshi_order_book_data(
             interval_seconds=storage_profile.definition.feed_health_interval_seconds
         )
         if (
-            storage_profile.definition.profile_version == "2"
+            storage_profile.definition.profile_version in {"2", "3"}
             and DatasetRole.INSTRUMENT_EVIDENCE in storage_profile.enabled_roles
         ):
             instrument_evidence_tracker = CaptureInstrumentEvidenceTracker(
+            integrity_evidence=integrity_evidence,
                 collector_run_id=run_dir.name,
                 venue="kalshi",
                 shard_id=capture_shard_id,
@@ -1045,6 +1075,11 @@ async def stream_kalshi_order_book_data(
         configured_feed_control_interval_ns=configured_feed_control_interval_ns,
         next_book_checkpoint_ns=next_book_checkpoint_ns,
     )
+    retry_budget = WebSocketRetryBudget(
+        session.max_reconnects,
+        on_reconnect=session.mark_reconnect,
+        deadline=deadline,
+    )
 
     try:
         capture_context = session.profile_runtime or session.outputs.open_sinks()
@@ -1069,6 +1104,7 @@ async def stream_kalshi_order_book_data(
                 connect_factory=connect_factory,
                 auth=auth,
                 transport_settings=session.transport_settings,
+                retry_budget=retry_budget,
                 use_yes_price=session.use_yes_price,
                 public_channels=(
                     ("orderbook_delta", "trade", "market_lifecycle_v2")
@@ -1087,10 +1123,7 @@ async def stream_kalshi_order_book_data(
                 ),
             ) as ws:
                 connected_at = session.monotonic_ns()
-                if (
-                    session.health_emitter is not None
-                    and session.runtime_projection_recorder is None
-                ):
+                if session.health_emitter is not None:
                     session.feed_control_scheduler = FeedControlScheduler.from_thresholds(
                         now_monotonic_ns=connected_at,
                         max_message_age_ms=session.supervisor.max_message_age_ms,
@@ -1134,149 +1167,79 @@ async def stream_kalshi_order_book_data(
                                 now_monotonic_ns=now_monotonic_ns,
                                 venue="kalshi",
                             )
-                        if not recovery_actions:
-                            # A healthy transition ends the current targeted-
-                            # refresh episode. A later stale episode is then
-                            # eligible for one fresh snapshot attempt.
-                            last_targeted_recovery_ns_by_shard.clear()
+                        expired = [
+                            ticker for ticker, pending in session.pending_snapshot_requests.items()
+                            if now_monotonic_ns >= pending[2]
+                        ]
+                        for ticker in expired:
+                            del session.pending_snapshot_requests[ticker]
+                        session.targeted_snapshot_response_timeout_count += len(expired)
+                        if expired:
+                            session.targeted_snapshot_refresh_exhausted_count += 1
+                        if not recovery_actions and not expired:
                             return False
 
-                        freshness_reasons = {
-                            "connection_stale",
-                            "stale_messages",
-                            "stale_books",
-                            "missing_instrument_books",
-                        }
-                        freshness_only = all(
-                            set(action.reasons) <= freshness_reasons
+                        targeted = not expired and all(
+                            set(action.reasons) <= {"missing_instrument_books", "book_integrity"}
                             for action in recovery_actions
                         )
-                        refresh_interval_ns = max(
-                            1_000_000_000,
-                            min(
-                                session.supervisor.max_message_age_ms,
-                                session.supervisor.max_valid_book_age_ms,
-                            )
-                            * 1_000_000,
-                        )
-                        due_actions = [
-                            action
-                            for action in recovery_actions
-                            if now_monotonic_ns
-                            - last_targeted_recovery_ns_by_shard.get(
-                                (action.venue, action.shard_id), 0
-                            )
-                            >= refresh_interval_ns
-                        ]
-                        if freshness_only and not due_actions:
-                            return False
-                        refresh_exhausted = freshness_only and any(
-                            (action.venue, action.shard_id)
-                            in last_targeted_recovery_ns_by_shard
-                            for action in due_actions
-                        )
-                        if refresh_exhausted:
-                            # A live transport that ignored one targeted refresh
-                            # is not sufficient evidence of a healthy market-data
-                            # subscription. Escalate to the existing reconnect
-                            # path instead of refreshing forever.
-                            session.targeted_snapshot_refresh_exhausted_count += 1
                         snapshot_targets: dict[int, list[str]] = {}
-                        if freshness_only and not refresh_exhausted:
-                            targetable = True
-                            for action in due_actions:
-                                shard = session.supervisor.shard(
-                                    action.venue, action.shard_id
-                                )
-                                stale_markets = list(action.instruments) or [
-                                    instrument
-                                    for instrument, health in shard.instrument_health.items()
-                                    if any(
-                                        flag.startswith("stale_")
-                                        for flag in health.quality_flags
-                                    )
-                                ]
-                                if not stale_markets:
-                                    targetable = False
-                                    break
-                                for market_ticker in stale_markets:
-                                    state = session.states.get(market_ticker)
-                                    if state is None or state.sid is None:
-                                        targetable = False
+                        if targeted:
+                            for action in recovery_actions:
+                                for ticker in action.instruments:
+                                    if ticker in session.pending_snapshot_requests:
+                                        continue
+                                    state = session.states.get(ticker)
+                                    sid = state.sid if state is not None else None
+                                    if sid is None:
+                                        sid = session.orderbook_subscription_sid
+                                    if sid is None:
+                                        targeted = False
                                         break
-                                    snapshot_targets.setdefault(state.sid, []).append(
-                                        market_ticker
-                                    )
-                                if not targetable:
-                                    break
-                            if targetable and snapshot_targets:
-                                session.transport_liveness_probe_count += 1
-                                transport_alive = await ws.probe_liveness(
-                                    timeout_seconds=1.0
-                                )
-                                if transport_alive:
-                                    session.transport_liveness_probe_success_count += 1
-                                    try:
-                                        for sid, market_tickers in sorted(
-                                            snapshot_targets.items()
-                                        ):
-                                            unique_tickers = sorted(set(market_tickers))
-                                            await ws.request_snapshot(
-                                                sid=sid,
-                                                market_tickers=unique_tickers,
+                                    snapshot_targets.setdefault(sid, []).append(ticker)
+                            if targeted:
+                                try:
+                                    for sid, tickers in sorted(snapshot_targets.items()):
+                                        unique_tickers = sorted(set(tickers))
+                                        await ws.request_snapshot(sid=sid, market_tickers=unique_tickers)
+                                        session.snapshot_resync_request_count += 1
+                                        session.targeted_snapshot_refresh_count += 1
+                                        session.targeted_snapshot_market_count += len(unique_tickers)
+                                        # Never renew a deadline when a scheduler observes the same condition.
+                                        for ticker in unique_tickers:
+                                            session.pending_snapshot_requests[ticker] = (
+                                                session.reconnect_count, sid,
+                                                session.monotonic_ns() + 30_000_000_000,
                                             )
-                                            session.snapshot_resync_request_count += 1
-                                            session.targeted_snapshot_refresh_count += 1
-                                            session.targeted_snapshot_market_count += (
-                                                len(unique_tickers)
-                                            )
-                                    except (
-                                        ConnectionClosed,
-                                        OSError,
-                                        RuntimeError,
-                                        asyncio.TimeoutError,
-                                    ):
-                                        session.targeted_snapshot_refresh_failure_count += 1
-                                    else:
-                                        targeted_actions: list[FeedRecoveryAction] = []
-                                        for action in due_actions:
-                                            key = (action.venue, action.shard_id)
-                                            last_targeted_recovery_ns_by_shard[key] = (
-                                                now_monotonic_ns
-                                            )
-                                            shard = session.supervisor.shard(*key)
-                                            if shard.mark_transport_alive():
-                                                session.pending_health_shard_keys.add(
-                                                    key
-                                                )
-                                            targeted_actions.append(
-                                                FeedRecoveryAction(
-                                                    action="request_snapshot",
-                                                    venue=action.venue,
-                                                    shard_id=action.shard_id,
-                                                    reasons=action.reasons,
-                                                    instruments=action.instruments,
-                                                )
-                                            )
-                                        if (
-                                            session.runtime_projection_recorder
-                                            is not None
-                                        ):
+                                        if session.runtime_projection_recorder is not None:
                                             session.runtime_projection_recorder.record_recovery_actions(
-                                                actions=targeted_actions,
+                                                actions=[FeedRecoveryAction(
+                                                    action="request_snapshot", venue="kalshi",
+                                                    shard_id=capture_shard_id,
+                                                    reasons=("book_integrity_or_initialization",),
+                                                    instruments=tuple(unique_tickers),
+                                                )],
                                                 observed_at_utc=_utc_now().isoformat(),
                                             )
-                                        return False
+                                except (ConnectionClosed, OSError, RuntimeError, asyncio.TimeoutError):
+                                    session.targeted_snapshot_refresh_failure_count += 1
                                 else:
-                                    session.transport_liveness_probe_failure_count += 1
+                                    return False
 
+                        if session.reconnect_count >= session.max_reconnects:
+                            raise RuntimeError("Kalshi recovery retry budget exhausted")
                         if session.runtime_projection_recorder is not None:
                             session.runtime_projection_recorder.record_recovery_actions(
-                                actions=recovery_actions,
+                                actions=[FeedRecoveryAction(
+                                    action="reconnect_socket", venue="kalshi",
+                                    shard_id=capture_shard_id,
+                                    reasons=("snapshot_response_timeout",) if expired else tuple(
+                                        sorted({reason for action in recovery_actions for reason in action.reasons})
+                                    ),
+                                    instruments=tuple(sorted(expired)),
+                                )],
                                 observed_at_utc=_utc_now().isoformat(),
                             )
-                        if session.reconnect_count >= session.max_reconnects:
-                            return False
                         if (
                             next_message_task is not None
                             and not next_message_task.done()
@@ -1285,8 +1248,9 @@ async def stream_kalshi_order_book_data(
                             with contextlib.suppress(asyncio.CancelledError):
                                 await next_message_task
                         next_message_task = None
-                        session.mark_reconnect()
-                        await ws.reconnect()
+                        await retry_budget.run(
+                            ws.reconnect, retry_first=True, immediate_first=True,
+                        )
                         session.socket_recovery_count += 1
                         connected_at = session.monotonic_ns()
                         for shard in session.health_shards:
@@ -1327,13 +1291,16 @@ async def stream_kalshi_order_book_data(
                                 )
                             try:
                                 wait_started_ns = session.monotonic_ns()
-                                message = await asyncio.wait_for(
-                                    asyncio.shield(next_message_task),
+                                done, _ = await asyncio.wait(
+                                    {next_message_task},
                                     timeout=session.message_wait_timeout(
                                         remaining,
                                         now_monotonic_ns=wait_started_ns,
                                     ),
                                 )
+                                if not done:
+                                    raise asyncio.TimeoutError
+                                message = next_message_task.result()
                                 next_message_task = None
                             except asyncio.TimeoutError:
                                 observed_at_utc = _utc_now().isoformat()
@@ -1429,6 +1396,10 @@ async def stream_kalshi_order_book_data(
                                 )
                                 if row.get("market_ticker") in requested_tickers
                             ]
+                            if message.get("type") == "subscribed":
+                                payload = message.get("msg")
+                                if isinstance(payload, Mapping) and payload.get("channel") == "orderbook_delta":
+                                    session.orderbook_subscription_sid = _parse_int(payload.get("sid"))
                             sequence_gap_sid = session.subscription_sequence_gap_sid(
                                 message
                             )
@@ -1464,7 +1435,10 @@ async def stream_kalshi_order_book_data(
                                         (message_shard.venue, message_shard.shard_id)
                                     )
                             if sequence_gap_sid is not None:
-                                affected_markets = tuple(sorted(requested_tickers))
+                                affected_markets = tuple(sorted(
+                                    ticker for ticker in requested_tickers
+                                    if session.states[ticker].sid == sequence_gap_sid
+                                ))
                                 snapshots_by_market = {
                                     snapshot.market_ticker: snapshot
                                     for snapshot in snapshots
@@ -1473,8 +1447,11 @@ async def stream_kalshi_order_book_data(
                                     state = session.states.get(market_ticker)
                                     if state is None:
                                         continue
-                                    state.mark_sequence_gap()
                                     current = snapshots_by_market.get(market_ticker)
+                                    # This snapshot already replaces its own book; the
+                                    # gap still invalidates siblings on the same SID.
+                                    if current is None or current.event_type != "orderbook_snapshot":
+                                        state.mark_sequence_gap()
                                     snapshots_by_market[market_ticker] = state.snapshot(
                                         event_type=(
                                             current.event_type
@@ -1507,11 +1484,6 @@ async def stream_kalshi_order_book_data(
                                         session.pending_health_shard_keys.add(
                                             (shard.venue, shard.shard_id)
                                         )
-                                await ws.request_snapshot(
-                                    sid=sequence_gap_sid,
-                                    market_tickers=affected_markets,
-                                )
-                                session.snapshot_resync_request_count += 1
 
                             if (
                                 session.tape_producer is not None
@@ -1571,6 +1543,7 @@ async def stream_kalshi_order_book_data(
 
                             resync_boundary_due = False
                             for snapshot in snapshots:
+                                session.observe_snapshot_response(snapshot, now_monotonic_ns=received_at_monotonic_ns)
                                 flags = set(snapshot.quality_flags)
                                 snapshot_shard = session.health_shard_for_instrument(
                                     snapshot.market_ticker
@@ -1580,7 +1553,6 @@ async def stream_kalshi_order_book_data(
                                         snapshot.market_ticker
                                         not in active_sequence_gap_markets
                                     ):
-                                        sid = snapshot.sid
                                         session.sequence_gap_count += 1
                                         active_sequence_gap_markets.add(
                                             snapshot.market_ticker
@@ -1594,12 +1566,6 @@ async def stream_kalshi_order_book_data(
                                                     snapshot_shard.shard_id,
                                                 )
                                             )
-                                        if sid is not None:
-                                            await ws.request_snapshot(
-                                                sid=sid,
-                                                market_tickers=[snapshot.market_ticker],
-                                            )
-                                            session.snapshot_resync_request_count += 1
                                 else:
                                     if (
                                         snapshot.market_ticker
@@ -1621,6 +1587,8 @@ async def stream_kalshi_order_book_data(
                                     )
                                 if snapshot_shard.record_book(
                                     valid_state=bool(snapshot.valid_state),
+                                    book_integrity_valid=snapshot.book_integrity_valid,
+                                    initial_snapshot_received=snapshot.initial_snapshot_received,
                                     now_monotonic_ns=received_at_monotonic_ns,
                                     instrument=snapshot.market_ticker,
                                     quality_flags=flags,
@@ -1642,6 +1610,12 @@ async def stream_kalshi_order_book_data(
                                         )
                                     )
                                     session.snapshot_count += 1
+                                if session.instrument_evidence_tracker is not None:
+                                    session.instrument_evidence_tracker.record_book(
+                                        snapshot.market_ticker, observed_at_utc=received_at_utc,
+                                        snapshot_received=snapshot.event_type == 'orderbook_snapshot',
+                                        book_integrity_valid=snapshot.book_integrity_valid,
+                                    )
                                 if snapshot.valid_state:
                                     session.instruments_with_snapshots.add(
                                         snapshot.market_ticker
@@ -1662,6 +1636,7 @@ async def stream_kalshi_order_book_data(
                                     received_at_monotonic_ns=received_at_monotonic_ns,
                                     local_sequence=session.sequence,
                                 ):
+                                    topbook = add_book_integrity(topbook, integrity=snapshot.book_integrity_valid, selection=session.storage_profile)
                                     instrument_id = topbook.get("instrument_id")
                                     topbook_emission = None
                                     if session.topbook_tracker is not None:
@@ -1768,7 +1743,7 @@ async def stream_kalshi_order_book_data(
                                         snapshot=snapshot,
                                         state=state,
                                     ):
-                                        await depth_sink.write(depth)
+                                        await depth_sink.write(add_book_integrity(depth, integrity=snapshot.book_integrity_valid, selection=session.storage_profile))
                                         session.quality_counter.update(
                                             depth.get("quality_flags") or []
                                         )
@@ -1910,11 +1885,13 @@ async def stream_kalshi_order_book_data(
         if not isinstance(exc, CaptureCompletenessError):
             if isinstance(exc, asyncio.CancelledError):
                 session.terminal_reason = CaptureTerminationReason.CANCELLED
+            elif isinstance(exc, WebSocketDeadlineExceeded):
+                session.terminal_reason = CaptureTerminationReason.DEADLINE_REACHED
             elif capture_phase == "finalization":
                 session.terminal_reason = CaptureTerminationReason.FINALIZATION_ERROR
                 # ConnectionError is an OSError subclass, but here it represents
                 # websocket transport exhaustion rather than a persistence failure.
-            elif isinstance(exc, ConnectionError):
+            elif isinstance(exc, ConnectionError) or exc is retry_budget.last_error:
                 session.terminal_reason = CaptureTerminationReason.STREAM_ERROR
             elif isinstance(exc, OSError):
                 session.terminal_reason = CaptureTerminationReason.PERSISTENCE_ERROR

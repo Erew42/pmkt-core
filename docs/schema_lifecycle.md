@@ -11,8 +11,8 @@ rewriting, moving, or deleting an artifact.
 
 ## Status model
 
-- `active_core`: current capture, ingestion, matching, tracking, or persistence
-  behavior depends on the contract.
+- `active_core`: current capture, ingestion, or consumer persistence behavior
+  depends on the contract; this status is distinct from repository ownership.
 - `active_experiment`: research, paper, canary, or deferred execution code owns
   the contract. It is retained conservatively even when not routinely run.
 - `compatibility_legacy`: the contract may be needed to read older data.
@@ -39,45 +39,61 @@ The evidence baseline recorded on 2026-08-20 found no snapshot-v2,
 main retained roots or a representative `tmp` sample. That sample contained
 unreadable paths and was not exhaustive, so it is not sufficient for removal.
 
+## Post-split ownership and compatibility
+
+The 2026-09-11 source baseline names each repository and revision separately in
+`evidence_as_of.repositories`. Research has no committed revision yet; its
+source inventory cannot be reproduced from a Git SHA. The older August scan is
+retained as `historical_evidence_as_of`, not represented as a current core commit.
+Historical paths in `evidence_overrides` describe the combined layout.
+
+`repository_ownership` covers every registered version. Core owns physical
+contracts and policy-neutral validation. `cross_repository_contract` entries
+have private semantic policy in `pmkt-trading`; registration or public export
+is not an ownership violation. Existing exports remain compatible. No schemas
+are removed by this refresh, and the five proposed dimension/snapshot removals
+still require complete retained-artifact and consumer evidence.
+
+The dashboard's generic reader is now
+`pmkt-trading:src/pmkt_trading/dashboard/data/artifacts.py`. Literal token scans
+cannot enumerate its runtime manifest-supplied versions. Review it and actual
+producer functions before concluding that a schema is unused.
+
 ## Reproducing the evidence report
 
-The scanner is read-only. Without `--output` it writes JSON to standard output:
+Run the scanner from the repository being inventoried. Public core's default
+text roots are `src`, `scripts`, `tests`, and `docs`. It declares no artifact
+roots because core intentionally holds no workspace datasets:
 
 ```powershell
-python scripts/inventory_schema_usage.py
+python scripts/inventory_schema_usage.py --allow-incomplete
 ```
 
-Write an ignored report and include all local research roots explicitly:
+This produces a source-only report, with `artifact_roots_not_declared` as an
+explicit removal-evidence blocker. Without `--allow-incomplete`, its exit code
+is 2. A successful source scan is not zero-use evidence for retained artifacts.
+Every report records the repository name, Git HEAD, and dirty/untracked status.
+Use an explicit `--catalog` to keep the public catalog authoritative when
+scanning a consumer checkout. For example, from the trading Git root:
 
 ```powershell
-python scripts/inventory_schema_usage.py `
-  --artifact-root data `
-  --artifact-root generated `
-  --artifact-root local_data `
-  --artifact-root tmp `
-  --output tmp/schema_usage_inventory.json
+python ../pmkt-core/scripts/inventory_schema_usage.py --root . `
+  --catalog ../pmkt-core/docs/schema_lifecycle.json `
+  --artifact-root data --artifact-root generated --artifact-root local_data `
+  --artifact-root tmp --output tmp/schema_usage_inventory.json
 ```
 
-The default exit code is nonzero when a declared root or file cannot be read.
-`--allow-incomplete` is available for exploratory reporting, but it does not
-turn an incomplete report into removal evidence.
+Declare the real retained roots, including any external archival locations;
+missing roots remain errors. For a research source scan, provide its actual
+`--text-root` directories explicitly. Keep generated reports in ignored local
+locations; never copy consumer datasets into core.
 
-Routine checks should scope `--artifact-root` to the dataset under review. The
-all-root command is an intentionally exhaustive manual gate and can take several
-minutes on the current 100,000-plus-file tree. Parquet inspection uses at most
-eight workers by default; override that bound with `--parquet-workers` when local
-I/O characteristics require a smaller value.
-
-The default text roots are `src`, `apps`, `scripts`, `tests`, and `docs`. The
-report separates registry, public-export, package source, application source,
-scripts, tests, documentation, notebooks, manifest text, and persisted Parquet
-evidence. Text matches are exact literal registered-version tokens only. They
-cannot discover readers that resolve a version dynamically.
-
-For example, the dashboard resolves manifest-supplied versions through
-`get_table_spec(schema_version)`. The catalog therefore records reviewed generic
-consumers separately, and every removal packet must supplement literal scanning
-with reviewed semantic producer/reader evidence.
+Reports distinguish registry, public-export, source, tests, scripts, docs,
+notebooks, manifests, and persisted Parquet. References are exact literal
+registered-version tokens, not proof of semantic producer/reader behavior.
+Parquet inspection uses at most eight workers by default; `--parquet-workers`
+can lower this bound. `--allow-incomplete` permits exploration but never turns
+incomplete attribution into removal evidence.
 
 Parquet row counts are calculated per `schema_version`, including mixed-version
 files. The scanner distinguishes:

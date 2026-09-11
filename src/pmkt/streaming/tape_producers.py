@@ -201,9 +201,10 @@ class CompactValidityProducer:
 
 
 class PolymarketTapeProducer:
-    def __init__(self, *, collector_run_id: str, shard_id: str) -> None:
+    def __init__(self, *, collector_run_id: str, shard_id: str, integrity_evidence: bool = False) -> None:
         self.collector_run_id = collector_run_id
         self.shard_id = shard_id
+        self.integrity_evidence = integrity_evidence
         self._epochs = _EpochTracker()
 
     def observe(
@@ -233,13 +234,14 @@ class PolymarketTapeProducer:
                     cursor + 1,
                 )
                 closed_epoch = None
-                if state.valid_state:
+                if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                     opened = self._epochs.open(coordinate, book_id)
                 else:
                     closed_epoch = self._epochs.close(book_id)
                     opened = self._epochs.issue(coordinate, book_id)
                 levels = polymarket_book_levels(state)
                 batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                     coordinate=coordinate,
                     venue="polymarket",
                     venue_market_id=market_id,
@@ -253,7 +255,7 @@ class PolymarketTapeProducer:
                     full_book_levels=levels,
                     allowed_source_sides=("bid", "ask"),
                     valid_state=state.valid_state,
-                    reconstructible=state.valid_state,
+                    reconstructible=(state.book_integrity_valid if self.integrity_evidence else state.valid_state),
                     quality_flags=state.quality_flags,
                     raw_event_hash=semantic_hash(message),
                 )
@@ -273,11 +275,12 @@ class PolymarketTapeProducer:
                             control_type="book_invalidated",
                             reason="invalid_snapshot",
                             valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                             epoch=closed_epoch,
                             quality_flags=state.quality_flags,
                         )
                     )
-                if state.valid_state:
+                if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                     controls.append(
                         build_control_row(
                             coordinate=self._coordinate(
@@ -291,7 +294,8 @@ class PolymarketTapeProducer:
                             venue_book_id=book_id,
                             control_type="book_recovered",
                             reason="snapshot_validated",
-                            valid_after=True,
+                            valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                             epoch=opened,
                             evidence_role="tape_event",
                             evidence_id=str(batch.event["event_id"]),
@@ -305,7 +309,7 @@ class PolymarketTapeProducer:
             if event_type != "price_change":
                 continue
             open_epoch = self._epochs.open_epochs.get(book_id)
-            invalid_reason = _polymarket_invalidation_reason(state)
+            invalid_reason = _polymarket_invalidation_reason(state, integrity_evidence=self.integrity_evidence)
             if invalid_reason is not None and open_epoch is not None:
                 closed_epoch = self._epochs.close(book_id)
                 controls.append(
@@ -322,6 +326,7 @@ class PolymarketTapeProducer:
                         control_type="book_invalidated",
                         reason=invalid_reason,
                         valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                         epoch=closed_epoch,
                         quality_flags=state.quality_flags,
                     )
@@ -329,7 +334,7 @@ class PolymarketTapeProducer:
                 open_epoch = None
                 cursor += 1
             mutations = polymarket_delta_levels(state, message)
-            if mutations and state.valid_state and open_epoch is None:
+            if mutations and (state.book_integrity_valid if self.integrity_evidence else state.valid_state) and open_epoch is None:
                 coordinate = self._coordinate(
                     received_at_utc,
                     received_at_monotonic_ns,
@@ -339,6 +344,7 @@ class PolymarketTapeProducer:
                 opened = self._epochs.open(coordinate, book_id)
                 levels = polymarket_book_levels(state)
                 batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                     coordinate=coordinate,
                     venue="polymarket",
                     venue_market_id=market_id,
@@ -349,7 +355,7 @@ class PolymarketTapeProducer:
                     levels=levels,
                     full_book_levels=levels,
                     allowed_source_sides=("bid", "ask"),
-                    valid_state=True,
+                    valid_state=state.valid_state,
                     reconstructible=True,
                     quality_flags=state.quality_flags,
                     raw_event_hash=semantic_hash(message),
@@ -368,7 +374,8 @@ class PolymarketTapeProducer:
                         venue_book_id=book_id,
                         control_type="book_recovered",
                         reason="checkpoint_validated",
-                        valid_after=True,
+                        valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                         epoch=opened,
                         evidence_role="tape_event",
                         evidence_id=str(batch.event["event_id"]),
@@ -381,6 +388,7 @@ class PolymarketTapeProducer:
             if mutations:
                 batches.append(
                     build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                         coordinate=self._coordinate(
                             received_at_utc,
                             received_at_monotonic_ns,
@@ -396,7 +404,7 @@ class PolymarketTapeProducer:
                         full_book_levels=polymarket_book_levels(state),
                         allowed_source_sides=("bid", "ask"),
                         valid_state=state.valid_state,
-                        reconstructible=open_epoch is not None and state.valid_state,
+                        reconstructible=open_epoch is not None and (state.book_integrity_valid if self.integrity_evidence else state.valid_state),
                         quality_flags=state.quality_flags,
                         raw_event_hash=semantic_hash(message),
                     )
@@ -439,6 +447,7 @@ class PolymarketTapeProducer:
                     control_type="book_invalidated",
                     reason="reconnect",
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=closed_epoch,
                     quality_flags={*state.quality_flags, "reconnect"},
                 )
@@ -467,13 +476,14 @@ class PolymarketTapeProducer:
                 received_at_utc, received_at_monotonic_ns, local_sequence, cursor + 1
             )
             closed_epoch = None
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 opened = self._epochs.open(coordinate, book_id)
             else:
                 closed_epoch = self._epochs.close(book_id)
                 opened = self._epochs.issue(coordinate, book_id)
             levels = polymarket_book_levels(state)
             batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                 coordinate=coordinate,
                 venue="polymarket",
                 venue_market_id=str(state.market or book_id),
@@ -485,7 +495,7 @@ class PolymarketTapeProducer:
                 full_book_levels=levels,
                 allowed_source_sides=("bid", "ask"),
                 valid_state=state.valid_state,
-                reconstructible=state.valid_state,
+                reconstructible=(state.book_integrity_valid if self.integrity_evidence else state.valid_state),
                 quality_flags=state.quality_flags,
             )
             batches.append(batch)
@@ -504,11 +514,12 @@ class PolymarketTapeProducer:
                         control_type="book_invalidated",
                         reason="invalid_checkpoint",
                         valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                         epoch=closed_epoch,
                         quality_flags=state.quality_flags,
                     )
                 )
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 controls.append(
                     build_control_row(
                         coordinate=self._coordinate(
@@ -522,7 +533,8 @@ class PolymarketTapeProducer:
                         venue_book_id=book_id,
                         control_type="book_recovered",
                         reason="checkpoint_validated",
-                        valid_after=True,
+                        valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                         epoch=opened,
                         evidence_role="tape_event",
                         evidence_id=str(batch.event["event_id"]),
@@ -564,6 +576,7 @@ class PolymarketTapeProducer:
                     control_type="stream_ended",
                     reason=reason,
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=self._epochs.close(book_id),
                     quality_flags=state.quality_flags,
                 )
@@ -592,6 +605,7 @@ class KalshiTapeProducer:
         collector_run_id: str,
         shard_id: str,
         use_yes_price: bool,
+        integrity_evidence: bool = False,
         quote_normalization_policy: str = KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT,
     ) -> None:
         self.collector_run_id = collector_run_id
@@ -600,6 +614,7 @@ class KalshiTapeProducer:
         self.quote_normalization_policy = resolve_kalshi_quote_normalization_policy(
             quote_normalization_policy
         )
+        self.integrity_evidence = integrity_evidence
         self._epochs = _EpochTracker()
 
     def _adapter_settings(self) -> dict[str, Any]:
@@ -643,13 +658,14 @@ class KalshiTapeProducer:
         settings = self._adapter_settings()
         if event_type == "orderbook_snapshot":
             closed_epoch = None
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 opened = self._epochs.open(base, book_id)
             else:
                 closed_epoch = self._epochs.close(book_id)
                 opened = self._epochs.issue(base, book_id)
             levels = kalshi_book_levels(state)
             batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                 coordinate=base,
                 venue="kalshi",
                 venue_market_id=market_id,
@@ -663,7 +679,7 @@ class KalshiTapeProducer:
                 full_book_levels=levels,
                 allowed_source_sides=("yes", "no"),
                 valid_state=state.valid_state,
-                reconstructible=state.valid_state,
+                reconstructible=(state.book_integrity_valid if self.integrity_evidence else state.valid_state),
                 quality_flags=state.quality_flags,
                 venue_sequence=state.last_seq,
                 venue_sid=state.sid,
@@ -687,12 +703,13 @@ class KalshiTapeProducer:
                     control_type="book_invalidated",
                     reason="invalid_snapshot",
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=closed_epoch,
                     venue_sequence=state.last_seq,
                     quality_flags=state.quality_flags,
                 )
                 snapshot_controls = (invalidation,)
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 recovery = build_control_row(
                     coordinate=CaptureCoordinate(
                         self.collector_run_id,
@@ -707,7 +724,8 @@ class KalshiTapeProducer:
                     venue_book_id=book_id,
                     control_type="book_recovered",
                     reason="snapshot_validated",
-                    valid_after=True,
+                    valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                     epoch=opened,
                     venue_sequence=batch.event.get("venue_sequence"),
                     evidence_role="tape_event",
@@ -725,7 +743,7 @@ class KalshiTapeProducer:
             return TapeCaptureEmission()
         controls: list[Mapping[str, Any]] = []
         open_epoch = self._epochs.open_epochs.get(book_id)
-        invalid_reason = _kalshi_invalidation_reason(state)
+        invalid_reason = _kalshi_invalidation_reason(state, integrity_evidence=self.integrity_evidence)
         if invalid_reason is not None and open_epoch is not None:
             closed_epoch = self._epochs.close(book_id)
             controls.append(
@@ -744,6 +762,7 @@ class KalshiTapeProducer:
                     control_type="book_invalidated",
                     reason=invalid_reason,
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=closed_epoch,
                     venue_sequence=state.last_seq,
                     quality_flags=state.quality_flags,
@@ -756,10 +775,11 @@ class KalshiTapeProducer:
                 controls=tuple(controls),
                 barrier_cause=CaptureCommitCause.INVALIDATION if controls else None,
             )
-        if state.valid_state and open_epoch is None:
+        if (state.book_integrity_valid if self.integrity_evidence else state.valid_state) and open_epoch is None:
             opened = self._epochs.open(base, book_id)
             levels = kalshi_book_levels(state)
             batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                 coordinate=base,
                 venue="kalshi",
                 venue_market_id=market_id,
@@ -770,7 +790,7 @@ class KalshiTapeProducer:
                 levels=levels,
                 full_book_levels=levels,
                 allowed_source_sides=("yes", "no"),
-                valid_state=True,
+                valid_state=state.valid_state,
                 reconstructible=True,
                 quality_flags=state.quality_flags,
                 venue_sequence=state.last_seq,
@@ -792,7 +812,8 @@ class KalshiTapeProducer:
                 venue_book_id=book_id,
                 control_type="book_recovered",
                 reason="checkpoint_validated",
-                valid_after=True,
+                valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                 epoch=opened,
                 venue_sequence=batch.event.get("venue_sequence"),
                 evidence_role="tape_event",
@@ -804,6 +825,7 @@ class KalshiTapeProducer:
                 (batch,), (recovery,), _emission_barrier((batch,), (recovery,))
             )
         batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
             coordinate=base,
             venue="kalshi",
             venue_market_id=market_id,
@@ -814,7 +836,7 @@ class KalshiTapeProducer:
             full_book_levels=kalshi_book_levels(state),
             allowed_source_sides=("yes", "no"),
             valid_state=state.valid_state,
-            reconstructible=open_epoch is not None and state.valid_state,
+            reconstructible=open_epoch is not None and (state.book_integrity_valid if self.integrity_evidence else state.valid_state),
             quality_flags=state.quality_flags,
             venue_sequence=state.last_seq,
             venue_sid=state.sid,
@@ -853,13 +875,14 @@ class KalshiTapeProducer:
                 cursor + 1,
             )
             closed_epoch = None
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 opened = self._epochs.open(coordinate, book_id)
             else:
                 closed_epoch = self._epochs.close(book_id)
                 opened = self._epochs.issue(coordinate, book_id)
             levels = kalshi_book_levels(state)
             batch = build_tape_batch(
+                    encoding_version="book-tape.v2" if self.integrity_evidence else "book-tape.v1",
                 coordinate=coordinate,
                 venue="kalshi",
                 venue_market_id=str(state.market_id or book_id),
@@ -871,7 +894,7 @@ class KalshiTapeProducer:
                 full_book_levels=levels,
                 allowed_source_sides=("yes", "no"),
                 valid_state=state.valid_state,
-                reconstructible=state.valid_state,
+                reconstructible=(state.book_integrity_valid if self.integrity_evidence else state.valid_state),
                 quality_flags=state.quality_flags,
                 venue_sequence=state.last_seq,
                 venue_sid=state.sid,
@@ -895,12 +918,13 @@ class KalshiTapeProducer:
                         control_type="book_invalidated",
                         reason="invalid_checkpoint",
                         valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                         epoch=closed_epoch,
                         venue_sequence=state.last_seq,
                         quality_flags=state.quality_flags,
                     )
                 )
-            if state.valid_state:
+            if (state.book_integrity_valid if self.integrity_evidence else state.valid_state):
                 controls.append(
                     build_control_row(
                         coordinate=CaptureCoordinate(
@@ -916,7 +940,8 @@ class KalshiTapeProducer:
                         venue_book_id=book_id,
                         control_type="book_recovered",
                         reason="checkpoint_validated",
-                        valid_after=True,
+                        valid_after=state.valid_state,
+                            book_integrity_after=True if self.integrity_evidence else None,
                         epoch=opened,
                         venue_sequence=batch.event.get("venue_sequence"),
                         evidence_role="tape_event",
@@ -959,6 +984,7 @@ class KalshiTapeProducer:
                     control_type="book_invalidated",
                     reason="reconnect",
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=self._epochs.close(book_id),
                     venue_sequence=state.last_seq,
                     quality_flags={*state.quality_flags, "reconnect"},
@@ -996,6 +1022,7 @@ class KalshiTapeProducer:
                     control_type="stream_ended",
                     reason=reason,
                     valid_after=False,
+                            book_integrity_after=False if self.integrity_evidence else None,
                     epoch=self._epochs.close(book_id),
                     venue_sequence=state.last_seq,
                     quality_flags=state.quality_flags,
@@ -1045,17 +1072,17 @@ def _polymarket_message_books(message: Mapping[str, Any]) -> tuple[str, ...]:
     return (book,) if book else ()
 
 
-def _polymarket_invalidation_reason(state: MarketBookState) -> str | None:
+def _polymarket_invalidation_reason(state: MarketBookState, *, integrity_evidence: bool = False) -> str | None:
     if "hash_mismatch" in state.quality_flags:
         return "hash_mismatch"
     if "delta_before_snapshot" in state.quality_flags:
         return "delta_before_snapshot"
-    if not state.valid_state:
+    if not (state.book_integrity_valid if integrity_evidence else state.valid_state):
         return "invalid_state"
     return None
 
 
-def _kalshi_invalidation_reason(state: KalshiOrderBookState) -> str | None:
+def _kalshi_invalidation_reason(state: KalshiOrderBookState, *, integrity_evidence: bool = False) -> str | None:
     flags = state.quality_flags
     if "sid_changed" in flags:
         return "sid_changed"
@@ -1065,7 +1092,7 @@ def _kalshi_invalidation_reason(state: KalshiOrderBookState) -> str | None:
         return "missing_sequence"
     if "delta_before_snapshot" in flags:
         return "delta_before_snapshot"
-    if not state.valid_state:
+    if not (state.book_integrity_valid if integrity_evidence else state.valid_state):
         return "invalid_state"
     return None
 

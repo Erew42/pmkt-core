@@ -292,7 +292,12 @@ def build_tape_batch(
         for level in unique_levels:
             counts[level.source_side] += 1
         side_counts = canonical_json(counts)
+    integrity_fields = (
+        {"schema_version": "book_tape_event.v2", "book_integrity_valid": reconstructible}
+        if encoding_version == "book-tape.v2" else {}
+    )
     header = book_tape_event_row(
+        **integrity_fields,
         collector_run_id=coordinate.collector_run_id,
         event_id=None,
         venue=venue,
@@ -376,6 +381,7 @@ def build_control_row(
     control_type: str,
     reason: str,
     valid_after: bool,
+    book_integrity_after: bool | None = None,
     epoch: str | None = None,
     exchange_at_utc: str | None = None,
     venue_sequence: Any | None = None,
@@ -395,6 +401,11 @@ def build_control_row(
         evidence_id,
         sorted(set(quality_flags)),
     ]
+    integrity_fields: dict[str, Any] = {}
+    if book_integrity_after is not None:
+        semantic_payload.extend(["book_tape_control.v2", book_integrity_after])
+        integrity_fields = {"schema_version": "book_tape_control.v2",
+                            "book_integrity_after": book_integrity_after}
     control_id = versioned_id(
         "book-tape-control",
         [
@@ -407,6 +418,7 @@ def build_control_row(
         ],
     )
     return book_tape_control_row(
+        **integrity_fields,
         collector_run_id=coordinate.collector_run_id,
         control_id=control_id,
         venue=venue,

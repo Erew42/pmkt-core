@@ -903,7 +903,7 @@ def _capture_instrument_evidence_errors(
     datasets: Iterable[ManifestDatasetValidation],
 ) -> list[str]:
     profile = payload.get("storage_profile")
-    if not isinstance(profile, Mapping) or profile.get("profile_version") != "2":
+    if not isinstance(profile, Mapping) or profile.get("profile_version") not in {"2", "3"}:
         return []
     from pmkt.streaming.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
@@ -912,6 +912,9 @@ def _capture_instrument_evidence_errors(
 
     errors: list[str] = []
     completeness = payload.get("capture_completeness")
+    if profile.get("profile_version") == "3" and isinstance(completeness, Mapping):
+        if completeness.get("policy_version") != "capture_completeness.v3":
+            errors.append("profile v3 requires capture_completeness.v3")
     if not isinstance(completeness, Mapping):
         return ["capture_completeness must be an object for storage profile v2"]
     artifact = artifacts.get(CAPTURE_INSTRUMENT_EVIDENCE_ROLE)
@@ -953,6 +956,20 @@ def _capture_instrument_evidence_errors(
         ),
         None,
     )
+    # A process can die before terminal instrument evidence is journaled.
+    # Its exact, empty segment manifest is still checked above. Reconcile an
+    # empty evidence set only for explicitly failed process-loss recovery;
+    # never infer instrument coverage from the surviving book tape.
+    if (
+        payload.get("capture_termination") == "crashed"
+        and payload.get("status") in {"partial", "failed"}
+        and artifact.get("completion_status") == "failed"
+        and artifact.get("row_count") == 0
+        and completeness.get("acceptance_eligible") is False
+        and completeness.get("ok") is False
+    ):
+        errors.extend(evidence_manifest_reconciliation_errors([], completeness))
+        return errors
     if (
         evidence_dataset is None
         or not evidence_dataset.exists

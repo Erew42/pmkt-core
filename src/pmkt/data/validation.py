@@ -22,6 +22,7 @@ from pmkt.data.registry import (
     CO_RESOLUTION_SCORE_SCHEMA_VERSION,
     BOOK_TAPE_CONTROL_SCHEMA_VERSION,
     BOOK_TAPE_EVENT_SCHEMA_VERSION,
+    INTEGRITY_SCHEMA_VERSIONS,
     BOOK_TAPE_LEVEL_SCHEMA_VERSION,
     KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
     KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION_V2,
@@ -360,7 +361,14 @@ def _strict_int_compatible(value: Any, dtype: str) -> bool:
 
 def _coerce_series(series: pd.Series, dtype: str) -> pd.Series:
     if dtype == "float64":
-        return pd.to_numeric(series, errors="coerce")
+        # Use the same binary64 conversion as strict validation and journal
+        # restoration; pandas' string parser can round canonical decimals anew.
+        return pd.Series(
+            [_parse_strict_float(value) for value in series.tolist()],
+            index=series.index,
+            name=series.name,
+            dtype="float64",
+        )
     if dtype in {"int32", "int64"}:
         pandas_dtype = "Int32" if dtype == "int32" else "Int64"
         values = [_bounded_int(value, dtype) for value in series.tolist()]
@@ -459,16 +467,24 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
     errors: list[str] = []
     errors.extend(_price_invariant_errors(df, spec))
     errors.extend(_flag_token_errors(df, spec))
+    if spec.version in {"topbook.v2", "depth.v2", "book_tape_event.v2"} and "book_integrity_valid" in df:
+        broken = _quality_flag_series(df).map(lambda value: bool(set(_flags(value)) & {
+            "crossed_book", "negative_spread", "seq_gap", "reconnect",
+            "no_initial_snapshot", "malformed_book", "missing_sequence",
+            "sid_changed", "delta_before_snapshot", "hash_mismatch",
+        }))
+        if (_parsed_bool_mask(df["book_integrity_valid"]) & broken).any():
+            errors.append("book_integrity_valid cannot accompany unresolved book failures")
     if spec.version == MARKET_RESOLUTION_SCHEMA_VERSION:
         errors.extend(_market_resolution_invariant_errors(df))
     if spec.version == CONTRACT_EVIDENCE_SCHEMA_VERSION:
         errors.extend(_contract_evidence_invariant_errors(df))
     if spec.version == MARKET_TAXONOMY_EVIDENCE_SCHEMA_VERSION:
         errors.extend(_market_taxonomy_evidence_invariant_errors(df))
-    if spec.version == "topbook.v1":
+    if spec.version in {"topbook.v1", "topbook.v2"}:
         errors.extend(_topbook_invariant_errors(df))
         errors.extend(_canonical_kalshi_topbook_errors(df))
-    if spec.version == "depth.v1":
+    if spec.version in {"depth.v1", "depth.v2"}:
         errors.extend(_depth_invariant_errors(df))
     if spec.version == "match_relation.v1":
         errors.extend(_match_relation_invariant_errors(df))
@@ -500,7 +516,7 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
         errors.extend(_co_resolution_observation_invariant_errors(df))
     if spec.version == CO_RESOLUTION_SCORE_SCHEMA_VERSION:
         errors.extend(_co_resolution_score_invariant_errors(df))
-    if spec.version == BOOK_TAPE_EVENT_SCHEMA_VERSION and _has_columns(
+    if spec.version in {BOOK_TAPE_EVENT_SCHEMA_VERSION, "book_tape_event.v2"} and _has_columns(
         df,
         "event_kind",
         "epoch_id",
@@ -517,7 +533,7 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
         "price_dollars",
     ):
         errors.extend(_book_tape_level_invariant_errors(df))
-    if spec.version == BOOK_TAPE_CONTROL_SCHEMA_VERSION and _has_columns(
+    if spec.version in {BOOK_TAPE_CONTROL_SCHEMA_VERSION, "book_tape_control.v2"} and _has_columns(
         df,
         "control_type",
         "valid_after",
@@ -648,6 +664,10 @@ def _book_tape_event_invariant_errors(df: pd.DataFrame) -> list[str]:
     checkpoint_missing_sides = checkpoint & ~side_counts_present
     delta_with_reason = delta & reason_present
     delta_with_sides = delta & side_counts_present
+    if "book_integrity_valid" in df.columns:
+        integrity = _parsed_bool_mask(df["book_integrity_valid"])
+        if bool((integrity != reconstructible).any()):
+            errors.append("book_integrity_valid must agree with reconstructible")
     reconstructible_missing_epoch = reconstructible & ~epoch_present
     side_errors_by_position: dict[int, list[str]] = {}
     for position in (checkpoint & side_counts_present).to_numpy().nonzero()[0]:
@@ -783,11 +803,15 @@ def _book_tape_control_invariant_errors(df: pd.DataFrame) -> list[str]:
     role_valid = df["evidence_role"].fillna("").astype(str).isin(
         _BOOK_RECOVERY_EVIDENCE_ROLES
     )
-    recovered_invalid = recovered & ~valid_after
+    intact_after = (
+        _parsed_bool_mask(df["book_integrity_after"])
+        if "book_integrity_after" in df.columns else valid_after
+    )
+    recovered_invalid = recovered & ~intact_after
     recovered_missing_reference = recovered & ~(role_present & id_present)
     recovered_invalid_role = recovered & role_present & id_present & ~role_valid
-    invalidated_valid = control_type.eq("book_invalidated") & valid_after
-    ended_valid = control_type.eq("stream_ended") & valid_after
+    invalidated_valid = control_type.eq("book_invalidated") & (valid_after | intact_after)
+    ended_valid = control_type.eq("stream_ended") & (valid_after | intact_after)
     failing = (
         recovered_invalid
         | recovered_missing_reference
@@ -967,6 +991,20 @@ def _decoded_json(value: Any) -> Any:
     return value
 
 
+def resolve_evidence_schema(frame: pd.DataFrame, legacy_version: str) -> str:
+    newer = INTEGRITY_SCHEMA_VERSIONS.get(legacy_version)
+    if newer is not None:
+        field = "book_integrity_after" if legacy_version == BOOK_TAPE_CONTROL_SCHEMA_VERSION else "book_integrity_valid"
+        if field in frame.columns:
+            return newer
+    return legacy_version
+
+
+def coerce_book_evidence_frame(frame: pd.DataFrame, legacy_version: str) -> pd.DataFrame:
+    """Normalize supported book evidence without dropping explicit integrity."""
+    return coerce_frame(frame, resolve_evidence_schema(frame, legacy_version))
+
+
 def validate_book_tape_bundle(
     events: pd.DataFrame,
     levels: pd.DataFrame,
@@ -980,10 +1018,10 @@ def validate_book_tape_bundle(
         (events, BOOK_TAPE_EVENT_SCHEMA_VERSION),
         (levels, BOOK_TAPE_LEVEL_SCHEMA_VERSION),
     ):
-        report = validate_frame(frame, version, strict=True)
+        report = validate_frame(frame, resolve_evidence_schema(frame, version), strict=True)
         errors.extend(f"{version}: {error}" for error in report.errors)
     if controls is not None:
-        report = validate_frame(controls, BOOK_TAPE_CONTROL_SCHEMA_VERSION, strict=True)
+        report = validate_frame(controls, resolve_evidence_schema(controls, BOOK_TAPE_CONTROL_SCHEMA_VERSION), strict=True)
         errors.extend(
             f"{BOOK_TAPE_CONTROL_SCHEMA_VERSION}: {error}" for error in report.errors
         )
@@ -1158,7 +1196,7 @@ def validate_book_control_evidence(
     ):
         if frame is None:
             continue
-        report = validate_frame(frame, version, strict=True)
+        report = validate_frame(frame, resolve_evidence_schema(frame, version), strict=True)
         errors.extend(f"{version}: {error}" for error in report.errors)
     if not errors:
         errors.extend(
@@ -1292,7 +1330,11 @@ def _book_control_evidence_errors(
                 errors.append(
                     "book_tape_control.v1: recovery evidence must be reconstructible"
                 )
-        if _parse_bool(parent.get("valid_state")) is not True:
+        parent_validity_field = (
+            "book_integrity_valid" if control.get("schema_version") == "book_tape_control.v2"
+            else "valid_state"
+        )
+        if _parse_bool(parent.get(parent_validity_field)) is not True:
             errors.append(
                 "book_tape_control.v1: recovery evidence must have valid state"
             )

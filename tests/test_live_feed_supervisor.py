@@ -218,7 +218,7 @@ def test_stale_invalidation_refreshes_cached_shard_book_flags() -> None:
     }
 
 
-def test_instrument_local_staleness_emits_scoped_recovery_action() -> None:
+def test_instrument_local_staleness_preserves_integrity_without_recovery() -> None:
     supervisor = LiveFeedSupervisor(
         [
             FeedShardHealth(
@@ -244,15 +244,9 @@ def test_instrument_local_staleness_emits_scoped_recovery_action() -> None:
         instrument="active",
     )
 
-    assert supervisor.recovery_actions(now_monotonic_ns=1_065_000_000) == [
-        FeedRecoveryAction(
-            action="reconnect_socket",
-            venue="polymarket",
-            shard_id="pm-0",
-            reasons=("stale_messages", "stale_books"),
-            instruments=("stale",),
-        )
-    ]
+    assert supervisor.recovery_actions(now_monotonic_ns=1_065_000_000) == []
+    assert shard.instrument_health["stale"].book_integrity_valid
+    assert "stale_messages" in shard.instrument_health["stale"].quality_flags
 
 
 def test_never_observed_instrument_emits_recovery_after_initial_grace() -> None:
@@ -276,7 +270,7 @@ def test_never_observed_instrument_emits_recovery_after_initial_grace() -> None:
     )
 
     assert supervisor.recovery_actions(now_monotonic_ns=1_020_000_000) == []
-    assert supervisor.recovery_actions(now_monotonic_ns=1_025_000_000) == [
+    assert supervisor.recovery_actions(now_monotonic_ns=31_001_000_000) == [
         FeedRecoveryAction(
             action="reconnect_socket",
             venue="kalshi",
@@ -288,7 +282,7 @@ def test_never_observed_instrument_emits_recovery_after_initial_grace() -> None:
 
     shard.record_book(
         valid_state=True,
-        now_monotonic_ns=1_026_000_000,
+        now_monotonic_ns=31_002_000_000,
         instrument="KXMISSING",
     )
     assert supervisor.current_recovery_actions() == []
@@ -805,7 +799,7 @@ def test_shard_health_reconnect_does_not_wait_for_never_observed_instrument() ->
     assert "reconnect" not in recovered["quality_flags"]
 
 
-def test_supervisor_recovery_actions_emit_for_each_stale_shard() -> None:
+def test_supervisor_recovery_uses_initialization_sla_not_shard_age() -> None:
     supervisor = LiveFeedSupervisor(
         [
             FeedShardHealth(
@@ -837,34 +831,12 @@ def test_supervisor_recovery_actions_emit_for_each_stale_shard() -> None:
         venue="polymarket",
     )
 
-    assert actions == [
-        FeedRecoveryAction(
-            action="reconnect_socket",
-            venue="polymarket",
-            shard_id="pm-idle",
-            reasons=("connection_stale", "stale_messages", "stale_books"),
-        ),
-    ]
-
-    actions = supervisor.recovery_actions(
-        now_monotonic_ns=1_100_000_000,
-        venue="polymarket",
-    )
-
-    assert actions == [
-        FeedRecoveryAction(
-            action="reconnect_socket",
-            venue="polymarket",
-            shard_id="pm-active",
-            reasons=("connection_stale", "stale_messages", "stale_books"),
-        ),
-        FeedRecoveryAction(
-            action="reconnect_socket",
-            venue="polymarket",
-            shard_id="pm-idle",
-            reasons=("connection_stale", "stale_messages", "stale_books"),
-        ),
-    ]
+    assert actions == []
+    actions = supervisor.recovery_actions(now_monotonic_ns=31_001_000_000)
+    assert len(actions) == 1
+    assert actions[0].shard_id == "pm-idle"
+    assert actions[0].reasons == ("missing_instrument_books",)
+    assert actions[0].instruments == ("token-2",)
 
 
 def test_supervisor_staleness_heap_examines_only_due_instruments() -> None:
@@ -930,7 +902,7 @@ def test_filtered_recovery_refreshes_staleness_for_every_venue() -> None:
         venue="polymarket",
     )
 
-    assert [action.venue for action in actions] == ["polymarket"]
+    assert actions == []
     assert supervisor.shard("polymarket", "pm-0").connection_state == "stale"
     assert supervisor.shard("kalshi", "kx-0").connection_state == "stale"
 

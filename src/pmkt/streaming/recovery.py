@@ -943,7 +943,7 @@ def _recovered_capture_completeness(
     state: RunStateV1,
     artifacts: Mapping[str, Mapping[str, Any]],
 ) -> dict[str, Any] | None:
-    if state.profile_version != "2":
+    if state.profile_version not in {"2", "3"}:
         return None
     from pmkt.streaming.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
@@ -965,10 +965,10 @@ def _recovered_capture_completeness(
     rows = pd.read_parquet(dataset_path).to_dict("records")
     summary = summarize_capture_instrument_evidence(rows)
     return {
-        "policy_version": CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
+        "policy_version": "capture_completeness.v3" if state.profile_version == "3" else CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
         "policy_status": "provisional",
         "ok": False,
-        "evaluated": True,
+        "evaluated": bool(rows),
         "acceptance_eligible": False,
         "execution_status": "failed",
         "capture_status": "partial",
@@ -978,7 +978,9 @@ def _recovered_capture_completeness(
         "evidence_artifact_hash": artifact.get("segment_manifest_hash"),
         "evidence_artifact_reconciled": True,
         "terminal_reason": "stream_error",
-        "reasons": ["recovered_after_process_loss"],
+        "reasons": ["recovered_after_process_loss"] + (
+            [] if rows else ["terminal_instrument_evidence_not_committed"]
+        ),
     }
 
 

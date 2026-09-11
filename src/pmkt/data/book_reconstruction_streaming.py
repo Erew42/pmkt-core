@@ -23,6 +23,8 @@ from pmkt.data.book_reconstruction import (
     _apply_absolute_delta,
     _bool,
     _causal_items,
+    _causal_progress,
+    _intact_source_mask,
     _checkpoint_book,
     _filter_committed_role_rows,
     _kalshi_quote_policy,
@@ -46,9 +48,6 @@ from pmkt.data.manifests import (
     validate_run_manifest,
 )
 from pmkt.data.registry import (
-    DEPTH_COLUMNS,
-    DEPTH_SCHEMA_VERSION,
-    TOPBOOK_COLUMNS,
     TOPBOOK_SCHEMA_VERSION,
     arrow_schema,
     get_table_spec,
@@ -159,6 +158,8 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         self._requested_book = requested_book
         self._started_at_perf = time.perf_counter()
         self._evidence = _load_streaming_run_authority(Path(manifest_path).resolve())
+        self._topbook_schema = self._evidence.selected_schemas["topbook_main"]
+        self._depth_schema = "depth.v2" if self._topbook_schema == "topbook.v2" else "depth.v1"
         self._authority_loaded_at_perf = time.perf_counter()
         self._engine = _ReconstructionEngine(
             shard_by_book=self._evidence.shard_by_book,
@@ -263,15 +264,15 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         self._depth_count += len(depth_rows)
         topbook_batch = _public_record_batch_from_stage(
             topbook_stage,
-            TOPBOOK_SCHEMA_VERSION,
+            self._topbook_schema,
         )
         depth_batch = (
             _public_record_batch_from_stage(
                 depth_stage,
-                DEPTH_SCHEMA_VERSION,
+                self._depth_schema,
             )
             if depth_stage is not None
-            else _public_record_batch(depth_rows, DEPTH_SCHEMA_VERSION)
+            else _public_record_batch(depth_rows, self._depth_schema)
         )
         _update_batch_hash(self._topbook_hash, topbook_batch)
         _update_batch_hash(self._depth_hash, depth_batch)
@@ -311,7 +312,7 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         )
         self._source_topbook_count += len(source_topbooks)
         valid_topbooks = source_topbooks[
-            source_topbooks["valid_state"].fillna(False).astype(bool)
+            _intact_source_mask(source_topbooks)
         ]
         self._excluded_invalid_topbook_count += len(source_topbooks) - len(
             valid_topbooks
@@ -326,13 +327,13 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
 
     def _stage_source_frame(self, name: str, frame: pd.DataFrame) -> None:
         schema_version = (
-            TOPBOOK_SCHEMA_VERSION if name.endswith("topbook") else DEPTH_SCHEMA_VERSION
+            self._topbook_schema if name.endswith("topbook") else self._depth_schema
         )
         rows = [
             {
                 column: normalize_capture_value(row.get(column))
                 for column in (
-                    *(TOPBOOK_COLUMNS if name.endswith("topbook") else DEPTH_COLUMNS),
+                    *get_table_spec(schema_version).columns,
                     *_PROVENANCE_COLUMNS,
                 )
             }
@@ -346,7 +347,7 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         rows: list[dict[str, Any]],
     ) -> pa.Table:
         schema_version = (
-            TOPBOOK_SCHEMA_VERSION if name.endswith("topbook") else DEPTH_SCHEMA_VERSION
+            self._topbook_schema if name.endswith("topbook") else self._depth_schema
         )
         table = _rows_to_table(
             rows,
@@ -394,9 +395,9 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
             if path.exists():
                 continue
             schema_version = (
-                TOPBOOK_SCHEMA_VERSION
+                self._topbook_schema
                 if name.endswith("topbook")
-                else DEPTH_SCHEMA_VERSION
+                else self._depth_schema
             )
             source = name.startswith("source_")
             pq.write_table(
@@ -563,7 +564,7 @@ class _ReconstructionEngine:
         self.last_venue_sid: dict[tuple[str, str, str], str] = {}
         self.last_book_coordinate: dict[
             tuple[str, str, str],
-            tuple[pd.Timestamp, int, int, int, str],
+            tuple[int, int, int],
         ] = {}
         self.epoch_reports: dict[
             tuple[str, str, str, str],
@@ -618,7 +619,7 @@ class _ReconstructionEngine:
                 sort=False,
             )
         }
-        causal_items = _causal_items(events, controls)
+        causal_items = _causal_items(events, controls, shard_by_book=self.shard_by_book)
         self.event_control_coordinate_count += len(causal_items)
         self.event_count += len(events)
         for family, row, coordinate in causal_items:
@@ -648,7 +649,8 @@ class _ReconstructionEngine:
                     f"no exact shard mapping for {key[1]}:{key[2]}"
                 )
             previous = self.last_book_coordinate.get(key)
-            if previous is not None and coordinate <= previous:
+            progress = _causal_progress(row, family=family)
+            if previous is not None and progress <= previous:
                 raise BookTapeReconstructionError(
                     f"non-continuous {family} coordinate for {key[1]}:{key[2]}"
                 )
@@ -657,7 +659,7 @@ class _ReconstructionEngine:
                     f"{family} evidence occurs after terminal boundary for "
                     f"{key[1]}:{key[2]}"
                 )
-            self.last_book_coordinate[key] = coordinate
+            self.last_book_coordinate[key] = progress
             if family == "control":
                 self._apply_control(row, key)
                 continue
@@ -956,6 +958,11 @@ def _load_streaming_run_authority(path: Path) -> _StreamingRunAuthority:
             for role, schema in _COMPARISON_SCHEMAS.items()
             if role in artifacts
         },
+    }
+    selected_schemas = {
+        role: next(iter(definition.role_schema_versions[DatasetRole(role)]))
+        if DatasetRole(role) in definition.role_schema_versions else version
+        for role, version in selected_schemas.items()
     }
     if "topbook_main" not in selected_schemas:
         raise BookTapeReconstructionError(
@@ -1472,7 +1479,7 @@ def _duckdb_topbook_parity(
     reconstructed_path: Path,
     source_path: Path,
 ) -> dict[str, Any]:
-    fields = (
+    fields: tuple[str, ...] = (
         "venue_market_id",
         "outcome",
         "best_bid_dollars",
@@ -1500,6 +1507,9 @@ def _duckdb_topbook_parity(
         connection.execute(f"SET temp_directory = {sql_literal(spill_root.as_posix())}")
         connection.from_parquet(str(reconstructed_path)).create_view("reconstructed")
         connection.from_parquet(str(source_path)).create_view("source")
+        integrity_field = "book_integrity_valid" if "book_integrity_valid" in pq.read_schema(reconstructed_path).names else "valid_state"
+        if integrity_field == "book_integrity_valid":
+            fields = (*fields, integrity_field)
         duplicate_count = _duckdb_scalar_int(
             connection.execute(
                 """
@@ -1602,7 +1612,7 @@ def _duckdb_topbook_parity(
                                  received_at_utc, _reconstruction_event_id
                     ) AS next_sequence
                 FROM reconstructed
-                WHERE coalesce(valid_state, false)
+                WHERE coalesce({integrity_field}, false)
             ),
             changes AS (
                 SELECT * FROM ordered
@@ -1804,7 +1814,7 @@ def _duckdb_depth_parity(
         "side",
         "level_index",
     )
-    fields = (
+    fields: tuple[str, ...] = (
         "venue_market_id",
         "outcome",
         "price_dollars",
@@ -1895,11 +1905,14 @@ def _duckdb_depth_parity(
                 WHERE {selection}
             """
         )
+        integrity_field = "book_integrity_valid" if "book_integrity_valid" in pq.read_schema(source_groups[0][1]).names else "valid_state"
+        if integrity_field == "book_integrity_valid":
+            fields = (*fields, integrity_field)
         connection.execute(
-            """
+            f"""
             CREATE TEMP VIEW valid_source AS
                 SELECT * FROM selected_source_artifacts
-                WHERE coalesce(valid_state, false)
+                WHERE coalesce({integrity_field}, false)
             """
         )
         connection.execute(
@@ -1955,10 +1968,10 @@ def _duckdb_depth_parity(
             """
         )
         source_counts = connection.execute(
-            """
+            f"""
             SELECT
                 count(*) AS selected_rows,
-                count(*) FILTER (WHERE coalesce(valid_state, false)) AS valid_rows
+                count(*) FILTER (WHERE coalesce({integrity_field}, false)) AS valid_rows
             FROM selected_source_artifacts
             """
         ).fetchone()

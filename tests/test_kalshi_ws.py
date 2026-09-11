@@ -29,6 +29,48 @@ class FakeReadAuth:
         self.calls.append(path)
         return {"KALSHI-ACCESS-KEY": "key-id"}
 
+
+@pytest.mark.parametrize("sides", [{}, {"yes_dollars_fp": []}, {"no_dollars_fp": [["0.6", "5"]]}, {"yes_dollars_fp": [["0.4", "5"]]}])
+def test_omitted_and_empty_kalshi_sides_are_intact(sides) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    snapshot = state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+        "msg": {"market_ticker": "KXTEST", **sides}})
+    assert snapshot.initial_snapshot_received
+    assert snapshot.book_integrity_valid
+    assert not snapshot.valid_state
+    state.mark_reconnect()
+    assert not state.book_integrity_valid
+    assert state.quality_flags == {"reconnect", "no_initial_snapshot"}
+
+
+@pytest.mark.parametrize("side", ["bad", [["broken", "5"]], [["0.4", "nan"]], [["0.4", -5]], [[True, 1]]])
+def test_malformed_kalshi_side_never_restores_integrity(side) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    snapshot = state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+        "msg": {"market_ticker": "KXTEST", "yes_dollars_fp": side, "yes_dollars": [["0.4", "5"]]}})
+    assert not snapshot.book_integrity_valid
+    assert not snapshot.valid_state
+
+
+def test_empty_kalshi_book_still_requires_sequence_and_initial_snapshot() -> None:
+    state = KalshiOrderBookState("KXTEST")
+    snapshot = state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "msg": {"market_ticker": "KXTEST"}})
+    assert not snapshot.book_integrity_valid
+    state.mark_reconnect()
+    snapshot = state.apply_delta({"type": "orderbook_delta", "sid": 7, "seq": 2,
+        "msg": {"market_ticker": "KXTEST", "side": "yes", "price_dollars": "0.4", "delta": 5}})
+    assert not snapshot.book_integrity_valid
+
+@pytest.mark.parametrize("changes", [{"price_dollars": True}, {"delta_fp": False}, {"price_dollars": "bad", "price": 0.4}])
+def test_malformed_delta_does_not_fall_back_to_another_field(changes):
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1, "msg": {}})
+    snapshot = state.apply_delta({"type": "orderbook_delta", "sid": 7, "seq": 2,
+        "msg": {"side": "yes", "price_dollars": "0.4", "delta_fp": "5", **changes}})
+    assert not snapshot.book_integrity_valid
+    assert not snapshot.valid_state
+
+
 class FakeWebSocket:
     def __init__(self, messages: list[Any] | None = None) -> None:
         self.messages = deque(messages or [])

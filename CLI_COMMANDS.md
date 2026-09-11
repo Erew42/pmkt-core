@@ -43,3 +43,9 @@ installed version.
 Matching, tracking, opportunity scans, replay/strategy workflows, credentials,
 deployment, execution, ledger, alerts, soak, runtime backup, and operator
 commands belong to `pmkt-trading`. They are not registered by this package.
+
+Storage capture commands `stream-books` and `stream-kalshi-books` accept
+`--profile-version 3` with `--storage-profile full` or `book-tape` to select the
+integrity-aware contract explicitly. Omitting `--profile-version` retains v2.
+`book-tape` still requires `--acknowledge-experimental-profile`; unsupported
+name/version pairs fail before capture or output creation.

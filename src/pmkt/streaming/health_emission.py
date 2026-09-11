@@ -34,7 +34,7 @@ def feed_health_fingerprint(row: Mapping[str, Any]) -> str:
     projection["instrument_state"] = _stable_instrument_state(
         row.get("instrument_state_json")
     )
-    projection["version"] = HEALTH_FINGERPRINT_VERSION
+    projection["version"] = ("feed-health-fingerprint.v2" if row.get("schema_version") == "feed_health.v2" else HEALTH_FINGERPRINT_VERSION)
     return semantic_hash(projection)
 
 

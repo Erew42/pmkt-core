@@ -137,6 +137,7 @@ def _capture_summary_suffix(manifest: Mapping[str, Any]) -> str:
 def _storage_profile_selection(
     *,
     name: str,
+    profile_version: str | None,
     acknowledge_experimental: bool,
     keep_raw_jsonl: bool,
     topbook_emission_per_event: bool,
@@ -149,6 +150,7 @@ def _storage_profile_selection(
     try:
         selection = select_storage_profile(
             name,
+            profile_version=profile_version,
             overrides=StorageProfileOverrides(
                 keep_raw_jsonl=keep_raw_jsonl,
                 topbook_emission_per_event=topbook_emission_per_event,
@@ -932,6 +934,10 @@ def stream_books(
             "--storage-profile", help="Storage profile: full, book-tape, or mm-compact."
         ),
     ] = "full",
+    profile_version: Annotated[
+        Optional[str],
+        typer.Option("--profile-version", help="Explicit storage contract version; defaults remain v2."),
+    ] = None,
     capture_storage_backend: Annotated[
         CaptureStorageBackend,
         typer.Option(
@@ -985,6 +991,7 @@ def stream_books(
     )
     selection = _storage_profile_selection(
         name=storage_profile,
+        profile_version=profile_version,
         acknowledge_experimental=acknowledge_experimental_profile,
         keep_raw_jsonl=keep_raw_jsonl,
         topbook_emission_per_event=topbook_emission_per_event,
@@ -1197,6 +1204,10 @@ def stream_kalshi_books(
             "--storage-profile", help="Storage profile: full, book-tape, or mm-compact."
         ),
     ] = "full",
+    profile_version: Annotated[
+        Optional[str],
+        typer.Option("--profile-version", help="Explicit storage contract version; defaults remain v2."),
+    ] = None,
     capture_storage_backend: Annotated[
         CaptureStorageBackend,
         typer.Option(
@@ -1249,6 +1260,7 @@ def stream_kalshi_books(
     )
     selection = _storage_profile_selection(
         name=storage_profile,
+        profile_version=profile_version,
         acknowledge_experimental=acknowledge_experimental_profile,
         keep_raw_jsonl=keep_raw_jsonl,
         topbook_emission_per_event=topbook_emission_per_event,

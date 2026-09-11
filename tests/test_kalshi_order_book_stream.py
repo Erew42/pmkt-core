@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 import json
+import socket
 from collections import deque
 from itertools import count
 from typing import Any
@@ -86,6 +88,55 @@ class SnapshotThenFailedRefreshWebSocket(SnapshotThenPongWebSocket):
         message = json.loads(payload)
         if message.get("params", {}).get("action") == "get_snapshot":
             raise OSError("snapshot refresh transport failure")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_delay", [0.0, 0.08])
+async def test_targeted_refresh_matches_one_sided_and_new_sibling_responses(tmp_path, response_delay):
+    def snapshot(ticker, seq, sides):
+        return json.dumps({"type": "orderbook_snapshot", "sid": 7, "seq": seq,
+                           "msg": {"market_ticker": ticker, **sides}})
+
+    class QueueSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__([])
+            self.queue = asyncio.Queue()
+            self.queue.put_nowait(snapshot("A", 1, {"yes_dollars_fp": [["broken", "1"]]}))
+
+        async def send(self, payload):
+            await super().send(payload)
+            request = json.loads(payload)
+            if request.get("params", {}).get("action") != "get_snapshot":
+                return
+            tickers = request["params"]["market_tickers"]
+            await asyncio.sleep(response_delay)
+            if tickers == ["A"]:
+                self.queue.put_nowait(snapshot("A", 2, {"no_dollars_fp": [["0.6", "5"]]}))
+                self.queue.put_nowait(snapshot("B", 3, {"yes_dollars_fp": [["broken", "1"]]}))
+            elif tickers == ["B"]:
+                self.queue.put_nowait(snapshot("B", 4, {}))
+
+        async def __anext__(self):
+            return await self.queue.get()
+
+    ws = QueueSocket()
+
+    async def connect_factory(*args, **kwargs):
+        return ws
+
+    manifest = await stream_kalshi_order_book_data(["A", "B"], output_root=tmp_path,
+        run_name="responses", duration_s=1, max_messages=4, capture_intent="smoke",
+        connect_factory=connect_factory, auth=FakeReadAuth(),
+        monotonic_ns=lambda: time.monotonic_ns() * 100, max_reconnects=0)
+    requests = [json.loads(row) for row in ws.sent if json.loads(row).get("cmd") == "update_subscription"]
+    assert [row["params"]["market_tickers"] for row in requests] == [["A"], ["B"]]
+    counters = manifest["kalshi_feed_recovery"]
+    assert counters["targeted_snapshot_refresh_count"] == 2
+    assert counters["targeted_snapshot_response_count"] == 2
+    assert counters["targeted_snapshot_response_success_count"] == 2
+    assert counters["targeted_snapshot_response_timeout_count"] == 0
+    assert counters["pending_snapshot_request_count"] == 0
+    assert manifest["reconnect_count"] == 0
 
 
 class DelayedFakeWebSocket(FakeWebSocket):
@@ -775,9 +826,24 @@ async def test_stream_kalshi_order_book_data_marks_silent_feed_stale(tmp_path) -
 
 
 @pytest.mark.asyncio
-async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect(
+@pytest.mark.parametrize("connect_failures", [0, 2])
+async def test_stream_kalshi_order_book_data_recovers_missing_initialization_with_shared_budget(
     tmp_path,
+    monkeypatch,
+    connect_failures,
 ) -> None:
+    import pmkt.exchanges.kalshi.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
+
+    delays = []
+
+    async def no_sleep(delay):
+        delays.append(delay)
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
+    )
     first = SilentWebSocket()
     second = FakeWebSocket(
         [
@@ -795,10 +861,16 @@ async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect
             )
         ]
     )
-    sockets = deque([first, second])
+    sockets = deque([first, *[socket.gaierror(11001, "DNS failed")] * connect_failures, second])
+    calls = 0
 
     async def connect_factory(_: str, __: dict[str, str]) -> FakeWebSocket:
-        return sockets.popleft()
+        nonlocal calls
+        calls += 1
+        result = sockets.popleft()
+        if isinstance(result, BaseException):
+            raise result
+        return result
 
     supervisor = LiveFeedSupervisor(
         [
@@ -812,6 +884,8 @@ async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect
         max_valid_book_age_ms=20,
     )
 
+    supervisor.initialization_sla_ms = 20  # Short deterministic test SLA; production remains 30 seconds.
+
     manifest = await stream_kalshi_order_book_data(
         ["KXTEST"],
         output_root=tmp_path,
@@ -819,7 +893,7 @@ async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect
         duration_s=1.0,
         max_messages=1,
         capture_intent="smoke",
-        max_reconnects=2,
+        max_reconnects=3,
         connect_factory=connect_factory,
         auth=FakeReadAuth(),
         feed_supervisor=supervisor,
@@ -832,7 +906,9 @@ async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect
     assert first.closed is True
     assert json.loads(second.sent[0])["params"]["market_tickers"] == ["KXTEST"]
     assert manifest["row_counts"]["events"] == 1
-    assert manifest["reconnect_count"] == 1
+    assert manifest["reconnect_count"] == 1 + connect_failures
+    assert calls == 2 + connect_failures
+    assert delays == ([1.0, 1.5] if connect_failures else [])
     assert manifest["socket_recovery_count"] == 1
     assert topbook["valid_state"].tolist() == [True, True]
     assert "stale" in health["connection_state"].tolist()
@@ -841,7 +917,7 @@ async def test_stream_kalshi_order_book_data_recovers_silent_feed_with_reconnect
 
 
 @pytest.mark.asyncio
-async def test_stream_kalshi_refreshes_stale_market_on_live_transport(
+async def test_stream_kalshi_retains_quiet_intact_market_without_refresh(
     tmp_path,
 ) -> None:
     fake = SnapshotThenPongWebSocket(
@@ -888,20 +964,12 @@ async def test_stream_kalshi_refreshes_stale_market_on_live_transport(
 
     sent = [json.loads(payload) for payload in fake.sent]
     recovery = manifest["kalshi_feed_recovery"]
-    assert fake.ping_count >= 1
-    assert any(
-        payload.get("cmd") == "update_subscription"
-        and payload["params"].get("action") == "get_snapshot"
-        for payload in sent
-    )
+    assert fake.ping_count == 0
+    assert not any(payload.get("cmd") == "update_subscription" for payload in sent)
     assert manifest["socket_recovery_count"] == 0
-    assert recovery["transport_liveness_probe_success_count"] >= 1
-    assert recovery["transport_liveness_probe_failure_count"] == 0
-    assert recovery["targeted_snapshot_refresh_exhausted_count"] == 0
-    assert recovery["targeted_snapshot_market_count"] >= 1
-    shard_row = manifest["feed_health_summary"]["shards"][0]
-    assert shard_row["connection_state"] == "connected"
-    assert shard_row["stale_instrument_count"] == 1
+    assert recovery["targeted_snapshot_refresh_count"] == 0
+    assert recovery["targeted_snapshot_market_count"] == 0
+    assert manifest["feed_health_summary"]["shards"][0]["stale_instrument_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -920,7 +988,9 @@ async def test_stream_kalshi_reconnects_when_targeted_refresh_send_fails(
             },
         }
     )
-    first = SnapshotThenFailedRefreshWebSocket(snapshot)
+    malformed = json.loads(snapshot)
+    malformed["msg"]["yes_dollars_fp"] = [["broken", "10"]]
+    first = SnapshotThenFailedRefreshWebSocket(json.dumps(malformed))
     second = FakeWebSocket([snapshot])
     sockets = deque([first, second])
 
@@ -950,11 +1020,12 @@ async def test_stream_kalshi_reconnects_when_targeted_refresh_send_fails(
         connect_factory=connect_factory,
         auth=FakeReadAuth(),
         feed_supervisor=supervisor,
+        monotonic_ns=lambda: time.monotonic_ns() * 100,
     )
 
     recovery = manifest["kalshi_feed_recovery"]
-    assert first.ping_count >= 1
-    assert recovery["transport_liveness_probe_success_count"] == 1
+    assert first.ping_count == 0
+    assert recovery["transport_liveness_probe_success_count"] == 0
     assert recovery["transport_liveness_probe_failure_count"] == 0
     assert recovery["targeted_snapshot_refresh_failure_count"] == 1
     assert manifest["socket_recovery_count"] == 1
@@ -977,7 +1048,9 @@ async def test_stream_kalshi_reconnects_when_targeted_refresh_is_ignored(
             },
         }
     )
-    first = SnapshotThenPongWebSocket(snapshot)
+    malformed = json.loads(snapshot)
+    malformed["msg"]["yes_dollars_fp"] = [["broken", "10"]]
+    first = SnapshotThenPongWebSocket(json.dumps(malformed))
     second = FakeWebSocket([snapshot])
     sockets = deque([first, second])
 
@@ -1007,10 +1080,11 @@ async def test_stream_kalshi_reconnects_when_targeted_refresh_is_ignored(
         connect_factory=connect_factory,
         auth=FakeReadAuth(),
         feed_supervisor=supervisor,
+        monotonic_ns=lambda: time.monotonic_ns() * 100,
     )
 
     recovery = manifest["kalshi_feed_recovery"]
-    assert first.ping_count == 1
+    assert first.ping_count == 0
     assert recovery["targeted_snapshot_refresh_count"] == 1
     assert recovery["targeted_snapshot_refresh_exhausted_count"] == 1
     assert manifest["socket_recovery_count"] == 1
@@ -1190,7 +1264,7 @@ async def test_stream_kalshi_order_book_data_emits_complete_same_shard_stale_tra
 
 
 @pytest.mark.asyncio
-async def test_stream_kalshi_order_book_data_recovers_idle_shard_while_peer_is_active(
+async def test_stream_kalshi_order_book_data_does_not_recover_for_quietness_while_peer_is_active(
     tmp_path,
 ) -> None:
     first = DelayedFakeWebSocket(
@@ -1308,7 +1382,7 @@ async def test_stream_kalshi_order_book_data_recovers_idle_shard_while_peer_is_a
         "KXTWO",
     ]
     assert manifest["row_counts"]["events"] >= 2
-    assert 1 <= manifest["socket_recovery_count"] <= 2
+    assert manifest["socket_recovery_count"] == 0
     assert 1 <= manifest["reconnect_count"] <= 2
     assert "KXTWO:YES" in set(topbook["instrument_id"])
     latest_kxtwo = topbook[topbook["instrument_id"] == "KXTWO:YES"].iloc[-1]
@@ -1782,6 +1856,71 @@ async def test_stream_kalshi_order_book_data_writes_partial_manifest_on_failure(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("max_reconnects", [0, 2])
+async def test_startup_dns_exhaustion_is_classified_as_transport(
+    tmp_path, monkeypatch, max_reconnects,
+) -> None:
+    import pmkt.exchanges.kalshi.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
+
+    calls = 0
+
+    async def no_sleep(delay):
+        pass
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
+    )
+
+    async def factory(*args):
+        nonlocal calls
+        calls += 1
+        raise socket.gaierror(11001, "DNS failed")
+
+    with pytest.raises(socket.gaierror):
+        await stream_kalshi_order_book_data(
+            ["KXTEST"], output_root=tmp_path, run_name="dns",
+            duration_s=10, capture_intent="smoke", max_reconnects=max_reconnects,
+            storage_profile=select_storage_profile("full"),
+            connect_factory=factory, auth=FakeReadAuth(),
+        )
+    manifest = json.loads((tmp_path / "dns" / "manifest.json").read_text())
+    assert calls == 1 + max_reconnects
+    assert manifest["reconnect_count"] == max_reconnects
+    assert manifest["capture_completeness"]["terminal_reason"] == "stream_error"
+    assert manifest["error_type"] == "gaierror"
+    assert validate_run_manifest(tmp_path / "dns" / "manifest.json").ok
+
+
+@pytest.mark.asyncio
+async def test_deadline_before_initialization_preserves_incomplete_capture(
+    tmp_path, monkeypatch,
+) -> None:
+    import pmkt.exchanges.kalshi.order_book_stream as stream_module
+    from pmkt.exchanges.ws_transport import WebSocketDeadlineExceeded, WebSocketRetryBudget
+
+    monkeypatch.setattr(
+        stream_module, "WebSocketRetryBudget",
+        lambda *args, **kwargs: WebSocketRetryBudget(*args, **{**kwargs, "deadline": -1}),
+    )
+
+    async def factory(*args):
+        pytest.fail("connection must not start after deadline")
+
+    with pytest.raises(WebSocketDeadlineExceeded):
+        await stream_kalshi_order_book_data(
+            ["KXTEST"], output_root=tmp_path, run_name="expired",
+            duration_s=10, capture_intent="smoke", connect_factory=factory,
+            auth=FakeReadAuth(),
+        )
+    manifest = json.loads((tmp_path / "expired" / "manifest.json").read_text())
+    assert manifest["status"] in {"failed", "partial"}
+    assert manifest["capture_completeness"]["terminal_reason"] == "deadline_reached"
+    assert manifest["capture_completeness"]["instruments_with_snapshots"] == 0
+
+
+@pytest.mark.asyncio
 async def test_kalshi_clean_close_exhaustion_is_classified_as_stream_error(
     tmp_path,
 ) -> None:
@@ -1815,8 +1954,11 @@ async def test_kalshi_clean_close_exhaustion_is_classified_as_stream_error(
 @pytest.mark.asyncio
 async def test_stream_kalshi_persists_cancelled_manifest(tmp_path) -> None:
     fake = SilentWebSocket()
+    connections = 0
 
     async def connect_factory(_: str, __: dict[str, str]) -> SilentWebSocket:
+        nonlocal connections
+        connections += 1
         return fake
 
     task = asyncio.create_task(
@@ -1837,8 +1979,11 @@ async def test_stream_kalshi_persists_cancelled_manifest(tmp_path) -> None:
     assert fake.sent
 
     task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=1.0)
+    assert task in done, "cancellation must finish within one second"
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert connections == 1
 
     manifest_path = tmp_path / "cancelled-run" / "manifest.json"
     assert manifest_path.exists()

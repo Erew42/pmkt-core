@@ -45,21 +45,18 @@ class FakeWebSocket:
 
 
 class SlowFailingPingWebSocket(FakeWebSocket):
+    def __init__(self, error: Exception) -> None:
+        super().__init__()
+        self.error = error
+
     async def send(self, payload: str) -> None:
         if payload == "PING":
-            raise OSError("ping failed")
+            raise self.error
         await super().send(payload)
 
     async def __anext__(self):
         await asyncio.sleep(0.05)
         raise StopAsyncIteration
-
-
-class UnexpectedFailingPingWebSocket(SlowFailingPingWebSocket):
-    async def send(self, payload: str) -> None:
-        if payload == "PING":
-            raise ValueError("unexpected ping failure")
-        await super().send(payload)
 
 
 def decoded_payload(raw: str) -> dict[str, Any]:
@@ -70,6 +67,101 @@ def decoded_payload(raw: str) -> dict[str, Any]:
 
 async def no_sleep(_: float) -> None:
     return None
+
+
+@pytest.mark.asyncio
+async def test_pong_deadline_is_not_extended_by_ping_and_reconnect_resets() -> None:
+    now = [100.0]
+    sockets = deque([FakeWebSocket(), FakeWebSocket()])
+
+    async def connect_factory(_):
+        return sockets.popleft()
+
+    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
+        heartbeat_interval=None, heartbeat_clock=lambda: now[0])
+    await client.connect()
+    await client.ping()
+    now[0] += 10
+    await client.ping()
+    assert client._pending_ping_since == 100
+    now[0] += 10
+    with pytest.raises(asyncio.TimeoutError, match="PONG"):
+        client._check_pong_deadline()
+    await client.reconnect()
+    assert client._pending_ping_since is None
+    client._check_pong_deadline()
+    await client.close()
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None:
+    class BusySocket(FakeWebSocket):
+        async def __anext__(self):
+            await asyncio.sleep(0.002)
+            return '{"event_type":"last_trade_price","asset_id":"a"}'
+
+    ws = BusySocket()
+
+    async def connect_factory(_):
+        return ws
+
+    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
+        heartbeat_interval=0.01, pong_timeout_seconds=0.02)
+    seen = []
+    async with client:
+        with pytest.raises(asyncio.TimeoutError, match="PONG"):
+            async for message in client.iter_messages(reconnect=False):
+                seen.append(message)
+    assert seen
+    assert ws.closed
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -> None:
+    class ResponsiveSocket(FakeWebSocket):
+        async def __anext__(self):
+            await asyncio.sleep(0.004)
+            return "PONG"
+
+    ws = ResponsiveSocket()
+
+    async def connect_factory(_):
+        return ws
+
+    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
+        heartbeat_interval=0.01, pong_timeout_seconds=0.02)
+    state = MarketBookState("a")
+    async with client:
+        task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
+        await asyncio.sleep(0.065)
+        assert not task.done()
+        assert client._heartbeat_error is None
+        assert not state.initial_snapshot_received
+        assert not state.book_integrity_valid
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.parametrize("bids,asks", [([], []), ([], [["0.6", "5"]]), ([["0.4", "8"]], [])])
+def test_initialized_one_sided_polymarket_book_is_intact_but_not_quote_valid(bids, asks):
+    state = MarketBookState("a")
+    state.apply_book({"asset_id": "a", "bids": bids, "asks": asks})
+    assert state.book_integrity_valid
+    assert not state.valid_state
+    state.mark_reconnect()
+    assert not state.book_integrity_valid
+
+
+@pytest.mark.parametrize("bad", [[["bad", 3]], [[0.4, -1]], [[0.4, float("nan")]], [[True, 1]], "bad"])
+def test_malformed_polymarket_ladders_invalidate_integrity(bad):
+    state = MarketBookState("a")
+    state.apply_book({"asset_id": "a", "bids": bad, "asks": []})
+    assert not state.book_integrity_valid
+    assert not state.valid_state
 
 
 def test_market_payloads_use_asset_ids_and_custom_features() -> None:
@@ -255,8 +347,15 @@ async def test_heartbeat_sends_text_ping() -> None:
 
 
 @pytest.mark.asyncio
-async def test_iter_messages_surfaces_heartbeat_send_failure() -> None:
-    fake = SlowFailingPingWebSocket()
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(OSError("ping failed"), id="transport-error"),
+        pytest.param(ValueError("unexpected ping failure"), id="unexpected-error"),
+    ],
+)
+async def test_iter_messages_surfaces_heartbeat_send_failure(error: Exception) -> None:
+    fake = SlowFailingPingWebSocket(error)
 
     async def connect_factory(_: str) -> SlowFailingPingWebSocket:
         return fake
@@ -270,29 +369,7 @@ async def test_iter_messages_surfaces_heartbeat_send_failure() -> None:
         connect_factory=connect_factory,
         sleep=fast_sleep,
     ) as client:
-        with pytest.raises(OSError, match="ping failed"):
-            await client.iter_messages(reconnect=False).__anext__()
-
-    assert fake.closed is True
-
-
-@pytest.mark.asyncio
-async def test_iter_messages_surfaces_unexpected_heartbeat_send_failure() -> None:
-    fake = UnexpectedFailingPingWebSocket()
-
-    async def connect_factory(_: str) -> UnexpectedFailingPingWebSocket:
-        return fake
-
-    async def fast_sleep(_: float) -> None:
-        await asyncio.sleep(0)
-
-    async with AsyncMarketWebSocketClient(
-        ["asset-a"],
-        heartbeat_interval=0.01,
-        connect_factory=connect_factory,
-        sleep=fast_sleep,
-    ) as client:
-        with pytest.raises(ValueError, match="unexpected ping failure"):
+        with pytest.raises(type(error), match=str(error)):
             await client.iter_messages(reconnect=False).__anext__()
 
     assert fake.closed is True

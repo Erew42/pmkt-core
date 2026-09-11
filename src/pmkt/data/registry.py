@@ -3330,6 +3330,44 @@ SCHEMA_REGISTRY: dict[str, TableSpec] = {
 
 _NAME_TO_VERSION = {spec.name: version for version, spec in SCHEMA_REGISTRY.items()}
 
+# Explicit migration: historical schema IDs and unversioned aliases retain their
+# original contracts. Absent integrity in historical data is unknown, never true.
+INTEGRITY_SCHEMA_VERSIONS = {
+    "topbook.v1": "topbook.v2",
+    "depth.v1": "depth.v2",
+    "feed_health.v1": "feed_health.v2",
+    "capture_instrument_evidence.v1": "capture_instrument_evidence.v2",
+    "book_tape_event.v1": "book_tape_event.v2",
+    "book_tape_control.v1": "book_tape_control.v2",
+}
+for _old_version, _new_version in INTEGRITY_SCHEMA_VERSIONS.items():
+    _extra_fields: tuple[FieldSpec, ...] = (
+        (FieldSpec("book_integrity_after", "bool", False),)
+        if _old_version == BOOK_TAPE_CONTROL_SCHEMA_VERSION
+        else (FieldSpec("book_integrity_valid", "bool", False),)
+    )
+    if _old_version == CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION:
+        _extra_fields += (
+            FieldSpec("first_snapshot_received_at_utc", "string", True),
+            FieldSpec("first_integrity_valid_book_at_utc", "string", True),
+            FieldSpec("first_integrity_valid_book_latency_ms", "float64", True),
+        )
+    SCHEMA_REGISTRY[_new_version] = replace(
+        SCHEMA_REGISTRY[_old_version], version=_new_version,
+        fields=SCHEMA_REGISTRY[_old_version].fields + _extra_fields,
+        description=SCHEMA_REGISTRY[_old_version].description + (
+            " Integrity evidence is independent of conservative quote validity."
+        ),
+    )
+    if _old_version == CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION:
+        SCHEMA_REGISTRY[_new_version] = replace(
+            SCHEMA_REGISTRY[_new_version], fields=tuple(
+                replace(field, allowed_values=(*field.allowed_values, "observed_intact", "integrity_failed"))
+                if field.name == "terminal_outcome" and field.allowed_values else field
+                for field in SCHEMA_REGISTRY[_new_version].fields
+            ),
+        )
+
 SCHEMA_DOCUMENTATION_ALLOWLIST: dict[str, str] = {}
 
 

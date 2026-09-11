@@ -370,7 +370,7 @@ def evaluate_capture_completeness(
     reasons = [*execution_reasons, *capture_reasons]
     return CaptureCompletenessReport(
         ok=ok,
-        policy_version=COMPLETENESS_POLICY_VERSION,
+        policy_version=("capture_completeness.v3" if getattr(instrument_evidence_summary, "integrity_evidence", False) else COMPLETENESS_POLICY_VERSION),
         venue=venue,
         instruments_requested=instruments_requested,
         instruments_with_snapshots=instruments_with_snapshots,

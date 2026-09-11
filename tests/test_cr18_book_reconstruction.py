@@ -251,6 +251,102 @@ class _FakeWebSocket:
         raise StopAsyncIteration
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("profile_name", ["full", "book-tape"])
+async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue, profile_name) -> None:
+    if venue == "polymarket":
+        messages = [{"event_type": "book", "asset_id": "token-1", "market": "market-1",
+                     "bids": [], "asks": [{"price": "0.6", "size": "5"}]}]
+        for side, price, size in [("SELL", "0.6", "0"), ("BUY", "0.4", "8"), ("SELL", "0.6", "3")]:
+            messages.append({"event_type": "price_change", "asset_id": "token-1", "market": "market-1",
+                             "price_changes": [{"asset_id": "token-1", "side": side, "price": price, "size": size}]})
+    else:
+        messages = [{"type": "orderbook_snapshot", "sid": 1, "seq": 1,
+                     "msg": {"market_ticker": "KXTEST", "no_dollars": [["0.6", 5]]}}]
+        for seq, (side, price, delta) in enumerate([("no", "0.6", -5), ("yes", "0.4", 8), ("no", "0.6", 3)], 2):
+            messages.append({"type": "orderbook_delta", "sid": 1, "seq": seq,
+                             "msg": {"market_ticker": "KXTEST", "side": side, "price_dollars": price, "delta": delta}})
+    fake = _FakeWebSocket([json.dumps(message) for message in messages])
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    kwargs = dict(output_root=tmp_path, run_name="intact", max_messages=len(messages), capture_intent="smoke",
+                  instrument_eligibility_evidence=_eligibility_evidence("token-1" if venue == "polymarket" else "KXTEST"),
+                  max_reconnects=0, connect_factory=connect_factory,
+                  storage_profile=select_storage_profile(profile_name, profile_version="3"))
+    if venue == "polymarket":
+        await stream_order_book_data(["token-1"], **kwargs)
+    else:
+        await stream_kalshi_order_book_data(["KXTEST"], auth=FakeReadAuth(), **kwargs)
+    manifest_path = tmp_path / "intact" / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    completeness = manifest["capture_completeness"]
+    assert completeness["policy_version"] == "capture_completeness.v3"
+    assert completeness["evidence_artifact_reconciled"] is True
+    assert completeness["initial_snapshot_count"] == 1
+    assert completeness["evidence_row_count"] == 1
+    evidence = pd.read_parquet(manifest_path.parent / manifest["dataset_artifacts"]["instrument_evidence"]["path"])
+    assert evidence["first_snapshot_received_at_utc"].notna().all()
+    assert evidence["first_integrity_valid_book_at_utc"].notna().all()
+    assert evidence["first_valid_snapshot_at_utc"].notna().all()
+    assert evidence["book_integrity_valid"].all()
+    for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
+        result = reconstruct(manifest_path)
+        assert result.report["status"] == "success"
+        assert result.topbooks["book_integrity_valid"].all()
+        assert (~result.topbooks["valid_state"]).any()
+        assert (result.topbooks["best_bid_dollars"].isna() & result.topbooks["best_ask_dollars"].isna()).any()
+        assert set(result.topbooks["schema_version"]) == {"topbook.v2"}
+    from pmkt.data.manifests import validate_run_manifest
+    manifest["capture_completeness"]["evidence_artifact_role"] = None
+    manifest_path.write_text(json.dumps(manifest))
+    validation = validate_run_manifest(manifest_path)
+    assert not validation.ok
+    assert any("evidence_artifact_role" in error for error in validation.all_errors)
+
+
+def test_timestamp_inversion_preserves_sequence_across_journal_groups():
+    from pmkt.exchanges.polymarket.ws import MarketBookState
+    from pmkt.streaming.tape_producers import PolymarketTapeProducer
+    from pmkt.data.registry import get_table_spec
+
+    state = MarketBookState("a")
+    states = {"a": state}
+    producer = PolymarketTapeProducer(collector_run_id="r", shard_id="s", integrity_evidence=True)
+    snapshot = {"event_type": "book", "asset_id": "a", "bids": [["0.4", "2"]], "asks": [["0.6", "3"]]}
+    state.apply_book(snapshot)
+    first = producer.observe(message=snapshot, states=states,
+        received_at_utc="2026-09-10T00:00:00Z", received_at_monotonic_ns=1, local_sequence=1)
+    delta = {"event_type": "price_change", "asset_id": "a",
+             "price_changes": [{"asset_id": "a", "side": "BUY", "price": "0.4", "size": "4"}]}
+    state.apply_price_change(delta["price_changes"][0], delta)
+    second = producer.observe(message=delta, states=states,
+        received_at_utc="2026-09-10T00:00:01.000001Z", received_at_monotonic_ns=2, local_sequence=2)
+    ended = producer.ended(states=states, received_at_utc="2026-09-10T00:00:01Z",
+        received_at_monotonic_ns=2, local_sequence=3, reason="deadline_reached")
+
+    def frames(emissions):
+        return (
+            pd.DataFrame([dict(b.event) for e in emissions for b in e.batches], columns=get_table_spec("book_tape_event.v2").columns),
+            pd.DataFrame([dict(row) for e in emissions for b in e.batches for row in b.levels], columns=get_table_spec("book_tape_level.v1").columns),
+            pd.DataFrame([dict(row) for e in emissions for row in e.controls], columns=get_table_spec("book_tape_control.v2").columns),
+        )
+    outputs = []
+    for groups in (([first, second, ended],), ([first, second], [ended])):
+        engine = _ReconstructionEngine(shard_by_book={("polymarket", "a"): "s"}, adapter_settings_by_venue={})
+        rows = []
+        for group in groups:
+            topbooks, _ = engine.process(*frames(group))
+            rows.extend(topbooks)
+        tail, _ = engine.finish()
+        rows.extend(tail)
+        outputs.append(rows)
+    assert outputs[0] == outputs[1]
+    assert outputs[0][-1]["bid_size_contracts"] == 4
+
+
 def test_reconstruction_semantic_hash_treats_decimal_nan_as_null() -> None:
     missing = pd.DataFrame([{"nullable_decimal": None}])
     decimal_nan = pd.DataFrame([{"nullable_decimal": Decimal("NaN")}])
@@ -404,11 +500,8 @@ async def test_promoted_sqlite_capture_reconstructs_through_both_readers(
     assert streamed_batches
 
 
-@pytest.mark.asyncio
-async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_deterministically(
-    tmp_path,
-    monkeypatch,
-) -> None:
+@pytest.fixture
+def polymarket_tape_manifest(tmp_path: Path) -> Path:
     fake = _FakeWebSocket(
         [
             json.dumps(
@@ -447,19 +540,42 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     async def connect_factory(_: str) -> _FakeWebSocket:
         return fake
 
-    await stream_order_book_data(
-        ["token-1"],
-        output_root=tmp_path,
-        run_name="poly-reconstruct",
-        duration_s=10,
-        max_messages=2,
-        capture_intent="smoke",
-        instrument_eligibility_evidence=_eligibility_evidence("token-1"),
-        heartbeat_interval=None,
-        connect_factory=connect_factory,
-        storage_profile=select_storage_profile("book-tape"),
+    asyncio.run(
+        stream_order_book_data(
+            ["token-1"],
+            output_root=tmp_path,
+            run_name="poly-reconstruct",
+            duration_s=10,
+            max_messages=2,
+            capture_intent="smoke",
+            instrument_eligibility_evidence=_eligibility_evidence("token-1"),
+            heartbeat_interval=None,
+            connect_factory=connect_factory,
+            storage_profile=select_storage_profile("book-tape"),
+        )
     )
-    manifest = tmp_path / "poly-reconstruct" / "manifest.json"
+    return tmp_path / "poly-reconstruct" / "manifest.json"
+
+
+@pytest.fixture
+def tape_event_segment(polymarket_tape_manifest: Path) -> Path:
+    manifest = polymarket_tape_manifest
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    entry = payload["dataset_artifacts"]["tape_event"]
+    segment_manifest = json.loads(
+        (manifest.parent / entry["segment_manifest_path"]).read_text(encoding="utf-8")
+    )
+    return (
+        manifest.parent
+        / entry["path"]
+        / segment_manifest["completed_segments"][0]["path"]
+    )
+
+
+def test_reconstructs_polymarket_checkpoint_and_absolute_delta_deterministically(
+    polymarket_tape_manifest: Path,
+) -> None:
+    manifest = polymarket_tape_manifest
     first = reconstruct_book_tape(manifest)
     second = reconstruct_book_tape(manifest)
     pd.testing.assert_frame_equal(first.topbooks, second.topbooks)
@@ -510,11 +626,17 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     assert MAX_RECONSTRUCTION_MATERIALIZED_ROWS == 250_000
 
     payload = json.loads(manifest.read_text(encoding="utf-8"))
-    original_profile_version = payload["storage_profile"]["profile_version"]
     assert {item["role"] for item in first.report["source_artifact_provenance"]} == set(
         payload["dataset_artifacts"]
     )
 
+
+def test_reconstruction_publication_and_cli(
+    polymarket_tape_manifest: Path,
+    tmp_path: Path,
+) -> None:
+    manifest = polymarket_tape_manifest
+    first = reconstruct_book_tape(manifest)
     output_dir = tmp_path / "published-reconstruction"
     outputs = reconstruction_cli.publish_book_tape_reconstruction(
         first,
@@ -547,6 +669,12 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     with pytest.raises(FileExistsError, match="already exists"):
         reconstruction_cli.publish_book_tape_reconstruction(first, output_dir)
 
+
+def test_reconstruction_refuses_to_publish_mismatched_result(
+    polymarket_tape_manifest: Path,
+    tmp_path: Path,
+) -> None:
+    first = reconstruct_book_tape(polymarket_tape_manifest)
     mismatch = BookTapeReconstructionResult(
         first.topbooks,
         first.depths,
@@ -560,6 +688,13 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
         )
     assert not rejected_dir.exists()
 
+
+def test_reconstruction_publication_cleans_up_after_write_failure(
+    polymarket_tape_manifest: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    first = reconstruct_book_tape(polymarket_tape_manifest)
     real_write_parquet = reconstruction_cli.write_parquet
     call_count = 0
 
@@ -585,6 +720,12 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     assert not failed_dir.exists()
     assert not list(tmp_path.glob(".failed-reconstruction.staging-*"))
 
+
+def test_reconstruction_rejects_mismatched_row_encoding(
+    polymarket_tape_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
     read_committed_rows = reconstruction_data.read_committed_capture_rows
 
     def read_with_mismatched_tape_encoding(
@@ -611,7 +752,11 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
         with pytest.raises(BookTapeReconstructionError, match="encoding_version"):
             reconstruction_data._load_committed_run_evidence(manifest)
 
-    evidence = reconstruction_data._load_committed_run_evidence(manifest)
+
+def test_reconstruction_groups_split_events_from_one_source_message(
+    polymarket_tape_manifest: Path,
+) -> None:
+    evidence = reconstruction_data._load_committed_run_evidence(polymarket_tape_manifest)
     original_events = evidence.frames["tape_event"]
     original_levels = evidence.frames["tape_level"]
     delta = original_events[original_events["event_kind"] == "delta"].iloc[0]
@@ -677,6 +822,13 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     assert grouped_topbooks[-1]["best_ask_dollars"] == 0.55
     assert len(grouped_depths) == 4
 
+
+def test_reconstruction_rejects_duplicate_event_coordinates(
+    polymarket_tape_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    evidence = reconstruction_data._load_committed_run_evidence(manifest)
     duplicate_events = pd.concat(
         [
             evidence.frames["tape_event"],
@@ -700,6 +852,13 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
         ):
             reconstruction_data._reconstruct_book_tape_legacy(manifest)
 
+
+def test_reconstruction_rejects_delta_outside_open_epoch(
+    polymarket_tape_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    evidence = reconstruction_data._load_committed_run_evidence(manifest)
     outside_events = evidence.frames["tape_event"].copy()
     delta_index = outside_events.index[outside_events["event_kind"] == "delta"][0]
     outside_events.loc[delta_index, "epoch_id"] = "f" * 64
@@ -719,6 +878,13 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
         ):
             reconstruction_data._reconstruct_book_tape_legacy(manifest)
 
+
+def test_reconstruction_rejects_unmapped_event_even_with_book_filter(
+    polymarket_tape_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    evidence = reconstruction_data._load_committed_run_evidence(manifest)
     unmapped_row = evidence.frames["tape_event"].iloc[[0]].copy()
     unmapped_row.loc[:, "event_id"] = "unmapped-event"
     unmapped_row.loc[:, "venue_book_id"] = "unmapped-token"
@@ -747,6 +913,14 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
                 manifest,
                 venue_book_id="token-1",
             )
+
+
+def test_reconstruction_rejects_journal_changed_after_validation(
+    polymarket_tape_manifest: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
     journal_path = manifest.parent / payload["capture_commit_journal"]
     journal_bytes = journal_path.read_bytes()
     real_validate_journal = reconstruction_data.validate_commit_journal
@@ -767,45 +941,50 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
             match="source commit journal changed",
         ):
             reconstruction_data._reconstruct_book_tape_legacy(manifest)
-    journal_path.write_bytes(journal_bytes)
 
-    payload["storage_profile"]["tape_encoding_version"] = "unknown"
+
+@pytest.mark.parametrize(
+    ("section", "field", "value", "error"),
+    [
+        ("storage_profile", "tape_encoding_version", "unknown", "tape_encoding_version"),
+        ("storage_profile", "profile_version", "999", "profile"),
+        (None, "sequence_gap_count", 1, "sequence gap"),
+    ],
+    ids=["unknown-encoding", "unknown-profile", "sequence-gap"],
+)
+def test_reconstruction_rejects_invalid_manifest(
+    polymarket_tape_manifest: Path,
+    section: str | None,
+    field: str,
+    value: str | int,
+    error: str,
+) -> None:
+    manifest = polymarket_tape_manifest
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    target = payload if section is None else payload[section]
+    target[field] = value
     manifest.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(BookTapeReconstructionError, match="tape_encoding_version"):
+    with pytest.raises(BookTapeReconstructionError, match=error):
         reconstruct_book_tape(manifest)
 
-    payload["storage_profile"]["tape_encoding_version"] = "book-tape.v1"
-    payload["storage_profile"]["profile_version"] = "999"
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(BookTapeReconstructionError, match="profile"):
-        reconstruct_book_tape(manifest)
 
-    payload["storage_profile"]["profile_version"] = original_profile_version
-    payload["sequence_gap_count"] = 1
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
-    with pytest.raises(BookTapeReconstructionError, match="sequence gap"):
-        reconstruct_book_tape(manifest)
-
-    payload["sequence_gap_count"] = 0
-    manifest.write_text(json.dumps(payload), encoding="utf-8")
-    event_entry = payload["dataset_artifacts"]["tape_event"]
-    segment_manifest = json.loads(
-        (manifest.parent / event_entry["segment_manifest_path"]).read_text(
-            encoding="utf-8"
-        )
-    )
-    segment_path = (
-        manifest.parent
-        / event_entry["path"]
-        / segment_manifest["completed_segments"][0]["path"]
-    )
+def test_reconstruction_rejects_uncommitted_artifact(
+    polymarket_tape_manifest: Path,
+    tape_event_segment: Path,
+) -> None:
+    manifest = polymarket_tape_manifest
     orphan_path = manifest.parent / "unjournaled.parquet"
-    shutil.copyfile(segment_path, orphan_path)
+    shutil.copyfile(tape_event_segment, orphan_path)
     with pytest.raises(BookTapeReconstructionError, match="uncommitted artifacts"):
         reconstruct_book_tape(manifest)
-    orphan_path.unlink()
 
-    original_segment = segment_path.read_bytes()
+
+def test_reconstruction_rejects_artifact_hash_mismatch(
+    polymarket_tape_manifest: Path,
+    tape_event_segment: Path,
+) -> None:
+    manifest = polymarket_tape_manifest
+    segment_path = tape_event_segment
     altered_segment = pq.read_table(segment_path)
     field = altered_segment.schema.field("received_at_monotonic_ns")
     field_index = altered_segment.schema.get_field_index(field.name)
@@ -817,8 +996,15 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
     pq.write_table(altered_segment, segment_path)
     with pytest.raises(BookTapeReconstructionError, match="artifact hash mismatch"):
         reconstruct_book_tape(manifest)
-    segment_path.write_bytes(original_segment)
 
+
+def test_reconstruction_rejects_artifact_changed_after_recovery(
+    polymarket_tape_manifest: Path,
+    tape_event_segment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    segment_path = tape_event_segment
     real_scoped_recover = reconstruction_streaming.recover_stream_run
 
     def mutate_segment_after_scoped_recovery(*args: Any, **kwargs: Any) -> Any:
@@ -846,6 +1032,17 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
         with pytest.raises(BookTapeReconstructionError, match="changed after recovery"):
             reconstruct_book_tape(manifest)
 
+
+def test_reconstruction_rejects_artifact_changed_while_loading(
+    polymarket_tape_manifest: Path,
+    tape_event_segment: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = polymarket_tape_manifest
+    segment_path = tape_event_segment
+    original_segment = segment_path.read_bytes()
+    real_validate_journal = reconstruction_data.validate_commit_journal
+
     def mutate_segment_after_validation(run_dir: Any) -> Any:
         records = real_validate_journal(run_dir)
         segment_path.write_bytes(original_segment + b"\n")
@@ -862,7 +1059,14 @@ async def test_reconstructs_polymarket_checkpoint_and_absolute_delta_determinist
             match="artifact hash changed while loading",
         ):
             reconstruction_data._reconstruct_book_tape_legacy(manifest)
-    segment_path.write_bytes(original_segment)
+
+
+def test_reconstruction_rejects_duplicate_commit_group(
+    polymarket_tape_manifest: Path,
+) -> None:
+    manifest = polymarket_tape_manifest
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    journal_path = manifest.parent / payload["capture_commit_journal"]
     lines = journal_path.read_text(encoding="utf-8").splitlines()
     journal_path.write_text("\n".join([*lines, lines[0]]) + "\n", encoding="utf-8")
     with pytest.raises(BookTapeReconstructionError, match="duplicate group_id"):
@@ -1674,3 +1878,80 @@ def test_depth_comparison_is_separate_and_reports_source_coordinates() -> None:
     assert mismatch["source_provenance"]["role"] == "depth_main"
     assert set(mismatch["fields"]) == {"size_contracts"}
     assert comparison["excluded_fields"] == ["book_hash"]
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_v3_process_loss_finalizes_without_claiming_reconstructible_capture(tmp_path, venue):
+    from pmkt.data.manifests import validate_run_manifest
+    from pmkt.streaming.recovery import recover_stream_run
+
+    script = r"""
+import asyncio, json, os, sys
+from pathlib import Path
+from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
+from pmkt.exchanges.kalshi.order_book_stream import stream_kalshi_order_book_data
+from pmkt.streaming.profiles import select_storage_profile
+
+root, venue = sys.argv[1:]
+class ReadAuth:
+    def headers_for_get(self, path): return {}
+class Socket:
+    closed = False
+    seen = False
+    async def send(self, payload): pass
+    async def close(self): self.closed = True
+    def __aiter__(self): return self
+    async def __anext__(self):
+        if self.seen:
+            journal = Path(root) / "crashed" / "capture_commit_journal.v2.jsonl"
+            if journal.exists() and journal.stat().st_size:
+                os._exit(92)
+            raise RuntimeError("capture did not journal its initial snapshot")
+        self.seen = True
+        if venue == "polymarket":
+            return json.dumps({"event_type":"book", "asset_id":"a", "market":"m",
+                               "bids":[["0.4","3"]], "asks":[["0.6","5"]]})
+        return json.dumps({"type":"orderbook_snapshot", "sid":1, "seq":1,
+                           "msg":{"market_ticker":"a", "yes_dollars_fp":[["0.4","3"]],
+                                  "no_dollars_fp":[["0.6","5"]]}})
+async def connect(*args): return Socket()
+async def main():
+    kwargs = dict(output_root=root, run_name="crashed", duration_s=10,
+                  capture_intent="smoke", connect_factory=connect,
+                  storage_profile=select_storage_profile("full", profile_version="3"))
+    if venue == "polymarket":
+        await stream_order_book_data(["a"], heartbeat_interval=None, **kwargs)
+    else:
+        await stream_kalshi_order_book_data(["a"], auth=ReadAuth(), **kwargs)
+asyncio.run(main())
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), venue],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 92, completed.stderr
+    recovered = recover_stream_run(tmp_path / "crashed", finalize=True)
+    assert not recovered.journal_errors
+    assert recovered.valid_group_count > 0
+    assert recovered.finalized_manifest_path is not None
+    manifest_path = Path(recovered.finalized_manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["capture_termination"] == "crashed"
+    assert manifest["status"] != "success"
+    validation = validate_run_manifest(manifest_path)
+    assert validation.ok, validation.all_errors
+    assert manifest["capture_completeness"]["evidence_row_count"] == 0
+    assert manifest["capture_completeness"]["acceptance_eligible"] is False
+    # Recovery preserves journaled data, but partial runs are deliberately
+    # outside the accepted reconstruction API contract.
+    for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
+        with pytest.raises(BookTapeReconstructionError, match="successful clean capture"):
+            reconstruct(manifest_path)
+
+    manifest["capture_completeness"]["evidence_row_count"] = 1
+    manifest_path.write_text(json.dumps(manifest))
+    assert not validate_run_manifest(manifest_path).ok
+    manifest["capture_completeness"]["evidence_row_count"] = 0
+    manifest["capture_completeness"]["acceptance_eligible"] = True
+    manifest_path.write_text(json.dumps(manifest))
+    assert not validate_run_manifest(manifest_path).ok

@@ -63,7 +63,11 @@ from pmkt.streaming.capture_completeness import (
     CaptureIntent,
     CaptureTerminationReason,
 )
-from pmkt.exchanges.ws_transport import WebSocketTransportSettings
+from pmkt.exchanges.ws_transport import (
+    WebSocketDeadlineExceeded,
+    WebSocketRetryBudget,
+    WebSocketTransportSettings,
+)
 from pmkt.streaming.profile_runtime import ProfileCaptureRuntime, create_profile_runtime
 from pmkt.streaming.storage_backends import CaptureStorageBackend
 from pmkt.streaming.profiles import (
@@ -71,6 +75,8 @@ from pmkt.streaming.profiles import (
     StorageProfileSelection,
     TopbookEmissionMode,
     resolve_dataset_specs,
+    integrity_dataset_specs,
+    add_book_integrity,
 )
 from pmkt.streaming.tape import CaptureCoordinate, canonical_utc
 from pmkt.streaming.tape_producers import (
@@ -760,13 +766,9 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
                     scheduler=self.feed_control_scheduler,
                     interval_ns=self.configured_feed_control_interval_ns,
                     suppression_reason=(
-                        "runtime_projection_recorder_attached"
-                        if self.runtime_projection_recorder is not None
-                        else (
-                            "slim_health_emitter_inactive"
-                            if self.health_emitter is None
-                            else None
-                        )
+                        "slim_health_emitter_inactive"
+                        if self.health_emitter is None
+                        else None
                     ),
                 ),
                 "instrument_evidence_policy": (
@@ -844,7 +846,7 @@ async def stream_order_book_data(
     if storage_profile is not None:
         profile_specs = resolve_dataset_specs(
             storage_profile,
-            merge_profile_dataset_specs(STREAM_DATASETS),
+            integrity_dataset_specs(storage_profile, merge_profile_dataset_specs(STREAM_DATASETS)),
         )
 
     root = Path(output_root).resolve()
@@ -885,6 +887,8 @@ async def stream_order_book_data(
             )
         ]
     )
+    integrity_evidence = storage_profile is not None and storage_profile.definition.profile_version == "3"
+    supervisor.integrity_evidence = integrity_evidence
     supervisor.require_preflight_ok()
     health_shards = supervisor.venue_shards("polymarket")
     if not health_shards:
@@ -932,6 +936,7 @@ async def stream_order_book_data(
         )
         if DatasetRole.TAPE_EVENT in storage_profile.enabled_roles:
             tape_producer = PolymarketTapeProducer(
+            integrity_evidence=integrity_evidence,
                 collector_run_id=run_dir.name, shard_id=capture_shard_id
             )
         elif DatasetRole.TAPE_CONTROL in storage_profile.enabled_roles:
@@ -956,10 +961,11 @@ async def stream_order_book_data(
         )
 
         if (
-            storage_profile.definition.profile_version == "2"
+            storage_profile.definition.profile_version in {"2", "3"}
             and DatasetRole.INSTRUMENT_EVIDENCE in storage_profile.enabled_roles
         ):
             instrument_evidence_tracker = CaptureInstrumentEvidenceTracker(
+            integrity_evidence=integrity_evidence,
                 collector_run_id=run_dir.name,
                 venue="polymarket",
                 shard_id=capture_shard_id,
@@ -1019,6 +1025,11 @@ async def stream_order_book_data(
         configured_feed_control_interval_ns=configured_feed_control_interval_ns,
         next_book_checkpoint_ns=next_book_checkpoint_ns,
     )
+    retry_budget = WebSocketRetryBudget(
+        session.max_reconnects,
+        on_reconnect=session.mark_reconnect,
+        deadline=deadline,
+    )
 
     try:
         capture_context = session.profile_runtime or session.outputs.open_sinks()
@@ -1044,6 +1055,7 @@ async def stream_order_book_data(
                 heartbeat_interval=heartbeat_interval,
                 connect_factory=connect_factory,
                 transport_settings=session.transport_settings,
+                retry_budget=retry_budget,
                 on_subscription_start=(
                     session.begin_instrument_subscription_attempt
                     if session.instrument_evidence_tracker is not None
@@ -1056,10 +1068,7 @@ async def stream_order_book_data(
                 ),
             ) as ws:
                 connected_at = session.monotonic_ns()
-                if (
-                    session.health_emitter is not None
-                    and session.runtime_projection_recorder is None
-                ):
+                if session.health_emitter is not None:
                     session.feed_control_scheduler = FeedControlScheduler.from_thresholds(
                         now_monotonic_ns=connected_at,
                         max_message_age_ms=session.supervisor.max_message_age_ms,
@@ -1103,19 +1112,15 @@ async def stream_order_book_data(
                                 now_monotonic_ns=now_monotonic_ns,
                                 venue="polymarket",
                             )
-                        if (
-                            recovery_actions
-                            and session.runtime_projection_recorder is not None
-                        ):
+                        if not recovery_actions:
+                            return False
+                        if session.reconnect_count >= session.max_reconnects:
+                            raise RuntimeError("Polymarket recovery retry budget exhausted")
+                        if session.runtime_projection_recorder is not None:
                             session.runtime_projection_recorder.record_recovery_actions(
                                 actions=recovery_actions,
                                 observed_at_utc=_utc_now().isoformat(),
                             )
-                        if (
-                            not recovery_actions
-                            or session.reconnect_count >= session.max_reconnects
-                        ):
-                            return False
                         if (
                             next_message_task is not None
                             and not next_message_task.done()
@@ -1124,8 +1129,9 @@ async def stream_order_book_data(
                             with contextlib.suppress(asyncio.CancelledError):
                                 await next_message_task
                         next_message_task = None
-                        session.mark_reconnect()
-                        await ws.reconnect()
+                        await retry_budget.run(
+                            ws.reconnect, retry_first=True, immediate_first=True,
+                        )
                         session.socket_recovery_count += 1
                         connected_at = session.monotonic_ns()
                         for shard in session.health_shards:
@@ -1166,13 +1172,16 @@ async def stream_order_book_data(
                                 )
                             try:
                                 wait_started_ns = session.monotonic_ns()
-                                message = await asyncio.wait_for(
-                                    asyncio.shield(next_message_task),
+                                done, _ = await asyncio.wait(
+                                    {next_message_task},
                                     timeout=session.message_wait_timeout(
                                         remaining,
                                         now_monotonic_ns=wait_started_ns,
                                     ),
                                 )
+                                if not done:
+                                    raise asyncio.TimeoutError
+                                message = next_message_task.result()
                                 next_message_task = None
                             except asyncio.TimeoutError:
                                 observed_at_utc = _utc_now().isoformat()
@@ -1390,6 +1399,8 @@ async def stream_order_book_data(
                                     )
                                 if snapshot_shard.record_book(
                                     valid_state=bool(snapshot.valid_state),
+                                    book_integrity_valid=snapshot.book_integrity_valid,
+                                    initial_snapshot_received=snapshot.initial_snapshot_received,
                                     now_monotonic_ns=received_at_monotonic_ns,
                                     instrument=snapshot.asset_id,
                                     quality_flags=flags,
@@ -1411,6 +1422,12 @@ async def stream_order_book_data(
                                         )
                                     )
                                     session.snapshot_count += 1
+                                if session.instrument_evidence_tracker is not None:
+                                    session.instrument_evidence_tracker.record_book(
+                                        snapshot.asset_id, observed_at_utc=received_at_utc,
+                                        snapshot_received=snapshot.event_type == 'book',
+                                        book_integrity_valid=snapshot.book_integrity_valid,
+                                    )
                                 if snapshot.valid_state:
                                     session.instruments_with_snapshots.add(
                                         snapshot.asset_id
@@ -1431,6 +1448,7 @@ async def stream_order_book_data(
                                     received_at_monotonic_ns=received_at_monotonic_ns,
                                     local_sequence=session.sequence,
                                 )
+                                topbook = add_book_integrity(topbook, integrity=snapshot.book_integrity_valid, selection=session.storage_profile)
                                 instrument_id = topbook.get("instrument_id")
                                 if instrument_id is not None:
                                     session.latest_topbooks[str(instrument_id)] = (
@@ -1522,7 +1540,7 @@ async def stream_order_book_data(
                                         snapshot=snapshot,
                                         state=state,
                                     ):
-                                        await depth_sink.write(depth)
+                                        await depth_sink.write(add_book_integrity(depth, integrity=snapshot.book_integrity_valid, selection=session.storage_profile))
                                         session.quality_counter.update(
                                             depth.get("quality_flags") or []
                                         )
@@ -1670,11 +1688,13 @@ async def stream_order_book_data(
         if not isinstance(exc, CaptureCompletenessError):
             if isinstance(exc, asyncio.CancelledError):
                 session.terminal_reason = CaptureTerminationReason.CANCELLED
+            elif isinstance(exc, WebSocketDeadlineExceeded):
+                session.terminal_reason = CaptureTerminationReason.DEADLINE_REACHED
             elif capture_phase == "finalization":
                 session.terminal_reason = CaptureTerminationReason.FINALIZATION_ERROR
                 # ConnectionError is an OSError subclass, but here it represents
                 # websocket transport exhaustion rather than a persistence failure.
-            elif isinstance(exc, ConnectionError):
+            elif isinstance(exc, ConnectionError) or exc is retry_budget.last_error:
                 session.terminal_reason = CaptureTerminationReason.STREAM_ERROR
             elif isinstance(exc, OSError):
                 session.terminal_reason = CaptureTerminationReason.PERSISTENCE_ERROR
