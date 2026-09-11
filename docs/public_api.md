@@ -411,6 +411,77 @@ capability and book requests; `observation` remains the final book request.
 runnable offline discovery-to-book example using injected synthetic HTTP
 responses and the actual public methods.
 
+Fetch normalized candles for one market with an explicit aware window and
+fixed native period:
+
+```python
+from datetime import datetime, timezone
+from pmkt.records import CandleHistoryResult
+
+history: CandleHistoryResult = await kalshi.get_candles(
+    KalshiMarketRef("KXMARKET"),
+    start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    period_minutes=60,
+    source="auto",
+    max_candles=10_000,
+    deadline_s=60.0,
+)
+```
+
+`period_minutes` is exactly `1`, `60`, or `1440`. Both bounds must be aware;
+they are normalized to UTC before ordering. Returned candles are fully
+contained in the original window and complete against one UTC clock value
+frozen at operation start. Thus 10:30–12:00 includes the 11:00–12:00 hourly
+bar only. Inclusive native end-label requests may overlap at internal adapter
+boundaries; all valid keys are reconciled before original-window containment,
+completion filtering, and the output cap. Chunk size is a bounded adapter
+choice, not a claimed upstream maximum.
+
+Live and historical payloads have separate contracts. Live fields use
+`*_dollars`, `volume_fp`, and `open_interest_fp`, and explicitly send
+`include_latest_before_start=false`. Historical fields use bare probability
+strings plus `volume` and `open_interest`, and receive no invented flag. The
+result keeps traded-price OHLC separate from YES bid and ask OHLC, with native
+mean, previous, volume, open interest, dataset, end label, and defensive native
+payload. Empty live price objects and historical null trade OHLC with valid
+quotes are retained as legitimate missing trade series. Values are never
+scaled by magnitude, filled, zeroed, or complemented into NO trades.
+
+The versioned `kalshi_market_candles.v1` interpretation treats a 1440-minute
+bar as a fixed 86,400-second interval whose inferred start must be midnight in
+`America/New_York`; the native end label is preserved. Around spring DST the
+end can be 01:00 local, and around fall DST it can be 23:00 local, so adjacent
+nominal intervals may overlap or have a gap. This rule is supported by bounded
+primary API observations, including both DST transitions, and is an analytical
+nominal-period convention. It does not assert a vendor timezone, calendar-day
+grid, source completeness, finality, or clock-skew bound. The base install
+includes `tzdata>=2026.3` so this rule is available on Windows without pandas.
+
+`source="live"` and `source="historical"` never switch. Explicit historical
+reads need no live metadata, event, or series lookup. Auto routing retains the
+historical `market_settled_ts` cutoff and a normalized routing market: a market
+settled strictly before the cutoff uses the archive, while equality stays live.
+Live series identity comes only from verified market or event evidence; ticker
+splitting and unverified caller hints are rejected. A live metadata 404 may
+trigger one archive existence lookup. A selected candle endpoint 404 may
+trigger one bounded alternate dataset attempt under the same deadline; an
+empty 200, authentication error, timeout, or server error never does.
+
+`HistoryCoverage` partitions every raw candle occurrence into accepted,
+rejected, nonconflicting duplicate, outside-window, running, or identified
+synthetic counts. Conflicts reject every occurrence of the key in report mode,
+including occurrences outside the requested window; strict mode raises.
+Malformed individual scalar rows follow `invalid_rows`, while malformed
+envelopes, identity contradictions, and unsupported live/archive component
+layouts always raise. `requests_complete=True` still leaves
+`source_completeness="unknown"`. `to_arrow()` and `to_pandas()` load optional
+dependencies lazily and preserve typed UTC columns for empty results.
+
+[`scripts/kalshi_candles_example.py`](../scripts/kalshi_candles_example.py) is
+a runnable offline example using the public method with an injected historical
+candle response.
+
 ## Retained native venue clients
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
@@ -460,8 +531,10 @@ existing signatures, interval suppression, models, and validation.
 Kalshi page methods return the native response envelope as a dictionary; the
 iterators yield one market or event dictionary at a time. `orderbook` returns
 the native YES/NO bid envelope, while `normalized_orderbook` returns the
-existing policy-neutral normalized dictionary. Candlestick and trade methods
-retain upstream units and layouts; no cross-venue candle schema is promised.
+existing policy-neutral normalized dictionary. Native candlestick and trade
+methods retain upstream units, layouts, signatures, defaults, and explicit
+source behavior. The separate `get_candles` workflow supplies the normalized
+candle contract described above; no cross-venue candle facade is promised.
 The default `markets_page` and `iter_markets` status is `"open"`.
 
 The narrow read-auth surface is importable from `pmkt.exchanges.read_auth`:

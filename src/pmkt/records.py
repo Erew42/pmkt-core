@@ -606,6 +606,8 @@ class HistoryCoverage:
     duplicate_rows: int
     conflicting_rows: int
     outside_window_rows: int
+    running_rows: int = 0
+    synthetic_rows: int = 0
 
     def __post_init__(self) -> None:
         _require_utc(self.requested_start_utc, "requested_start_utc")
@@ -637,6 +639,8 @@ class HistoryCoverage:
             "duplicate_rows",
             "conflicting_rows",
             "outside_window_rows",
+            "running_rows",
+            "synthetic_rows",
         ):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int):
@@ -650,6 +654,8 @@ class HistoryCoverage:
             + self.rejected_rows
             + self.duplicate_rows
             + self.outside_window_rows
+            + self.running_rows
+            + self.synthetic_rows
         )
         if self.raw_rows != partitioned:
             raise ValueError("history row counters do not partition raw_rows")
@@ -726,6 +732,163 @@ class PriceHistoryResult:
         """Materialize points as a pandas frame, loading the data extra lazily."""
 
         return _price_history_to_pandas(self)
+
+
+@dataclass(frozen=True)
+class CandleOHLC:
+    """Nullable probability OHLC values from one native candle component."""
+
+    open: float | None
+    high: float | None
+    low: float | None
+    close: float | None
+
+    def __post_init__(self) -> None:
+        for name in ("open", "high", "low", "close"):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a number or None")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+            if not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+
+
+@dataclass(frozen=True)
+class KalshiCandle:
+    """One reconciled Kalshi market candle at the native nominal interval."""
+
+    market: KalshiMarketRef
+    period_start_utc: datetime
+    period_end_utc: datetime
+    native_end_timestamp: int
+    period_minutes: Literal[1, 60, 1440]
+    dataset: Literal["live", "historical"]
+    traded_price: CandleOHLC
+    traded_price_mean: float | None
+    traded_price_previous: float | None
+    yes_bid: CandleOHLC
+    yes_ask: CandleOHLC
+    volume_contracts: float | None
+    open_interest_contracts: float | None
+    quality_flags: tuple[str, ...]
+    native_payload: dict[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.market, KalshiMarketRef):
+            raise TypeError("market must be a KalshiMarketRef")
+        _require_utc(self.period_start_utc, "period_start_utc")
+        _require_utc(self.period_end_utc, "period_end_utc")
+        if self.period_end_utc <= self.period_start_utc:
+            raise ValueError("candle period end must follow its start")
+        if isinstance(self.native_end_timestamp, bool) or not isinstance(
+            self.native_end_timestamp, int
+        ):
+            raise TypeError("native_end_timestamp must be an int")
+        if isinstance(self.period_minutes, bool) or not isinstance(
+            self.period_minutes, int
+        ):
+            raise TypeError("period_minutes must be an int")
+        if self.period_minutes not in (1, 60, 1440):
+            raise ValueError("unsupported candle period_minutes")
+        if self.dataset not in ("live", "historical"):
+            raise ValueError("unsupported candle dataset")
+        for name in ("traded_price", "yes_bid", "yes_ask"):
+            if not isinstance(getattr(self, name), CandleOHLC):
+                raise TypeError(f"{name} must be a CandleOHLC")
+        for name in (
+            "traded_price_mean",
+            "traded_price_previous",
+            "volume_contracts",
+            "open_interest_contracts",
+        ):
+            value = getattr(self, name)
+            if value is None:
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise TypeError(f"{name} must be a number or None")
+            if not math.isfinite(float(value)):
+                raise ValueError(f"{name} must be finite")
+            if name.startswith("traded_price") and not 0 <= value <= 1:
+                raise ValueError(f"{name} must be between 0 and 1")
+            if name.endswith("contracts") and value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        for flag in self.quality_flags:
+            _require_identifier(flag, "quality flag")
+        if not isinstance(self.native_payload, dict):
+            raise TypeError("native_payload must be a dict")
+
+
+@dataclass(frozen=True)
+class CandleHistoryResult:
+    """Normalized Kalshi candle history with routing and coverage evidence."""
+
+    market: KalshiMarketRef
+    candles: tuple[KalshiCandle, ...]
+    requested_start_utc: datetime
+    requested_end_utc: datetime
+    period_minutes: Literal[1, 60, 1440]
+    source: Literal["auto", "live", "historical"]
+    completed_through_utc: datetime
+    historical_cutoff_utc: datetime | None
+    observation: RequestObservation
+    observations: tuple[RequestObservation, ...]
+    issues: tuple[DataIssue, ...]
+    interpretation_id: str
+    package_version: str
+    coverage: HistoryCoverage
+    quality_flags: tuple[str, ...]
+    routing_market: KalshiMarket | None
+    native_payloads: tuple[dict[str, object], ...] = field(
+        repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.market, KalshiMarketRef):
+            raise TypeError("market must be a KalshiMarketRef")
+        _require_utc(self.requested_start_utc, "requested_start_utc")
+        _require_utc(self.requested_end_utc, "requested_end_utc")
+        _require_utc(self.completed_through_utc, "completed_through_utc")
+        if self.historical_cutoff_utc is not None:
+            _require_utc(self.historical_cutoff_utc, "historical_cutoff_utc")
+        if self.requested_end_utc <= self.requested_start_utc:
+            raise ValueError("requested history end must follow its start")
+        if isinstance(self.period_minutes, bool) or not isinstance(
+            self.period_minutes, int
+        ):
+            raise TypeError("period_minutes must be an int")
+        if self.period_minutes not in (1, 60, 1440):
+            raise ValueError("unsupported candle period_minutes")
+        if self.source not in ("auto", "live", "historical"):
+            raise ValueError("unsupported candle source")
+        if any(not isinstance(candle, KalshiCandle) for candle in self.candles):
+            raise TypeError("candles must contain KalshiCandle records")
+        if self.routing_market is not None and not isinstance(
+            self.routing_market, KalshiMarket
+        ):
+            raise TypeError("routing_market must be a KalshiMarket or None")
+        if not self.observations or self.observations[-1] != self.observation:
+            raise ValueError("observation must be the final request observation")
+        _require_identifier(self.interpretation_id, "interpretation_id")
+        _require_identifier(self.package_version, "package_version")
+        if self.coverage.accepted_rows != len(self.candles):
+            raise ValueError("coverage accepted_rows must equal returned candle count")
+        for flag in self.quality_flags:
+            _require_identifier(flag, "quality flag")
+        if any(not isinstance(payload, dict) for payload in self.native_payloads):
+            raise TypeError("native_payloads must contain dictionaries")
+
+    def to_arrow(self) -> pa.Table:
+        """Materialize candles as an Arrow table, loading the data extra lazily."""
+
+        return _candle_history_to_arrow(self)
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Materialize candles as a pandas frame, loading the data extra lazily."""
+
+        return _candle_history_to_pandas(self)
 
 
 def _price_history_metadata(result: PriceHistoryResult) -> dict[str, str]:
@@ -807,6 +970,139 @@ def _price_history_to_pandas(result: PriceHistoryResult) -> Any:
     return frame
 
 
+def _candle_history_metadata(result: CandleHistoryResult) -> dict[str, str]:
+    return {
+        "market_ticker": result.market.ticker,
+        "source": result.source,
+        "datasets": ",".join(result.coverage.datasets),
+        "period_minutes": str(result.period_minutes),
+        "interpretation_id": result.interpretation_id,
+        "package_version": result.package_version,
+    }
+
+
+def _candle_history_columns(result: CandleHistoryResult) -> dict[str, list[object]]:
+    candles = result.candles
+    return {
+        "market_ticker": [candle.market.ticker for candle in candles],
+        "period_start_utc": [candle.period_start_utc for candle in candles],
+        "period_end_utc": [candle.period_end_utc for candle in candles],
+        "native_end_timestamp": [candle.native_end_timestamp for candle in candles],
+        "period_minutes": [candle.period_minutes for candle in candles],
+        "dataset": [candle.dataset for candle in candles],
+        "traded_price_open": [candle.traded_price.open for candle in candles],
+        "traded_price_high": [candle.traded_price.high for candle in candles],
+        "traded_price_low": [candle.traded_price.low for candle in candles],
+        "traded_price_close": [candle.traded_price.close for candle in candles],
+        "traded_price_mean": [candle.traded_price_mean for candle in candles],
+        "traded_price_previous": [candle.traded_price_previous for candle in candles],
+        "yes_bid_open": [candle.yes_bid.open for candle in candles],
+        "yes_bid_high": [candle.yes_bid.high for candle in candles],
+        "yes_bid_low": [candle.yes_bid.low for candle in candles],
+        "yes_bid_close": [candle.yes_bid.close for candle in candles],
+        "yes_ask_open": [candle.yes_ask.open for candle in candles],
+        "yes_ask_high": [candle.yes_ask.high for candle in candles],
+        "yes_ask_low": [candle.yes_ask.low for candle in candles],
+        "yes_ask_close": [candle.yes_ask.close for candle in candles],
+        "volume_contracts": [candle.volume_contracts for candle in candles],
+        "open_interest_contracts": [
+            candle.open_interest_contracts for candle in candles
+        ],
+        "quality_flags": [list(candle.quality_flags) for candle in candles],
+    }
+
+
+def _candle_history_to_arrow(result: CandleHistoryResult) -> Any:
+    try:
+        import pyarrow as pa
+    except ImportError as exc:
+        from pmkt.errors import OptionalDependencyError
+
+        raise OptionalDependencyError(
+            "CandleHistoryResult.to_arrow requires pyarrow; install pmkt[data]"
+        ) from exc
+    schema = pa.schema(
+        [
+            pa.field("market_ticker", pa.string(), nullable=False),
+            pa.field("period_start_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+            pa.field("period_end_utc", pa.timestamp("us", tz="UTC"), nullable=False),
+            pa.field("native_end_timestamp", pa.int64(), nullable=False),
+            pa.field("period_minutes", pa.int64(), nullable=False),
+            pa.field("dataset", pa.string(), nullable=False),
+            *[
+                pa.field(name, pa.float64())
+                for name in (
+                    "traded_price_open",
+                    "traded_price_high",
+                    "traded_price_low",
+                    "traded_price_close",
+                    "traded_price_mean",
+                    "traded_price_previous",
+                    "yes_bid_open",
+                    "yes_bid_high",
+                    "yes_bid_low",
+                    "yes_bid_close",
+                    "yes_ask_open",
+                    "yes_ask_high",
+                    "yes_ask_low",
+                    "yes_ask_close",
+                    "volume_contracts",
+                    "open_interest_contracts",
+                )
+            ],
+            pa.field("quality_flags", pa.list_(pa.string()), nullable=False),
+        ],
+        metadata={
+            key.encode("utf-8"): value.encode("utf-8")
+            for key, value in _candle_history_metadata(result).items()
+        },
+    )
+    columns = _candle_history_columns(result)
+    return pa.Table.from_pydict(columns, schema=schema)
+
+
+def _candle_history_to_pandas(result: CandleHistoryResult) -> Any:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        from pmkt.errors import OptionalDependencyError
+
+        raise OptionalDependencyError(
+            "CandleHistoryResult.to_pandas requires pandas; install pmkt[data]"
+        ) from exc
+    columns = _candle_history_columns(result)
+    frame = pd.DataFrame(columns)
+    frame = frame.astype(
+        {
+            "market_ticker": "string",
+            "native_end_timestamp": "int64",
+            "period_minutes": "int64",
+            "dataset": "string",
+            **{
+                name: "float64"
+                for name in columns
+                if name not in {
+                    "market_ticker",
+                    "period_start_utc",
+                    "period_end_utc",
+                    "native_end_timestamp",
+                    "period_minutes",
+                    "dataset",
+                    "quality_flags",
+                }
+            },
+        }
+    )
+    frame["period_start_utc"] = pd.Series(
+        columns["period_start_utc"], dtype="datetime64[ns, UTC]"
+    )
+    frame["period_end_utc"] = pd.Series(
+        columns["period_end_utc"], dtype="datetime64[ns, UTC]"
+    )
+    frame.attrs.update(_candle_history_metadata(result))
+    return frame
+
+
 @dataclass(frozen=True)
 class RequestObservation:
     """Sanitized provenance for one HTTP request within a workflow operation."""
@@ -877,6 +1173,8 @@ __all__ = [
     "BookQuantityUnit",
     "BookSideProvenance",
     "BookSnapshot",
+    "CandleHistoryResult",
+    "CandleOHLC",
     "DataScope",
     "DataIssue",
     "DiscoveryReport",
@@ -887,6 +1185,7 @@ __all__ = [
     "InstrumentRef",
     "KalshiFilter",
     "KalshiInstrumentRef",
+    "KalshiCandle",
     "KalshiMarket",
     "KalshiMarketRef",
     "KalshiMveFilter",

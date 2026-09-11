@@ -34,9 +34,10 @@ The following paths are owned by `pmkt-core`:
 - The supported Polymarket discovery, typed-book, and sampled CLOB history
   workflows, their private decoders, OpenAPI contracts, offline examples, and
   focused records/Gamma/CLOB/package tests.
-- The supported Kalshi standard-market discovery, source-scoped detail, and
-  projected current-book workflows, their private decoder, offline example,
-  and focused records/Kalshi/package tests.
+- The supported Kalshi standard-market discovery, source-scoped detail,
+  projected current-book, and explicit-window candle workflows, their private
+  decoders and routing planner, offline examples, and focused
+  records/Kalshi/package tests.
 
 ## Private trading
 

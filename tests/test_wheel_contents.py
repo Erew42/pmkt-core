@@ -75,6 +75,7 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
     assert "cryptography" not in requirements.lower()
     assert "py-clob-client" not in requirements.lower()
     assert "py-builder-relayer-client" not in requirements.lower()
+    assert "tzdata>=2026.3" in requirements
 
 
 def test_sdist_rebuild_preserves_observed_identity_outside_git(tmp_path: Path) -> None:
@@ -359,6 +360,31 @@ assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sy
         "token_id": "offline-token",
     }
 
+    kalshi_example = tmp_path / "kalshi_candles_example.py"
+    kalshi_example.write_bytes((ROOT / "scripts" / kalshi_example.name).read_bytes())
+    kalshi_example_runtime = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            example_runtime_script,
+            str(installed),
+            str(kalshi_example),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert kalshi_example_runtime.returncode == 0, kalshi_example_runtime.stderr
+    assert json.loads(kalshi_example_runtime.stdout) == {
+        "accepted_rows": 1,
+        "close": 0.4,
+        "dataset": "historical",
+        "source_completeness": "unknown",
+        "ticker": "OFFLINE-CANDLE-MARKET",
+        "volume_contracts": 12.5,
+    }
+
     positive = tmp_path / "catalog_positive.py"
     positive.write_text(
         """\
@@ -368,7 +394,7 @@ from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
 from pmkt.config import PmktConfig, RequestPolicy
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrumentRef, KalshiMarket, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
-from pmkt.records import BookSnapshot, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
+from pmkt.records import BookSnapshot, CandleHistoryResult, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
@@ -425,6 +451,18 @@ async def kalshi_workflow() -> None:
     book: BookSnapshot = await kalshi.get_book(
         discovery.items[0].instruments[0], depth=5, deadline_s=5.0
     )
+    candles: CandleHistoryResult = await kalshi.get_candles(
+        KalshiMarketRef("ticker"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        period_minutes=60,
+        source="historical",
+        max_candles=100,
+        deadline_s=5.0,
+        invalid_rows="report",
+    )
+    candles.to_arrow()
+    candles.to_pandas()
 """,
         encoding="utf-8",
     )
@@ -483,6 +521,25 @@ async def invalid_kalshi_calls() -> None:
     await kalshi.get_market(ticker="ticker", source="archive")
     await kalshi.get_book(PolymarketInstrumentRef("token"))
     await kalshi.get_book(KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes"), depth="one")
+    await kalshi.get_candles(
+        PolymarketMarketRef("market"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        period_minutes=60,
+    )
+    await kalshi.get_candles(
+        KalshiMarketRef("ticker"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    await kalshi.get_candles(
+        KalshiMarketRef("ticker"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        period_minutes=5,
+        source="archive",
+        deadline_s=None,
+    )
 """,
         encoding="utf-8",
     )
@@ -535,3 +592,8 @@ async def invalid_kalshi_calls() -> None:
     assert 'Argument "source" to "get_market" of "AsyncKalshiClient"' in rejected.stdout
     assert 'Argument 1 to "get_book" of "AsyncKalshiClient"' in rejected.stdout
     assert 'Argument "depth" to "get_book" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Argument 1 to "get_candles" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Missing named argument "period_minutes" for "get_candles"' in rejected.stdout
+    assert 'Argument "period_minutes" to "get_candles"' in rejected.stdout
+    assert 'Argument "source" to "get_candles"' in rejected.stdout
+    assert 'Argument "deadline_s" to "get_candles"' in rejected.stdout

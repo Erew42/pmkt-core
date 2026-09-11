@@ -1,7 +1,7 @@
 # Venue Historical Data Capabilities
 
-Checked for CR-10.0 on 2026-06-17 and the public sampled-history workflow on
-2026-09-11.
+Checked for CR-10.0 on 2026-06-17 and the public sampled-price and Kalshi
+candle-history workflows on 2026-09-11.
 
 ## Polymarket
 
@@ -24,6 +24,19 @@ Checked for CR-10.0 on 2026-06-17 and the public sampled-history workflow on
 - `/historical/markets/{ticker}/candlesticks` provides archived market candlesticks after Kalshi's historical cutoff. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-market-candlesticks>
 - `/historical/trades` provides historical trade context. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-trades>
 - There is no documented historical topbook or historical depth endpoint. `/markets/{ticker}/orderbook` is a current order-book snapshot endpoint, so CR-10.1 recording is required for forward-looking executable topbook evidence.
+- `AsyncKalshiClient.get_candles(...)` is the supported single-market,
+  explicit-window adapter. Auto routing compares native market settlement with
+  the retained `market_settled_ts` cutoff; explicit source modes do not switch.
+  A qualified 404 permits at most one alternate dataset attempt, while empty
+  success, authentication, timeout, and server errors do not.
+- Live and archive field names and units are decoded independently. Returned
+  records separate traded price from YES bid and ask OHLC and retain native
+  evidence. Fully contained, completed periods are selected after global
+  reconciliation. HTTP traversal does not establish source completeness.
+- For the versioned initial 1440-minute interpretation, the native end minus
+  86,400 seconds must be `America/New_York` midnight. Saved primary API checks
+  across both 2025 fall and 2026 spring DST transitions support this bounded
+  analytical rule; it is not a vendor timezone or calendar-day guarantee.
 
 ## Implementation Notes
 

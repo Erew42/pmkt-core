@@ -217,6 +217,8 @@
         "BookQuantityUnit",
         "BookSideProvenance",
         "BookSnapshot",
+        "CandleHistoryResult",
+        "CandleOHLC",
         "DataIssue",
         "DataScope",
         "DiscoveryReport",
@@ -225,6 +227,7 @@
         "HistoryCoverage",
         "HistoryQueryWindow",
         "InstrumentRef",
+        "KalshiCandle",
         "KalshiFilter",
         "KalshiInstrumentRef",
         "KalshiMarket",
@@ -535,6 +538,14 @@
       "tier": "supported"
     },
     {
+      "path": "pmkt.records.CandleHistoryResult",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.CandleOHLC",
+      "tier": "supported"
+    },
+    {
       "path": "pmkt.records.PriceHistoryResult",
       "tier": "supported"
     },
@@ -556,6 +567,10 @@
     },
     {
       "path": "pmkt.records.KalshiMarketRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.KalshiCandle",
       "tier": "supported"
     },
     {

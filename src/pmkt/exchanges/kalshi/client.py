@@ -4,7 +4,8 @@ import json
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, Sequence
+import math
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterable, Literal, Sequence
 from urllib.parse import quote, urlparse
 from uuid import uuid4
 
@@ -36,6 +37,16 @@ from pmkt.exchanges.kalshi._workflow import (
     normalize_kalshi_workflow_book,
     normalize_kalshi_workflow_market,
 )
+from pmkt.exchanges.kalshi._history import (
+    CandlePayload,
+    decode_kalshi_event_series,
+    decode_kalshi_historical_cutoff,
+    kalshi_candle_identities,
+    kalshi_cutoff_identities,
+    kalshi_event_identities,
+    normalize_kalshi_candle_history,
+    parse_kalshi_settlement_timestamp,
+)
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
     ReadOnlyRequestError,
@@ -43,6 +54,7 @@ from pmkt.exchanges.read_auth import (
 )
 from pmkt.records import (
     BookSnapshot,
+    CandleHistoryResult,
     DataIssue,
     DataScope,
     DiscoveryReport,
@@ -51,6 +63,8 @@ from pmkt.records import (
     KalshiFilter,
     KalshiInstrumentRef,
     KalshiMarket,
+    KalshiMarketRef,
+    HistoryQueryWindow,
     RequestObservation,
 )
 from pmkt import __version__
@@ -64,6 +78,10 @@ _MARKETS_ENDPOINT = "/markets"
 _MARKETS_PARAMETER_ALLOWLIST = frozenset(
     {"limit", "cursor", "status", "event_ticker", "series_ticker", "tickers", "mve_filter"}
 )
+_CANDLE_PARAMETER_ALLOWLIST = frozenset(
+    {"start_ts", "end_ts", "period_interval", "include_latest_before_start"}
+)
+KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST = 10_000
 
 
 @dataclass
@@ -226,6 +244,7 @@ class AsyncKalshiClient:
         request_policy: RequestPolicy | None = None,
         config: PmktConfig | None = None,
         timeout_s: float = 10.0,
+        _utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         self.base_url = (
             base_url
@@ -237,6 +256,7 @@ class AsyncKalshiClient:
         self.header_provider = auth
         self.transport = transport
         self.limiter = limiter or AsyncLimiter(10, 1)
+        self._utc_now = _utc_now or (lambda: datetime.now(timezone.utc))
         self._http = KalshiHttpClient(
             base_url=self.base_url,
             auth=self.header_provider,
@@ -575,6 +595,317 @@ class AsyncKalshiClient:
         expiry.checkpoint()
         return result
 
+    async def get_candles(
+        self,
+        market: KalshiMarketRef,
+        *,
+        start: datetime,
+        end: datetime,
+        period_minutes: Literal[1, 60, 1440],
+        source: Literal["auto", "live", "historical"] = "auto",
+        max_candles: int = 100_000,
+        deadline_s: float = 60.0,
+        invalid_rows: Literal["raise", "report"] = "raise",
+    ) -> CandleHistoryResult:
+        """Fetch fully contained, completed candles for one Kalshi market."""
+
+        if not isinstance(market, KalshiMarketRef):
+            raise TypeError("market must be a KalshiMarketRef")
+        start_utc, end_utc = _utc_history_bounds(start, end)
+        if isinstance(period_minutes, bool) or not isinstance(period_minutes, int):
+            raise TypeError("period_minutes must be an int")
+        if period_minutes not in (1, 60, 1440):
+            raise ValueError("period_minutes must be one of 1, 60, or 1440")
+        if source not in ("auto", "live", "historical"):
+            raise ValueError("source must be 'auto', 'live', or 'historical'")
+        _require_positive_int(max_candles, "max_candles")
+        if invalid_rows not in ("raise", "report"):
+            raise ValueError("invalid_rows must be 'raise' or 'report'")
+        expiry = OperationExpiry.bounded(deadline_s)
+        frozen_now = self._utc_now()
+        if not isinstance(frozen_now, datetime):
+            raise TypeError("injected UTC clock must return a datetime")
+        frozen_offset = frozen_now.utcoffset()
+        if (
+            frozen_now.tzinfo is None
+            or frozen_offset is None
+            or frozen_offset.total_seconds() != 0
+        ):
+            raise ValueError("injected UTC clock must return a UTC datetime")
+        expiry.checkpoint()
+
+        windows = _kalshi_candle_query_windows(
+            start_utc,
+            end_utc,
+            period_minutes=period_minutes,
+            expiry=expiry,
+        )
+        observations: list[RequestObservation] = []
+        payloads: list[CandlePayload] = []
+        queried_windows: list[HistoryQueryWindow] = []
+        routing_flags: list[str] = []
+        cutoff: datetime | None = None
+        live_market: KalshiMarket | None = None
+        routing_market: KalshiMarket | None = None
+        live_series: str | None = None
+
+        selected_source: Literal["live", "historical"]
+        if source == "auto":
+            cutoff = await self._historical_cutoff_with_expiry(
+                expiry=expiry, observations=observations
+            )
+            try:
+                live_market = await self._get_market_with_expiry(
+                    ticker=market.ticker,
+                    source="live",
+                    expiry=expiry,
+                    observations=observations,
+                    expected_series_ticker=market.series_ticker,
+                )
+            except MarketNotFoundError:
+                routing_market = await self._get_market_with_expiry(
+                    ticker=market.ticker,
+                    source="historical",
+                    expiry=expiry,
+                    observations=observations,
+                    expected_series_ticker=market.series_ticker,
+                )
+                selected_source = "historical"
+                routing_flags.append("live_metadata_absent_archive_verified")
+            else:
+                routing_market = live_market
+                settlement = parse_kalshi_settlement_timestamp(
+                    live_market.native_payload.get("settlement_ts")
+                )
+                if settlement is not None and settlement < cutoff:
+                    selected_source = "historical"
+                    routing_flags.append("settlement_before_archive_cutoff")
+                else:
+                    selected_source = "live"
+                    routing_flags.append("settlement_after_archive_cutoff_or_unsettled")
+        elif source == "live":
+            selected_source = "live"
+        else:
+            selected_source = "historical"
+
+        if selected_source == "live":
+            if live_market is None:
+                live_market = await self._get_market_with_expiry(
+                    ticker=market.ticker,
+                    source="live",
+                    expiry=expiry,
+                    observations=observations,
+                    expected_series_ticker=market.series_ticker,
+                )
+            routing_market = live_market
+            live_series = await self._verified_live_series(
+                market=market,
+                market_detail=live_market,
+                expiry=expiry,
+                observations=observations,
+            )
+
+        fetched, attempted, missing = await self._fetch_candle_dataset(
+            market=market,
+            dataset=selected_source,
+            series_ticker=live_series,
+            query_windows=windows,
+            period_minutes=period_minutes,
+            expiry=expiry,
+            observations=observations,
+        )
+        payloads.extend(fetched)
+        queried_windows.extend(attempted)
+
+        if missing:
+            if source != "auto":
+                raise MarketNotFoundError(
+                    venue="kalshi",
+                    identifier=market.ticker,
+                    lookup_scope=f"Kalshi {selected_source} candle dataset",
+                )
+            alternate: Literal["live", "historical"] = (
+                "historical" if selected_source == "live" else "live"
+            )
+            if alternate == "live":
+                if live_market is None:
+                    live_market = await self._get_market_with_expiry(
+                        ticker=market.ticker,
+                        source="live",
+                        expiry=expiry,
+                        observations=observations,
+                        expected_series_ticker=market.series_ticker,
+                    )
+                live_series = await self._verified_live_series(
+                    market=market,
+                    market_detail=live_market,
+                    expiry=expiry,
+                    observations=observations,
+                )
+                routing_market = live_market
+            alternate_payloads, alternate_windows, alternate_missing = (
+                await self._fetch_candle_dataset(
+                    market=market,
+                    dataset=alternate,
+                    series_ticker=live_series if alternate == "live" else None,
+                    query_windows=windows,
+                    period_minutes=period_minutes,
+                    expiry=expiry,
+                    observations=observations,
+                )
+            )
+            queried_windows.extend(alternate_windows)
+            if alternate_missing:
+                raise MarketNotFoundError(
+                    venue="kalshi",
+                    identifier=market.ticker,
+                    lookup_scope="Kalshi live and historical candle datasets",
+                )
+            payloads.extend(alternate_payloads)
+            routing_flags.append("qualified_404_migration_fallback")
+
+        expiry.checkpoint()
+        result = normalize_kalshi_candle_history(
+            payloads,
+            market=market,
+            requested_start_utc=start_utc,
+            requested_end_utc=end_utc,
+            period_minutes=period_minutes,
+            requested_source=source,
+            completed_through_utc=frozen_now,
+            historical_cutoff_utc=cutoff,
+            queried_windows=queried_windows,
+            observations=observations,
+            max_candles=max_candles,
+            invalid_rows=invalid_rows,
+            routing_flags=routing_flags,
+            routing_market=routing_market,
+            expiry=expiry,
+        )
+        expiry.checkpoint()
+        return result
+
+    async def _historical_cutoff_with_expiry(
+        self,
+        *,
+        expiry: OperationExpiry,
+        observations: list[RequestObservation],
+    ) -> datetime:
+        payload, observation = await self._historical_cutoff_payload(
+            expiry=expiry, observations=observations
+        )
+        assert observation is not None
+        return decode_kalshi_historical_cutoff(payload)
+
+    async def _verified_live_series(
+        self,
+        *,
+        market: KalshiMarketRef,
+        market_detail: KalshiMarket,
+        expiry: OperationExpiry,
+        observations: list[RequestObservation],
+    ) -> str:
+        if market_detail.ref.series_ticker is not None:
+            if (
+                market.series_ticker is not None
+                and market.series_ticker != market_detail.ref.series_ticker
+            ):
+                raise InvalidDataError("Kalshi market series evidence is inconsistent")
+            return market_detail.ref.series_ticker
+        event_ticker = market_detail.event_ticker
+        if event_ticker is None:
+            raise InvalidDataError(
+                "Kalshi live candle routing requires verified event or series evidence"
+            )
+        encoded_event = quote(event_ticker, safe="")
+        payload, _ = await self._http.request_json_observed(
+            "GET",
+            f"/events/{encoded_event}",
+            request_id=f"kalshi-candle-event-{uuid4().hex}",
+            endpoint_template="/events/{event_ticker}",
+            parameter_allowlist=(),
+            effective_parameters=None,
+            params=None,
+            expiry=expiry,
+            response_identities=lambda value: kalshi_event_identities(
+                value,
+                event_ticker=event_ticker,
+                expected_series_ticker=market.series_ticker,
+            ),
+            record_observation=observations.append,
+        )
+        return decode_kalshi_event_series(
+            payload,
+            event_ticker=event_ticker,
+            expected_series_ticker=market.series_ticker,
+        )
+
+    async def _fetch_candle_dataset(
+        self,
+        *,
+        market: KalshiMarketRef,
+        dataset: Literal["live", "historical"],
+        series_ticker: str | None,
+        query_windows: Sequence[tuple[int, int]],
+        period_minutes: Literal[1, 60, 1440],
+        expiry: OperationExpiry,
+        observations: list[RequestObservation],
+    ) -> tuple[list[CandlePayload], list[HistoryQueryWindow], bool]:
+        payloads: list[CandlePayload] = []
+        attempted: list[HistoryQueryWindow] = []
+        endpoint = (
+            "/series/{series_ticker}/markets/{ticker}/candlesticks"
+            if dataset == "live"
+            else "/historical/markets/{ticker}/candlesticks"
+        )
+        for start_ts, end_ts in query_windows:
+            expiry.checkpoint()
+            attempted.append(
+                HistoryQueryWindow(
+                    start_utc=datetime.fromtimestamp(start_ts, tz=timezone.utc),
+                    end_utc=datetime.fromtimestamp(end_ts, tz=timezone.utc),
+                    dataset=dataset,
+                    endpoint=endpoint,
+                )
+            )
+            try:
+                if dataset == "live":
+                    if series_ticker is None:
+                        raise RuntimeError("live candle fetch requires a verified series")
+                    response_market = KalshiMarketRef(
+                        market.ticker, series_ticker=series_ticker
+                    )
+                    payload, observation = await self._market_candlesticks_payload(
+                        series_ticker=series_ticker,
+                        ticker=market.ticker,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        period_interval=period_minutes,
+                        include_latest_before_start=False,
+                        market=response_market,
+                        expiry=expiry,
+                        observations=observations,
+                    )
+                else:
+                    payload, observation = (
+                        await self._historical_market_candlesticks_payload(
+                            ticker=market.ticker,
+                            start_ts=start_ts,
+                            end_ts=end_ts,
+                            period_interval=period_minutes,
+                            market=market,
+                            expiry=expiry,
+                            observations=observations,
+                        )
+                    )
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 404:
+                    return payloads, attempted, True
+                raise
+            assert observation is not None
+            payloads.append(CandlePayload(payload, dataset, observation))
+        return payloads, attempted, False
+
     @staticmethod
     def _validate_limit(limit: int) -> None:
         if isinstance(limit, bool) or not isinstance(limit, int):
@@ -766,19 +1097,62 @@ class AsyncKalshiClient:
         period_interval: int,
         include_latest_before_start: bool | None = None,
     ) -> dict[str, Any]:
-        data = await self._http.request_json(
-            "GET",
-            f"/series/{series_ticker}/markets/{ticker}/candlesticks",
-            params={
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "period_interval": period_interval,
-                "include_latest_before_start": include_latest_before_start,
-            },
+        data, _ = await self._market_candlesticks_payload(
+            series_ticker=series_ticker,
+            ticker=ticker,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
+            include_latest_before_start=include_latest_before_start,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
+
+    async def _market_candlesticks_payload(
+        self,
+        *,
+        series_ticker: str,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int,
+        include_latest_before_start: bool | None,
+        market: KalshiMarketRef | None = None,
+        expiry: OperationExpiry | None = None,
+        observations: list[RequestObservation] | None = None,
+    ) -> tuple[object, RequestObservation | None]:
+        encoded_series = quote(series_ticker, safe="") if expiry is not None else series_ticker
+        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
+        path = f"/series/{encoded_series}/markets/{encoded_ticker}/candlesticks"
+        params = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+            "include_latest_before_start": include_latest_before_start,
+        }
+        if expiry is None:
+            return await self._http.request_json("GET", path, params=params), None
+        if market is None or observations is None:
+            raise RuntimeError("observed candle fetch requires workflow context")
+        effective_parameters = {
+            key: value for key, value in params.items() if value is not None
+        }
+        data, observation = await self._http.request_json_observed(
+            "GET",
+            path,
+            request_id=f"kalshi-candles-live-{uuid4().hex}",
+            endpoint_template="/series/{series_ticker}/markets/{ticker}/candlesticks",
+            parameter_allowlist=_CANDLE_PARAMETER_ALLOWLIST,
+            effective_parameters=effective_parameters,
+            params=params,
+            expiry=expiry,
+            response_identities=lambda value: kalshi_candle_identities(
+                value, market=market
+            ),
+            record_observation=observations.append,
+        )
+        return data, observation
 
     async def batch_market_candlesticks(
         self,
@@ -815,24 +1189,83 @@ class AsyncKalshiClient:
         end_ts: int,
         period_interval: int,
     ) -> dict[str, Any]:
-        data = await self._http.request_json(
-            "GET",
-            f"/historical/markets/{ticker}/candlesticks",
-            params={
-                "start_ts": start_ts,
-                "end_ts": end_ts,
-                "period_interval": period_interval,
-            },
+        data, _ = await self._historical_market_candlesticks_payload(
+            ticker=ticker,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            period_interval=period_interval,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
+    async def _historical_market_candlesticks_payload(
+        self,
+        *,
+        ticker: str,
+        start_ts: int,
+        end_ts: int,
+        period_interval: int,
+        market: KalshiMarketRef | None = None,
+        expiry: OperationExpiry | None = None,
+        observations: list[RequestObservation] | None = None,
+    ) -> tuple[object, RequestObservation | None]:
+        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
+        path = f"/historical/markets/{encoded_ticker}/candlesticks"
+        params = {
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "period_interval": period_interval,
+        }
+        if expiry is None:
+            return await self._http.request_json("GET", path, params=params), None
+        if market is None or observations is None:
+            raise RuntimeError("observed candle fetch requires workflow context")
+        data, observation = await self._http.request_json_observed(
+            "GET",
+            path,
+            request_id=f"kalshi-candles-historical-{uuid4().hex}",
+            endpoint_template="/historical/markets/{ticker}/candlesticks",
+            parameter_allowlist=_CANDLE_PARAMETER_ALLOWLIST,
+            effective_parameters=params,
+            params=params,
+            expiry=expiry,
+            response_identities=lambda value: kalshi_candle_identities(
+                value, market=market
+            ),
+            record_observation=observations.append,
+        )
+        return data, observation
+
     async def historical_cutoff(self) -> dict[str, Any]:
-        data = await self._http.request_json("GET", "/historical/cutoff")
+        data, _ = await self._historical_cutoff_payload()
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
+
+    async def _historical_cutoff_payload(
+        self,
+        *,
+        expiry: OperationExpiry | None = None,
+        observations: list[RequestObservation] | None = None,
+    ) -> tuple[object, RequestObservation | None]:
+        if expiry is None:
+            return await self._http.request_json("GET", "/historical/cutoff"), None
+        if observations is None:
+            raise RuntimeError("observed cutoff fetch requires workflow context")
+        data, observation = await self._http.request_json_observed(
+            "GET",
+            "/historical/cutoff",
+            request_id=f"kalshi-candle-cutoff-{uuid4().hex}",
+            endpoint_template="/historical/cutoff",
+            parameter_allowlist=(),
+            effective_parameters=None,
+            params=None,
+            expiry=expiry,
+            response_identities=kalshi_cutoff_identities,
+            record_observation=observations.append,
+        )
+        return data, observation
 
     async def series(
         self,
@@ -938,6 +1371,51 @@ def _require_positive_int(value: object, name: str) -> None:
         raise TypeError(f"{name} must be an int")
     if value <= 0:
         raise ValueError(f"{name} must be positive")
+
+
+def _utc_history_bounds(start: object, end: object) -> tuple[datetime, datetime]:
+    normalized: list[datetime] = []
+    for name, value in (("start", start), ("end", end)):
+        if not isinstance(value, datetime):
+            raise TypeError(f"{name} must be a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{name} must be timezone-aware")
+        normalized.append(value.astimezone(timezone.utc))
+    start_utc, end_utc = normalized
+    if start_utc >= end_utc:
+        raise ValueError("start must precede end after UTC normalization")
+    return start_utc, end_utc
+
+
+def _kalshi_candle_query_windows(
+    start_utc: datetime,
+    end_utc: datetime,
+    *,
+    period_minutes: int,
+    periods_per_request: int | None = None,
+    expiry: OperationExpiry | None = None,
+) -> tuple[tuple[int, int], ...]:
+    """Build bounded inclusive-label requests with one-marker overlap."""
+
+    if periods_per_request is None:
+        periods_per_request = KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST
+    _require_positive_int(periods_per_request, "periods_per_request")
+    query_start = math.floor(start_utc.timestamp())
+    query_end = math.ceil(end_utc.timestamp())
+    if query_end <= query_start:
+        query_end = query_start + 1
+    span = period_minutes * 60 * periods_per_request
+    windows: list[tuple[int, int]] = []
+    cursor = query_start
+    while cursor < query_end:
+        if expiry is not None:
+            expiry.checkpoint()
+        chunk_end = min(query_end, cursor + span)
+        windows.append((cursor, chunk_end))
+        if chunk_end == query_end:
+            break
+        cursor = chunk_end
+    return tuple(windows)
 
 
 def _deduplicate(values: Sequence[str]) -> tuple[str, ...]:
