@@ -12,6 +12,15 @@
         "__version__"
       ]
     },
+    "pmkt.catalog": {
+      "default_tier": "supported",
+      "exports": [
+        "CatalogQueryResult",
+        "CatalogReference",
+        "CatalogSnapshot",
+        "CatalogValidationReport"
+      ]
+    },
     "pmkt.data": {
       "default_tier": "retained_native",
       "exports": [
@@ -173,6 +182,14 @@
         "order_book_summary_dataframe": "inherited",
         "trade_history_dataframe": "inherited"
       }
+    },
+    "pmkt.errors": {
+      "default_tier": "supported",
+      "exports": [
+        "CatalogError",
+        "OptionalDependencyError",
+        "ResultLimitExceededError"
+      ]
     },
     "pmkt.data.market_catalog": {
       "default_tier": "inherited",
@@ -370,6 +387,34 @@
     }
   },
   "direct_imports": [
+    {
+      "path": "pmkt.catalog.CatalogQueryResult",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.catalog.CatalogReference",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.catalog.CatalogSnapshot",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.catalog.CatalogValidationReport",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.errors.CatalogError",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.errors.OptionalDependencyError",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.errors.ResultLimitExceededError",
+      "tier": "supported"
+    },
     {
       "path": "pmkt.config.PmktConfig",
       "tier": "retained_native"

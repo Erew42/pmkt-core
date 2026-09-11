@@ -9,7 +9,7 @@ the public repository by accident.
 
 The following paths are owned by `pmkt-core`:
 
-- `src/pmkt/{__init__,_http,config,models,pagination,tokens}.py` and
+- `src/pmkt/{__init__,_http,catalog,config,errors,models,pagination,tokens}.py` and
   `src/pmkt/py.typed`.
 - `src/pmkt/data/**`, except semantic sports-corpus and matching-policy code.
 - `src/pmkt/exchanges/**`, except credential/private-key loaders, generic signed
@@ -28,6 +28,9 @@ The following paths are owned by `pmkt-core`:
 - `tests/test_public_api_inventory.py` and
   `tests/fixtures/public_api_inventory.json`, which classify the current public
   facade without reserving future workflow modules.
+- `tests/test_catalog.py` and `scripts/create_synthetic_catalog_fixture.py`,
+  which verify the pinned read-only catalog contract and provide its offline
+  synthetic fixture recipe.
 
 ## Private trading
 

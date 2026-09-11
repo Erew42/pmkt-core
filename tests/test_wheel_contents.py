@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import json
+import os
 import tarfile
 import zipfile
 from email.parser import Parser
@@ -122,3 +123,98 @@ assert json.loads(output.read_text())["pmkt_core_commit"] == identity.commit
         cwd=tmp_path, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_installed_catalog_api_has_positive_and_negative_typing_evidence(
+    tmp_path: Path,
+) -> None:
+    wheel = _build_wheel(tmp_path / "wheel")
+    installed = tmp_path / "installed"
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            "--no-deps",
+            "--target",
+            str(installed),
+            str(wheel),
+        ],
+        cwd=tmp_path,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    runtime = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            "import pathlib, sys; sys.path.insert(0, sys.argv[1]); "
+            "import pmkt.catalog; "
+            "assert pathlib.Path(pmkt.catalog.__file__).is_relative_to(pathlib.Path(sys.argv[1]))",
+            str(installed),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert runtime.returncode == 0, runtime.stderr
+
+    positive = tmp_path / "catalog_positive.py"
+    positive.write_text(
+        """\
+from pathlib import Path
+from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
+
+snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
+result: CatalogQueryResult = snapshot.query(
+    "SELECT ? AS n", parameters=(1,), max_result_rows=1, max_result_bytes=1024
+)
+table = result.to_arrow()
+""",
+        encoding="utf-8",
+    )
+    negative = tmp_path / "catalog_negative.py"
+    negative.write_text(
+        """\
+from pathlib import Path
+from pmkt.catalog import CatalogSnapshot
+
+snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
+snapshot.query("SELECT 1", params=())
+snapshot.query("SELECT ?", parameters=(object(),))
+""",
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment["MYPYPATH"] = str(installed)
+    command = [
+        sys.executable,
+        "-m",
+        "mypy",
+        "--strict",
+        "--follow-imports=silent",
+        "--no-incremental",
+        "--show-error-codes",
+    ]
+    accepted = subprocess.run(
+        [*command, str(positive)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+    rejected = subprocess.run(
+        [*command, str(negative)],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+    )
+
+    assert accepted.returncode == 0, accepted.stdout + accepted.stderr
+    assert rejected.returncode != 0
+    assert "[call-arg]" in rejected.stdout
+    assert "[arg-type]" in rejected.stdout
