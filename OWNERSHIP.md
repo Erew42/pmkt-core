@@ -20,11 +20,14 @@ The following paths are owned by `pmkt-core`:
   `src/pmkt/text/**` utilities and taxonomy data.
 - The core CLI modules and commands documented in `CLI_COMMANDS.md`.
 - `openapi/**`, `docs/api/**`, `docs/data_dictionary.md`,
-  `docs/schema_lifecycle.{md,json}`, and
+  `docs/public_api.md`, `docs/schema_lifecycle.{md,json}`, and
   `docs/storage_profile_capture_runbook.md`.
 - Read-only capture/contract/example scripts retained under `scripts/` and the
   tests for the public modules.
 - The two normalized Kalshi order-book fixtures under `tests/fixtures/`.
+- `tests/test_public_api_inventory.py` and
+  `tests/fixtures/public_api_inventory.json`, which classify the current public
+  facade without reserving future workflow modules.
 
 ## Private trading
 

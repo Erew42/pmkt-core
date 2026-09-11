@@ -1,0 +1,434 @@
+{
+  "format_version": 1,
+  "tier_meanings": {
+    "supported": "Delivered high-level workflow with an explicit public contract.",
+    "retained_native": "Native client method, model, or schema/storage contract retained under its existing lifecycle.",
+    "inherited": "Import preserved for compatibility without promotion into the new workflow guarantee."
+  },
+  "facades": {
+    "pmkt": {
+      "default_tier": "retained_native",
+      "exports": [
+        "__version__"
+      ]
+    },
+    "pmkt.data": {
+      "default_tier": "retained_native",
+      "exports": [
+        "ARBITRAGE_CANDIDATE_COLUMNS",
+        "ARBITRAGE_CANDIDATE_SCHEMA_VERSION",
+        "BASKET_ORDER_INTENT_COLUMNS",
+        "BASKET_ORDER_INTENT_SCHEMA_VERSION",
+        "BASKET_PAPER_FILL_COLUMNS",
+        "BASKET_PAPER_FILL_SCHEMA_VERSION",
+        "BASKET_PAPER_POSITION_COLUMNS",
+        "BASKET_PAPER_POSITION_SCHEMA_VERSION",
+        "CANARY_CANDIDATE_COLUMNS",
+        "CANARY_CANDIDATE_SCHEMA_VERSION",
+        "CANARY_REJECTION_COLUMNS",
+        "CANARY_REJECTION_SCHEMA_VERSION",
+        "CONTRACT_EVIDENCE_COLUMNS",
+        "CONTRACT_EVIDENCE_SCHEMA_VERSION",
+        "CsvSink",
+        "DEFAULT_BOOK_BATCH_SIZE",
+        "DEFAULT_EVENT_SLUG",
+        "DEPTH_COLUMNS",
+        "DEPTH_SCHEMA_VERSION",
+        "EVENT_COLUMNS",
+        "EVENT_SCHEMA_VERSION",
+        "FEED_HEALTH_COLUMNS",
+        "FEED_HEALTH_SCHEMA_VERSION",
+        "FieldSpec",
+        "INSTRUMENT_COLUMNS",
+        "INSTRUMENT_SCHEMA_VERSION",
+        "JsonlSink",
+        "KALSHI_MARKET_SNAPSHOT_COLUMNS",
+        "KALSHI_MARKET_SNAPSHOT_COLUMNS_V2",
+        "KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION",
+        "KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION_V2",
+        "MAKER_QUOTE_PLAN_COLUMNS",
+        "MAKER_QUOTE_PLAN_SCHEMA_VERSION",
+        "MARKET_COLUMNS",
+        "MARKET_RESOLUTION_COLUMNS",
+        "MARKET_RESOLUTION_SCHEMA_VERSION",
+        "MARKET_SCHEMA_VERSION",
+        "MATCH_COLUMNS",
+        "MATCH_COLUMNS_V1",
+        "MATCH_RELATION_COLUMNS",
+        "MATCH_RELATION_SCHEMA_VERSION",
+        "MATCH_SCHEMA_VERSION",
+        "MATCH_SCHEMA_VERSION_V1",
+        "ManifestDatasetValidation",
+        "ManifestValidationReport",
+        "ORDER_INTENT_COLUMNS",
+        "ORDER_INTENT_SCHEMA_VERSION",
+        "ORDER_STATE_COLUMNS",
+        "ORDER_STATE_SCHEMA_VERSION",
+        "PAPER_FILL_COLUMNS",
+        "PAPER_FILL_SCHEMA_VERSION",
+        "PAPER_POSITION_COLUMNS",
+        "PAPER_POSITION_SCHEMA_VERSION",
+        "PASSIVE_FILL_COLUMNS",
+        "PASSIVE_FILL_SCHEMA_VERSION",
+        "PASSIVE_MARKOUT_COLUMNS",
+        "PASSIVE_MARKOUT_SCHEMA_VERSION",
+        "PASSIVE_QUOTE_EVALUATION_COLUMNS",
+        "PASSIVE_QUOTE_EVALUATION_SCHEMA_VERSION",
+        "POLYMARKET_MARKET_SNAPSHOT_COLUMNS",
+        "POLYMARKET_MARKET_SNAPSHOT_COLUMNS_V2",
+        "POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION",
+        "POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION_V2",
+        "ParquetSink",
+        "RUN_MANIFEST_COLUMNS",
+        "RUN_MANIFEST_SCHEMA_VERSION",
+        "SCAN_CYCLE_COLUMNS",
+        "SCAN_CYCLE_SCHEMA_VERSION",
+        "SCHEMA_SPECS",
+        "SIGNAL_COLUMNS",
+        "SIGNAL_SCHEMA_VERSION",
+        "SchemaValidationReport",
+        "Sink",
+        "TOPBOOK_COLUMNS",
+        "TOPBOOK_SCHEMA_VERSION",
+        "TRACKING_HEALTH_COLUMNS",
+        "TRACKING_HEALTH_SCHEMA_VERSION",
+        "TRACKING_MATCH_COLUMNS",
+        "TRACKING_MATCH_SCHEMA_VERSION",
+        "TRADE_COLUMNS",
+        "TRADE_SCHEMA_VERSION",
+        "TableSpec",
+        "arbitrage_candidate_row",
+        "arrow_schema",
+        "basket_order_intent_row",
+        "basket_paper_fill_row",
+        "basket_paper_position_row",
+        "batched",
+        "canary_candidate_row",
+        "canary_rejection_row",
+        "coerce_frame",
+        "coerce_snapshot_frame",
+        "collect_order_book_summaries_parquet",
+        "compute_features",
+        "contract_evidence_dataframe",
+        "contract_evidence_row",
+        "convert_frame_strict",
+        "depth_row",
+        "event_row",
+        "feed_health_row",
+        "fetch_trade_history",
+        "find_event_by_slug",
+        "get_table_spec",
+        "infer_and_validate_frame",
+        "instrument_row",
+        "iter_order_book_metrics",
+        "join_market_metadata",
+        "kalshi_market_snapshot_row",
+        "kalshi_market_snapshot_v2_row",
+        "kalshi_orderbook_to_topbook",
+        "kalshi_ws_snapshot_to_topbook",
+        "list_table_specs",
+        "logit",
+        "maker_quote_plan_row",
+        "market_match_row",
+        "market_resolution_row",
+        "market_row",
+        "match_relation_row",
+        "order_book_summary_dataframe",
+        "order_intent_row",
+        "order_state_row",
+        "paper_fill_row",
+        "paper_position_row",
+        "passive_fill_row",
+        "passive_markout_row",
+        "passive_quote_evaluation_row",
+        "polymarket_book_to_topbook",
+        "polymarket_market_snapshot_row",
+        "polymarket_market_snapshot_v2_row",
+        "polymarket_ws_snapshot_to_topbook",
+        "quality_flag_counts",
+        "run_manifest_row",
+        "scan_cycle_row",
+        "signal_row",
+        "stable_evidence_projection_hash",
+        "stable_source_row_hash",
+        "topbook_row",
+        "tracking_health_row",
+        "tracking_match_row",
+        "trade_history_dataframe",
+        "trade_row",
+        "validate_frame",
+        "validate_run_manifest"
+      ],
+      "tier_overrides": {
+        "DEFAULT_BOOK_BATCH_SIZE": "inherited",
+        "DEFAULT_EVENT_SLUG": "inherited",
+        "batched": "inherited",
+        "collect_order_book_summaries_parquet": "inherited",
+        "compute_features": "inherited",
+        "fetch_trade_history": "inherited",
+        "find_event_by_slug": "inherited",
+        "iter_order_book_metrics": "inherited",
+        "join_market_metadata": "inherited",
+        "logit": "inherited",
+        "order_book_summary_dataframe": "inherited",
+        "trade_history_dataframe": "inherited"
+      }
+    },
+    "pmkt.data.market_catalog": {
+      "default_tier": "inherited",
+      "exports": [
+        "CURRENT_MANIFEST_SCHEMA",
+        "CatalogError",
+        "CollectionResult",
+        "DISCOVERY_MANIFEST_SCHEMA",
+        "DISCOVERY_POINTER_SCHEMA",
+        "DiscoveryStream",
+        "FAMILY_CLASSIFIER_VERSION",
+        "FilterAgreementError",
+        "HISTORY_MANIFEST_SCHEMA",
+        "MarketCatalogService",
+        "POLYMARKET_RECURRING_DURATIONS",
+        "POLYMARKET_RECURRING_FORMS",
+        "collect_kalshi_current_family",
+        "collect_kalshi_discovery",
+        "collect_polymarket_current",
+        "collect_polymarket_discovery",
+        "fs",
+        "iso_utc",
+        "kalshi_snapshot_dataframe",
+        "native_family_for_legacy_kalshi",
+        "parquet_files",
+        "parquet_row_count",
+        "parse_timestamp",
+        "polymarket_operational_family",
+        "register_catalog_views",
+        "row_timestamp",
+        "sha256_file",
+        "tree_sha256",
+        "utc_now",
+        "verify_kalshi_filter_agreement"
+      ]
+    },
+    "pmkt.data.storage": {
+      "default_tier": "retained_native",
+      "exports": [
+        "read_parquet",
+        "write_parquet"
+      ]
+    },
+    "pmkt.exchanges": {
+      "default_tier": "inherited",
+      "exports": [
+        "VenueAdapter",
+        "kalshi",
+        "polymarket"
+      ]
+    },
+    "pmkt.exchanges.polymarket": {
+      "default_tier": "inherited",
+      "exports": [
+        "AsyncClobClient",
+        "AsyncGammaClient",
+        "AsyncMarketWebSocketClient",
+        "AsyncPolymarketDataClient",
+        "AsyncSubgraphClient",
+        "AsyncWebSocketClient",
+        "ClobClient",
+        "DEFAULT_DATA_API_MAX_RATE",
+        "DEFAULT_DATA_API_PERIOD_SECONDS",
+        "DEFAULT_ORDER_BOOK_STREAM_ROOT",
+        "GammaClient",
+        "MarketBookState",
+        "MarketStreamSnapshot",
+        "SubgraphClient",
+        "WebSocketProtocolError",
+        "apply_market_message",
+        "collect_market_snapshots",
+        "decode_market_messages",
+        "market_operation_payload",
+        "market_subscription_payload",
+        "stream_order_book_data"
+      ],
+      "tier_overrides": {
+        "AsyncClobClient": "retained_native",
+        "ClobClient": "retained_native",
+        "AsyncGammaClient": "retained_native",
+        "GammaClient": "retained_native"
+      }
+    },
+    "pmkt.exchanges.kalshi": {
+      "default_tier": "inherited",
+      "exports": [
+        "AsyncKalshiClient",
+        "AsyncKalshiWebSocketClient",
+        "DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT",
+        "KalshiBookSnapshot",
+        "KalshiClient",
+        "KalshiConnectFactory",
+        "KalshiOrderBookState",
+        "KalshiSubscriptionAck",
+        "KalshiTickerUpdate",
+        "KalshiWebSocketError",
+        "RawFrameCallback",
+        "apply_kalshi_orderbook_message",
+        "decode_kalshi_messages",
+        "kalshi_events_dataframe",
+        "kalshi_markets_dataframe",
+        "kalshi_orderbook_subscription_payload",
+        "kalshi_public_subscription_payload",
+        "normalize_kalshi_event",
+        "normalize_kalshi_market",
+        "normalize_kalshi_orderbook",
+        "normalize_market_tickers",
+        "parse_kalshi_subscription_ack",
+        "parse_kalshi_ticker_update",
+        "parse_kalshi_websocket_error",
+        "stream_kalshi_order_book_data"
+      ],
+      "tier_overrides": {
+        "AsyncKalshiClient": "retained_native",
+        "KalshiClient": "retained_native"
+      }
+    },
+    "pmkt.market_structure": {
+      "default_tier": "inherited",
+      "exports": [
+        "Interval",
+        "build_market_groups",
+        "canonical_signature",
+        "coverage_looks_complete",
+        "discover_structures",
+        "extract_bounds_heuristic",
+        "group_key",
+        "infer_group_type",
+        "interval_order_key",
+        "intervals_disjoint_and_ordered",
+        "parse_interval",
+        "structures_to_group_records",
+        "sum_prob_sanity"
+      ]
+    },
+    "pmkt.resolution": {
+      "default_tier": "retained_native",
+      "exports": [
+        "CONFIDENCE_CANONICAL",
+        "CONFIDENCE_INCONSISTENT",
+        "CONFIDENCE_METADATA_ONLY",
+        "CONFIDENCE_PLATFORM_CONFIRMED",
+        "CONFIDENCE_PROVISIONAL",
+        "CONFIDENCE_UNAVAILABLE",
+        "Payout",
+        "RESOLVER_VERSION",
+        "RESULT_TYPE_BINARY",
+        "RESULT_TYPE_FRACTIONAL",
+        "RESULT_TYPE_SCALAR",
+        "RESULT_TYPE_UNKNOWN",
+        "ResolutionRecord",
+        "STATE_CLOSED_UNRESOLVED",
+        "STATE_DISPUTED",
+        "STATE_FINAL",
+        "STATE_INCONSISTENT",
+        "STATE_METADATA_ONLY",
+        "STATE_OPEN",
+        "STATE_ORACLE_RESOLVED_CHAIN_PENDING",
+        "STATE_PLATFORM_REPORTED_CHAIN_PENDING",
+        "STATE_PROVISIONAL",
+        "STATE_UNAVAILABLE",
+        "SourceObservation"
+      ]
+    },
+    "pmkt.streaming": {
+      "default_tier": "inherited",
+      "exports": [
+        "CliImportTimingResult",
+        "CliImportTimingSpec",
+        "FakeWebsocketReplayConfig",
+        "FakeWebsocketReplayReport",
+        "FeedPreflightReport",
+        "FeedRecoveryAction",
+        "FeedShardHealth",
+        "LiveFeedSupervisor",
+        "RuntimeFeedProjectionRecorder",
+        "StreamDatasetSpec",
+        "StreamRunOutputs",
+        "StreamSinkSet",
+        "SubscriptionPlanValidation",
+        "SubscriptionPlanValidator",
+        "default_cli_import_timing_specs",
+        "measure_cli_import_timing",
+        "pr15_fake_websocket_replay_config",
+        "run_fake_websocket_load_replay",
+        "validate_parquet_rotation_config"
+      ]
+    },
+    "pmkt.text": {
+      "default_tier": "inherited",
+      "exports": [
+        "normalize_text",
+        "token_set"
+      ]
+    }
+  },
+  "direct_imports": [
+    {
+      "path": "pmkt.config.PmktConfig",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.Event",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.Market",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.Order",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.OrderBook",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.PriceHistory",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.models.PriceHistoryPoint",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.exchanges.read_auth.ReadAuthHeaderProvider",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.exchanges.read_auth.ReadAuthenticationRequiredError",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.exchanges.read_auth.ReadOnlyRequestError",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.exchanges.read_auth.headers_for_read",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.resolution.polymarket.PolymarketResolutionResolver",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.resolution.kalshi.KalshiResolutionResolver",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.resolution.evm.PolygonCtfClient",
+      "tier": "retained_native"
+    },
+    {
+      "path": "pmkt.resolution.evm.EvmRpcError",
+      "tier": "retained_native"
+    }
+  ]
+}
