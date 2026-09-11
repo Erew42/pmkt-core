@@ -222,6 +222,8 @@
         "DiscoveryReport",
         "DiscoveryResult",
         "DiscoveryStopReason",
+        "HistoryCoverage",
+        "HistoryQueryWindow",
         "InstrumentRef",
         "KalshiFilter",
         "KalshiInstrumentRef",
@@ -235,8 +237,12 @@
         "PolymarketInstrumentRef",
         "PolymarketMarket",
         "PolymarketMarketRef",
+        "PriceBasis",
+        "PriceHistoryResult",
         "RequestObservation",
         "RequestOutcome",
+        "SampledPricePoint",
+        "SourceCompleteness",
         "TransportOrigin"
       ]
     },
@@ -526,6 +532,22 @@
     },
     {
       "path": "pmkt.records.BookSnapshot",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.PriceHistoryResult",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.SampledPricePoint",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.HistoryCoverage",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.HistoryQueryWindow",
       "tier": "supported"
     },
     {

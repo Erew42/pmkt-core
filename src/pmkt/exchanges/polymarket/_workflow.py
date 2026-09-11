@@ -10,20 +10,26 @@ from typing import Any, Literal, Sequence
 
 from pmkt import __version__
 from pmkt._operation import OperationExpiry
-from pmkt.errors import InvalidDataError
+from pmkt.errors import InvalidDataError, ResultLimitExceededError
 from pmkt.records import (
     BookLevel,
     BookSnapshot,
     DataIssue,
+    HistoryCoverage,
+    HistoryQueryWindow,
     PolymarketInstrumentRef,
     PolymarketMarket,
     PolymarketMarketRef,
+    PriceHistoryResult,
     RequestObservation,
+    SampledPricePoint,
 )
 
 
 POLYMARKET_MARKET_INTERPRETATION_ID = "polymarket_gamma_market.v1"
 POLYMARKET_CLOB_BOOK_INTERPRETATION_ID = "polymarket_clob_book.v1"
+POLYMARKET_CLOB_HISTORY_INTERPRETATION_ID = "polymarket_clob_price_history.v1"
+POLYMARKET_CLOB_HISTORY_DATASET = "clob_sampled_prices"
 
 
 def gamma_market_identity(payload: object) -> tuple[str, str | None]:
@@ -229,6 +235,255 @@ def clob_book_identities(
     if condition_id is not None:
         identities.append(f"condition_id={condition_id}")
     return tuple(identities)
+
+
+def clob_history_identities(
+    payload: object, *, instrument: PolymarketInstrumentRef
+) -> tuple[str, ...]:
+    """Validate the history envelope and any endpoint-specific identity hints."""
+
+    if not isinstance(payload, dict):
+        raise InvalidDataError("CLOB price-history response must be an object")
+    if not isinstance(payload.get("history", _MISSING), list):
+        raise InvalidDataError("CLOB price-history field 'history' must be an array")
+
+    token_id = _optional_identifier_group(
+        payload,
+        ("market", "market_id", "asset_id", "assetId", "token_id", "tokenId"),
+        label="CLOB history token ID",
+    )
+    condition_id = _optional_identifier_group(
+        payload,
+        ("condition_id", "conditionId"),
+        label="CLOB history condition ID",
+    )
+    parent_market_id = _optional_identifier_group(
+        payload,
+        ("parent_market_id", "parentMarketId", "gamma_market_id", "gammaMarketId"),
+        label="CLOB history parent market ID",
+    )
+    if token_id is not None and token_id != instrument.token_id:
+        raise InvalidDataError(
+            f"CLOB history token mismatch: requested {instrument.token_id!r}, "
+            f"received {token_id!r}"
+        )
+    expected_condition = (
+        instrument.market.condition_id if instrument.market is not None else None
+    )
+    if (
+        condition_id is not None
+        and expected_condition is not None
+        and condition_id != expected_condition
+    ):
+        raise InvalidDataError(
+            f"CLOB history condition mismatch: expected {expected_condition!r}, "
+            f"received {condition_id!r}"
+        )
+    expected_parent = instrument.market.market_id if instrument.market is not None else None
+    if (
+        parent_market_id is not None
+        and expected_parent is not None
+        and parent_market_id != expected_parent
+    ):
+        raise InvalidDataError(
+            f"CLOB history parent market mismatch: expected {expected_parent!r}, "
+            f"received {parent_market_id!r}"
+        )
+    identities: list[str] = []
+    if token_id is not None:
+        identities.append(f"token_id={token_id}")
+    if condition_id is not None:
+        identities.append(f"condition_id={condition_id}")
+    if parent_market_id is not None:
+        identities.append(f"parent_market_id={parent_market_id}")
+    return tuple(identities)
+
+
+def normalize_clob_price_history(
+    payload: object,
+    *,
+    instrument: PolymarketInstrumentRef,
+    requested_start_utc: datetime,
+    requested_end_utc: datetime,
+    queried_start_utc: datetime,
+    queried_end_utc: datetime,
+    sampling_minutes: int,
+    max_points: int,
+    invalid_rows: Literal["raise", "report"],
+    observation: RequestObservation,
+    expiry: OperationExpiry,
+) -> PriceHistoryResult:
+    """Normalize one complete sampled-price response without filling a grid."""
+
+    clob_history_identities(payload, instrument=instrument)
+    assert isinstance(payload, dict)
+    raw_history = payload["history"]
+    assert isinstance(raw_history, list)
+
+    invalid_count = 0
+    outside_window_rows = 0
+    invalid_examples: list[str] = []
+    # timestamp -> (UTC time, first price, occurrence count, conflicts, examples)
+    candidates: dict[
+        int, tuple[datetime, float, int, bool, tuple[float, ...]]
+    ] = {}
+    for index, row in enumerate(raw_history):
+        if index % 256 == 0:
+            expiry.checkpoint()
+        try:
+            source_timestamp, timestamp_utc, price = _clob_history_row(row, index=index)
+        except InvalidDataError as exc:
+            if invalid_rows == "raise":
+                raise
+            invalid_count += 1
+            if len(invalid_examples) < 20:
+                invalid_examples.append(f"row {index}: {exc}"[:512])
+            continue
+        previous = candidates.get(source_timestamp)
+        if previous is None:
+            candidates[source_timestamp] = (
+                timestamp_utc,
+                price,
+                1,
+                False,
+                (price,),
+            )
+            continue
+        (
+            previous_timestamp_utc,
+            first_price,
+            occurrence_count,
+            conflicting,
+            example_prices,
+        ) = previous
+        conflicting = conflicting or price != first_price
+        if price not in example_prices and len(example_prices) < 5:
+            example_prices = (*example_prices, price)
+        candidates[source_timestamp] = (
+            previous_timestamp_utc,
+            first_price,
+            occurrence_count + 1,
+            conflicting,
+            example_prices,
+        )
+
+    points: list[SampledPricePoint] = []
+    duplicate_rows = 0
+    conflicting_rows = 0
+    conflict_examples: list[str] = []
+    for offset, source_timestamp in enumerate(sorted(candidates)):
+        if offset % 256 == 0:
+            expiry.checkpoint()
+        (
+            timestamp_utc,
+            price,
+            occurrence_count,
+            conflicting,
+            example_prices,
+        ) = candidates[source_timestamp]
+        if conflicting:
+            if invalid_rows == "raise":
+                raise InvalidDataError(
+                    "CLOB price-history contains conflicting prices at "
+                    f"timestamp {source_timestamp}"
+                )
+            conflicting_rows += occurrence_count
+            if len(conflict_examples) < 20:
+                prices = ", ".join(str(value) for value in sorted(example_prices))
+                conflict_examples.append(
+                    f"timestamp {source_timestamp}: prices {prices}"[:512]
+                )
+            continue
+        if not requested_start_utc <= timestamp_utc < requested_end_utc:
+            outside_window_rows += occurrence_count
+            continue
+        duplicate_rows += occurrence_count - 1
+        points.append(
+            SampledPricePoint(
+                timestamp_utc=timestamp_utc,
+                price=price,
+            )
+        )
+
+    expiry.checkpoint()
+    if len(points) > max_points:
+        raise ResultLimitExceededError(
+            f"CLOB price history exceeded max_points={max_points}"
+        )
+
+    issues: list[DataIssue] = []
+    if invalid_count:
+        issues.append(
+            DataIssue(
+                code="invalid_row",
+                severity="warning",
+                request_id=observation.request_id,
+                row_locator="history",
+                occurrence_count=invalid_count,
+                examples=tuple(invalid_examples),
+            )
+        )
+    if conflicting_rows:
+        issues.append(
+            DataIssue(
+                code="conflicting_duplicate",
+                severity="warning",
+                request_id=observation.request_id,
+                row_locator="history",
+                field_locator="t/p",
+                occurrence_count=conflicting_rows,
+                examples=tuple(conflict_examples),
+            )
+        )
+
+    rejected_rows = invalid_count + conflicting_rows
+    observed_start = points[0].timestamp_utc if points else None
+    observed_end = points[-1].timestamp_utc if points else None
+    query_window = HistoryQueryWindow(
+        start_utc=queried_start_utc,
+        end_utc=queried_end_utc,
+        dataset=POLYMARKET_CLOB_HISTORY_DATASET,
+        endpoint="/prices-history",
+    )
+    coverage = HistoryCoverage(
+        requested_start_utc=requested_start_utc,
+        requested_end_utc=requested_end_utc,
+        queried_windows=(query_window,),
+        datasets=(POLYMARKET_CLOB_HISTORY_DATASET,),
+        observed_start_utc=observed_start,
+        observed_end_utc=observed_end,
+        requests_complete=True,
+        source_completeness="unknown",
+        raw_rows=len(raw_history),
+        accepted_rows=len(points),
+        rejected_rows=rejected_rows,
+        duplicate_rows=duplicate_rows,
+        conflicting_rows=conflicting_rows,
+        outside_window_rows=outside_window_rows,
+    )
+    native_payload = deepcopy(payload)
+    expiry.checkpoint()
+    return PriceHistoryResult(
+        instrument=instrument,
+        points=tuple(points),
+        requested_start_utc=requested_start_utc,
+        requested_end_utc=requested_end_utc,
+        queried_start_utc=queried_start_utc,
+        queried_end_utc=queried_end_utc,
+        sampling_minutes=sampling_minutes,
+        observed_start_utc=observed_start,
+        observed_end_utc=observed_end,
+        source="polymarket_clob",
+        dataset=POLYMARKET_CLOB_HISTORY_DATASET,
+        price_basis="venue_defined",
+        observation=observation,
+        observations=(observation,),
+        issues=tuple(issues),
+        interpretation_id=POLYMARKET_CLOB_HISTORY_INTERPRETATION_ID,
+        package_version=__version__,
+        coverage=coverage,
+        native_payloads=(native_payload,),
+    )
 
 
 def normalize_clob_book(
@@ -490,6 +745,56 @@ def _optional_alias_identifier(
     return _optional_identifier(value, label)
 
 
+def _optional_identifier_group(
+    payload: dict[str, Any], names: tuple[str, ...], *, label: str
+) -> str | None:
+    present = [(name, payload[name]) for name in names if name in payload]
+    if not present:
+        return None
+    values = tuple(_optional_identifier(value, label) for _name, value in present)
+    if any(value is None for value in values):
+        raise InvalidDataError(f"{label} must be a nonempty string")
+    if len(set(values)) != 1:
+        raise InvalidDataError(f"conflicting {label} aliases")
+    return values[0]
+
+
+def _clob_history_row(
+    row: object, *, index: int
+) -> tuple[int, datetime, float]:
+    if not isinstance(row, dict):
+        raise InvalidDataError(f"CLOB price-history row {index} must be an object")
+    if "t" not in row or "p" not in row:
+        raise InvalidDataError(
+            f"CLOB price-history row {index} must contain t and p"
+        )
+    timestamp_value = row["t"]
+    if isinstance(timestamp_value, bool) or not isinstance(timestamp_value, (str, int)):
+        raise InvalidDataError(
+            f"CLOB price-history row {index} timestamp must be integer seconds"
+        )
+    timestamp_text = str(timestamp_value)
+    if not timestamp_text.isascii() or not timestamp_text.isdecimal():
+        raise InvalidDataError(
+            f"CLOB price-history row {index} timestamp must be integer seconds"
+        )
+    try:
+        source_timestamp = int(timestamp_text)
+        timestamp_utc = datetime.fromtimestamp(source_timestamp, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise InvalidDataError(
+            f"CLOB price-history row {index} timestamp is outside the supported range"
+        ) from exc
+    price = _finite_number(
+        row["p"], f"CLOB price-history row {index} price"
+    )
+    if not 0 <= price <= 1:
+        raise InvalidDataError(
+            f"CLOB price-history row {index} price must be in [0, 1]"
+        )
+    return source_timestamp, timestamp_utc, price
+
+
 def _optional_identifier(value: object, label: str) -> str | None:
     if value is _MISSING or value is None:
         return None
@@ -525,12 +830,16 @@ def _issue(
 
 __all__ = [
     "POLYMARKET_CLOB_BOOK_INTERPRETATION_ID",
+    "POLYMARKET_CLOB_HISTORY_DATASET",
+    "POLYMARKET_CLOB_HISTORY_INTERPRETATION_ID",
     "POLYMARKET_MARKET_INTERPRETATION_ID",
     "clob_book_identities",
+    "clob_history_identities",
     "decode_gamma_keyset_envelope",
     "gamma_detail_identities",
     "gamma_market_identity",
     "gamma_page_identities",
     "normalize_clob_book",
+    "normalize_clob_price_history",
     "normalize_gamma_market",
 ]

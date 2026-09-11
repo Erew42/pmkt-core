@@ -148,6 +148,7 @@ def test_installed_public_api_has_positive_and_negative_typing_evidence(
     )
     runtime_script = r'''
 import asyncio
+from datetime import datetime, timedelta, timezone
 import pathlib
 import sys
 
@@ -179,6 +180,13 @@ def gamma_handler(request):
 
 
 def clob_handler(request):
+    if request.url.path == "/prices-history":
+        assert request.url.params["market"] == "yes-token"
+        assert request.url.params["fidelity"] == "60"
+        return httpx.Response(
+            200,
+            json={"history": [{"t": 1767312000, "p": 0.45}]},
+        )
     assert request.url.path == "/book"
     assert request.url.params["token_id"] == "yes-token"
     return httpx.Response(
@@ -210,12 +218,25 @@ async def main():
         transport=httpx.MockTransport(clob_handler),
     ) as clob:
         book = await clob.get_book(instrument, depth=1, deadline_s=5.0)
+        history = await clob.get_price_history(
+            instrument,
+            start=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            end=datetime(2026, 1, 2, tzinfo=timezone.utc) + timedelta(days=1),
+            sampling_minutes=60,
+            max_points=10,
+            deadline_s=5.0,
+        )
     assert book.bids[0].quantity == 3.0
+    assert history.points[0].price == 0.45
+    assert history.coverage.source_completeness == "unknown"
     assert result.report.stop_reason == "source_exhausted"
 
 
 asyncio.run(main())
 assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+assert "pandas" not in sys.modules
+assert "pyarrow" not in sys.modules
+assert "duckdb" not in sys.modules
 assert "pmkt.data" not in sys.modules
 assert "pmkt.streaming" not in sys.modules
 import pmkt.catalog
@@ -304,15 +325,50 @@ assert "pmkt.streaming" not in sys.modules
     )
     assert kalshi_runtime.returncode == 0, kalshi_runtime.stderr
 
+    example = tmp_path / "polymarket_history_example.py"
+    example.write_bytes((ROOT / "scripts" / example.name).read_bytes())
+    example_runtime_script = r'''
+import pathlib
+import runpy
+import sys
+
+sys.path.insert(0, sys.argv[1])
+runpy.run_path(sys.argv[2], run_name="__main__")
+assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+'''
+    example_runtime = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            example_runtime_script,
+            str(installed),
+            str(example),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert example_runtime.returncode == 0, example_runtime.stderr
+    assert json.loads(example_runtime.stdout) == {
+        "accepted_rows": 2,
+        "price_basis": "venue_defined",
+        "prices": [0.35, 0.4],
+        "raw_rows": 2,
+        "source_completeness": "unknown",
+        "token_id": "offline-token",
+    }
+
     positive = tmp_path / "catalog_positive.py"
     positive.write_text(
         """\
+from datetime import datetime, timezone
 from pathlib import Path
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
 from pmkt.config import PmktConfig, RequestPolicy
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrumentRef, KalshiMarket, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
-from pmkt.records import BookSnapshot, DiscoveryResult, InstrumentRef, MarketRef
+from pmkt.records import BookSnapshot, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
@@ -325,8 +381,9 @@ gamma = AsyncGammaClient(config=config, timeout_s=5.0, request_policy=policy)
 clob = AsyncClobClient(config=config, timeout_s=5.0, request_policy=policy)
 kalshi = AsyncKalshiClient(config=config, timeout_s=5.0, request_policy=policy)
 poly_market = PolymarketMarketRef("market", condition_id="condition")
+poly_instrument = PolymarketInstrumentRef("token", market=poly_market, outcome_index=0)
 market: MarketRef = poly_market
-instrument: InstrumentRef = PolymarketInstrumentRef("token", market=poly_market, outcome_index=0)
+instrument: InstrumentRef = poly_instrument
 kalshi_instrument: InstrumentRef = KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes")
 
 async def polymarket_workflow() -> None:
@@ -341,6 +398,17 @@ async def polymarket_workflow() -> None:
     )
     selected = detail.instrument_for_label("Yes")
     book: BookSnapshot = await clob.get_book(selected, depth=5, deadline_s=5.0)
+    history: PriceHistoryResult = await clob.get_price_history(
+        poly_instrument,
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        sampling_minutes=60,
+        max_points=100,
+        deadline_s=5.0,
+        invalid_rows="report",
+    )
+    history.to_arrow()
+    history.to_pandas()
 
 async def kalshi_workflow() -> None:
     discovery: DiscoveryResult[KalshiMarket] = await kalshi.discover_markets(
@@ -363,6 +431,7 @@ async def kalshi_workflow() -> None:
     negative = tmp_path / "catalog_negative.py"
     negative.write_text(
         """\
+from datetime import datetime, timezone
 from pathlib import Path
 from pmkt.catalog import CatalogSnapshot
 from pmkt.config import PmktConfig
@@ -387,6 +456,24 @@ async def invalid_polymarket_calls() -> None:
     await clob.get_book(PolymarketMarketRef("market"))
     await clob.get_book(PolymarketInstrumentRef("token"), depth="one")
     await clob.get_book(PolymarketInstrumentRef("token"), deadline_s=None)
+    await clob.get_price_history(
+        KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        sampling_minutes=60,
+    )
+    await clob.get_price_history(
+        PolymarketInstrumentRef("token"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    )
+    await clob.get_price_history(
+        PolymarketInstrumentRef("token"),
+        start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+        end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+        sampling_minutes=60,
+        interval="1d",
+    )
 
 async def invalid_kalshi_calls() -> None:
     kalshi = AsyncKalshiClient(config=config)
@@ -439,6 +526,9 @@ async def invalid_kalshi_calls() -> None:
     assert 'Argument 1 to "get_book"' in rejected.stdout
     assert 'Argument "depth" to "get_book"' in rejected.stdout
     assert 'Argument "deadline_s" to "get_book"' in rejected.stdout
+    assert 'Argument 1 to "get_price_history"' in rejected.stdout
+    assert 'Missing named argument "sampling_minutes" for "get_price_history"' in rejected.stdout
+    assert 'Unexpected keyword argument "interval" for "get_price_history"' in rejected.stdout
     assert 'Missing named argument "filters" for "discover_markets" of "AsyncKalshiClient"' in rejected.stdout
     assert 'Argument "filters" to "discover_markets" of "AsyncKalshiClient"' in rejected.stdout
     assert 'Too many positional arguments for "get_market" of "AsyncKalshiClient"' in rejected.stdout

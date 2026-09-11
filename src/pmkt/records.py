@@ -5,7 +5,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 import math
-from typing import ClassVar, Generic, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, TypeVar
+
+if TYPE_CHECKING:
+    import pandas as pd
+    import pyarrow as pa
 
 
 DataScope = Literal["production", "demo", "synthetic", "unknown"]
@@ -26,6 +30,8 @@ DiscoveryStopReason = Literal[
 BookQuantityUnit = Literal["shares", "contracts"]
 BookSideProvenance = Literal["direct", "complement_derived", "missing"]
 IssueSeverity = Literal["info", "warning", "error"]
+SourceCompleteness = Literal["confirmed", "unknown"]
+PriceBasis = Literal["venue_defined"]
 _MarketT = TypeVar("_MarketT")
 
 
@@ -547,6 +553,261 @@ class BookSnapshot:
 
 
 @dataclass(frozen=True)
+class SampledPricePoint:
+    """One sourced CLOB sample, with no implied trade or quote meaning."""
+
+    timestamp_utc: datetime
+    price: float
+
+    def __post_init__(self) -> None:
+        _require_utc(self.timestamp_utc, "timestamp_utc")
+        if isinstance(self.price, bool) or not isinstance(self.price, (int, float)):
+            raise TypeError("price must be a number")
+        if not math.isfinite(float(self.price)):
+            raise ValueError("price must be finite")
+        if not 0 <= self.price <= 1:
+            raise ValueError("price must be between 0 and 1")
+
+
+@dataclass(frozen=True)
+class HistoryQueryWindow:
+    """The UTC boundary markers and dataset used by one history request."""
+
+    start_utc: datetime
+    end_utc: datetime
+    dataset: str
+    endpoint: str
+
+    def __post_init__(self) -> None:
+        _require_utc(self.start_utc, "start_utc")
+        _require_utc(self.end_utc, "end_utc")
+        if self.end_utc <= self.start_utc:
+            raise ValueError("history query end must follow its start")
+        _require_identifier(self.dataset, "dataset")
+        if not isinstance(self.endpoint, str) or not self.endpoint.startswith("/"):
+            raise ValueError("endpoint must be an absolute path template")
+
+
+@dataclass(frozen=True)
+class HistoryCoverage:
+    """Auditable traversal, extent, and row reconciliation for history."""
+
+    requested_start_utc: datetime
+    requested_end_utc: datetime
+    queried_windows: tuple[HistoryQueryWindow, ...]
+    datasets: tuple[str, ...]
+    observed_start_utc: datetime | None
+    observed_end_utc: datetime | None
+    requests_complete: bool
+    source_completeness: SourceCompleteness
+    raw_rows: int
+    accepted_rows: int
+    rejected_rows: int
+    duplicate_rows: int
+    conflicting_rows: int
+    outside_window_rows: int
+
+    def __post_init__(self) -> None:
+        _require_utc(self.requested_start_utc, "requested_start_utc")
+        _require_utc(self.requested_end_utc, "requested_end_utc")
+        if self.requested_end_utc <= self.requested_start_utc:
+            raise ValueError("requested history end must follow its start")
+        if not self.queried_windows:
+            raise ValueError("queried_windows must contain at least one request")
+        if not self.datasets:
+            raise ValueError("datasets must contain at least one dataset")
+        for dataset in self.datasets:
+            _require_identifier(dataset, "dataset")
+        if (self.observed_start_utc is None) != (self.observed_end_utc is None):
+            raise ValueError("observed history bounds must both be present or absent")
+        if self.observed_start_utc is not None:
+            _require_utc(self.observed_start_utc, "observed_start_utc")
+            assert self.observed_end_utc is not None
+            _require_utc(self.observed_end_utc, "observed_end_utc")
+            if self.observed_end_utc < self.observed_start_utc:
+                raise ValueError("observed history end must not precede its start")
+        if not isinstance(self.requests_complete, bool):
+            raise TypeError("requests_complete must be a bool")
+        if self.source_completeness not in ("confirmed", "unknown"):
+            raise ValueError("unsupported source_completeness")
+        for name in (
+            "raw_rows",
+            "accepted_rows",
+            "rejected_rows",
+            "duplicate_rows",
+            "conflicting_rows",
+            "outside_window_rows",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise TypeError(f"{name} must be an int")
+            if value < 0:
+                raise ValueError(f"{name} must be nonnegative")
+        if self.conflicting_rows > self.rejected_rows:
+            raise ValueError("conflicting_rows must be a subset of rejected_rows")
+        partitioned = (
+            self.accepted_rows
+            + self.rejected_rows
+            + self.duplicate_rows
+            + self.outside_window_rows
+        )
+        if self.raw_rows != partitioned:
+            raise ValueError("history row counters do not partition raw_rows")
+
+
+@dataclass(frozen=True)
+class PriceHistoryResult:
+    """Normalized sampled CLOB history with retained provenance and coverage."""
+
+    instrument: PolymarketInstrumentRef
+    points: tuple[SampledPricePoint, ...]
+    requested_start_utc: datetime
+    requested_end_utc: datetime
+    queried_start_utc: datetime
+    queried_end_utc: datetime
+    sampling_minutes: int
+    observed_start_utc: datetime | None
+    observed_end_utc: datetime | None
+    source: str
+    dataset: str
+    price_basis: PriceBasis
+    observation: RequestObservation
+    observations: tuple[RequestObservation, ...]
+    issues: tuple[DataIssue, ...]
+    interpretation_id: str
+    package_version: str
+    coverage: HistoryCoverage
+    native_payloads: tuple[dict[str, object], ...] = field(
+        repr=False, compare=False
+    )
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.instrument, PolymarketInstrumentRef):
+            raise TypeError("instrument must be a PolymarketInstrumentRef")
+        _require_utc(self.requested_start_utc, "requested_start_utc")
+        _require_utc(self.requested_end_utc, "requested_end_utc")
+        _require_utc(self.queried_start_utc, "queried_start_utc")
+        _require_utc(self.queried_end_utc, "queried_end_utc")
+        if self.requested_end_utc <= self.requested_start_utc:
+            raise ValueError("requested history end must follow its start")
+        if self.queried_end_utc <= self.queried_start_utc:
+            raise ValueError("queried history end must follow its start")
+        if isinstance(self.sampling_minutes, bool) or not isinstance(
+            self.sampling_minutes, int
+        ):
+            raise TypeError("sampling_minutes must be an int")
+        if self.sampling_minutes <= 0:
+            raise ValueError("sampling_minutes must be positive")
+        if (self.observed_start_utc is None) != (self.observed_end_utc is None):
+            raise ValueError("observed history bounds must both be present or absent")
+        if self.observed_start_utc is not None:
+            _require_utc(self.observed_start_utc, "observed_start_utc")
+            assert self.observed_end_utc is not None
+            _require_utc(self.observed_end_utc, "observed_end_utc")
+        _require_identifier(self.source, "source")
+        _require_identifier(self.dataset, "dataset")
+        if self.price_basis != "venue_defined":
+            raise ValueError("unsupported price_basis")
+        if not self.observations or self.observations[-1] != self.observation:
+            raise ValueError("observation must be the final request observation")
+        _require_identifier(self.interpretation_id, "interpretation_id")
+        _require_identifier(self.package_version, "package_version")
+        if self.coverage.accepted_rows != len(self.points):
+            raise ValueError("coverage accepted_rows must equal returned point count")
+        if any(not isinstance(payload, dict) for payload in self.native_payloads):
+            raise TypeError("native_payloads must contain dictionaries")
+
+    def to_arrow(self) -> pa.Table:
+        """Materialize points as an Arrow table, loading the data extra lazily."""
+
+        return _price_history_to_arrow(self)
+
+    def to_pandas(self) -> pd.DataFrame:
+        """Materialize points as a pandas frame, loading the data extra lazily."""
+
+        return _price_history_to_pandas(self)
+
+
+def _price_history_metadata(result: PriceHistoryResult) -> dict[str, str]:
+    return {
+        "instrument_token_id": result.instrument.token_id,
+        "source": result.source,
+        "dataset": result.dataset,
+        "price_basis": result.price_basis,
+        "sampling_minutes": str(result.sampling_minutes),
+        "interpretation_id": result.interpretation_id,
+        "package_version": result.package_version,
+    }
+
+
+def _price_history_to_arrow(result: PriceHistoryResult) -> Any:
+    try:
+        import pyarrow as pa
+    except ImportError as exc:
+        from pmkt.errors import OptionalDependencyError
+
+        raise OptionalDependencyError(
+            "PriceHistoryResult.to_arrow requires pyarrow; install pmkt[data]"
+        ) from exc
+    schema = pa.schema(
+        [
+            pa.field("token_id", pa.string(), nullable=False),
+            pa.field("timestamp_utc", pa.timestamp("s", tz="UTC"), nullable=False),
+            pa.field("price", pa.float64(), nullable=False),
+            pa.field("price_basis", pa.string(), nullable=False),
+        ],
+        metadata={
+            key.encode("utf-8"): value.encode("utf-8")
+            for key, value in _price_history_metadata(result).items()
+        },
+    )
+    return pa.Table.from_arrays(
+        [
+            pa.array(
+                [result.instrument.token_id] * len(result.points), type=pa.string()
+            ),
+            pa.array(
+                [point.timestamp_utc for point in result.points],
+                type=pa.timestamp("s", tz="UTC"),
+            ),
+            pa.array([point.price for point in result.points], type=pa.float64()),
+            pa.array([result.price_basis] * len(result.points), type=pa.string()),
+        ],
+        schema=schema,
+    )
+
+
+def _price_history_to_pandas(result: PriceHistoryResult) -> Any:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        from pmkt.errors import OptionalDependencyError
+
+        raise OptionalDependencyError(
+            "PriceHistoryResult.to_pandas requires pandas; install pmkt[data]"
+        ) from exc
+    frame = pd.DataFrame(
+        {
+            "token_id": pd.Series(
+                [result.instrument.token_id] * len(result.points), dtype="string"
+            ),
+            "timestamp_utc": pd.Series(
+                [point.timestamp_utc for point in result.points],
+                dtype="datetime64[ns, UTC]",
+            ),
+            "price": pd.Series(
+                [point.price for point in result.points], dtype="float64"
+            ),
+            "price_basis": pd.Series(
+                [result.price_basis] * len(result.points), dtype="string"
+            ),
+        }
+    )
+    frame.attrs.update(_price_history_metadata(result))
+    return frame
+
+
+@dataclass(frozen=True)
 class RequestObservation:
     """Sanitized provenance for one HTTP request within a workflow operation."""
 
@@ -621,6 +882,8 @@ __all__ = [
     "DiscoveryReport",
     "DiscoveryResult",
     "DiscoveryStopReason",
+    "HistoryCoverage",
+    "HistoryQueryWindow",
     "InstrumentRef",
     "KalshiFilter",
     "KalshiInstrumentRef",
@@ -634,7 +897,11 @@ __all__ = [
     "PolymarketInstrumentRef",
     "PolymarketMarket",
     "PolymarketMarketRef",
+    "PriceBasis",
+    "PriceHistoryResult",
     "RequestObservation",
     "RequestOutcome",
+    "SampledPricePoint",
+    "SourceCompleteness",
     "TransportOrigin",
 ]

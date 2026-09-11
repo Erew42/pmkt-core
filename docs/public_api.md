@@ -184,7 +184,7 @@ paths are not retained. Known secure default Gamma, CLOB, and Kalshi endpoints
 receive conservative production/demo scope. Injected transports, custom paths,
 ports, insecure endpoints, and unrecognized redirect targets remain unknown.
 
-## Polymarket discovery and current books
+## Polymarket discovery, current books, and sampled history
 
 The supported Polymarket facade stays venue-specific:
 
@@ -197,7 +197,7 @@ from pmkt.exchanges.polymarket import (
     PolymarketMarket,
     PolymarketMarketRef,
 )
-from pmkt.records import BookSnapshot, DiscoveryResult
+from pmkt.records import BookSnapshot, DiscoveryResult, PriceHistoryResult
 ```
 
 `AsyncGammaClient.discover_markets(...)` returns
@@ -278,7 +278,65 @@ observation. A CLOB 404 raises `MarketNotFoundError` scoped to the current token
 book. A book is a current REST snapshot from one request, not a historical or
 atomic cross-instrument view.
 
-All three workflow methods require a finite positive deadline and fail before
+Fetch sampled CLOB prices for one selected outcome token with an explicit UTC
+window and sampling request:
+
+```python
+from datetime import datetime, timezone
+
+history: PriceHistoryResult = await clob.get_price_history(
+    instrument,
+    start=datetime(2026, 1, 1, tzinfo=timezone.utc),
+    end=datetime(2026, 1, 2, tzinfo=timezone.utc),
+    sampling_minutes=60,
+    max_points=10_000,
+    deadline_s=10.0,
+)
+```
+
+Both bounds must be timezone-aware and are converted to UTC before ordering,
+including ambiguous daylight-saving folds. `sampling_minutes` maps directly to
+the native `fidelity` parameter. The adapter sends one explicit-window request;
+the upstream documentation states no per-request maximum span, so this method
+does not claim or impose a vendor chunk size. Integer request markers are
+widened only enough for the endpoint's strict `startTs` and `endTs`
+comparisons, then points are selected locally with
+`start <= timestamp < end`.
+
+Returned `SampledPricePoint` values are sorted and immutable. Equal points at
+one token/timestamp key collapse. The default `invalid_rows="raise"` fails on
+any malformed row or conflicting price. `invalid_rows="report"` reports
+malformed rows and removes every occurrence of a conflicting key, including
+equal observations seen before or after the conflict. The output cap is checked
+after reconciliation and containment; overflow raises
+`ResultLimitExceededError` and never returns a shortened success.
+
+`HistoryCoverage` partitions every source row into accepted, rejected,
+nonconflicting duplicate, or outside-window counts. `conflicting_rows` is a
+subset of rejected rows. Reconciliation precedes containment, so strict mode
+also detects a conflicting key in the widened query margin. In report mode all
+occurrences of that key are rejected; every occurrence of a nonconflicting key
+outside the requested window is counted as outside-window. This distinguishes
+a source-empty response from an all-rejected response. Coverage retains the
+requested bounds, transmitted query markers, dataset, and observed returned
+extent; the owning result separately retains its request observation(s). A
+successful request sets `requests_complete=True`, while
+`source_completeness` remains `"unknown"`: one HTTP response does not prove the
+venue supplied every possible sample.
+
+`price_basis="venue_defined"` reflects the qualified evidence. Fidelity does
+not promise a regular grid, and these rows are not represented as trades,
+quotes, sizes, volume, depth, or executable prices. `to_arrow()` and
+`to_pandas()` load optional dependencies only when called. Both preserve typed
+UTC timestamp columns for empty results and attach result metadata to the
+materialized table or frame; the full observations, coverage, issues, and
+defensive native payload remain on the owning result.
+
+[`scripts/polymarket_history_example.py`](../scripts/polymarket_history_example.py)
+is a runnable offline example using an injected synthetic response and the
+installed public client method.
+
+All four workflow methods require a finite positive deadline and fail before
 I/O for `None`, booleans, nonpositive values, or nonfinite values. The deadline
 covers transport, decoding, and normalization. Expiry raises
 `OperationTimeoutError` and returns no partial result; the borrowed client
@@ -385,8 +443,9 @@ one token snapshot represented by `pmkt.models.OrderBook`; `books` preserves the
 server response as a list of token snapshots. `prices_history` returns one
 `PriceHistory` series whose points contain Unix seconds and a sampled price.
 These are native endpoint results. The supported typed current snapshot is the
-separate `get_book` method described above; historical observations remain a
-later workflow.
+separate `get_book` method described above. The supported normalized sampled
+history is the separate `get_price_history` method; native methods keep their
+existing signatures, interval suppression, models, and validation.
 
 `AsyncKalshiClient` retains:
 

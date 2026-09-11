@@ -31,8 +31,9 @@ The following paths are owned by `pmkt-core`:
 - `tests/test_catalog.py` and `scripts/create_synthetic_catalog_fixture.py`,
   which verify the pinned read-only catalog contract and provide its offline
   synthetic fixture recipe.
-- The supported Polymarket discovery and typed-book workflows, their private
-  decoder, OpenAPI contracts, and focused records/Gamma/CLOB/package tests.
+- The supported Polymarket discovery, typed-book, and sampled CLOB history
+  workflows, their private decoders, OpenAPI contracts, offline examples, and
+  focused records/Gamma/CLOB/package tests.
 - The supported Kalshi standard-market discovery, source-scoped detail, and
   projected current-book workflows, their private decoder, offline example,
   and focused records/Kalshi/package tests.

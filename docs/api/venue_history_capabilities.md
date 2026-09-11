@@ -1,12 +1,21 @@
 # Venue Historical Data Capabilities
 
-Checked for CR-10.0 on 2026-06-17.
+Checked for CR-10.0 on 2026-06-17 and the public sampled-history workflow on
+2026-09-11.
 
 ## Polymarket
 
 - `/prices-history` is available for CLOB market price history and supports time-bounded price context. Source: <https://docs.polymarket.com/api-reference/markets/get-prices-history>
 - `/batch-prices-history` is available for batched CLOB market price history, with a documented maximum of 20 markets per request. Source: <https://docs.polymarket.com/api-reference/markets/get-batch-prices-history>
 - There is no documented historical topbook or historical depth endpoint. `/book` is a current order-book snapshot endpoint, so old `/prices-history` rows must not be treated as executable order-book evidence.
+- `AsyncClobClient.get_price_history(...)` is the supported single-token,
+  explicit-window adapter over `/prices-history`. It maps `sampling_minutes` to
+  fidelity and retains `price_basis="venue_defined"`; it does not imply a
+  regular grid, trades, quotes, sizes, volume, depth, or source completeness.
+- The upstream reference documents strict second-based bounds but no maximum
+  request span. The adapter therefore widens integer boundary markers only for
+  half-open local containment and performs one request; it makes no vendor
+  maximum-span claim.
 
 ## Kalshi
 

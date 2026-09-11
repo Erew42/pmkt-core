@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import math
 from typing import Any, Literal, Sequence
 from uuid import uuid4
 
@@ -12,10 +14,17 @@ from pmkt.config import PmktConfig, get_config
 from pmkt.errors import MarketNotFoundError
 from pmkt.exchanges.polymarket._workflow import (
     clob_book_identities,
+    clob_history_identities,
     normalize_clob_book,
+    normalize_clob_price_history,
 )
 from pmkt.models import OrderBook, PriceHistory
-from pmkt.records import BookSnapshot, PolymarketInstrumentRef, RequestObservation
+from pmkt.records import (
+    BookSnapshot,
+    PolymarketInstrumentRef,
+    PriceHistoryResult,
+    RequestObservation,
+)
 from pmkt.tokens import extract_token_ids
 
 
@@ -176,6 +185,84 @@ class AsyncClobClient:
         start_ts: int | None = None,
         end_ts: int | None = None,
     ) -> PriceHistory:
+        data, _observation = await self._prices_history_payload(
+            market=market,
+            interval=interval,
+            fidelity=fidelity,
+            start_ts=start_ts,
+            end_ts=end_ts,
+        )
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict, got {type(data)}")
+        return PriceHistory(**data)
+
+    async def get_price_history(
+        self,
+        instrument: PolymarketInstrumentRef,
+        *,
+        start: datetime,
+        end: datetime,
+        sampling_minutes: int,
+        max_points: int = 100_000,
+        deadline_s: float = 60.0,
+        invalid_rows: Literal["raise", "report"] = "raise",
+    ) -> PriceHistoryResult:
+        """Fetch explicit-window sampled CLOB prices for one token."""
+
+        if not isinstance(instrument, PolymarketInstrumentRef):
+            raise TypeError("instrument must be a PolymarketInstrumentRef")
+        start_utc, end_utc = _utc_history_bounds(start, end)
+        _require_positive_int(sampling_minutes, "sampling_minutes")
+        _require_positive_int(max_points, "max_points")
+        if invalid_rows not in ("raise", "report"):
+            raise ValueError("invalid_rows must be 'raise' or 'report'")
+        expiry = OperationExpiry.bounded(deadline_s)
+        query_start_ts, query_end_ts = _clob_history_query_bounds(
+            start_utc, end_utc
+        )
+        queried_start_utc = datetime.fromtimestamp(query_start_ts, tz=timezone.utc)
+        queried_end_utc = datetime.fromtimestamp(query_end_ts, tz=timezone.utc)
+        observations: list[RequestObservation] = []
+        payload, observation = await self._prices_history_payload(
+            market=instrument.token_id,
+            interval=None,
+            fidelity=sampling_minutes,
+            start_ts=query_start_ts,
+            end_ts=query_end_ts,
+            instrument=instrument,
+            expiry=expiry,
+            observations=observations,
+        )
+        assert observation is not None
+        expiry.checkpoint()
+        result = normalize_clob_price_history(
+            payload,
+            instrument=instrument,
+            requested_start_utc=start_utc,
+            requested_end_utc=end_utc,
+            queried_start_utc=queried_start_utc,
+            queried_end_utc=queried_end_utc,
+            sampling_minutes=sampling_minutes,
+            max_points=max_points,
+            invalid_rows=invalid_rows,
+            observation=observation,
+            expiry=expiry,
+        )
+        expiry.checkpoint()
+        return result
+
+    async def _prices_history_payload(
+        self,
+        *,
+        market: str,
+        interval: str | None,
+        fidelity: int | None,
+        start_ts: int | None,
+        end_ts: int | None,
+        instrument: PolymarketInstrumentRef | None = None,
+        expiry: OperationExpiry | None = None,
+        observations: list[RequestObservation] | None = None,
+    ) -> tuple[object, RequestObservation | None]:
         params: dict[str, Any] = {
             "market": market,
             "fidelity": fidelity,
@@ -184,10 +271,33 @@ class AsyncClobClient:
         }
         if start_ts is None and end_ts is None:
             params["interval"] = interval
-        data = await self._http.request_json("GET", "/prices-history", params=params)
-        if not isinstance(data, dict):
-            raise TypeError(f"Expected dict, got {type(data)}")
-        return PriceHistory(**data)
+        if expiry is None:
+            data = await self._http.request_json(
+                "GET", "/prices-history", params=params
+            )
+            return data, None
+        if instrument is None or observations is None:
+            raise RuntimeError("observed history fetch requires workflow context")
+        data, observation = await self._http.request_json_observed(
+            "GET",
+            "/prices-history",
+            request_id=f"clob-history-{uuid4().hex}",
+            endpoint_template="/prices-history",
+            parameter_allowlist={"market", "fidelity", "startTs", "endTs"},
+            effective_parameters={
+                "market": market,
+                "fidelity": fidelity,
+                "startTs": start_ts,
+                "endTs": end_ts,
+            },
+            params=params,
+            expiry=expiry,
+            response_identities=lambda value: clob_history_identities(
+                value, instrument=instrument
+            ),
+            record_observation=observations.append,
+        )
+        return data, observation
 
     async def batch_prices_history(
         self,
@@ -263,3 +373,32 @@ class AsyncClobClient:
         return history
 
 ClobClient = AsyncClobClient
+
+
+def _utc_history_bounds(start: datetime, end: datetime) -> tuple[datetime, datetime]:
+    normalized: list[datetime] = []
+    for name, value in (("start", start), ("end", end)):
+        if not isinstance(value, datetime):
+            raise TypeError(f"{name} must be a datetime")
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError(f"{name} must be timezone-aware")
+        normalized.append(value.astimezone(timezone.utc))
+    start_utc, end_utc = normalized
+    if start_utc >= end_utc:
+        raise ValueError("start must precede end after UTC normalization")
+    return start_utc, end_utc
+
+
+def _require_positive_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _clob_history_query_bounds(start_utc: datetime, end_utc: datetime) -> tuple[int, int]:
+    start_floor = math.floor(start_utc.timestamp())
+    query_start = start_floor - 1 if start_utc.microsecond == 0 else start_floor
+    end_floor = math.floor(end_utc.timestamp())
+    query_end = end_floor if end_utc.microsecond == 0 else end_floor + 1
+    return query_start, query_end
