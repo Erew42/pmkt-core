@@ -61,6 +61,83 @@ async def test_fetch_trade_history_parses_price_history_model() -> None:
     ]
 
 
+@pytest.mark.parametrize(
+    ("history", "expected"),
+    [
+        (
+            [
+                {"t": 0, "p": 0.0, "s": 0},
+                {"t": "1", "p": "1", "s": "0"},
+                [2, "0", 1],
+                (3, 1.0, "1"),
+            ],
+            [
+                {"timestamp": 0.0, "price": 0.0, "size": 0.0},
+                {"timestamp": 1.0, "price": 1.0, "size": 0.0},
+                {"timestamp": 2.0, "price": 0.0, "size": 1.0},
+                {"timestamp": 3.0, "price": 1.0, "size": 1.0},
+            ],
+        ),
+        (
+            [
+                {"t": None, "timestamp": 0, "p": None, "price": 0, "s": None, "size": 0},
+                {"timestamp": 1, "price": 1, "amount": 0},
+                {"time": 2, "value": 0, "volume": "0"},
+            ],
+            [
+                {"timestamp": 0.0, "price": 0.0, "size": 0.0},
+                {"timestamp": 1.0, "price": 1.0, "size": 0.0},
+                {"timestamp": 2.0, "price": 0.0, "size": 0.0},
+            ],
+        ),
+        (
+            [
+                {"t": 1, "timestamp": 9, "p": 0, "price": 0.7, "s": 0, "size": 8},
+                {"t": "bad", "timestamp": 2, "p": 0.5},
+                {"t": 3, "p": "bad", "price": 0.5},
+                {"t": 4, "p": 0.5, "s": "bad", "size": 2},
+                {"t": float("nan"), "p": 0.5},
+                {"t": 5, "p": float("inf")},
+                [float("inf"), 0.5],
+                (6, float("-inf")),
+            ],
+            [
+                {"timestamp": 1.0, "price": 0.0, "size": 0.0},
+                {"timestamp": 4.0, "price": 0.5, "size": None},
+            ],
+        ),
+    ],
+)
+async def test_fetch_trade_history_preserves_alias_values(
+    history: list[object], expected: list[dict[str, float | None]]
+) -> None:
+    class FakeClob:
+        async def prices_history(
+            self, token_id: str, interval: str, fidelity: int | None = None
+        ):
+            return {"history": history}
+
+    assert await fetch_trade_history(FakeClob(), "token", interval="1h") == expected
+
+
+async def test_fetch_trade_history_preserves_price_history_boundary_prices() -> None:
+    class FakeClob:
+        async def prices_history(
+            self, token_id: str, interval: str, fidelity: int | None = None
+        ):
+            return PriceHistory(
+                history=[
+                    PriceHistoryPoint(t=0, p=0),
+                    PriceHistoryPoint(t=1, p=1),
+                ]
+            )
+
+    assert await fetch_trade_history(FakeClob(), "token", interval="1h") == [
+        {"timestamp": 0.0, "price": 0.0, "size": None},
+        {"timestamp": 1.0, "price": 1.0, "size": None},
+    ]
+
+
 async def test_find_event_by_slug_iterates_pages() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         offset = int(request.url.params.get("offset", "0"))

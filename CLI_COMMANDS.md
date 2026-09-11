@@ -18,7 +18,7 @@ installed version.
 - `ingest-markets`: fetch normalized Polymarket market snapshots.
 - `ingest-markets-keyset`: fetch Polymarket markets by keyset pagination.
 - `ingest-kalshi-markets`: fetch normalized Kalshi market snapshots.
-- `query`: query local Parquet data with DuckDB.
+- `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
 - `backfill-venue-history`: fetch public venue history.

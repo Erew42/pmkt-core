@@ -164,3 +164,62 @@ def test_base_console_help_does_not_require_optional_dependencies() -> None:
 
     assert result.returncode == 0, result.stderr
     assert "Usage: pmkt" in result.stdout
+
+
+def test_data_query_does_not_import_streaming_dependencies() -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    code = """
+        import importlib.abc
+        import sys
+
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.', 1)[0] == 'websockets':
+                    raise ModuleNotFoundError(fullname, name=fullname)
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        from pmkt.cli.entrypoint import main
+        main(['query', 'SELECT 1 AS ok'])
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "ok" in result.stdout
+    assert "1" in result.stdout
+
+
+def test_streaming_command_names_the_missing_extra_without_network() -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    code = """
+        import importlib.abc
+        import sys
+
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.', 1)[0] == 'websockets':
+                    raise ModuleNotFoundError(fullname, name=fullname)
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        from pmkt.cli.entrypoint import main
+        main(['stream-books', '--token-id', 'offline-test'])
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 1
+    assert "pmkt[streaming]" in result.stdout + result.stderr

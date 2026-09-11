@@ -19,10 +19,6 @@ from pmkt.exchanges.read_auth import (
     ReadAuthenticationRequiredError,
 )
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
-from pmkt.exchanges.kalshi.order_book_stream import (
-    DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
-    stream_kalshi_order_book_data,
-)
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
 from pmkt.data.io import (
     RECOMMENDED_PARQUET_SEGMENT_ROWS,
@@ -40,10 +36,6 @@ from pmkt.data.market_data import (
 )
 from pmkt.data.normalize_books import kalshi_orderbook_to_topbook
 from pmkt.data.schemas import TOPBOOK_COLUMNS
-from pmkt.exchanges.polymarket.order_book_stream import (
-    DEFAULT_ORDER_BOOK_STREAM_ROOT,
-    stream_order_book_data,
-)
 from pmkt.data.storage.parquet import read_parquet, write_parquet
 from pmkt.exchanges.ws_transport import (
     WS_MAX_QUEUE_FRAMES,
@@ -75,6 +67,43 @@ class BookOutputFormat(str, Enum):
 
 DEFAULT_CONNECTION_START_STAGGER_SECONDS = 0.1
 DEFAULT_EXTENDED_SEGMENT_LIMIT_SECONDS = 30.0
+DEFAULT_ORDER_BOOK_STREAM_ROOT = Path("generated/order_book_streams")
+DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT = Path("generated/kalshi_order_book_streams")
+
+
+def _load_stream_collector(module_name: str, attribute_name: str) -> Any:
+    try:
+        module = importlib.import_module(module_name)
+    except ModuleNotFoundError as exc:
+        missing_root = (exc.name or "").split(".", 1)[0]
+        if missing_root == "websockets":
+            error_exit(
+                "WebSocket streaming requires the streaming extra; "
+                "install pmkt[streaming] and retry"
+            )
+        raise
+    return getattr(module, attribute_name)
+
+
+async def _lazy_stream_order_book_data(*args: Any, **kwargs: Any) -> dict[str, Any]:
+    collector = _load_stream_collector(
+        "pmkt.exchanges.polymarket.order_book_stream", "stream_order_book_data"
+    )
+    return await collector(*args, **kwargs)
+
+
+async def _lazy_stream_kalshi_order_book_data(
+    *args: Any, **kwargs: Any
+) -> dict[str, Any]:
+    collector = _load_stream_collector(
+        "pmkt.exchanges.kalshi.order_book_stream", "stream_kalshi_order_book_data"
+    )
+    return await collector(*args, **kwargs)
+
+
+# Keep these module-level seams stable for callers and tests that replace collectors.
+stream_order_book_data = _lazy_stream_order_book_data
+stream_kalshi_order_book_data = _lazy_stream_kalshi_order_book_data
 
 
 def _default_feed_supervisor(
@@ -1029,6 +1058,11 @@ def stream_books(
         if markets:
             error_exit(f"no token ids found in markets parquet {markets}")
         error_exit("provide --token-id or --markets")
+    collector = stream_order_book_data
+    if collector is _lazy_stream_order_book_data:
+        collector = _load_stream_collector(
+            "pmkt.exchanges.polymarket.order_book_stream", "stream_order_book_data"
+        )
     _warn_experimental_profile(selection)
     partitions = _capture_connection_partitions(
         venue="polymarket",
@@ -1047,7 +1081,7 @@ def stream_books(
         capture_group.run_connection_partition_group(
             venue="polymarket",
             partitions=partitions,
-            collector=stream_order_book_data,
+            collector=collector,
             output_dir=output_dir,
             run_name=run_name,
             start_stagger_seconds=connection_start_stagger_seconds,
@@ -1294,6 +1328,12 @@ def stream_kalshi_books(
             error_exit(f"no tickers found in Kalshi markets parquet {markets}")
         error_exit("provide --ticker or --markets")
     resolved_header_provider = _load_read_auth_header_provider(header_provider)
+    collector = stream_kalshi_order_book_data
+    if collector is _lazy_stream_kalshi_order_book_data:
+        collector = _load_stream_collector(
+            "pmkt.exchanges.kalshi.order_book_stream",
+            "stream_kalshi_order_book_data",
+        )
     _warn_experimental_profile(selection)
     partitions = _capture_connection_partitions(
         venue="kalshi",
@@ -1313,7 +1353,7 @@ def stream_kalshi_books(
             capture_group.run_connection_partition_group(
                 venue="kalshi",
                 partitions=partitions,
-                collector=stream_kalshi_order_book_data,
+                collector=collector,
                 output_dir=output_dir,
                 run_name=run_name,
                 start_stagger_seconds=connection_start_stagger_seconds,

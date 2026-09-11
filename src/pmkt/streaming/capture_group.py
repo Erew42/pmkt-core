@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
 from pmkt.streaming.connection_partitions import ConnectionPartition
 from pmkt.streaming.durability import file_sha256, write_json_atomic_fsync
@@ -19,6 +18,12 @@ from pmkt.streaming.profiles import (
     StorageProfileSelection,
     select_storage_profile,
 )
+
+
+def _polymarket_stream_collector() -> Any:
+    from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
+
+    return stream_order_book_data
 
 
 def _safe_run_component(value: str) -> str:
@@ -122,7 +127,7 @@ def _polymarket_partition_process_entry(
                 collector_kwargs["storage_profile"] = (
                     _storage_profile_from_process_payload(storage_profile_payload)
                 )
-            manifest = await stream_order_book_data(
+            manifest = await _polymarket_stream_collector()(
                 list(request["instruments"]),
                 output_root=Path(request["output_root"]),
                 run_name=str(request["run_name"]),
@@ -313,7 +318,7 @@ async def run_connection_partition_group(
     if process_count > 1:
         if venue != "polymarket":
             raise ValueError("multi-process connection groups currently support Polymarket")
-        if collector is not stream_order_book_data:
+        if collector is not _polymarket_stream_collector():
             raise ValueError(
                 "multi-process Polymarket capture requires the real collector"
             )
