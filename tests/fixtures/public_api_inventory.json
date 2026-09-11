@@ -641,11 +641,19 @@
     },
     {
       "path": "pmkt.resolution.polymarket.PolymarketResolutionResolver",
-      "tier": "supported"
+      "tier": "supported",
+      "methods": [
+        "resolve",
+        "resolve_many"
+      ]
     },
     {
       "path": "pmkt.resolution.kalshi.KalshiResolutionResolver",
-      "tier": "supported"
+      "tier": "supported",
+      "methods": [
+        "resolve",
+        "resolve_many"
+      ]
     },
     {
       "path": "pmkt.resolution.evm.PolygonCtfClient",

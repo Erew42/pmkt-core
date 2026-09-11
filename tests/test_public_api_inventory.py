@@ -54,7 +54,10 @@ def test_direct_public_imports_resolve_and_have_explicit_tiers() -> None:
     assert len({entry["path"] for entry in entries}) == len(entries)
     assert {entry["tier"] for entry in entries} <= TIERS
     for entry in entries:
-        assert _resolve(entry["path"]) is not None
+        resolved = _resolve(entry["path"])
+        assert resolved is not None
+        for method in entry.get("methods", []):
+            assert callable(getattr(resolved, method))
 
 
 def test_package_root_remains_version_only() -> None:

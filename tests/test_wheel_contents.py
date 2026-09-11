@@ -411,6 +411,36 @@ assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sy
         "winner": "yes",
     }
 
+    resolution_batch_example = tmp_path / "resolution_batch_example.py"
+    resolution_batch_example.write_bytes(
+        (ROOT / "scripts" / resolution_batch_example.name).read_bytes()
+    )
+    resolution_batch_example_runtime = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            example_runtime_script,
+            str(installed),
+            str(resolution_batch_example),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert resolution_batch_example_runtime.returncode == 0, (
+        resolution_batch_example_runtime.stderr
+    )
+    assert json.loads(resolution_batch_example_runtime.stdout) == {
+        "market_keys": ["offline-b", "offline-a", "offline-b"],
+        "resolver_versions": [
+            "market_resolution_resolver.v3",
+            "market_resolution_resolver.v3",
+            "market_resolution_resolver.v3",
+        ],
+        "winners": ["yes", "yes", "yes"],
+    }
+
     positive = tmp_path / "catalog_positive.py"
     positive.write_text(
         """\
@@ -448,6 +478,11 @@ async def polymarket_workflow() -> None:
         snapshot={"market_id": "market", "condition_id": "0xabc"},
         deadline_s=None,
     )
+    resolutions: list[ResolutionRecord] = await poly_resolver.resolve_many(
+        [PolymarketMarketRef("market", condition_id="0xabc")],
+        concurrency=2,
+        deadline_s=5.0,
+    )
     discovery: DiscoveryResult[PolymarketMarket] = await gamma.discover_markets(
         filters=PolymarketFilter(condition_ids=("condition",), closed=False),
         max_markets=1,
@@ -474,6 +509,9 @@ async def polymarket_workflow() -> None:
 async def kalshi_workflow() -> None:
     resolution: ResolutionRecord = await kalshi_resolver.resolve(
         KalshiMarketRef("ticker"), deadline_s=5.0
+    )
+    resolutions: list[ResolutionRecord] = await kalshi_resolver.resolve_many(
+        [KalshiMarketRef("ticker")], concurrency=2, deadline_s=5.0
     )
     discovery: DiscoveryResult[KalshiMarket] = await kalshi.discover_markets(
         filters=KalshiFilter(
@@ -587,6 +625,14 @@ async def invalid_resolution_calls() -> None:
     await kalshi.resolve(PolymarketMarketRef("market"))
     await polymarket.resolve(PolymarketMarketRef("market"), deadline_s="slow")
     await kalshi.resolve(KalshiMarketRef("ticker"), 5.0)
+    await polymarket.resolve_many([KalshiMarketRef("ticker")])
+    await kalshi.resolve_many([PolymarketMarketRef("market")])
+    await polymarket.resolve_many(
+        [PolymarketMarketRef("market")], deadline_s=None
+    )
+    await kalshi.resolve_many(
+        [KalshiMarketRef("ticker")], parallelism=2
+    )
 """,
         encoding="utf-8",
     )
@@ -664,3 +710,15 @@ async def invalid_resolution_calls() -> None:
         'matches argument types "KalshiMarketRef", "float"'
         in rejected.stdout
     )
+    assert (
+        'List item 0 has incompatible type "KalshiMarketRef"; expected '
+        '"PolymarketMarketRef"'
+        in rejected.stdout
+    )
+    assert (
+        'List item 0 has incompatible type "PolymarketMarketRef"; expected '
+        '"KalshiMarketRef"'
+        in rejected.stdout
+    )
+    assert 'Argument "deadline_s" to "resolve_many"' in rejected.stdout
+    assert 'Unexpected keyword argument "parallelism" for "resolve_many"' in rejected.stdout

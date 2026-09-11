@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from json import JSONDecodeError
 from typing import Any, NoReturn, Literal, overload
@@ -12,6 +12,7 @@ from pmkt._operation import OperationExpiry
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
 from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
 from pmkt.records import KalshiMarketRef
+from pmkt.resolution._batch import resolve_ordered_batch
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
@@ -48,6 +49,14 @@ _EXPECTED_SOURCE_ERRORS = (
     UnicodeDecodeError,
     InvalidResolutionEvidenceError,
 )
+
+
+@dataclass(frozen=True)
+class _PreparedKalshiResolution:
+    market_key: str
+    typed_ref: KalshiMarketRef | None
+    snapshot: dict[str, Any]
+    has_snapshot: bool
 
 
 def _mapping(payload: Mapping[str, Any] | Any | None) -> dict[str, Any]:
@@ -528,6 +537,35 @@ class KalshiResolutionResolver:
     def __init__(self, client: AsyncKalshiClient | None = None) -> None:
         self.client = client
 
+    def _prepare_resolution_input(
+        self,
+        market_key: str | KalshiMarketRef,
+        *,
+        snapshot: Mapping[str, Any] | Any | None,
+    ) -> _PreparedKalshiResolution:
+        key, typed_ref = _require_market_input(market_key)
+        snapshot_map = _snapshot_mapping(snapshot)
+        if typed_ref is not None:
+            _validate_typed_identity(
+                snapshot_map,
+                market=typed_ref,
+                source="snapshot",
+                caller_input=True,
+            )
+        return _PreparedKalshiResolution(
+            market_key=key,
+            typed_ref=typed_ref,
+            snapshot=snapshot_map,
+            has_snapshot=snapshot is not None,
+        )
+
+    def _prepare_batch_input(
+        self, market: KalshiMarketRef
+    ) -> _PreparedKalshiResolution:
+        if not isinstance(market, KalshiMarketRef):
+            raise TypeError("markets must contain only KalshiMarketRef values")
+        return self._prepare_resolution_input(market, snapshot=None)
+
     async def _market_payload(
         self,
         ticker: str,
@@ -583,6 +621,23 @@ class KalshiResolutionResolver:
             expiry=OperationExpiry.after(deadline_s),
         )
 
+    async def resolve_many(
+        self,
+        markets: Sequence[KalshiMarketRef],
+        *,
+        concurrency: int = 8,
+        deadline_s: float = 120.0,
+    ) -> list[ResolutionRecord]:
+        return await resolve_ordered_batch(
+            markets,
+            concurrency=concurrency,
+            deadline_s=deadline_s,
+            prepare=self._prepare_batch_input,
+            resolve_one=lambda prepared, expiry: self._resolve_prepared_with_expiry(
+                prepared, expiry=expiry
+            ),
+        )
+
     async def _resolve_with_expiry(
         self,
         market_key: str | KalshiMarketRef,
@@ -590,20 +645,23 @@ class KalshiResolutionResolver:
         snapshot: Mapping[str, Any] | Any | None,
         expiry: OperationExpiry,
     ) -> ResolutionRecord:
-        market_key, typed_ref = _require_market_input(market_key)
-        snapshot_map = _snapshot_mapping(snapshot)
-        if typed_ref is not None:
-            _validate_typed_identity(
-                snapshot_map,
-                market=typed_ref,
-                source="snapshot",
-                caller_input=True,
-            )
+        prepared = self._prepare_resolution_input(market_key, snapshot=snapshot)
         expiry.checkpoint()
+        return await self._resolve_prepared_with_expiry(prepared, expiry=expiry)
+
+    async def _resolve_prepared_with_expiry(
+        self,
+        prepared: _PreparedKalshiResolution,
+        *,
+        expiry: OperationExpiry,
+    ) -> ResolutionRecord:
+        market_key = prepared.market_key
+        typed_ref = prepared.typed_ref
+        snapshot_map = prepared.snapshot
         observed = utc_now_iso()
         observations: list[SourceObservation] = []
         snapshot_fallback: ResolutionRecord | None = None
-        if snapshot is not None:
+        if prepared.has_snapshot:
             snapshot_record = kalshi_resolution_from_payload(
                 snapshot_map,
                 input_identifier=market_key,

@@ -81,6 +81,7 @@ jobs:
               tests/test_polymarket_data_api.py
               tests/test_recorder.py
               tests/test_resolution.py
+              tests/test_resolution_batch.py
               tests/test_resolution_cache.py
               tests/test_resolution_terminal_labels.py
               tests/test_run_manifests.py

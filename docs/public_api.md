@@ -570,6 +570,42 @@ and payout hints at its existing metadata-only ceiling. The offline ownership
 and typed-reference flow is executable in
 [`scripts/resolution_example.py`](../scripts/resolution_example.py).
 
+Both resolvers also expose an ordered typed batch:
+
+```python
+records = await resolver.resolve_many(
+    markets,
+    concurrency=8,
+    deadline_s=120.0,
+)
+```
+
+`markets` must be a sequence of the resolver's matching market references.
+The full sequence and options are validated before requests. Empty input returns
+an empty list. Results preserve input order, cardinality, and duplicates; each
+duplicate is resolved independently and retains its own observations. A fixed
+number of workers bounds active work, and one deadline covers worker queueing,
+all nested source requests, and normalization. Expected per-market evidence
+failures still occupy their result slots. Expiry, caller cancellation,
+`ReadAuthenticationRequiredError`, and unexpected implementation errors raise
+only after the resolver has cancelled and drained its owned workers. Borrowed
+clients remain open and reusable. The offline ordered and duplicate-preserving
+flow is executable in
+[`scripts/resolution_batch_example.py`](../scripts/resolution_batch_example.py).
+
+To materialize results, including an empty batch, with stable canonical
+columns:
+
+```python
+import pandas as pd
+from pmkt.data import MARKET_RESOLUTION_COLUMNS
+
+frame = pd.DataFrame(
+    [record.to_row() for record in records],
+    columns=MARKET_RESOLUTION_COLUMNS,
+)
+```
+
 Matching typed references protect identity before interpretation. Conflicting
 snapshot identity or enrichment fails before I/O; conflicting returned venue
 identity becomes a source error observation, so another valid source can still

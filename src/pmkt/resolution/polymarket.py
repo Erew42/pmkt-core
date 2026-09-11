@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from fractions import Fraction
 from json import JSONDecodeError
 from typing import Any, NoReturn, overload
@@ -13,6 +14,7 @@ from pmkt._operation import OperationExpiry
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.records import PolymarketMarketRef
+from pmkt.resolution._batch import resolve_ordered_batch
 from pmkt.resolution.evm import EvmRpcError, PolygonCtfClient, _normalize_hex32
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
@@ -45,6 +47,15 @@ _EXPECTED_SOURCE_ERRORS = (
     UnicodeDecodeError,
     InvalidResolutionEvidenceError,
 )
+
+
+@dataclass(frozen=True)
+class _PreparedPolymarketResolution:
+    input_identifier: str
+    typed_ref: PolymarketMarketRef | None
+    snapshot: dict[str, Any]
+    market_key: str
+    condition_id: str | None
 
 
 def _mapping(payload: Mapping[str, Any] | Any | None) -> dict[str, Any]:
@@ -608,6 +619,50 @@ class PolymarketResolutionResolver:
         self.ctf_client = ctf_client
         self._ctf_chain_checked = False
 
+    def _prepare_resolution_input(
+        self,
+        market_key: str | PolymarketMarketRef,
+        *,
+        snapshot: Mapping[str, Any] | Any | None,
+    ) -> _PreparedPolymarketResolution:
+        input_identifier, typed_ref = _require_market_input(market_key)
+        snapshot_map = _snapshot_mapping(snapshot)
+        if typed_ref is not None:
+            _validate_typed_identity(
+                snapshot_map,
+                market=typed_ref,
+                source="snapshot",
+                caller_input=True,
+            )
+        key = (
+            typed_ref.market_id
+            if typed_ref is not None
+            else _market_key(snapshot_map, fallback=input_identifier)
+        )
+        condition_id = _condition_id(snapshot_map) or (
+            typed_ref.condition_id if typed_ref is not None else None
+        )
+        if condition_id is not None and self.ctf_client is not None:
+            condition_id = _validate_condition_id(
+                condition_id,
+                source="snapshot or PolymarketMarketRef",
+                caller_input=True,
+            )
+        return _PreparedPolymarketResolution(
+            input_identifier=input_identifier,
+            typed_ref=typed_ref,
+            snapshot=snapshot_map,
+            market_key=key,
+            condition_id=condition_id,
+        )
+
+    def _prepare_batch_input(
+        self, market: PolymarketMarketRef
+    ) -> _PreparedPolymarketResolution:
+        if not isinstance(market, PolymarketMarketRef):
+            raise TypeError("markets must contain only PolymarketMarketRef values")
+        return self._prepare_resolution_input(market, snapshot=None)
+
     async def _gamma_market(
         self, market_key: str, *, expiry: OperationExpiry
     ) -> dict[str, Any]:
@@ -719,6 +774,23 @@ class PolymarketResolutionResolver:
             expiry=OperationExpiry.after(deadline_s),
         )
 
+    async def resolve_many(
+        self,
+        markets: Sequence[PolymarketMarketRef],
+        *,
+        concurrency: int = 8,
+        deadline_s: float = 120.0,
+    ) -> list[ResolutionRecord]:
+        return await resolve_ordered_batch(
+            markets,
+            concurrency=concurrency,
+            deadline_s=deadline_s,
+            prepare=self._prepare_batch_input,
+            resolve_one=lambda prepared, expiry: self._resolve_prepared_with_expiry(
+                prepared, expiry=expiry
+            ),
+        )
+
     async def _resolve_with_expiry(
         self,
         market_key: str | PolymarketMarketRef,
@@ -726,34 +798,25 @@ class PolymarketResolutionResolver:
         snapshot: Mapping[str, Any] | Any | None,
         expiry: OperationExpiry,
     ) -> ResolutionRecord:
-        input_identifier, typed_ref = _require_market_input(market_key)
-        snapshot_map = _snapshot_mapping(snapshot)
-        if typed_ref is not None:
-            _validate_typed_identity(
-                snapshot_map,
-                market=typed_ref,
-                source="snapshot",
-                caller_input=True,
-            )
+        prepared = self._prepare_resolution_input(market_key, snapshot=snapshot)
         expiry.checkpoint()
+        return await self._resolve_prepared_with_expiry(prepared, expiry=expiry)
+
+    async def _resolve_prepared_with_expiry(
+        self,
+        prepared: _PreparedPolymarketResolution,
+        *,
+        expiry: OperationExpiry,
+    ) -> ResolutionRecord:
+        input_identifier = prepared.input_identifier
+        typed_ref = prepared.typed_ref
+        snapshot_map = prepared.snapshot
+        key = prepared.market_key
+        condition_id = prepared.condition_id
         observed = utc_now_iso()
         gamma_payload: dict[str, Any] = {}
         clob_payload: dict[str, Any] = {}
         endpoint_observations: list[SourceObservation] = []
-        key = (
-            typed_ref.market_id
-            if typed_ref is not None
-            else _market_key(snapshot_map, fallback=input_identifier)
-        )
-        condition_id = _condition_id(snapshot_map) or (
-            typed_ref.condition_id if typed_ref is not None else None
-        )
-        if condition_id is not None and self.ctf_client is not None:
-            condition_id = _validate_condition_id(
-                condition_id,
-                source="snapshot or PolymarketMarketRef",
-                caller_input=True,
-            )
 
         if self.gamma_client is not None and (
             not condition_id or not _labels(snapshot_map)
