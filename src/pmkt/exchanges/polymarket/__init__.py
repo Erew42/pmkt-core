@@ -13,7 +13,9 @@ if TYPE_CHECKING:
         GammaClient as GammaClient,
     )
     from pmkt.records import (
+        PolymarketFilter as PolymarketFilter,
         PolymarketInstrumentRef as PolymarketInstrumentRef,
+        PolymarketMarket as PolymarketMarket,
         PolymarketMarketRef as PolymarketMarketRef,
     )
 
@@ -55,7 +57,9 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "GammaClient": ("pmkt.exchanges.polymarket.gamma", "GammaClient"),
     "MarketBookState": ("pmkt.exchanges.polymarket.ws", "MarketBookState"),
     "MarketStreamSnapshot": ("pmkt.exchanges.polymarket.ws", "MarketStreamSnapshot"),
+    "PolymarketFilter": ("pmkt.records", "PolymarketFilter"),
     "PolymarketInstrumentRef": ("pmkt.records", "PolymarketInstrumentRef"),
+    "PolymarketMarket": ("pmkt.records", "PolymarketMarket"),
     "PolymarketMarketRef": ("pmkt.records", "PolymarketMarketRef"),
     "SubgraphClient": ("pmkt.exchanges.polymarket.subgraph", "SubgraphClient"),
     "WebSocketProtocolError": ("pmkt.exchanges.polymarket.ws", "WebSocketProtocolError"),

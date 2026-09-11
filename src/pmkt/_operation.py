@@ -38,6 +38,19 @@ class OperationExpiry:
             raise ValueError("timeout_s must be finite and positive")
         return cls(clock() + timeout, clock)
 
+    @classmethod
+    def bounded(
+        cls,
+        timeout_s: float,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> "OperationExpiry":
+        """Create an expiry for a workflow that may never be unbounded."""
+
+        if timeout_s is None:
+            raise TypeError("timeout_s must be a number")
+        return cls.after(timeout_s, clock=clock)
+
     def remaining_s(self) -> float | None:
         if self.deadline_monotonic is None:
             return None

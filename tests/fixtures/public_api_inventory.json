@@ -201,6 +201,8 @@
       "default_tier": "supported",
       "exports": [
         "CatalogError",
+        "InvalidDataError",
+        "MarketNotFoundError",
         "OperationTimeoutError",
         "OptionalDependencyError",
         "ReadAuthenticationRequiredError",
@@ -210,12 +212,23 @@
     "pmkt.records": {
       "default_tier": "supported",
       "exports": [
+        "BookLevel",
+        "BookQuantityUnit",
+        "BookSideProvenance",
+        "BookSnapshot",
+        "DataIssue",
         "DataScope",
+        "DiscoveryReport",
+        "DiscoveryResult",
+        "DiscoveryStopReason",
         "InstrumentRef",
         "KalshiInstrumentRef",
         "KalshiMarketRef",
+        "MappingStatus",
         "MarketRef",
+        "PolymarketFilter",
         "PolymarketInstrumentRef",
+        "PolymarketMarket",
         "PolymarketMarketRef",
         "RequestObservation",
         "RequestOutcome",
@@ -288,7 +301,9 @@
         "GammaClient",
         "MarketBookState",
         "MarketStreamSnapshot",
+        "PolymarketFilter",
         "PolymarketInstrumentRef",
+        "PolymarketMarket",
         "PolymarketMarketRef",
         "SubgraphClient",
         "WebSocketProtocolError",
@@ -300,11 +315,13 @@
         "stream_order_book_data"
       ],
       "tier_overrides": {
-        "AsyncClobClient": "retained_native",
+        "AsyncClobClient": "supported",
         "ClobClient": "retained_native",
-        "AsyncGammaClient": "retained_native",
+        "AsyncGammaClient": "supported",
         "GammaClient": "retained_native",
+        "PolymarketFilter": "supported",
         "PolymarketInstrumentRef": "supported",
+        "PolymarketMarket": "supported",
         "PolymarketMarketRef": "supported"
       }
     },
@@ -455,6 +472,14 @@
       "tier": "supported"
     },
     {
+      "path": "pmkt.errors.InvalidDataError",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.errors.MarketNotFoundError",
+      "tier": "supported"
+    },
+    {
       "path": "pmkt.errors.OptionalDependencyError",
       "tier": "supported"
     },
@@ -472,6 +497,22 @@
     },
     {
       "path": "pmkt.records.PolymarketMarketRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.PolymarketFilter",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.PolymarketMarket",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.DiscoveryResult",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.BookSnapshot",
       "tier": "supported"
     },
     {

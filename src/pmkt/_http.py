@@ -19,7 +19,7 @@ from pmkt._observations import (
     source_after_response,
 )
 from pmkt._operation import OperationExpiry
-from pmkt.errors import OperationTimeoutError
+from pmkt.errors import InvalidDataError, OperationTimeoutError
 from pmkt.records import RequestObservation, RequestOutcome
 
 
@@ -499,6 +499,9 @@ class HttpClient:
             outcome = "transport_error"
             raise
         except JSONDecodeError:
+            outcome = "invalid_response"
+            raise
+        except InvalidDataError:
             outcome = "invalid_response"
             raise
         finally:

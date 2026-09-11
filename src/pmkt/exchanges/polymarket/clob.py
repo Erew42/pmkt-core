@@ -1,13 +1,21 @@
 from __future__ import annotations
 
 from typing import Any, Literal, Sequence
+from uuid import uuid4
 
 import httpx
 from aiolimiter import AsyncLimiter
 
 from pmkt._http import HttpClient, RequestPolicy
+from pmkt._operation import OperationExpiry
 from pmkt.config import PmktConfig, get_config
+from pmkt.errors import MarketNotFoundError
+from pmkt.exchanges.polymarket._workflow import (
+    clob_book_identities,
+    normalize_clob_book,
+)
 from pmkt.models import OrderBook, PriceHistory
+from pmkt.records import BookSnapshot, PolymarketInstrumentRef, RequestObservation
 from pmkt.tokens import extract_token_ids
 
 
@@ -62,6 +70,58 @@ class AsyncClobClient:
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return OrderBook(**data)
+
+    async def get_book(
+        self,
+        instrument: PolymarketInstrumentRef,
+        *,
+        depth: int | None = None,
+        deadline_s: float = 30.0,
+    ) -> BookSnapshot:
+        """Fetch one strictly validated, normalized CLOB token book."""
+
+        if not isinstance(instrument, PolymarketInstrumentRef):
+            raise TypeError("instrument must be a PolymarketInstrumentRef")
+        if depth is not None:
+            if isinstance(depth, bool) or not isinstance(depth, int):
+                raise TypeError("depth must be an int or None")
+            if depth <= 0:
+                raise ValueError("depth must be positive")
+        expiry = OperationExpiry.bounded(deadline_s)
+        observations: list[RequestObservation] = []
+        try:
+            payload, observation = await self._http.request_json_observed(
+                "GET",
+                "/book",
+                request_id=f"clob-book-{uuid4().hex}",
+                endpoint_template="/book",
+                parameter_allowlist={"token_id"},
+                effective_parameters={"token_id": instrument.token_id},
+                params={"token_id": instrument.token_id},
+                expiry=expiry,
+                response_identities=lambda value: clob_book_identities(
+                    value, instrument=instrument
+                ),
+                record_observation=observations.append,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise MarketNotFoundError(
+                    venue="polymarket",
+                    identifier=instrument.token_id,
+                    lookup_scope="CLOB current token book",
+                ) from exc
+            raise
+        expiry.checkpoint()
+        result = normalize_clob_book(
+            payload,
+            instrument=instrument,
+            depth=depth,
+            observation=observation,
+            expiry=expiry,
+        )
+        expiry.checkpoint()
+        return result
 
     async def books(self, token_ids: Sequence[str]) -> list[OrderBook]:
         payload = [{"token_id": str(token_id)} for token_id in token_ids]

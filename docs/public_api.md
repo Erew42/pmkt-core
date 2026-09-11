@@ -9,9 +9,8 @@ and CI checks every listed lazy and eager export.
 ## Compatibility tiers
 
 - **Supported workflow** means a delivered high-level workflow with explicit
-  result types and error semantics. The pinned history catalog described below
-  is the first workflow in this tier; the proposed REST workflows have not
-  shipped yet.
+  result types and error semantics. The pinned history catalog and the
+  Polymarket discovery-to-book path described below are in this tier.
 - **Retained native** means an existing venue method, model, or canonical
   schema/storage contract kept under its current lifecycle. These APIs remain
   compatible, but do not acquire the guarantees of a future high-level
@@ -185,6 +184,107 @@ paths are not retained. Known secure default Gamma, CLOB, and Kalshi endpoints
 receive conservative production/demo scope. Injected transports, custom paths,
 ports, insecure endpoints, and unrecognized redirect targets remain unknown.
 
+## Polymarket discovery and current books
+
+The supported Polymarket facade stays venue-specific:
+
+```python
+from pmkt.exchanges.polymarket import (
+    AsyncClobClient,
+    AsyncGammaClient,
+    PolymarketFilter,
+    PolymarketInstrumentRef,
+    PolymarketMarket,
+    PolymarketMarketRef,
+)
+from pmkt.records import BookSnapshot, DiscoveryResult
+```
+
+`AsyncGammaClient.discover_markets(...)` returns
+`DiscoveryResult[PolymarketMarket]`. Its `filters` argument accepts
+`condition_ids`, `closed`, `tag_id`, `related_tags`, `question_contains`,
+`outcome_count`, and `has_instruments`. Targeted condition IDs are deduplicated
+in caller order and split into adapter chunks of 20. That chunk size is a
+conservative client bound, not an upstream maximum. With `closed=None`, each
+chunk visits `closed=false` and `closed=true` in round-robin order. With no
+condition selector, the same lifecycle partitions form a bounded keyset scan.
+Gamma defines row order within each page; cross-partition order is the
+documented round-robin traversal order.
+
+Gamma applies the condition, lifecycle, tag, and related-tag filters. The
+adapter rechecks requested condition IDs and lifecycle values, then applies
+the question, outcome-count, and instrument filters locally. Question matching
+uses Unicode case folding. `outcome_count` can use a validated outcome-label
+array even when the token array is unavailable. `has_instruments=False`
+matches only a validated empty mapping; unknown or inconsistent mappings do
+not match either boolean choice.
+
+`max_markets`, `max_pages`, and `deadline_s` have positive defaults; caller
+overrides must also be valid positive bounds. A literal empty
+`condition_ids=()` selection performs no request. The report
+states whether traversal ended because the result cap, page cap, source
+exhaustion, or empty selection was reached. It also preserves page and row
+counts, duplicate counts, applied server and local filters, unknown-filter
+counts, bounded diagnostics, request observations, source/data scope, adapter
+interpretation ID, package version, and traversal strategy. A result or page
+cap is a bounded sample rather than a complete venue census.
+
+Gamma normalization requires unambiguous native market and condition identity.
+Outcome labels and CLOB token IDs may arrive as arrays or JSON-encoded arrays;
+aliases must decode to equal arrays. Only equal-length, nonempty arrays with
+unique nonempty token IDs produce `mapping_status="mapped"`. Validated empty
+arrays produce `"empty"`; absent evidence produces `"unknown"`; malformed,
+duplicate, contradictory, or length-mismatched evidence produces
+`"inconsistent"`. Outcome prices are optional supplemental evidence. Invalid
+prices are reported without inventing or discarding an otherwise valid
+label-to-token mapping. `instrument_for_label(...)` uses exact, case-sensitive
+label equality and fails when the mapping is unavailable, the label is absent,
+or the label is ambiguous.
+
+Fetch a known market by Gamma market ID with
+`await gamma.get_market(market_id=..., deadline_s=...)`. The ID is encoded as
+one URL path segment. A Gamma 404 raises `MarketNotFoundError` scoped to current
+Gamma detail. Discovery and detail records retain a defensive copy of the
+native payload and the actual `RequestObservation` used to produce them.
+
+After selecting an instrument, fetch its current CLOB REST snapshot directly:
+
+```python
+async with AsyncGammaClient() as gamma, AsyncClobClient() as clob:
+    result = await gamma.discover_markets(
+        filters=PolymarketFilter(condition_ids=("condition-id",)),
+        max_markets=1,
+        max_pages=2,
+        deadline_s=10.0,
+    )
+    instrument = result.items[0].instrument_for_label("Yes")
+    book = await clob.get_book(instrument, depth=10, deadline_s=10.0)
+```
+
+`get_book` accepts only a `PolymarketInstrumentRef`. It validates prices in
+`[0, 1]` and nonnegative quantities, removes zero-quantity levels, sorts bids
+descending and asks ascending, then applies the optional positive depth per
+side. Quantities are shares. Counts distinguish the native ladder, the
+validated pre-trim ladder, and returned levels. Empty sides remain a valid
+response payload but set quality flags and make `valid_state=False`; a crossed
+book is also flagged. The exchange timestamp is UTC when the response supplies
+a valid millisecond timestamp, otherwise it is absent.
+
+The CLOB response `market` field is a condition ID. It is compared only with a
+supplied condition-ID enrichment and is never interpreted as the Gamma market
+ID. A supplied token or condition identity contradiction raises
+`InvalidDataError`; absent response identity remains unverified in the request
+observation. A CLOB 404 raises `MarketNotFoundError` scoped to the current token
+book. A book is a current REST snapshot from one request, not a historical or
+atomic cross-instrument view.
+
+All three workflow methods require a finite positive deadline and fail before
+I/O for `None`, booleans, nonpositive values, or nonfinite values. The deadline
+covers transport, decoding, and normalization. Expiry raises
+`OperationTimeoutError` and returns no partial result; the borrowed client
+remains reusable. Malformed or contradictory upstream workflow data raises
+`InvalidDataError`.
+
 ## Retained native venue clients
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
@@ -205,8 +305,9 @@ The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
 
 One page method call has page grain; one iterator item has market or event
 grain. Offset methods accept `limit` from 1 through 1000. Keyset methods accept
-`limit` from 1 through 100. Current filters are passed to Gamma as implemented;
-they are not the proposed `PolymarketFilter` contract.
+`limit` from 1 through 100. These native parameters are passed to Gamma as
+implemented. They remain separate from the supported `PolymarketFilter`
+workflow contract.
 
 `AsyncClobClient` retains `book(token_id)`, `books(token_ids)`,
 `clob_market_info(condition_id)`, `price(token_id, side)`,
@@ -215,8 +316,9 @@ they are not the proposed `PolymarketFilter` contract.
 one token snapshot represented by `pmkt.models.OrderBook`; `books` preserves the
 server response as a list of token snapshots. `prices_history` returns one
 `PriceHistory` series whose points contain Unix seconds and a sampled price.
-These are native endpoint results, not the proposed typed `get_book` or
-historical-observation workflows.
+These are native endpoint results. The supported typed current snapshot is the
+separate `get_book` method described above; historical observations remain a
+later workflow.
 
 `AsyncKalshiClient` retains:
 
@@ -261,8 +363,9 @@ or `ValueError` for malformed upstream payloads, and propagate `httpx` request
 and HTTP status exceptions. WebSocket helpers additionally use
 `WebSocketProtocolError` or their documented frame/state errors. `pmkt.errors`
 exports `CatalogError`, `OptionalDependencyError`,
-`ResultLimitExceededError`, `OperationTimeoutError`, and the compatible
-`ReadAuthenticationRequiredError` reexport.
+`ResultLimitExceededError`, `OperationTimeoutError`, `InvalidDataError`,
+`MarketNotFoundError`, and the compatible `ReadAuthenticationRequiredError`
+reexport.
 
 ## Canonical data and storage contracts
 

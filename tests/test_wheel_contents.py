@@ -146,14 +146,87 @@ def test_installed_public_api_has_positive_and_negative_typing_evidence(
         capture_output=True,
         text=True,
     )
+    runtime_script = r'''
+import asyncio
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+import httpx
+from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter
+
+
+def gamma_handler(request):
+    assert request.url.path == "/markets/keyset"
+    assert request.url.params.get_list("condition_ids") == ["condition"]
+    assert request.url.params["closed"] == "false"
+    return httpx.Response(
+        200,
+        json={
+            "markets": [{
+                "id": "market",
+                "conditionId": "condition",
+                "question": "Installed workflow?",
+                "outcomes": '["Yes", "No"]',
+                "clobTokenIds": '["yes-token", "no-token"]',
+                "closed": False,
+                "enableOrderBook": True,
+            }],
+            "next_cursor": "",
+        },
+    )
+
+
+def clob_handler(request):
+    assert request.url.path == "/book"
+    assert request.url.params["token_id"] == "yes-token"
+    return httpx.Response(
+        200,
+        json={
+            "asset_id": "yes-token",
+            "market": "condition",
+            "bids": [{"price": "0.4", "size": "3"}],
+            "asks": [{"price": "0.6", "size": "2"}],
+        },
+    )
+
+
+async def main():
+    async with AsyncGammaClient(
+        base_url="https://gamma.example",
+        transport=httpx.MockTransport(gamma_handler),
+    ) as gamma:
+        result = await gamma.discover_markets(
+            filters=PolymarketFilter(condition_ids=("condition",), closed=False),
+            max_markets=2,
+            max_pages=2,
+            deadline_s=5.0,
+        )
+    market = result.items[0]
+    instrument = market.instrument_for_label("Yes")
+    async with AsyncClobClient(
+        base_url="https://clob.example",
+        transport=httpx.MockTransport(clob_handler),
+    ) as clob:
+        book = await clob.get_book(instrument, depth=1, deadline_s=5.0)
+    assert book.bids[0].quantity == 3.0
+    assert result.report.stop_reason == "source_exhausted"
+
+
+asyncio.run(main())
+assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+assert "pmkt.data" not in sys.modules
+assert "pmkt.streaming" not in sys.modules
+import pmkt.catalog
+assert pathlib.Path(pmkt.catalog.__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+'''
     runtime = subprocess.run(
         [
             sys.executable,
             "-I",
             "-c",
-            "import pathlib, sys; sys.path.insert(0, sys.argv[1]); "
-            "import pmkt.catalog; "
-            "assert pathlib.Path(pmkt.catalog.__file__).is_relative_to(pathlib.Path(sys.argv[1]))",
+            runtime_script,
             str(installed),
         ],
         cwd=tmp_path,
@@ -169,8 +242,8 @@ from pathlib import Path
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
 from pmkt.config import PmktConfig, RequestPolicy
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
-from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketInstrumentRef, PolymarketMarketRef
-from pmkt.records import InstrumentRef, MarketRef
+from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
+from pmkt.records import BookSnapshot, DiscoveryResult, InstrumentRef, MarketRef
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
@@ -186,6 +259,19 @@ poly_market = PolymarketMarketRef("market", condition_id="condition")
 market: MarketRef = poly_market
 instrument: InstrumentRef = PolymarketInstrumentRef("token", market=poly_market, outcome_index=0)
 kalshi_instrument: InstrumentRef = KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes")
+
+async def polymarket_workflow() -> None:
+    discovery: DiscoveryResult[PolymarketMarket] = await gamma.discover_markets(
+        filters=PolymarketFilter(condition_ids=("condition",), closed=False),
+        max_markets=1,
+        max_pages=2,
+        deadline_s=5.0,
+    )
+    detail: PolymarketMarket = await gamma.get_market(
+        market_id="market", deadline_s=5.0
+    )
+    selected = detail.instrument_for_label("Yes")
+    book: BookSnapshot = await clob.get_book(selected, depth=5, deadline_s=5.0)
 """,
         encoding="utf-8",
     )
@@ -196,7 +282,7 @@ from pathlib import Path
 from pmkt.catalog import CatalogSnapshot
 from pmkt.config import PmktConfig
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
-from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketMarketRef
+from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketInstrumentRef, PolymarketMarketRef
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 snapshot.query("SELECT 1", params=())
@@ -207,6 +293,15 @@ KalshiInstrumentRef(KalshiMarketRef("ticker"), "buy")
 AsyncGammaClient(config=config, unsupported=True)
 AsyncClobClient(config=config, timeout_s="slow")
 AsyncKalshiClient(config=config, request_policy="bad")
+
+async def invalid_polymarket_calls() -> None:
+    gamma = AsyncGammaClient(config=config)
+    clob = AsyncClobClient(config=config)
+    await gamma.discover_markets(filters="bad")
+    await gamma.get_market("market")
+    await clob.get_book(PolymarketMarketRef("market"))
+    await clob.get_book(PolymarketInstrumentRef("token"), depth="one")
+    await clob.get_book(PolymarketInstrumentRef("token"), deadline_s=None)
 """,
         encoding="utf-8",
     )
@@ -245,3 +340,8 @@ AsyncKalshiClient(config=config, request_policy="bad")
     assert 'Unexpected keyword argument "unsupported" for "AsyncGammaClient"' in rejected.stdout
     assert 'Argument "timeout_s" to "AsyncClobClient" has incompatible type "str"' in rejected.stdout
     assert 'Argument "request_policy" to "AsyncKalshiClient" has incompatible type "str"' in rejected.stdout
+    assert 'Argument "filters" to "discover_markets"' in rejected.stdout
+    assert 'Too many positional arguments for "get_market"' in rejected.stdout
+    assert 'Argument 1 to "get_book"' in rejected.stdout
+    assert 'Argument "depth" to "get_book"' in rejected.stdout
+    assert 'Argument "deadline_s" to "get_book"' in rejected.stdout

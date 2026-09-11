@@ -22,7 +22,11 @@ from pmkt._observations import (
 from pmkt._operation import OperationExpiry
 from pmkt.config import PmktConfig
 from pmkt.config import RequestPolicy as ConfigRequestPolicy
-from pmkt.errors import OperationTimeoutError, ReadAuthenticationRequiredError
+from pmkt.errors import (
+    InvalidDataError,
+    OperationTimeoutError,
+    ReadAuthenticationRequiredError,
+)
 from pmkt.exchanges.kalshi import AsyncKalshiClient
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient
 from pmkt.exchanges.polymarket.data_api import AsyncPolymarketDataClient
@@ -493,6 +497,37 @@ async def test_unexpected_observation_error_propagates_without_remote_reclassifi
 
     assert len(observations) == 1
     assert observations[0].outcome == "error"
+
+
+@pytest.mark.asyncio
+async def test_invalid_data_from_identity_extractor_is_classified_as_invalid_response() -> None:
+    observations = []
+    client = HttpClient(
+        "https://example.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, request=request, json={"id": "wrong"})
+        ),
+    )
+
+    def invalid_identity(_payload: object) -> list[str]:
+        raise InvalidDataError("response identity mismatch")
+
+    try:
+        with pytest.raises(InvalidDataError, match="identity mismatch"):
+            await client.request_json_observed(
+                "GET",
+                "/markets/expected",
+                request_id="invalid-data",
+                endpoint_template="/markets/{market_id}",
+                parameter_allowlist=(),
+                response_identities=invalid_identity,
+                record_observation=observations.append,
+            )
+    finally:
+        await client.close()
+
+    assert len(observations) == 1
+    assert observations[0].outcome == "invalid_response"
 
 
 def test_observation_templates_parameters_and_sources_are_conservative() -> None:

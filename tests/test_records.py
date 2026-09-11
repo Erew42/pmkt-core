@@ -9,7 +9,33 @@ from pmkt.exchanges.polymarket import (
     PolymarketInstrumentRef,
     PolymarketMarketRef,
 )
-from pmkt.records import InstrumentRef, MarketRef
+from pmkt.records import InstrumentRef, MarketRef, PolymarketFilter
+
+
+def test_polymarket_filter_validates_qualified_surface() -> None:
+    value = PolymarketFilter(
+        condition_ids=("0xa", "0xb"),
+        closed=False,
+        tag_id="123",
+        related_tags=True,
+        question_contains="Inflation",
+        outcome_count=2,
+        has_instruments=True,
+    )
+    assert value.condition_ids == ("0xa", "0xb")
+
+    with pytest.raises(TypeError, match="tuple"):
+        PolymarketFilter(condition_ids=["0xa"])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="condition_id"):
+        PolymarketFilter(condition_ids=(" ",))
+    with pytest.raises(ValueError, match="decimal"):
+        PolymarketFilter(tag_id="-1")
+    with pytest.raises(ValueError, match="requires tag_id"):
+        PolymarketFilter(related_tags=False)
+    with pytest.raises(TypeError, match="outcome_count"):
+        PolymarketFilter(outcome_count=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="positive"):
+        PolymarketFilter(outcome_count=0)
 
 
 @pytest.mark.parametrize(
