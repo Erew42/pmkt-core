@@ -86,16 +86,21 @@ def _with_request_metadata(book: Any, metadata: dict[str, Any]) -> Any:
     return payload
 
 
+def _first_non_none_alias(item: dict[str, Any], aliases: Sequence[str]) -> Any:
+    """Select the first present, non-None alias without treating zero as missing."""
+    for alias in aliases:
+        if alias in item and item[alias] is not None:
+            return item[alias]
+    return None
+
+
 def _parse_history_item(item: Any) -> tuple[float, float, float | None] | None:
     if isinstance(item, dict):
-        ts = item.get("t") or item.get("timestamp") or item.get("time")
-        price = item.get("p") or item.get("price") or item.get("value")
-        size = (
-            item.get("s")
-            or item.get("size")
-            or item.get("amount")
-            or item.get("volume")
-        )
+        # Alias precedence is fixed: missing/None values fall through, while the
+        # first non-None value (including zero or malformed input) is authoritative.
+        ts = _first_non_none_alias(item, ("t", "timestamp", "time"))
+        price = _first_non_none_alias(item, ("p", "price", "value"))
+        size = _first_non_none_alias(item, ("s", "size", "amount", "volume"))
     elif isinstance(item, (list, tuple)) and len(item) >= 2:
         ts = item[0]
         price = item[1]

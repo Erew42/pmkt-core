@@ -1,8 +1,8 @@
 # Storage Profile Capture Runbook
 
-This runbook covers CR-18 profile captures, crash recovery, sparse research
-replay, and offline tape reconstruction. Reconstructed books and replayed fills
-are research/audit evidence; neither is runtime or execution authority.
+This runbook covers CR-18 profile captures, crash recovery, and offline tape
+reconstruction. Reconstructed books are research/audit evidence, not runtime or
+execution authority.
 
 ## Choose and validate a profile
 
@@ -102,27 +102,11 @@ Inspect `book_tape_reconstruction_report.v1.json` before using the output. A
 successful report records source hashes, journal coverage, ignored events,
 epoch coverage, and recorded/reconstructed topbook comparisons.
 
-## Run sparse-v2 research replay
+## Replay scope
 
-Dense legacy semantics stay explicit:
-
-```powershell
-pmkt replay-passive-quotes --replay-semantics dense-v1 --quote-proposals quotes.parquet --topbooks topbooks.parquet --out-dir replay_dense
-```
-
-Sparse replay requires validated manifests and an explicit tolerance:
-
-```powershell
-pmkt replay-passive-quotes --replay-semantics sparse-v2 --quote-proposals quotes.parquet --evidence-manifest RUN_A\manifest.json --evidence-manifest RUN_B\manifest.json --liveness-tolerance-ms 15000 --out-dir replay_sparse
-```
-
-Review the recorded semantics version, exact manifest and commit-journal
-hashes, versioned profiles, liveness policy, and `sparse_trigger_trace.json`.
-The trace v2 payload contains ordered state, control, lifecycle, health, and
-trade evidence with per-row artifact provenance, plus the economic trigger
-audit. Activation uses the last causally prior valid state. Only main-topbook
-changes and deduplicated trades can trigger fills; checkpoints, health,
-lifecycle, recovery, activation, and terminal rows cannot.
+Core provides capture evidence and book-tape reconstruction. Strategy replay
+and simulated-fill replay belong to consuming applications and are not exposed
+by the `pmkt` CLI.
 
 ## Operational acceptance
 

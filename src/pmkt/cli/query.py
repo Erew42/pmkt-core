@@ -5,7 +5,7 @@ from typing import Annotated, Optional
 import typer
 
 from pmkt.cli.shared import error_exit, parse_dataset_options
-from pmkt.data.storage.duckdb import query_parquet
+from pmkt.data.storage.duckdb import connect, query_parquet
 
 
 def query_cmd(
@@ -23,10 +23,14 @@ def query_cmd(
         typer.Option(help="Limit rows printed to the terminal; use 0 for no limit."),
     ] = 100,
 ) -> None:
-    """Run DuckDB SQL over Parquet datasets."""
-    datasets = parse_dataset_options(dataset)
+    """Run DuckDB SQL, optionally registering Parquet datasets as views."""
+    datasets = parse_dataset_options(dataset) if dataset else {}
     try:
-        df = query_parquet(sql, datasets)
+        if datasets:
+            df = query_parquet(sql, datasets)
+        else:
+            with connect() as connection:
+                df = connection.execute(sql).df()
     except Exception as exc:
         error_exit(f"query failed: {exc}")
     if limit and limit > 0:

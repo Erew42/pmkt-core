@@ -147,10 +147,12 @@ jobs:
       - name: Install wheel away from the checkout
         run: |
           cd "${RUNNER_TEMP}"
-          python -m pip install --force-reinstall "${GITHUB_WORKSPACE}"/dist/*.whl
+          WHEEL_PATH=$(find "${GITHUB_WORKSPACE}/dist" -maxdepth 1 -name '*.whl' -print -quit)
+          python -m pip install --force-reinstall "${WHEEL_PATH}[data]"
           python -c "import pmkt, pmkt.data.canonical, pmkt.streaming, pmkt.resolution, pmkt.text.taxonomy"
           python -c "import importlib.util; assert importlib.util.find_spec('pmkt.execution') is None; assert importlib.util.find_spec('pmkt_trading') is None"
+          python -c "import importlib.util; assert importlib.util.find_spec('websockets') is None"
           pmkt --help
-          python -m pip install "pmkt[data]==0.1.1"
+          pmkt query "SELECT 1 AS ok"
       - name: Inspect distribution boundary
         run: python -m pytest -q tests/test_wheel_contents.py
