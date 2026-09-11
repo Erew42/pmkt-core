@@ -118,9 +118,7 @@ def _recorded_relative(
     flavor = type(recorded_path_base)
     windows_value = PureWindowsPath(value)
     posix_value = PurePosixPath(value)
-    if flavor is PurePosixPath and (
-        bool(windows_value.drive) or bool(windows_value.root) or "\\" in value
-    ):
+    if flavor is PurePosixPath and (bool(windows_value.drive) or "\\" in value):
         raise CatalogError(f"{label} uses an incompatible path flavor")
     if flavor is PureWindowsPath and (
         (posix_value.is_absolute() and not windows_value.is_absolute())

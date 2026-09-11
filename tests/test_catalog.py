@@ -6,7 +6,7 @@ import builtins
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import shutil
 import subprocess
 import sys
@@ -395,6 +395,29 @@ def test_saved_reference_relocates_from_opposite_path_flavor(tmp_path: Path) -> 
 
     assert reopened.reference == foreign
     assert not Path(foreign.manifest_locator).is_absolute()
+    assert reopened.validation.row_count == 2
+
+
+def test_absolute_posix_manifest_locator_relocates_on_every_host(tmp_path: Path) -> None:
+    path_base, market_root, _manifest_path = _catalog_fixture(tmp_path)
+    reference = CatalogSnapshot.open_latest_history(
+        market_root, path_base=path_base
+    ).reference
+    recorded_base = PurePosixPath("/publisher")
+    recorded_locator = recorded_base / PurePosixPath(reference.manifest_locator)
+    portable = replace(
+        reference,
+        path_base=str(recorded_base),
+        manifest_locator=str(recorded_locator),
+    )
+    saved = tmp_path / "absolute-posix-reference.json"
+    portable.write_json(saved)
+
+    reopened = CatalogSnapshot.open(
+        saved, relocation={str(recorded_base): path_base}
+    )
+
+    assert reopened.reference == portable
     assert reopened.validation.row_count == 2
 
 
