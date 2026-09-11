@@ -9,7 +9,7 @@ from pmkt.exchanges.polymarket import (
     PolymarketInstrumentRef,
     PolymarketMarketRef,
 )
-from pmkt.records import InstrumentRef, MarketRef, PolymarketFilter
+from pmkt.records import InstrumentRef, KalshiFilter, MarketRef, PolymarketFilter
 
 
 def test_polymarket_filter_validates_qualified_surface() -> None:
@@ -33,9 +33,32 @@ def test_polymarket_filter_validates_qualified_surface() -> None:
     with pytest.raises(ValueError, match="requires tag_id"):
         PolymarketFilter(related_tags=False)
     with pytest.raises(TypeError, match="outcome_count"):
-        PolymarketFilter(outcome_count=True)  # type: ignore[arg-type]
+        PolymarketFilter(outcome_count=True)
     with pytest.raises(ValueError, match="positive"):
         PolymarketFilter(outcome_count=0)
+
+
+def test_kalshi_filter_validates_frozen_qualified_surface() -> None:
+    value = KalshiFilter(
+        tickers=("A", "B"),
+        event_ticker="EVENT",
+        series_ticker="SERIES",
+        status="open",
+        mve_filter="exclude",
+        question_contains="Will",
+        has_instruments=True,
+    )
+    assert value.tickers == ("A", "B")
+    with pytest.raises(TypeError, match="tuple"):
+        KalshiFilter(tickers=["A"])  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="ticker"):
+        KalshiFilter(tickers=(" ",))
+    with pytest.raises(ValueError, match="status"):
+        KalshiFilter(status="active")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="mve_filter"):
+        KalshiFilter(mve_filter="include")  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="has_instruments"):
+        KalshiFilter(has_instruments=1)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(

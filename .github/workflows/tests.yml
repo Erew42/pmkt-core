@@ -70,6 +70,7 @@ jobs:
               tests/test_historical_books.py
               tests/test_io.py
               tests/test_kalshi.py
+              tests/test_kalshi_workflows.py
               tests/test_catalog.py
               tests/test_market_catalog.py
               tests/test_market_data.py

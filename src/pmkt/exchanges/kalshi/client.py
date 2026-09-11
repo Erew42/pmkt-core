@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable
-from urllib.parse import urlparse
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Any, AsyncIterator, Iterable, Literal, Sequence
+from urllib.parse import quote, urlparse
+from uuid import uuid4
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -11,17 +15,67 @@ from pmkt._http import HttpClient, RequestPolicy
 from pmkt._operation import OperationExpiry
 from pmkt.config import PmktConfig, get_config
 from pmkt.data.canonical import KALSHI_MARKET_SNAPSHOT_COLUMNS
-from pmkt.data.normalize_kalshi import normalize_kalshi_market
-from pmkt.data.prices import complement_probability as _price_complement
-from pmkt.data.types import parse_float as _parse_float
+from pmkt.data.normalize_kalshi import (
+    kalshi_market_matches_query_status,
+    normalize_kalshi_market,
+)
+from pmkt.errors import (
+    InvalidDataError,
+    MarketNotFoundError,
+    UnsupportedCapabilityError,
+)
+from pmkt.exchanges.kalshi._workflow import (
+    KALSHI_MARKET_INTERPRETATION_ID,
+    decode_kalshi_detail_envelope,
+    decode_kalshi_markets_envelope,
+    kalshi_book_identities,
+    kalshi_detail_identities,
+    kalshi_market_identity,
+    kalshi_page_identities,
+    normalize_kalshi_orderbook,
+    normalize_kalshi_workflow_book,
+    normalize_kalshi_workflow_market,
+)
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
     ReadOnlyRequestError,
     headers_for_read,
 )
+from pmkt.records import (
+    BookSnapshot,
+    DataIssue,
+    DataScope,
+    DiscoveryReport,
+    DiscoveryResult,
+    DiscoveryStopReason,
+    KalshiFilter,
+    KalshiInstrumentRef,
+    KalshiMarket,
+    RequestObservation,
+)
+from pmkt import __version__
 
 if TYPE_CHECKING:
     import pandas as pd
+
+
+KALSHI_DISCOVERY_TICKER_CHUNK_SIZE = 20
+_MARKETS_ENDPOINT = "/markets"
+_MARKETS_PARAMETER_ALLOWLIST = frozenset(
+    {"limit", "cursor", "status", "event_ticker", "series_ticker", "tickers", "mve_filter"}
+)
+
+
+@dataclass
+class _DiscoveryPartition:
+    chunk_index: int
+    tickers: tuple[str, ...] | None
+    cursor: str | None = None
+    returned_cursors: set[str] | None = None
+
+    def __post_init__(self) -> None:
+        if self.returned_cursors is None:
+            self.returned_cursors = set()
 
 
 def _normalize_tickers(tickers: str | Iterable[str] | None) -> str | None:
@@ -39,96 +93,6 @@ def _signed_path(base_url: str, endpoint_path: str) -> str:
     if base_path and (endpoint == base_path or endpoint.startswith(base_path + "/")):
         return endpoint
     return f"{base_path}{endpoint}" if base_path else endpoint
-
-
-def _best_bid(levels: dict[float, float]) -> float | None:
-    return max(levels) if levels else None
-
-
-def _levels_to_map(levels: Any) -> dict[float, float]:
-    parsed: dict[float, float] = {}
-    if not isinstance(levels, list):
-        return parsed
-    for level in levels:
-        if isinstance(level, dict):
-            price = _parse_float(level.get("price") or level.get("price_dollars"))
-            size = _parse_float(level.get("size") or level.get("count") or level.get("count_fp"))
-        elif isinstance(level, (list, tuple)) and len(level) >= 2:
-            price = _parse_float(level[0])
-            size = _parse_float(level[1])
-        else:
-            continue
-        if price is None or size is None or size <= 0:
-            continue
-        parsed[price] = size
-    return parsed
-
-
-def normalize_kalshi_orderbook(
-    payload: dict[str, Any],
-    *,
-    market_ticker: str | None = None,
-    market_id: str | None = None,
-) -> dict[str, Any]:
-    """Normalize Kalshi bid-only YES/NO ladders into bid/ask probability fields."""
-    raw_book = payload.get("orderbook_fp")
-    book = raw_book if isinstance(raw_book, dict) else payload
-    yes_levels = _levels_to_map(
-        book.get("yes_dollars_fp")
-        or book.get("yes_dollars")
-        or book.get("yes")
-        or []
-    )
-    no_levels = _levels_to_map(
-        book.get("no_dollars_fp")
-        or book.get("no_dollars")
-        or book.get("no")
-        or []
-    )
-    yes_bid = _best_bid(yes_levels)
-    no_bid = _best_bid(no_levels)
-    yes_ask = _price_complement(no_bid)
-    no_ask = _price_complement(yes_bid)
-    yes_bid_source = "direct" if yes_bid is not None else "missing"
-    no_bid_source = "direct" if no_bid is not None else "missing"
-    yes_ask_source = "complement_derived" if no_bid is not None else "missing"
-    no_ask_source = "complement_derived" if yes_bid is not None else "missing"
-    yes_bid_size = yes_levels.get(yes_bid) if yes_bid is not None else None
-    no_bid_size = no_levels.get(no_bid) if no_bid is not None else None
-    mid = (yes_bid + yes_ask) / 2.0 if yes_bid is not None and yes_ask is not None else None
-    spread = yes_ask - yes_bid if yes_bid is not None and yes_ask is not None else None
-    return {
-        "exchange": "kalshi",
-        "market_ticker": market_ticker,
-        "market_id": market_id,
-        "yes_bid": yes_bid,
-        "yes_ask": yes_ask,
-        "no_bid": no_bid,
-        "no_ask": no_ask,
-        "yes_bid_source": yes_bid_source,
-        "yes_ask_source": yes_ask_source,
-        "no_bid_source": no_bid_source,
-        "no_ask_source": no_ask_source,
-        "yes_bid_size": yes_bid_size,
-        "yes_ask_size": no_bid_size,
-        "no_bid_size": no_bid_size,
-        "no_ask_size": yes_bid_size,
-        "mid": mid,
-        "spread": spread,
-        "depth": len(yes_levels) + len(no_levels),
-        "yes_bid_depth": len(yes_levels),
-        "no_bid_depth": len(no_levels),
-        "yes_levels": sorted(
-            ({"price": price, "size": size} for price, size in yes_levels.items()),
-            key=lambda item: item["price"],
-            reverse=True,
-        ),
-        "no_levels": sorted(
-            ({"price": price, "size": size} for price, size in no_levels.items()),
-            key=lambda item: item["price"],
-            reverse=True,
-        ),
-    }
 
 
 def kalshi_markets_dataframe(markets: list[dict[str, Any]]) -> pd.DataFrame:
@@ -294,6 +258,322 @@ class AsyncKalshiClient:
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
+
+    async def get_market(
+        self,
+        *,
+        ticker: str,
+        source: Literal["live", "historical"] = "live",
+        deadline_s: float = 30.0,
+    ) -> KalshiMarket:
+        """Fetch one normalized market from exactly the selected Kalshi dataset."""
+
+        _require_nonempty_string(ticker, "ticker")
+        if source not in ("live", "historical"):
+            raise ValueError("source must be 'live' or 'historical'")
+        expiry = OperationExpiry.bounded(deadline_s)
+        observations: list[RequestObservation] = []
+        market = await self._get_market_with_expiry(
+            ticker=ticker,
+            source=source,
+            expiry=expiry,
+            observations=observations,
+        )
+        expiry.checkpoint()
+        return market
+
+    async def _get_market_with_expiry(
+        self,
+        *,
+        ticker: str,
+        source: Literal["live", "historical"],
+        expiry: OperationExpiry,
+        observations: list[RequestObservation],
+        expected_series_ticker: str | None = None,
+    ) -> KalshiMarket:
+        encoded_ticker = quote(ticker, safe="")
+        if source == "live":
+            path = f"/markets/{encoded_ticker}"
+            template = "/markets/{ticker}"
+            lookup_scope = (
+                "Kalshi standard live market detail; historical archive was not checked"
+            )
+        else:
+            path = f"/historical/markets/{encoded_ticker}"
+            template = "/historical/markets/{ticker}"
+            lookup_scope = "Kalshi historical market detail"
+        try:
+            payload, observation = await self._http.request_json_observed(
+                "GET",
+                path,
+                request_id=f"kalshi-detail-{uuid4().hex}",
+                endpoint_template=template,
+                parameter_allowlist=(),
+                effective_parameters=None,
+                params=None,
+                expiry=expiry,
+                response_identities=lambda value: kalshi_detail_identities(
+                    value,
+                    requested_ticker=ticker,
+                    expected_series_ticker=expected_series_ticker,
+                ),
+                record_observation=observations.append,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise MarketNotFoundError(
+                    venue="kalshi", identifier=ticker, lookup_scope=lookup_scope
+                ) from exc
+            raise
+        expiry.checkpoint()
+        row = decode_kalshi_detail_envelope(payload)
+        market = normalize_kalshi_workflow_market(row, observation=observation)
+        expiry.checkpoint()
+        return market
+
+    async def discover_markets(
+        self,
+        *,
+        filters: KalshiFilter,
+        max_markets: int = 100,
+        max_pages: int = 20,
+        deadline_s: float = 60.0,
+    ) -> DiscoveryResult[KalshiMarket]:
+        """Discover a bounded set of normalized standard-dataset markets."""
+
+        if not isinstance(filters, KalshiFilter):
+            raise TypeError("filters must be a KalshiFilter")
+        _require_positive_int(max_markets, "max_markets")
+        _require_positive_int(max_pages, "max_pages")
+        expiry = OperationExpiry.bounded(deadline_s)
+        started = datetime.now(timezone.utc)
+        requested_filters = _reported_filters(filters)
+        requested_tickers = _deduplicate(filters.tickers or ())
+        requested_ticker_set = frozenset(requested_tickers)
+        selection_strategy = (
+            "targeted_tickers" if filters.tickers is not None else "cursor_scan"
+        )
+        if filters.tickers == ():
+            expiry.checkpoint()
+            return DiscoveryResult(
+                items=(),
+                report=_kalshi_discovery_report(
+                    started=started,
+                    stop_reason="empty_selection",
+                    filters=filters,
+                    requested_filters=requested_filters,
+                    pages_fetched=0,
+                    rows_scanned=0,
+                    unique_markets_seen=0,
+                    duplicates_seen=0,
+                    unknown_counts={},
+                    data_scope=self._http.source.data_scope,
+                    observations=(),
+                    issues=(),
+                    selection_strategy=selection_strategy,
+                    requested_selector_count=0,
+                    queried_chunks=0,
+                    traversal_complete=True,
+                ),
+            )
+
+        chunks: tuple[tuple[str, ...] | None, ...]
+        if requested_tickers:
+            chunks = tuple(
+                requested_tickers[index : index + KALSHI_DISCOVERY_TICKER_CHUNK_SIZE]
+                for index in range(
+                    0, len(requested_tickers), KALSHI_DISCOVERY_TICKER_CHUNK_SIZE
+                )
+            )
+        else:
+            chunks = (None,)
+        partitions = deque(
+            _DiscoveryPartition(index, chunk) for index, chunk in enumerate(chunks)
+        )
+        observations: list[RequestObservation] = []
+        items: list[KalshiMarket] = []
+        seen_tickers: set[str] = set()
+        unknown_counts: dict[str, int] = {}
+        issues: list[DataIssue] = []
+        queried_chunks: set[int] = set()
+        pages_fetched = 0
+        rows_scanned = 0
+        duplicates_seen = 0
+        stop_reason: DiscoveryStopReason | None = None
+        operation_id = uuid4().hex
+
+        while partitions and stop_reason is None:
+            if pages_fetched >= max_pages:
+                stop_reason = "page_limit"
+                break
+            partition = partitions.popleft()
+            params: dict[str, Any] = {
+                "limit": 1000,
+                "cursor": partition.cursor,
+                # Passing None is deliberate: HttpClient omits the wire parameter and
+                # avoids the native markets_page status="open" default.
+                "status": filters.status,
+                "event_ticker": filters.event_ticker,
+                "series_ticker": filters.series_ticker,
+                "tickers": ",".join(partition.tickers)
+                if partition.tickers is not None
+                else None,
+                "mve_filter": filters.mve_filter,
+            }
+            effective_parameters = {
+                key: value for key, value in params.items() if value is not None
+            }
+            payload, observation = await self._http.request_json_observed(
+                "GET",
+                _MARKETS_ENDPOINT,
+                request_id=f"kalshi-discovery-{operation_id}-{pages_fetched + 1}",
+                endpoint_template=_MARKETS_ENDPOINT,
+                parameter_allowlist=_MARKETS_PARAMETER_ALLOWLIST,
+                effective_parameters=effective_parameters,
+                params=params,
+                expiry=expiry,
+                response_identities=kalshi_page_identities,
+                record_observation=observations.append,
+            )
+            expiry.checkpoint()
+            rows, next_cursor = decode_kalshi_markets_envelope(payload)
+            pages_fetched += 1
+            queried_chunks.add(partition.chunk_index)
+            if next_cursor is not None:
+                assert partition.returned_cursors is not None
+                if next_cursor in partition.returned_cursors:
+                    raise InvalidDataError(
+                        "Kalshi markets returned a repeated cursor within one chunk"
+                    )
+            for row in rows:
+                expiry.checkpoint()
+                ticker, _ = kalshi_market_identity(row)
+                rows_scanned += 1
+                if ticker in seen_tickers:
+                    duplicates_seen += 1
+                    continue
+                seen_tickers.add(ticker)
+                market = normalize_kalshi_workflow_market(
+                    row,
+                    observation=observation,
+                    series_filter_evidence=filters.series_ticker,
+                )
+                issues.extend(market.issues)
+                if not _kalshi_market_matches(
+                    market,
+                    filters,
+                    requested_tickers=requested_ticker_set,
+                    unknown_counts=unknown_counts,
+                ):
+                    continue
+                items.append(market)
+                if len(items) >= max_markets:
+                    stop_reason = "result_limit"
+                    break
+            if stop_reason is not None:
+                break
+            if next_cursor is not None:
+                assert partition.returned_cursors is not None
+                partition.returned_cursors.add(next_cursor)
+                partition.cursor = next_cursor
+                partitions.append(partition)
+
+        if stop_reason is None:
+            stop_reason = "source_exhausted"
+        expiry.checkpoint()
+        report = _kalshi_discovery_report(
+            started=started,
+            stop_reason=stop_reason,
+            filters=filters,
+            requested_filters=requested_filters,
+            pages_fetched=pages_fetched,
+            rows_scanned=rows_scanned,
+            unique_markets_seen=len(seen_tickers),
+            duplicates_seen=duplicates_seen,
+            unknown_counts=unknown_counts,
+            data_scope=_combined_data_scope(observations, self._http.source.data_scope),
+            observations=tuple(observations),
+            issues=_aggregate_issues(issues),
+            selection_strategy=selection_strategy,
+            requested_selector_count=len(requested_tickers),
+            queried_chunks=len(queried_chunks),
+            traversal_complete=stop_reason == "source_exhausted",
+        )
+        expiry.checkpoint()
+        return DiscoveryResult(items=tuple(items), report=report)
+
+    async def get_book(
+        self,
+        instrument: KalshiInstrumentRef,
+        *,
+        depth: int | None = None,
+        deadline_s: float = 30.0,
+    ) -> BookSnapshot:
+        """Fetch one strictly validated projected Kalshi outcome book."""
+
+        if not isinstance(instrument, KalshiInstrumentRef):
+            raise TypeError("instrument must be a KalshiInstrumentRef")
+        if depth is not None:
+            if isinstance(depth, bool) or not isinstance(depth, int):
+                raise TypeError("depth must be an int or None")
+            if depth <= 0:
+                raise ValueError("depth must be positive")
+        expiry = OperationExpiry.bounded(deadline_s)
+        observations: list[RequestObservation] = []
+        capability = await self._get_market_with_expiry(
+            ticker=instrument.market.ticker,
+            source="live",
+            expiry=expiry,
+            observations=observations,
+            expected_series_ticker=instrument.market.series_ticker,
+        )
+        if capability.mapping_status == "inconsistent":
+            raise InvalidDataError("Kalshi market capability evidence is inconsistent")
+        if not capability.book_supported:
+            raise UnsupportedCapabilityError(
+                f"Kalshi market {instrument.market.ticker!r} is not a qualified binary book"
+            )
+        effective_market = (
+            capability.ref
+            if capability.ref.series_ticker is not None
+            else instrument.market
+        )
+        effective_instrument = KalshiInstrumentRef(effective_market, instrument.side)
+        expiry.checkpoint()
+        encoded_ticker = quote(instrument.market.ticker, safe="")
+        try:
+            payload, _ = await self._http.request_json_observed(
+                "GET",
+                f"/markets/{encoded_ticker}/orderbook",
+                request_id=f"kalshi-book-{uuid4().hex}",
+                endpoint_template="/markets/{ticker}/orderbook",
+                parameter_allowlist=(),
+                effective_parameters=None,
+                params=None,
+                expiry=expiry,
+                response_identities=lambda value: kalshi_book_identities(
+                    value, instrument=effective_instrument
+                ),
+                record_observation=observations.append,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 404:
+                raise MarketNotFoundError(
+                    venue="kalshi",
+                    identifier=instrument.market.ticker,
+                    lookup_scope="Kalshi current order book",
+                ) from exc
+            raise
+        expiry.checkpoint()
+        result = normalize_kalshi_workflow_book(
+            payload,
+            instrument=effective_instrument,
+            depth=depth,
+            observations=observations,
+            expiry=expiry,
+        )
+        expiry.checkpoint()
+        return result
 
     @staticmethod
     def _validate_limit(limit: int) -> None:
@@ -644,6 +924,211 @@ class AsyncKalshiClient:
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
+
+
+def _require_nonempty_string(value: object, name: str) -> None:
+    if not isinstance(value, str):
+        raise TypeError(f"{name} must be a string")
+    if not value.strip():
+        raise ValueError(f"{name} must not be empty")
+
+
+def _require_positive_int(value: object, name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an int")
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+
+
+def _deduplicate(values: Sequence[str]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
+def _reported_filters(filters: KalshiFilter) -> tuple[tuple[str, object], ...]:
+    values: tuple[tuple[str, object | None], ...] = (
+        ("tickers", filters.tickers),
+        ("event_ticker", filters.event_ticker),
+        ("series_ticker", filters.series_ticker),
+        ("status", filters.status),
+        ("mve_filter", filters.mve_filter),
+        ("question_contains", filters.question_contains),
+        ("has_instruments", filters.has_instruments),
+    )
+    return tuple((name, value) for name, value in values if value is not None)
+
+
+def _server_filter_names(filters: KalshiFilter) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name, value in (
+            ("tickers", filters.tickers),
+            ("event_ticker", filters.event_ticker),
+            ("series_ticker", filters.series_ticker),
+            ("status", filters.status),
+            ("mve_filter", filters.mve_filter),
+        )
+        if value is not None
+    )
+
+
+def _local_filter_names(filters: KalshiFilter) -> tuple[str, ...]:
+    return tuple(
+        name
+        for name, value in (
+            ("tickers", filters.tickers),
+            ("event_ticker", filters.event_ticker),
+            ("status", filters.status),
+            ("question_contains", filters.question_contains),
+            ("has_instruments", filters.has_instruments),
+        )
+        if value is not None
+    )
+
+
+def _source_scope(filters: KalshiFilter) -> str:
+    status = filters.status or "all_statuses"
+    mve = filters.mve_filter or "mve_included"
+    return f"kalshi_standard_markets_{status}_{mve}"
+
+
+def _kalshi_market_matches(
+    market: KalshiMarket,
+    filters: KalshiFilter,
+    *,
+    requested_tickers: frozenset[str],
+    unknown_counts: dict[str, int],
+) -> bool:
+    matches = True
+    if filters.tickers is not None and market.ref.ticker not in requested_tickers:
+        matches = False
+    if filters.event_ticker is not None:
+        if market.event_ticker is None:
+            _increment(unknown_counts, "event_ticker")
+            matches = False
+        elif market.event_ticker != filters.event_ticker:
+            matches = False
+    if filters.series_ticker is not None:
+        if market.ref.series_ticker is None:
+            _increment(unknown_counts, "series_ticker")
+        elif market.ref.series_ticker != filters.series_ticker:
+            matches = False
+    if filters.status is not None:
+        if market.status is None:
+            _increment(unknown_counts, "status")
+            matches = False
+        elif not kalshi_market_matches_query_status(market.status, filters.status):
+            matches = False
+    if filters.question_contains is not None:
+        if market.title is None:
+            _increment(unknown_counts, "question_contains")
+            matches = False
+        elif filters.question_contains.casefold() not in market.title.casefold():
+            matches = False
+    if filters.has_instruments is not None:
+        if market.mapping_status == "mapped":
+            has_instruments: bool | None = bool(market.instruments)
+        elif market.mapping_status == "empty":
+            has_instruments = False
+        else:
+            _increment(unknown_counts, "has_instruments")
+            has_instruments = None
+        if has_instruments is None or has_instruments is not filters.has_instruments:
+            matches = False
+    return matches
+
+
+def _increment(counts: dict[str, int], name: str) -> None:
+    counts[name] = counts.get(name, 0) + 1
+
+
+def _combined_data_scope(
+    observations: Sequence[RequestObservation], fallback: DataScope
+) -> DataScope:
+    scopes = {observation.data_scope for observation in observations}
+    if not scopes:
+        return fallback
+    if len(scopes) == 1:
+        return next(iter(scopes))
+    return "unknown"
+
+
+def _aggregate_issues(issues: Sequence[DataIssue]) -> tuple[DataIssue, ...]:
+    grouped: dict[tuple[str, str], list[DataIssue]] = {}
+    for issue in issues:
+        grouped.setdefault((issue.code, issue.severity), []).append(issue)
+    result: list[DataIssue] = []
+    for (code, severity), values in grouped.items():
+        examples: list[str] = []
+        for value in values:
+            for example in value.examples:
+                located = "; ".join(
+                    part
+                    for part in (
+                        f"request_id={value.request_id}" if value.request_id else "",
+                        value.row_locator or "",
+                        f"field={value.field_locator}" if value.field_locator else "",
+                        example,
+                    )
+                    if part
+                )[:512]
+                if len(examples) < 20 and located not in examples:
+                    examples.append(located)
+        result.append(
+            DataIssue(
+                code=code,
+                severity=severity,  # type: ignore[arg-type]
+                occurrence_count=sum(value.occurrence_count for value in values),
+                examples=tuple(examples),
+            )
+        )
+    return tuple(result)
+
+
+def _kalshi_discovery_report(
+    *,
+    started: datetime,
+    stop_reason: DiscoveryStopReason,
+    filters: KalshiFilter,
+    requested_filters: tuple[tuple[str, object], ...],
+    pages_fetched: int,
+    rows_scanned: int,
+    unique_markets_seen: int,
+    duplicates_seen: int,
+    unknown_counts: dict[str, int],
+    data_scope: DataScope,
+    observations: tuple[RequestObservation, ...],
+    issues: tuple[DataIssue, ...],
+    selection_strategy: str,
+    requested_selector_count: int,
+    queried_chunks: int,
+    traversal_complete: bool,
+) -> DiscoveryReport:
+    return DiscoveryReport(
+        started_at_utc=started,
+        finished_at_utc=datetime.now(timezone.utc),
+        stop_reason=stop_reason,
+        pages_fetched=pages_fetched,
+        rows_scanned=rows_scanned,
+        unique_markets_seen=unique_markets_seen,
+        duplicates_seen=duplicates_seen,
+        requested_filters=requested_filters,
+        applied_server_filters=_server_filter_names(filters),
+        applied_local_filters=_local_filter_names(filters),
+        unknown_filter_counts=tuple(sorted(unknown_counts.items())),
+        source_scope=_source_scope(filters),
+        data_scope=data_scope,
+        interpretation_id=KALSHI_MARKET_INTERPRETATION_ID,
+        package_version=__version__,
+        observations=observations,
+        issues=issues,
+        endpoints=(_MARKETS_ENDPOINT,),
+        pagination_strategy="opaque_cursor_round_robin",
+        ordering="server_defined",
+        selection_strategy=selection_strategy,
+        requested_selector_count=requested_selector_count,
+        queried_chunks=queried_chunks,
+        traversal_complete=traversal_complete,
+    )
 
 
 KalshiClient = AsyncKalshiClient

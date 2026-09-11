@@ -10,7 +10,7 @@ and CI checks every listed lazy and eager export.
 
 - **Supported workflow** means a delivered high-level workflow with explicit
   result types and error semantics. The pinned history catalog and the
-  Polymarket discovery-to-book path described below are in this tier.
+  Polymarket and Kalshi discovery-to-book paths described below are in this tier.
 - **Retained native** means an existing venue method, model, or canonical
   schema/storage contract kept under its current lifecycle. These APIs remain
   compatible, but do not acquire the guarantees of a future high-level
@@ -285,6 +285,74 @@ covers transport, decoding, and normalization. Expiry raises
 remains reusable. Malformed or contradictory upstream workflow data raises
 `InvalidDataError`.
 
+## Kalshi discovery, detail, and current books
+
+The supported Kalshi facade exports `AsyncKalshiClient`, `KalshiFilter`,
+`KalshiMarket`, `KalshiMarketRef`, and `KalshiInstrumentRef`. Discovery always
+requires an explicit filter object. `KalshiFilter()` means the unrestricted
+standard metadata dataset: the adapter sends no status restriction and includes
+MVE markets. It does not include the historical archive. A common conventional
+market selection is explicit:
+
+```python
+result = await kalshi.discover_markets(
+    filters=KalshiFilter(status="open", mve_filter="exclude"),
+    max_markets=100,
+    max_pages=20,
+    deadline_s=60.0,
+)
+```
+
+The frozen filter supports `tickers`, `event_ticker`, `series_ticker`, `status`,
+`mve_filter`, `question_contains`, and `has_instruments`. Status values are
+`unopened`, `open`, `paused`, `closed`, and `settled`; MVE values are `only` and
+`exclude`. A nonempty ticker selection is deduplicated in caller order and sent
+as comma-separated native requests in adapter chunks of 20. This is a bounded
+client choice, not a claimed venue maximum. Page and result budgets are global
+across chunks, and chunks advance in round-robin order. The first observation
+of a ticker wins before local filtering. Missing or inconsistent instrument
+mapping does not satisfy either value of `has_instruments`.
+
+Kalshi response statuses use a different vocabulary from query values, so the
+adapter rechecks them through the retained status mapping: for example, query
+`open` matches response `active`, and query `settled` matches `finalized`.
+`question_contains` is a literal Unicode-casefolded match against the returned
+title. A `series_ticker` filter remains request evidence when rows omit their
+series; it does not fabricate `market.ref.series_ticker`. An actual returned
+series contradiction is excluded and diagnosed.
+
+`await kalshi.get_market(ticker=..., source="historical")` reads only the
+selected dataset and never falls back; `source="live"` is the default. IDs are encoded as single URL path
+segments. A 404 reports its exact lookup scope; live absence explicitly says the
+historical archive was not checked. Returned binary markets map to YES then NO
+instrument references. Missing or recognized unsupported market types retain
+metadata with unknown mapping and no book capability. Contradictory type
+evidence produces inconsistent mapping, while malformed or contradictory native
+ticker identity raises `InvalidDataError`.
+
+`await kalshi.get_book(instrument, depth=..., deadline_s=...)` first reads live
+market metadata under the same operation deadline to qualify binary-book
+support, even when the caller supplies a series hint. It then fetches the full
+current `orderbook_fp` once without a native depth cap. Only the qualified
+`yes_dollars` and `no_dollars` probability/contract ladders are accepted by this
+workflow; legacy integer-cent or ambiguous aliases raise `InvalidDataError`.
+Native `orderbook` and `normalized_orderbook` behavior remains available.
+
+YES bids come directly from the YES ladder and YES asks complement the NO ladder
+with NO quantities. NO bids come directly from the NO ladder and NO asks
+complement the YES ladder with YES quantities. Projection and sorting happen
+before optional depth is applied independently to each output side. Prices are
+finite probabilities, quantities are finite nonnegative contracts, and the
+existing `kalshi_quote_normalization.v2` complement and provenance policy is
+retained. Duplicate prices retain the last positive quantity under the existing
+native normalizer behavior. Empty or unusable sides remain an inspectable snapshot with missing
+provenance and quality flags. `BookSnapshot.observations` retains both the
+capability and book requests; `observation` remains the final book request.
+
+[`scripts/kalshi_book_example.py`](../scripts/kalshi_book_example.py) is a
+runnable offline discovery-to-book example using injected synthetic HTTP
+responses and the actual public methods.
+
 ## Retained native venue clients
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
@@ -362,7 +430,7 @@ Native REST methods use `ValueError` for invalid caller parameters, `TypeError`
 or `ValueError` for malformed upstream payloads, and propagate `httpx` request
 and HTTP status exceptions. WebSocket helpers additionally use
 `WebSocketProtocolError` or their documented frame/state errors. `pmkt.errors`
-exports `CatalogError`, `OptionalDependencyError`,
+exports `CatalogError`, `OptionalDependencyError`, `UnsupportedCapabilityError`,
 `ResultLimitExceededError`, `OperationTimeoutError`, `InvalidDataError`,
 `MarketNotFoundError`, and the compatible `ReadAuthenticationRequiredError`
 reexport.

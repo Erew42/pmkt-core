@@ -28,6 +28,10 @@ class InvalidDataError(ValueError):
     """A remote response violates the workflow's structural contract."""
 
 
+class UnsupportedCapabilityError(NotImplementedError):
+    """A venue market or instrument kind has no normalized workflow contract."""
+
+
 class MarketNotFoundError(LookupError):
     """A market or instrument was absent from one explicit lookup scope."""
 
@@ -56,4 +60,5 @@ __all__ = [
     "OptionalDependencyError",
     "ReadAuthenticationRequiredError",
     "ResultLimitExceededError",
+    "UnsupportedCapabilityError",
 ]

@@ -9,7 +9,9 @@ if TYPE_CHECKING:
         KalshiClient as KalshiClient,
     )
     from pmkt.records import (
+        KalshiFilter as KalshiFilter,
         KalshiInstrumentRef as KalshiInstrumentRef,
+        KalshiMarket as KalshiMarket,
         KalshiMarketRef as KalshiMarketRef,
     )
 
@@ -31,8 +33,10 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "KalshiBookSnapshot": ("pmkt.exchanges.kalshi.ws", "KalshiBookSnapshot"),
     "KalshiClient": ("pmkt.exchanges.kalshi.client", "KalshiClient"),
+    "KalshiFilter": ("pmkt.records", "KalshiFilter"),
     "KalshiConnectFactory": ("pmkt.exchanges.kalshi.ws", "KalshiConnectFactory"),
     "KalshiInstrumentRef": ("pmkt.records", "KalshiInstrumentRef"),
+    "KalshiMarket": ("pmkt.records", "KalshiMarket"),
     "KalshiMarketRef": ("pmkt.records", "KalshiMarketRef"),
     "KalshiOrderBookState": ("pmkt.exchanges.kalshi.ws", "KalshiOrderBookState"),
     "KalshiSubscriptionAck": ("pmkt.exchanges.kalshi.ws", "KalshiSubscriptionAck"),

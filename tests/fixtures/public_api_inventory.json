@@ -206,7 +206,8 @@
         "OperationTimeoutError",
         "OptionalDependencyError",
         "ReadAuthenticationRequiredError",
-        "ResultLimitExceededError"
+        "ResultLimitExceededError",
+        "UnsupportedCapabilityError"
       ]
     },
     "pmkt.records": {
@@ -222,8 +223,12 @@
         "DiscoveryResult",
         "DiscoveryStopReason",
         "InstrumentRef",
+        "KalshiFilter",
         "KalshiInstrumentRef",
+        "KalshiMarket",
         "KalshiMarketRef",
+        "KalshiMveFilter",
+        "KalshiQueryStatus",
         "MappingStatus",
         "MarketRef",
         "PolymarketFilter",
@@ -334,7 +339,9 @@
         "KalshiBookSnapshot",
         "KalshiClient",
         "KalshiConnectFactory",
+        "KalshiFilter",
         "KalshiInstrumentRef",
+        "KalshiMarket",
         "KalshiMarketRef",
         "KalshiOrderBookState",
         "KalshiSubscriptionAck",
@@ -357,9 +364,11 @@
         "stream_kalshi_order_book_data"
       ],
       "tier_overrides": {
-        "AsyncKalshiClient": "retained_native",
+        "AsyncKalshiClient": "supported",
         "KalshiClient": "retained_native",
+        "KalshiFilter": "supported",
         "KalshiInstrumentRef": "supported",
+        "KalshiMarket": "supported",
         "KalshiMarketRef": "supported"
       }
     },
@@ -496,6 +505,10 @@
       "tier": "supported"
     },
     {
+      "path": "pmkt.errors.UnsupportedCapabilityError",
+      "tier": "supported"
+    },
+    {
       "path": "pmkt.records.PolymarketMarketRef",
       "tier": "supported"
     },
@@ -521,6 +534,14 @@
     },
     {
       "path": "pmkt.records.KalshiMarketRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.KalshiFilter",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.KalshiMarket",
       "tier": "supported"
     },
     {

@@ -162,6 +162,51 @@ class PolymarketFilter:
                 raise ValueError("outcome_count must be positive")
 
 
+KalshiQueryStatus = Literal["unopened", "open", "paused", "closed", "settled"]
+KalshiMveFilter = Literal["only", "exclude"]
+
+
+@dataclass(frozen=True)
+class KalshiFilter:
+    """Qualified filters for bounded Kalshi standard-market discovery."""
+
+    tickers: tuple[str, ...] | None = None
+    event_ticker: str | None = None
+    series_ticker: str | None = None
+    status: KalshiQueryStatus | None = None
+    mve_filter: KalshiMveFilter | None = None
+    question_contains: str | None = None
+    has_instruments: bool | None = None
+
+    def __post_init__(self) -> None:
+        if self.tickers is not None:
+            if not isinstance(self.tickers, tuple):
+                raise TypeError("tickers must be a tuple or None")
+            for ticker in self.tickers:
+                _require_identifier(ticker, "ticker")
+        _require_optional_identifier(self.event_ticker, "event_ticker")
+        _require_optional_identifier(self.series_ticker, "series_ticker")
+        if self.status is not None and self.status not in (
+            "unopened",
+            "open",
+            "paused",
+            "closed",
+            "settled",
+        ):
+            raise ValueError("unsupported Kalshi status filter")
+        if self.mve_filter is not None and self.mve_filter not in ("only", "exclude"):
+            raise ValueError("mve_filter must be 'only', 'exclude', or None")
+        if self.question_contains is not None:
+            if not isinstance(self.question_contains, str):
+                raise TypeError("question_contains must be a string or None")
+            if not self.question_contains:
+                raise ValueError("question_contains must not be empty")
+        if self.has_instruments is not None and not isinstance(
+            self.has_instruments, bool
+        ):
+            raise TypeError("has_instruments must be a bool or None")
+
+
 @dataclass(frozen=True)
 class DataIssue:
     """A bounded, count-preserving diagnostic for normalized public data."""
@@ -273,6 +318,79 @@ class PolymarketMarket:
 
 
 @dataclass(frozen=True)
+class KalshiMarket:
+    """One normalized Kalshi market metadata observation."""
+
+    ref: KalshiMarketRef
+    title: str | None
+    question: str | None
+    observed_at_utc: datetime
+    observation: RequestObservation
+    interpretation_id: str
+    package_version: str
+    instruments: tuple[KalshiInstrumentRef, ...]
+    mapping_status: MappingStatus
+    book_supported: bool
+    market_type: str | None
+    status: str | None
+    event_ticker: str | None
+    open_time: str | None
+    close_time: str | None
+    expected_expiration_time: str | None
+    expiration_time: str | None
+    created_time: str | None
+    updated_time: str | None
+    settlement_ts: str | None
+    issues: tuple[DataIssue, ...]
+    native_payload: dict[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, KalshiMarketRef):
+            raise TypeError("ref must be a KalshiMarketRef")
+        for name in (
+            "title",
+            "question",
+            "market_type",
+            "status",
+            "event_ticker",
+            "open_time",
+            "close_time",
+            "expected_expiration_time",
+            "expiration_time",
+            "created_time",
+            "updated_time",
+            "settlement_ts",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, str):
+                raise TypeError(f"{name} must be a string or None")
+        _require_utc(self.observed_at_utc, "observed_at_utc")
+        _require_identifier(self.interpretation_id, "interpretation_id")
+        _require_identifier(self.package_version, "package_version")
+        if self.mapping_status not in (
+            "mapped",
+            "empty",
+            "unknown",
+            "inconsistent",
+        ):
+            raise ValueError("unsupported mapping_status")
+        if not isinstance(self.book_supported, bool):
+            raise TypeError("book_supported must be a bool")
+        if self.mapping_status == "mapped":
+            if tuple(instrument.side for instrument in self.instruments) != (
+                "yes",
+                "no",
+            ):
+                raise ValueError("mapped Kalshi markets require YES then NO instruments")
+        elif self.instruments:
+            raise ValueError("only mapped markets may contain instruments")
+        if self.book_supported is not (self.mapping_status == "mapped"):
+            raise ValueError("book_supported must agree with a mapped binary market")
+        if not isinstance(self.native_payload, dict):
+            raise TypeError("native_payload must be a dict")
+
+
+@dataclass(frozen=True)
 class DiscoveryReport:
     """Bounded traversal metadata for one discovery operation."""
 
@@ -373,8 +491,10 @@ class BookSnapshot:
     source_scope: str
     data_scope: DataScope
     observation: RequestObservation
+    observations: tuple[RequestObservation, ...]
     interpretation_id: str
     package_version: str
+    quote_normalization_policy: str | None
     valid_state: bool
     quality_flags: tuple[str, ...]
     bid_provenance: BookSideProvenance
@@ -400,6 +520,13 @@ class BookSnapshot:
         _require_identifier(self.source_scope, "source_scope")
         _require_identifier(self.interpretation_id, "interpretation_id")
         _require_identifier(self.package_version, "package_version")
+        _require_optional_identifier(
+            self.quote_normalization_policy, "quote_normalization_policy"
+        )
+        if not self.observations:
+            raise ValueError("observations must contain at least one request observation")
+        if self.observations[-1] != self.observation:
+            raise ValueError("observation must be the final request observation")
         if not isinstance(self.valid_state, bool):
             raise TypeError("valid_state must be a bool")
         for name in (
@@ -495,8 +622,12 @@ __all__ = [
     "DiscoveryResult",
     "DiscoveryStopReason",
     "InstrumentRef",
+    "KalshiFilter",
     "KalshiInstrumentRef",
+    "KalshiMarket",
     "KalshiMarketRef",
+    "KalshiMveFilter",
+    "KalshiQueryStatus",
     "MarketRef",
     "MappingStatus",
     "PolymarketFilter",

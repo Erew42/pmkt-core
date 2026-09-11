@@ -33,6 +33,9 @@ The following paths are owned by `pmkt-core`:
   synthetic fixture recipe.
 - The supported Polymarket discovery and typed-book workflows, their private
   decoder, OpenAPI contracts, and focused records/Gamma/CLOB/package tests.
+- The supported Kalshi standard-market discovery, source-scoped detail, and
+  projected current-book workflows, their private decoder, offline example,
+  and focused records/Kalshi/package tests.
 
 ## Private trading
 

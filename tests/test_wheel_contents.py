@@ -235,13 +235,82 @@ assert pathlib.Path(pmkt.catalog.__file__).is_relative_to(pathlib.Path(sys.argv[
     )
     assert runtime.returncode == 0, runtime.stderr
 
+    kalshi_runtime_script = r'''
+import asyncio
+import pathlib
+import sys
+
+sys.path.insert(0, sys.argv[1])
+
+import httpx
+from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter
+
+
+def handler(request):
+    market = {
+        "ticker": "ticker",
+        "title": "Installed Kalshi workflow?",
+        "market_type": "binary",
+        "status": "active",
+    }
+    if request.url.path.endswith("/orderbook"):
+        assert not request.url.query
+        return httpx.Response(200, json={
+            "orderbook_fp": {
+                "yes_dollars": [["0.4", "3"]],
+                "no_dollars": [["0.35", "2"]],
+            }
+        })
+    if request.url.path.endswith("/markets/ticker"):
+        return httpx.Response(200, json={"market": market})
+    assert request.url.params["tickers"] == "ticker"
+    assert request.url.params["status"] == "open"
+    assert request.url.params["mve_filter"] == "exclude"
+    return httpx.Response(200, json={"markets": [market], "cursor": ""})
+
+
+async def main():
+    async with AsyncKalshiClient(
+        base_url="https://kalshi.example",
+        transport=httpx.MockTransport(handler),
+    ) as kalshi:
+        result = await kalshi.discover_markets(
+            filters=KalshiFilter(
+                tickers=("ticker",), status="open", mve_filter="exclude"
+            ),
+            max_markets=2,
+            max_pages=2,
+            deadline_s=5.0,
+        )
+        book = await kalshi.get_book(
+            result.items[0].instruments[0], depth=1, deadline_s=5.0
+        )
+    assert book.asks[0].quantity == 2.0
+    assert len(book.observations) == 2
+
+
+asyncio.run(main())
+assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+assert "pandas" not in sys.modules
+assert "pyarrow" not in sys.modules
+assert "duckdb" not in sys.modules
+assert "pmkt.streaming" not in sys.modules
+'''
+    kalshi_runtime = subprocess.run(
+        [sys.executable, "-I", "-c", kalshi_runtime_script, str(installed)],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert kalshi_runtime.returncode == 0, kalshi_runtime.stderr
+
     positive = tmp_path / "catalog_positive.py"
     positive.write_text(
         """\
 from pathlib import Path
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
 from pmkt.config import PmktConfig, RequestPolicy
-from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
+from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrumentRef, KalshiMarket, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
 from pmkt.records import BookSnapshot, DiscoveryResult, InstrumentRef, MarketRef
 
@@ -272,6 +341,22 @@ async def polymarket_workflow() -> None:
     )
     selected = detail.instrument_for_label("Yes")
     book: BookSnapshot = await clob.get_book(selected, depth=5, deadline_s=5.0)
+
+async def kalshi_workflow() -> None:
+    discovery: DiscoveryResult[KalshiMarket] = await kalshi.discover_markets(
+        filters=KalshiFilter(
+            tickers=("ticker",), status="open", mve_filter="exclude"
+        ),
+        max_markets=1,
+        max_pages=2,
+        deadline_s=5.0,
+    )
+    detail: KalshiMarket = await kalshi.get_market(
+        ticker="ticker", source="historical", deadline_s=5.0
+    )
+    book: BookSnapshot = await kalshi.get_book(
+        discovery.items[0].instruments[0], depth=5, deadline_s=5.0
+    )
 """,
         encoding="utf-8",
     )
@@ -302,6 +387,15 @@ async def invalid_polymarket_calls() -> None:
     await clob.get_book(PolymarketMarketRef("market"))
     await clob.get_book(PolymarketInstrumentRef("token"), depth="one")
     await clob.get_book(PolymarketInstrumentRef("token"), deadline_s=None)
+
+async def invalid_kalshi_calls() -> None:
+    kalshi = AsyncKalshiClient(config=config)
+    await kalshi.discover_markets()
+    await kalshi.discover_markets(filters="bad")
+    await kalshi.get_market("ticker")
+    await kalshi.get_market(ticker="ticker", source="archive")
+    await kalshi.get_book(PolymarketInstrumentRef("token"))
+    await kalshi.get_book(KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes"), depth="one")
 """,
         encoding="utf-8",
     )
@@ -345,3 +439,9 @@ async def invalid_polymarket_calls() -> None:
     assert 'Argument 1 to "get_book"' in rejected.stdout
     assert 'Argument "depth" to "get_book"' in rejected.stdout
     assert 'Argument "deadline_s" to "get_book"' in rejected.stdout
+    assert 'Missing named argument "filters" for "discover_markets" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Argument "filters" to "discover_markets" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Too many positional arguments for "get_market" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Argument "source" to "get_market" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Argument 1 to "get_book" of "AsyncKalshiClient"' in rejected.stdout
+    assert 'Argument "depth" to "get_book" of "AsyncKalshiClient"' in rejected.stdout
