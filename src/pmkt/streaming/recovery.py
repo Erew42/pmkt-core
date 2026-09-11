@@ -968,7 +968,7 @@ def _recovered_capture_completeness(
         "policy_version": "capture_completeness.v3" if state.profile_version == "3" else CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
         "policy_status": "provisional",
         "ok": False,
-        "evaluated": True,
+        "evaluated": bool(rows),
         "acceptance_eligible": False,
         "execution_status": "failed",
         "capture_status": "partial",
@@ -978,7 +978,9 @@ def _recovered_capture_completeness(
         "evidence_artifact_hash": artifact.get("segment_manifest_hash"),
         "evidence_artifact_reconciled": True,
         "terminal_reason": "stream_error",
-        "reasons": ["recovered_after_process_loss"],
+        "reasons": ["recovered_after_process_loss"] + (
+            [] if rows else ["terminal_instrument_evidence_not_committed"]
+        ),
     }
 
 

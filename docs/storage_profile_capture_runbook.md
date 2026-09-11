@@ -140,3 +140,32 @@ target-variance record — enumerating every known remaining reduction with its
 measured benefit — reviewed independently and decided by the maintainer.
 Until that exists, profile stabilization and the default flip stay blocked; the
 rest of the leaf does not.
+
+## Explicit v3 capture and recovery qualification
+
+Both venue CLIs accept `--profile-version 3`; their default remains v2. For
+example, `pmkt stream-books --token-id <TOKEN> --storage-profile full
+--profile-version 3 --duration 60` selects the integrity-aware full contract.
+For Kalshi use `stream-kalshi-books --ticker <TICKER>` and the existing narrow
+read-auth `--header-provider`. Reduced profiles still require explicit
+experimental acknowledgement. No `mm-compact@3` contract exists.
+
+Before merging recovery changes, run the cross-venue cancellation and transport
+checks, ignored/failed Kalshi snapshot-refresh tests, Polymarket heartbeat and
+reconnect tests, and tape durability/reconstruction tests. Qualification must
+cover concurrent operation completion and cancellation, receive, reconnect,
+backoff, journal boundaries, and manifest finalization. Cancellation must not
+consume another retry or become a timeout; cancelled captures retain a valid
+manifest with terminal reason `cancelled`.
+
+These controlled offline failures establish software behavior. A healthy live
+window with no recovery events does not establish live recovery behavior,
+continuous coverage, or thesis acceptance. Keep completeness policy provisional
+and experimental profiles unpromoted until separately recorded operational
+acceptance evidence exists. Retain original capture artifacts and their hashes.
+
+A process-loss recovery may have journaled book data but no terminal instrument
+evidence. Recovery publishes a partial/failed manifest, reconciles zero committed
+evidence rows, and records `terminal_instrument_evidence_not_committed`.
+It does not reconstruct missing coverage evidence. Both reconstruction readers
+continue to require successful clean captures and reject these partial runs.

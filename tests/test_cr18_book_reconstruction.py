@@ -1878,3 +1878,80 @@ def test_depth_comparison_is_separate_and_reports_source_coordinates() -> None:
     assert mismatch["source_provenance"]["role"] == "depth_main"
     assert set(mismatch["fields"]) == {"size_contracts"}
     assert comparison["excluded_fields"] == ["book_hash"]
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_v3_process_loss_finalizes_without_claiming_reconstructible_capture(tmp_path, venue):
+    from pmkt.data.manifests import validate_run_manifest
+    from pmkt.streaming.recovery import recover_stream_run
+
+    script = r"""
+import asyncio, json, os, sys
+from pathlib import Path
+from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
+from pmkt.exchanges.kalshi.order_book_stream import stream_kalshi_order_book_data
+from pmkt.streaming.profiles import select_storage_profile
+
+root, venue = sys.argv[1:]
+class ReadAuth:
+    def headers_for_get(self, path): return {}
+class Socket:
+    closed = False
+    seen = False
+    async def send(self, payload): pass
+    async def close(self): self.closed = True
+    def __aiter__(self): return self
+    async def __anext__(self):
+        if self.seen:
+            journal = Path(root) / "crashed" / "capture_commit_journal.v2.jsonl"
+            if journal.exists() and journal.stat().st_size:
+                os._exit(92)
+            raise RuntimeError("capture did not journal its initial snapshot")
+        self.seen = True
+        if venue == "polymarket":
+            return json.dumps({"event_type":"book", "asset_id":"a", "market":"m",
+                               "bids":[["0.4","3"]], "asks":[["0.6","5"]]})
+        return json.dumps({"type":"orderbook_snapshot", "sid":1, "seq":1,
+                           "msg":{"market_ticker":"a", "yes_dollars_fp":[["0.4","3"]],
+                                  "no_dollars_fp":[["0.6","5"]]}})
+async def connect(*args): return Socket()
+async def main():
+    kwargs = dict(output_root=root, run_name="crashed", duration_s=10,
+                  capture_intent="smoke", connect_factory=connect,
+                  storage_profile=select_storage_profile("full", profile_version="3"))
+    if venue == "polymarket":
+        await stream_order_book_data(["a"], heartbeat_interval=None, **kwargs)
+    else:
+        await stream_kalshi_order_book_data(["a"], auth=ReadAuth(), **kwargs)
+asyncio.run(main())
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path), venue],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert completed.returncode == 92, completed.stderr
+    recovered = recover_stream_run(tmp_path / "crashed", finalize=True)
+    assert not recovered.journal_errors
+    assert recovered.valid_group_count > 0
+    assert recovered.finalized_manifest_path is not None
+    manifest_path = Path(recovered.finalized_manifest_path)
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest["capture_termination"] == "crashed"
+    assert manifest["status"] != "success"
+    validation = validate_run_manifest(manifest_path)
+    assert validation.ok, validation.all_errors
+    assert manifest["capture_completeness"]["evidence_row_count"] == 0
+    assert manifest["capture_completeness"]["acceptance_eligible"] is False
+    # Recovery preserves journaled data, but partial runs are deliberately
+    # outside the accepted reconstruction API contract.
+    for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
+        with pytest.raises(BookTapeReconstructionError, match="successful clean capture"):
+            reconstruct(manifest_path)
+
+    manifest["capture_completeness"]["evidence_row_count"] = 1
+    manifest_path.write_text(json.dumps(manifest))
+    assert not validate_run_manifest(manifest_path).ok
+    manifest["capture_completeness"]["evidence_row_count"] = 0
+    manifest["capture_completeness"]["acceptance_eligible"] = True
+    manifest_path.write_text(json.dumps(manifest))
+    assert not validate_run_manifest(manifest_path).ok

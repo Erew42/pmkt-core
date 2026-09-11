@@ -1172,13 +1172,16 @@ async def stream_order_book_data(
                                 )
                             try:
                                 wait_started_ns = session.monotonic_ns()
-                                message = await asyncio.wait_for(
-                                    asyncio.shield(next_message_task),
+                                done, _ = await asyncio.wait(
+                                    {next_message_task},
                                     timeout=session.message_wait_timeout(
                                         remaining,
                                         now_monotonic_ns=wait_started_ns,
                                     ),
                                 )
+                                if not done:
+                                    raise asyncio.TimeoutError
+                                message = next_message_task.result()
                                 next_message_task = None
                             except asyncio.TimeoutError:
                                 observed_at_utc = _utc_now().isoformat()

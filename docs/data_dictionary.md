@@ -1,21 +1,10 @@
 # Canonical Data Dictionary
 
-## Account reservation v2
-
-`runtime_account_reservations` binds each reservation to an authoritative
-`account_id`, venue, and caller idempotency key. `reservation_id` includes the
-account scope. Caller metadata is nested and may not reuse authoritative field
-names. `runtime_account_reservation_aggregates` is updated in the same database
-transaction at account, account/venue, account/event, and account/match grains.
-
-## Run and restart authority v2
-
-`runtime_live_run_account_locks_v2` is the database-unique account-scoped
-live-run authority; `runtime_live_run_claims_v2` retains claim history.
-`runtime_unmatched_exposure_legs_v2` retains per-run legs so risk totals span
-all persisted runs. `runtime_restart_evidence_v2` binds a complete,
-unblocked `run_manifest.v2` to exact artifact IDs, SHA-256 hashes, and explicit
-UTC timestamps. Maker-rebate credit is zero until separate authority exists.
+This public dictionary covers canonical interchange contracts owned by
+`pmkt-core`. Trading runtime account reservations, run authority, and policy
+belong to `pmkt-trading`. Retained trading-facing schema registrations describe
+physical interchange formats, not permission to trade or public execution APIs.
+See [schema ownership and lifecycle](schema_lifecycle.md).
 
 This document defines the first stable normalized schemas for prediction-market
 research in `pmkt`. The raw exchange clients may expose venue-specific payloads,
@@ -39,6 +28,17 @@ Freshness pass: 2026-06-02.
 - Separate markets/contracts from tradable instruments/outcomes.
 - Treat cross-venue matches and arbitrage candidates as review artifacts, not
   facts or executable trade instructions.
+
+## Canonical floating-point conversion
+
+Float64 coercion and strict validation use Python's `float()` conversion to
+binary64. Canonical decimal strings therefore round once using the same parser
+as SQLite journal restoration. Booleans, non-finite values, and malformed
+numbers are rejected by strict conversion and become null in permissive
+coercion. Existing finite float values preserve their bits, including signed
+zero, through conversion and Parquet round trips. This does not change schema
+versions or promise exact decimal arithmetic. Previously written artifacts are
+not rewritten; their recorded hashes remain authoritative.
 
 ## Canonical timestamp-ingestion policy
 

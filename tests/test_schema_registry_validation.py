@@ -1918,3 +1918,38 @@ def test_validate_frame_reports_on_empty_frames(schema: str, dtype: str) -> None
 
     assert report.row_count == 0
     assert not report.missing_columns
+
+
+@pytest.mark.parametrize("raw", [
+    "15963.302752293577", "0.30000000000000004",
+    "1234.5678901234567", "0.1234567890123456789", "-0.0",
+])
+def test_canonical_float_conversion_survives_parquet_round_trip(raw, tmp_path):
+    spec = TableSpec(
+        name="precise_float", version="precise_float.v1",
+        fields=(FieldSpec("schema_version", "string", False),
+                FieldSpec("value", "float64", False)),
+    )
+    source = pd.DataFrame({"value": [raw]}, index=[7])
+    strict = convert_frame_strict(source, spec)
+    cleaned = coerce_frame(source, spec)
+    expected = float(raw).hex()
+    assert strict.loc[7, "value"].hex() == expected
+    assert cleaned.loc[7, "value"].hex() == expected
+    path = tmp_path / "precise.parquet"
+    strict.to_parquet(path)
+    restored = convert_frame_strict(pd.read_parquet(path), spec)
+    assert restored.loc[7, "value"].hex() == expected
+
+
+@pytest.mark.parametrize("raw", [True, "bad", "inf", "nan", float("inf")])
+def test_float_cleaning_and_strict_validation_agree_on_invalid_values(raw):
+    spec = TableSpec(
+        name="precise_float", version="precise_float.v1",
+        fields=(FieldSpec("schema_version", "string", False),
+                FieldSpec("value", "float64", True)),
+    )
+    source = pd.DataFrame({"value": [raw]})
+    assert pd.isna(coerce_frame(source, spec).loc[0, "value"])
+    with pytest.raises(ValueError, match="incompatible with float64"):
+        convert_frame_strict(source, spec)

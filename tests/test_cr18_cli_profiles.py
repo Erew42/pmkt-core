@@ -233,3 +233,30 @@ def test_both_stream_commands_expose_profile_controls() -> None:
             "--websocket-max-queue-frames",
         ):
             assert flag in options
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("version", [None, "3", "99"])
+def test_explicit_profile_version_selection(monkeypatch, tmp_path, venue, version):
+    captured = {}
+
+    async def capture(*args, **kwargs):
+        captured.update(kwargs)
+        return {"run_dir": str(tmp_path / "run"), "counts": {}}
+
+    monkeypatch.setattr(streaming_cli, "stream_order_book_data", capture)
+    monkeypatch.setattr(streaming_cli, "stream_kalshi_order_book_data", capture)
+    monkeypatch.setattr(streaming_cli, "_load_read_auth_header_provider", lambda _: object())
+    command = (["stream-books", "--token-id", "test"] if venue == "polymarket"
+               else ["stream-kalshi-books", "--ticker", "TEST", "--header-provider", "test:provider"])
+    command += ["--output-dir", str(tmp_path / "runs")]
+    if version is not None:
+        command += ["--profile-version", version]
+    result = CliRunner().invoke(app, command)
+    if version == "99":
+        assert result.exit_code != 0
+        assert not captured
+        assert not (tmp_path / "runs").exists()
+    else:
+        assert result.exit_code == 0, result.output
+        assert captured["storage_profile"].definition.profile_version == (version or "2")

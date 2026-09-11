@@ -361,7 +361,14 @@ def _strict_int_compatible(value: Any, dtype: str) -> bool:
 
 def _coerce_series(series: pd.Series, dtype: str) -> pd.Series:
     if dtype == "float64":
-        return pd.to_numeric(series, errors="coerce")
+        # Use the same binary64 conversion as strict validation and journal
+        # restoration; pandas' string parser can round canonical decimals anew.
+        return pd.Series(
+            [_parse_strict_float(value) for value in series.tolist()],
+            index=series.index,
+            name=series.name,
+            dtype="float64",
+        )
     if dtype in {"int32", "int64"}:
         pandas_dtype = "Int32" if dtype == "int32" else "Int64"
         values = [_bounded_int(value, dtype) for value in series.tolist()]

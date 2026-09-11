@@ -1941,8 +1941,11 @@ async def test_clean_close_exhaustion_is_classified_as_stream_error(tmp_path) ->
 @pytest.mark.asyncio
 async def test_stream_order_book_data_persists_cancelled_manifest(tmp_path) -> None:
     fake = SilentWebSocket()
+    connections = 0
 
     async def connect_factory(_: str) -> SilentWebSocket:
+        nonlocal connections
+        connections += 1
         return fake
 
     task = asyncio.create_task(
@@ -1963,8 +1966,11 @@ async def test_stream_order_book_data_persists_cancelled_manifest(tmp_path) -> N
     assert fake.sent
 
     task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=1.0)
+    assert task in done, "cancellation must finish within one second"
     with pytest.raises(asyncio.CancelledError):
         await task
+    assert connections == 1
 
     manifest_path = tmp_path / "cancelled-run" / "manifest.json"
     assert manifest_path.exists()

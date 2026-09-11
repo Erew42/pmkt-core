@@ -1,17 +1,49 @@
 {
   "catalog_version": "pmkt.schema_lifecycle.v2",
   "evidence_as_of": {
-    "date": "2026-08-20",
-    "source_commit": "8db6499",
-    "scope": "Tracked literal registered-version references include src, apps, scripts, tests, and docs as of source_commit. Artifact evidence retains the 2026-08-20 read-only inspection of data, generated, local_data, and a representative tmp sample. Semantic producer/reader evidence remains separately reviewed."
+    "date": "2026-09-11",
+    "scope": "Post-split source inventory and ownership review. No new exhaustive artifact scan; historical retained-data findings remain unqualified for removal.",
+    "repositories": {
+      "pmkt-core": {
+        "source_commit": "709ad73c0f7ecb29049473ef62aff1a923671c2d",
+        "worktree_state": "implementation in progress",
+        "text_roots": [
+          "docs",
+          "scripts",
+          "src",
+          "tests"
+        ]
+      },
+      "pmkt-trading": {
+        "source_commit": "f633c40c645d1495f6c0ebbf70754602b53aa680",
+        "worktree_state": "clean",
+        "text_roots": [
+          "docs",
+          "scripts",
+          "src",
+          "tests"
+        ]
+      },
+      "pmkt-research": {
+        "source_commit": null,
+        "worktree_state": "uncommitted research workspace",
+        "text_roots": [
+          "ai_explorations",
+          "capture_imbalance_venue.py",
+          "research_catalog.py",
+          "tests"
+        ]
+      }
+    }
   },
   "generic_consumers": [
     {
-      "path": "apps/dashboard/data/artifacts.py:_validate_manifest_candidate",
+      "path": "src/pmkt_trading/dashboard/data/artifacts.py:_validate_manifest_candidate",
       "kind": "runtime_schema_reader",
       "mechanism": "Resolves schema versions supplied by discovered manifests through get_table_spec(schema_version).",
       "scope": "Any registered schema version referenced by a dashboard-discovered manifest.",
-      "removal_effect": "A zero literal-reference count cannot establish zero production readers; each removal packet must review manifest compatibility and generic consumers."
+      "removal_effect": "A zero literal-reference count cannot establish zero production readers; each removal packet must review manifest compatibility and generic consumers.",
+      "repository": "pmkt-trading"
     }
   ],
   "status_definitions": {
@@ -24,7 +56,7 @@
   "groups": [
     {
       "id": "capture_matching_core",
-      "owner": "data-capture-matching",
+      "owner": "pmkt-core",
       "status": "active_core",
       "summary": "Capture, venue ingestion, matching, tracking, and their persisted provenance contracts.",
       "schemas": [
@@ -54,11 +86,13 @@
         "tracking_health.v1",
         "tracking_match.v1",
         "trade.v1"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "per-schema repository_ownership"
     },
     {
       "id": "offline_research",
-      "owner": "matching-research",
+      "owner": "pmkt-core",
       "status": "active_experiment",
       "summary": "Offline analysis and research sidecars; keep until each experiment is separately retired.",
       "schemas": [
@@ -76,11 +110,13 @@
         "passive_markout.v1",
         "passive_quote_evaluation.v1",
         "venue_history_capability.v1"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "per-schema repository_ownership"
     },
     {
       "id": "execution_deferred",
-      "owner": "execution-paper-canary",
+      "owner": "pmkt-core",
       "status": "active_experiment",
       "summary": "Execution, paper, canary, and soak contracts are deliberately frozen in this phase rather than assessed for removal.",
       "schemas": [
@@ -98,37 +134,45 @@
         "scan_cycle.v1",
         "soak_run_plan.v1",
         "soak_run_report.v1"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "pmkt-trading"
     },
     {
       "id": "match_compatibility",
-      "owner": "matching",
+      "owner": "pmkt-core",
       "status": "compatibility_legacy",
       "summary": "Legacy match contract whose retained-data claim and reader behavior require characterization.",
       "schemas": [
         "market_match.v1"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "pmkt-trading"
     },
     {
       "id": "unintegrated_dimensions",
-      "owner": "data",
+      "owner": "pmkt-core",
       "status": "provisional_unintegrated",
       "summary": "Proposed canonical dimensions with builders and tests but no demonstrated production producer or reader.",
       "schemas": [
         "event.v1",
         "instrument.v1",
         "market.v1"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "per-schema repository_ownership"
     },
     {
       "id": "unused_snapshot_exports",
-      "owner": "data-ingest",
+      "owner": "pmkt-core",
       "status": "removal_candidate",
       "summary": "Trimmed snapshot export contracts without a current writer or observed retained artifact.",
       "schemas": [
         "kalshi_market_snapshot.v2",
         "polymarket_market_snapshot.v2"
-      ]
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "per-schema repository_ownership"
     }
   ],
   "evidence_overrides": {
@@ -243,5 +287,425 @@
     "Migration would change grain, primary-key semantics, schema meaning, or discard fields.",
     "Removal would require moving, rewriting, or re-hashing retained data.",
     "Focused or repository-wide verification is not green."
+  ],
+  "historical_evidence_as_of": {
+    "date": "2026-08-20",
+    "source_commit": "8db6499",
+    "scope": "Tracked literal registered-version references include src, apps, scripts, tests, and docs as of source_commit. Artifact evidence retains the 2026-08-20 read-only inspection of data, generated, local_data, and a representative tmp sample. Semantic producer/reader evidence remains separately reviewed.",
+    "repository": "pre-split combined pmkt history; retained in pmkt-trading"
+  },
+  "repository_ownership": {
+    "arbitrage_candidate.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "backtest_report.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "basket_order_intent.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "basket_paper_fill.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "basket_paper_position.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "book_tape_control.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "book_tape_control.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "book_tape_event.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "book_tape_event.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "book_tape_level.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "canary_candidate.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "canary_rejection.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "capture_instrument_evidence.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "capture_instrument_evidence.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "co_resolution_observation.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "co_resolution_score.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "contract_evidence.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "convergence_observation.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "convergence_summary.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "depth.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "depth.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "event.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "event_taxonomy_prediction.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "execution_sizing_plan.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "feed_health.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "feed_health.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "historical_backfill_gap.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "historical_price.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "instrument.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "kalshi_market_snapshot.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "kalshi_market_snapshot.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "maker_quote_plan.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "market.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "market_match.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "market_match.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "market_resolution.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "market_taxonomy_evidence.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "match_relation.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "order_intent.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "order_state.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "paper_fill.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "paper_position.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "passive_fill.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "passive_markout.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "passive_quote_evaluation.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "polymarket_market_snapshot.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "polymarket_market_snapshot.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "run_manifest.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "scan_cycle.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "signal.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "soak_run_plan.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "soak_run_report.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "stream_lifecycle.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "topbook.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "topbook.v2": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "topbook_capture_gap.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "tracking_health.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "tracking_match.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "cross_repository_contract",
+      "consumer_policy_owner": "pmkt-trading"
+    },
+    "trade.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    },
+    "venue_history_capability.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": null
+    }
+  },
+  "source_inventory_summary": {
+    "core": {
+      "schemas_with_source_literals": [
+        "backtest_report.v1",
+        "book_tape_control.v1",
+        "book_tape_control.v2",
+        "book_tape_event.v1",
+        "book_tape_event.v2",
+        "book_tape_level.v1",
+        "capture_instrument_evidence.v2",
+        "contract_evidence.v1",
+        "convergence_observation.v1",
+        "convergence_summary.v1",
+        "depth.v1",
+        "depth.v2",
+        "feed_health.v1",
+        "feed_health.v2",
+        "historical_backfill_gap.v1",
+        "historical_price.v1",
+        "maker_quote_plan.v1",
+        "match_relation.v1",
+        "order_intent.v1",
+        "order_state.v1",
+        "paper_fill.v1",
+        "paper_position.v1",
+        "run_manifest.v1",
+        "signal.v1",
+        "topbook.v1",
+        "topbook.v2",
+        "topbook_capture_gap.v1",
+        "tracking_health.v1",
+        "tracking_match.v1",
+        "trade.v1",
+        "venue_history_capability.v1"
+      ],
+      "artifact_attribution_complete": false
+    },
+    "trading": {
+      "schemas_with_source_literals": [
+        "backtest_report.v1",
+        "basket_order_intent.v1",
+        "basket_paper_fill.v1",
+        "basket_paper_position.v1",
+        "book_tape_control.v1",
+        "book_tape_event.v1",
+        "book_tape_event.v2",
+        "canary_candidate.v1",
+        "canary_rejection.v1",
+        "co_resolution_score.v1",
+        "contract_evidence.v1",
+        "convergence_observation.v1",
+        "convergence_summary.v1",
+        "depth.v1",
+        "execution_sizing_plan.v1",
+        "feed_health.v1",
+        "maker_quote_plan.v1",
+        "market_match.v2",
+        "match_relation.v1",
+        "order_intent.v1",
+        "order_state.v1",
+        "paper_fill.v1",
+        "paper_position.v1",
+        "passive_fill.v1",
+        "scan_cycle.v1",
+        "signal.v1",
+        "soak_run_plan.v1",
+        "stream_lifecycle.v1",
+        "topbook.v1",
+        "topbook_capture_gap.v1",
+        "tracking_health.v1",
+        "tracking_match.v1",
+        "trade.v1"
+      ],
+      "artifact_attribution_complete": false
+    },
+    "research": {
+      "schemas_with_source_literals": [
+        "depth.v1",
+        "depth.v2",
+        "topbook.v1",
+        "topbook.v2"
+      ],
+      "artifact_attribution_complete": false
+    }
+  },
+  "compatibility_policy": {
+    "public_exports": "Retain existing exports and schema versions until reviewed consumer migration and removal packets are complete.",
+    "private_legacy": "Legacy policy implementations belong only in pmkt-trading; neutral registered contracts may remain in core. No schema is classified as removable private code solely by its name.",
+    "historical_paths": "Paths in historical evidence_overrides describe the pre-split layout; current consumer locations must be resolved in the named repository before removal."
+  },
+  "reviewed_consumer_interfaces": [
+    {
+      "repository": "pmkt-trading",
+      "path": "src/pmkt_trading/dashboard/data/artifacts.py:_validate_manifest_candidate",
+      "behavior": "Calls get_table_spec with the manifest-supplied version before shallow or deep artifact validation. Preserve registered schema lookup compatibility."
+    },
+    {
+      "repository": "pmkt-trading",
+      "path": "src/pmkt_trading/data/validation.py",
+      "behavior": "Imports core physical validation and adds private semantic checks. Keep the one-way dependency and neutral core validation."
+    },
+    {
+      "repository": "pmkt-research",
+      "path": "research_catalog.py:pin_catalog",
+      "behavior": "Uses MarketCatalogService.status(deep=...) and register_catalog_views, verifies the history pointer and manifest hash, and freezes view definitions. Preserve these entry points while reader ergonomics are reviewed separately."
+    },
+    {
+      "repository": "pmkt-research",
+      "path": "capture_current.py",
+      "behavior": "Builds venue-specific snapshots and writes them with core storage helpers. Proposed venue-neutral dimensions are not a replacement for these live snapshot contracts."
+    }
   ]
 }

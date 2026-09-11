@@ -82,14 +82,22 @@ class WebSocketRetryBudget:
 
         task = asyncio.ensure_future(start_before_deadline())
         try:
-            await asyncio.wait_for(task, timeout=self.deadline - self.clock())
-        except asyncio.TimeoutError:
-            if task.cancelled():
+            # asyncio.wait_for can lose outer cancellation when its child finishes
+            # concurrently on Python 3.10. wait keeps cancellation on this task.
+            done, _ = await asyncio.wait(
+                {task}, timeout=max(0.0, self.deadline - self.clock())
+            )
+            if not done:
                 raise WebSocketDeadlineExceeded(
                     "capture deadline reached during recovery"
-                ) from None
-            self.check_deadline()
-            raise
+                )
+            task.result()
+        finally:
+            if not task.done():
+                task.cancel()
+            # Retrieve child failures while preserving a new outer cancellation
+            # that arrives during timeout/cancellation cleanup.
+            await asyncio.gather(task, return_exceptions=True)
 
     async def run(
         self,

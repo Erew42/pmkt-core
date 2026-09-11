@@ -293,3 +293,124 @@ def test_transport_teardown_race_rejects_exception_without_traceback() -> None:
 
 def test_transport_teardown_race_rejects_unrelated_attribute_error() -> None:
     assert not is_transport_teardown_race(AttributeError("application bug"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_first", [False, True])
+async def test_cancellation_wins_concurrent_bounded_operation_completion(retry_first):
+    parent = None
+    calls = 0
+
+    async def complete_and_cancel():
+        nonlocal calls
+        calls += 1
+        assert parent is not None
+        parent.cancel()
+
+    budget = WebSocketRetryBudget(
+        deadline=asyncio.get_running_loop().time() + 10,
+        sleep=lambda _: complete_and_cancel(),
+    )
+    parent = asyncio.create_task(budget.run(complete_and_cancel, retry_first=retry_first))
+    with pytest.raises(asyncio.CancelledError):
+        await parent
+    assert calls == 1
+    assert budget.used == int(retry_first)
+    assert budget.last_error is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("boundary", ["connect", "receive", "reconnect", "backoff", "close"])
+async def test_capture_cancellation_persists_v3_manifest_at_lifecycle_boundaries(
+    monkeypatch, tmp_path, venue, boundary,
+):
+    import importlib
+    import json
+    from pmkt.data.manifests import validate_run_manifest
+    from pmkt.streaming.profiles import select_storage_profile
+
+    module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
+    capture = (module.stream_order_book_data if venue == "polymarket"
+               else module.stream_kalshi_order_book_data)
+    entered = asyncio.Event()
+    connections = 0
+
+    async def block():
+        entered.set()
+        await asyncio.Future()
+
+    class ControlledSocket(RetrySocket):
+        async def __anext__(self):
+            if boundary == "receive":
+                await block()
+            if boundary in {"reconnect", "backoff"}:
+                raise OSError("injected disconnect")
+            return '{"type":"ticker","event_type":"last_trade_price","asset_id":"a"}'
+
+        async def close(self):
+            self.closed = True
+            if boundary == "close":
+                await block()
+
+    raw = ControlledSocket()
+
+    async def factory(*args):
+        nonlocal connections
+        connections += 1
+        if boundary == "connect" or (boundary == "reconnect" and connections == 2):
+            await block()
+        return raw
+
+    async def backoff(_):
+        if boundary == "backoff":
+            await block()
+
+    def budget(*args, **kwargs):
+        return WebSocketRetryBudget(*args, **kwargs, sleep=backoff)
+
+    monkeypatch.setattr(module, "WebSocketRetryBudget", budget)
+    kwargs = {"heartbeat_interval": None} if venue == "polymarket" else {"auth": FakeReadAuth()}
+    task = asyncio.create_task(capture(
+        ["a"], output_root=tmp_path, run_name="cancelled", duration_s=60,
+        max_messages=1, connect_factory=factory,
+        storage_profile=select_storage_profile("full", profile_version="3"), **kwargs,
+    ))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3)
+        previous_connections = connections
+        task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "cancellation must finish within one second"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert connections == previous_connections
+        manifest_path = tmp_path / "cancelled" / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        assert manifest["capture_completeness"]["terminal_reason"] == "cancelled"
+        validation = validate_run_manifest(manifest_path)
+        assert validation.ok, validation.all_errors
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_outer_cancellation_during_deadline_cleanup_is_not_suppressed():
+    cleaning_up = asyncio.Event()
+
+    async def operation():
+        try:
+            await asyncio.Future()
+        finally:
+            cleaning_up.set()
+            await asyncio.Future()
+
+    budget = WebSocketRetryBudget(deadline=asyncio.get_running_loop().time() + 0.02)
+    task = asyncio.create_task(budget.run(operation))
+    await asyncio.wait_for(cleaning_up.wait(), timeout=1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert budget.used == 0

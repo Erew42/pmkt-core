@@ -956,6 +956,20 @@ def _capture_instrument_evidence_errors(
         ),
         None,
     )
+    # A process can die before terminal instrument evidence is journaled.
+    # Its exact, empty segment manifest is still checked above. Reconcile an
+    # empty evidence set only for explicitly failed process-loss recovery;
+    # never infer instrument coverage from the surviving book tape.
+    if (
+        payload.get("capture_termination") == "crashed"
+        and payload.get("status") in {"partial", "failed"}
+        and artifact.get("completion_status") == "failed"
+        and artifact.get("row_count") == 0
+        and completeness.get("acceptance_eligible") is False
+        and completeness.get("ok") is False
+    ):
+        errors.extend(evidence_manifest_reconciliation_errors([], completeness))
+        return errors
     if (
         evidence_dataset is None
         or not evidence_dataset.exists

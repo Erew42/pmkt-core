@@ -332,43 +332,49 @@ def test_schema_inventory_cli_fails_closed_on_unreadable_parquet(tmp_path: Path)
     assert allowed == 0
 
 
-def test_schema_inventory_cli_default_text_roots_include_apps(tmp_path: Path) -> None:
-    for relative in (
-        "src",
-        "apps/dashboard",
-        "scripts",
-        "tests",
-        "docs",
-        "data",
-        "generated",
-        "local_data",
-    ):
+def test_schema_inventory_cli_defaults_follow_public_layout(tmp_path: Path) -> None:
+    for relative in ("src/pmkt", "scripts", "tests", "docs"):
         (tmp_path / relative).mkdir(parents=True, exist_ok=True)
-    application = _write(
-        tmp_path / "apps" / "dashboard" / "consumer.py",
-        'SCHEMA = "market_match.v2"\n',
-    )
-    output = tmp_path / "local_data" / "schema_usage.json"
-
-    result = main(
-        [
-            "--root",
-            str(tmp_path),
-            "--catalog",
-            str(CATALOG_PATH),
-            "--output",
-            str(output),
-        ]
-    )
-
-    assert result == 0
+    consumer = _write(tmp_path / "src/pmkt/consumer.py", 'SCHEMA = "market_match.v2"\n')
+    output = tmp_path / "report.json"
+    result = main(["--root", str(tmp_path), "--catalog", str(CATALOG_PATH),
+                   "--output", str(output)])
+    assert result == 2  # Source-only success is not complete artifact evidence.
     report = json.loads(output.read_text(encoding="utf-8"))
+    assert report["scan"]["complete"]
+    assert report["scan"]["artifact_roots"] == []
+    assert "apps" not in report["scan"]["text_roots"]
     assert report["schemas"]["market_match.v2"]["text_references"] == {
-        "application": [application.relative_to(tmp_path).as_posix()]
+        "source": [consumer.relative_to(tmp_path).as_posix()]
     }
-    assert report["scan"]["text_reference_method"] == (
-        "literal_registered_schema_version_tokens"
+
+
+def test_source_only_inventory_cannot_authorize_artifact_removal(tmp_path):
+    source = tmp_path / "src"
+    source.mkdir()
+    report = inventory_schema_usage(
+        tmp_path, artifact_roots=(), text_roots=(source,), catalog_path=CATALOG_PATH,
     )
-    assert report["semantic_evidence"]["generic_consumers"][0]["path"] == (
-        "apps/dashboard/data/artifacts.py:_validate_manifest_candidate"
+    assert report["scan"]["complete"]
+    assert not report["removal_evidence"]["artifact_attribution_complete"]
+    assert report["removal_evidence"]["blockers"][0]["kind"] == "artifact_roots_not_declared"
+
+
+def test_post_split_ownership_covers_registry_without_removal():
+    catalog = load_lifecycle_catalog(CATALOG_PATH)
+    assert set(catalog["repository_ownership"]) == {spec.version for spec in list_table_specs()}
+    assert catalog["repository_ownership"]["order_intent.v1"] == {
+        "contract_owner": "pmkt-core", "classification": "cross_repository_contract",
+        "consumer_policy_owner": "pmkt-trading",
+    }
+    assert catalog["repository_ownership"]["topbook.v2"]["classification"] == "core_owned"
+    assert catalog["generic_consumers"][0]["repository"] == "pmkt-trading"
+
+
+def test_inventory_accepts_explicit_consumer_source_file(tmp_path):
+    source = _write(tmp_path / "consumer.py", 'SCHEMA = "topbook.v2"\n')
+    report = inventory_schema_usage(
+        tmp_path, artifact_roots=(), text_roots=(source,), catalog_path=CATALOG_PATH,
     )
+    assert report["scan"]["text_files_scanned"] == 1
+    assert report["schemas"]["topbook.v2"]["text_references"] == {"other": ["consumer.py"]}

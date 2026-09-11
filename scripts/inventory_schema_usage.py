@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 from typing import Any, Iterable, Mapping, Sequence
 
 try:
@@ -24,8 +25,8 @@ if str(SRC) not in sys.path:
 from pmkt.data.registry import list_table_specs  # noqa: E402
 
 
-DEFAULT_ARTIFACT_ROOTS = ("data", "generated", "local_data")
-DEFAULT_TEXT_ROOTS = ("src", "apps", "scripts", "tests", "docs")
+DEFAULT_ARTIFACT_ROOTS: tuple[str, ...] = ()
+DEFAULT_TEXT_ROOTS = ("src", "scripts", "tests", "docs")
 DEFAULT_CATALOG = "docs/schema_lifecycle.json"
 TEXT_SUFFIXES = {
     ".csv",
@@ -79,6 +80,8 @@ def _walk_files(scan_root: Path) -> tuple[list[Path], list[dict[str, str]]]:
                 "message": "declared scan root is a link or reparse point",
             }
         ]
+    if scan_root.is_file():
+        return [scan_root], errors
     for current, directory_names, file_names in os.walk(scan_root, followlinks=False):
         current_path = Path(current)
         retained_directories: list[str] = []
@@ -503,6 +506,11 @@ def inventory_schema_usage(
         key=lambda item: (item["path"], item["kind"], item["message"])
     )
     attribution_blockers: list[dict[str, Any]] = []
+    if not resolved_artifact_roots:
+        attribution_blockers.append({
+            "kind": "artifact_roots_not_declared",
+            "message": "Source-only inventory does not establish absence of retained artifacts.",
+        })
     if normalized_errors:
         attribution_blockers.append(
             {
@@ -545,6 +553,7 @@ def inventory_schema_usage(
     return {
         "report_version": "pmkt.schema_usage_inventory.v2",
         "catalog_version": catalog.get("catalog_version"),
+        "source_provenance": _source_provenance(root),
         "scan": {
             "artifact_roots": sorted(_repo_path(root, path) for path in resolved_artifact_roots),
             "text_roots": sorted(_repo_path(root, path) for path in resolved_text_roots),
@@ -585,6 +594,23 @@ def inventory_schema_usage(
             "blockers": attribution_blockers,
         },
         "errors": normalized_errors,
+    }
+
+
+def _source_provenance(root: Path) -> dict[str, Any]:
+    """Describe this checkout, including unborn or modified consumer sources."""
+    def git(*args: str) -> str | None:
+        result = subprocess.run(
+            ["git", "-C", str(root), *args], capture_output=True, text=True,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    return {
+        "repository": root.name,
+        "commit": git("rev-parse", "HEAD"),
+        "worktree_status": git("status", "--porcelain"),
+        "scope": "Declared roots only; commit does not identify uncommitted files.",
     }
 
 
