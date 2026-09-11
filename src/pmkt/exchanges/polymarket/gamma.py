@@ -124,11 +124,25 @@ class AsyncGammaClient:
         if limit < 1 or limit > 100:
             raise ValueError("keyset limit must be between 1 and 100")
 
+    async def _resolution_market_payload(
+        self,
+        market_id: str | int,
+        *,
+        expiry: OperationExpiry | None,
+    ) -> Any:
+        encoded_market_id = (
+            quote(str(market_id), safe="") if expiry is not None else market_id
+        )
+        return await self._http.request_json(
+            "GET",
+            f"/markets/{encoded_market_id}",
+            params=None,
+            expiry=expiry,
+        )
+
     async def market(self, market_id: str | int) -> dict[str, Any]:
         """Fetch one Gamma market by id, preserving raw fields for resolution joins."""
-        data = await self._http.request_json(
-            "GET", f"/markets/{market_id}", params=None
-        )
+        data = await self._resolution_market_payload(market_id, expiry=None)
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data

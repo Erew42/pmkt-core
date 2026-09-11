@@ -38,6 +38,9 @@ The following paths are owned by `pmkt-core`:
   projected current-book, and explicit-window candle workflows, their private
   decoders and routing planner, offline examples, and focused
   records/Kalshi/package tests.
+- The supported typed single-market resolution workflows, explicit borrowed
+  Polygon CTF evidence client, v2/v3 cache and label compatibility, sanitized
+  evidence errors, offline example, and focused resolution/package tests.
 
 ## Private trading
 

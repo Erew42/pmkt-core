@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import math
 from typing import Any, Literal, Sequence
+from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
@@ -139,12 +140,24 @@ class AsyncClobClient:
             raise TypeError(f"Expected list, got {type(data)}")
         return [OrderBook(**item) for item in data if isinstance(item, dict)]
 
-    async def clob_market_info(self, condition_id: str) -> dict[str, Any]:
-        data = await self._http.request_json(
-            "GET",
-            f"/clob-markets/{condition_id}",
-            params=None,
+    async def _resolution_market_payload(
+        self,
+        condition_id: str,
+        *,
+        expiry: OperationExpiry | None,
+    ) -> Any:
+        encoded_condition_id = (
+            quote(condition_id, safe="") if expiry is not None else condition_id
         )
+        return await self._http.request_json(
+            "GET",
+            f"/clob-markets/{encoded_condition_id}",
+            params=None,
+            expiry=expiry,
+        )
+
+    async def clob_market_info(self, condition_id: str) -> dict[str, Any]:
+        data = await self._resolution_market_payload(condition_id, expiry=None)
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data

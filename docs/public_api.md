@@ -550,13 +550,44 @@ The retained wire models are `Event`, `Market`, `Order`, `OrderBook`,
 fields currently declared by the models and allow additional upstream fields;
 they are not canonical persisted records.
 
-`pmkt.resolution` exports `ResolutionRecord`, `Payout`, `SourceObservation`, and
-their current state, result-type, confidence, and resolver-version constants.
-The existing resolvers remain directly importable as
-`pmkt.resolution.polymarket.PolymarketResolutionResolver` and
-`pmkt.resolution.kalshi.KalshiResolutionResolver`. Read-only Polygon evidence is
-available as `PolygonCtfClient` and `EvmRpcError` from `pmkt.resolution.evm`.
-Resolver package reexports beyond these records have not shipped.
+`pmkt.resolution` exports `PolymarketResolutionResolver`,
+`KalshiResolutionResolver`, `PolygonCtfClient`, `EvmRpcError`,
+`ResolutionRecord`, `Payout`, `SourceObservation`, and their state, result-type,
+confidence, and resolver-version constants. The resolvers accept their matching
+`PolymarketMarketRef` or `KalshiMarketRef`; retained string calls, including the
+`market_key=` keyword and optional snapshot, remain available. A keyword-only
+`deadline_s` bounds the complete single-market operation. Its default `None`
+preserves the unbounded legacy operation while each underlying client keeps its
+own request timeout.
+
+Resolvers borrow every supplied client and never create or close one. The
+caller constructs `PolygonCtfClient(rpc_url=...)` explicitly and owns its
+lifetime. No RPC endpoint is read from package configuration or the environment.
+Gamma and CLOB evidence can describe lifecycle, labels, prices, and tokens, but
+only validated retained Polygon CTF payout evidence can make a Polymarket record
+canonical. Snapshot-only resolution is fully offline: it retains useful state
+and payout hints at its existing metadata-only ceiling. The offline ownership
+and typed-reference flow is executable in
+[`scripts/resolution_example.py`](../scripts/resolution_example.py).
+
+Matching typed references protect identity before interpretation. Conflicting
+snapshot identity or enrichment fails before I/O; conflicting returned venue
+identity becomes a source error observation, so another valid source can still
+support the result. Expected HTTP, transport, malformed JSON, and source-evidence
+failures become sanitized observations. `ReadAuthenticationRequiredError`,
+operation expiry, caller cancellation, and unexpected implementation errors
+raise. An HTTP 401 or 403 alone remains per-market evidence and is not treated as
+a global credential diagnosis. Stored diagnostics include safe source, error
+class, and status summaries rather than RPC URLs, request secrets, or raw remote
+error bodies.
+
+New records use `market_resolution_resolver.v3`. The default terminal-label
+policy accepts eligible v2 and v3 canonical finals. Separately, the resolution
+cache preserves eligible retained v2 canonical finals and v2 conflicts without
+relabeling them; conflicts remain ineligible for terminal labels. A refresh with
+weaker evidence carries forward the original payout and resolver version, while
+contradictory canonical finals retain conflict handling. The existing unsafe v1
+cache migration behavior is unchanged.
 
 Native REST methods use `ValueError` for invalid caller parameters, `TypeError`
 or `ValueError` for malformed upstream payloads, and propagate `httpx` request

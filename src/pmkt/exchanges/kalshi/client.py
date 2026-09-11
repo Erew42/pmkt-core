@@ -955,8 +955,32 @@ class AsyncKalshiClient:
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
+    async def _resolution_market_payload(
+        self,
+        ticker: str,
+        *,
+        source: Literal["live", "historical"],
+        expiry: OperationExpiry | None,
+    ) -> Any:
+        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
+        path = (
+            f"/markets/{encoded_ticker}"
+            if source == "live"
+            else f"/historical/markets/{encoded_ticker}"
+        )
+        return await self._http.request_json(
+            "GET",
+            path,
+            params=None,
+            expiry=expiry,
+        )
+
     async def market(self, ticker: str) -> dict[str, Any]:
-        data = await self._http.request_json("GET", f"/markets/{ticker}", params=None)
+        data = await self._resolution_market_payload(
+            ticker,
+            source="live",
+            expiry=None,
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         market = data.get("market")
@@ -965,10 +989,10 @@ class AsyncKalshiClient:
         return data
 
     async def historical_market(self, ticker: str) -> dict[str, Any]:
-        data = await self._http.request_json(
-            "GET",
-            f"/historical/markets/{ticker}",
-            params=None,
+        data = await self._resolution_market_payload(
+            ticker,
+            source="historical",
+            expiry=None,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")

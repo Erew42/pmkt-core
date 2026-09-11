@@ -408,7 +408,11 @@
         "CONFIDENCE_PLATFORM_CONFIRMED",
         "CONFIDENCE_PROVISIONAL",
         "CONFIDENCE_UNAVAILABLE",
+        "EvmRpcError",
+        "KalshiResolutionResolver",
         "Payout",
+        "PolygonCtfClient",
+        "PolymarketResolutionResolver",
         "RESOLVER_VERSION",
         "RESULT_TYPE_BINARY",
         "RESULT_TYPE_FRACTIONAL",
@@ -426,7 +430,13 @@
         "STATE_PROVISIONAL",
         "STATE_UNAVAILABLE",
         "SourceObservation"
-      ]
+      ],
+      "tier_overrides": {
+        "EvmRpcError": "supported",
+        "KalshiResolutionResolver": "supported",
+        "PolygonCtfClient": "supported",
+        "PolymarketResolutionResolver": "supported"
+      }
     },
     "pmkt.streaming": {
       "default_tier": "inherited",
@@ -631,19 +641,19 @@
     },
     {
       "path": "pmkt.resolution.polymarket.PolymarketResolutionResolver",
-      "tier": "retained_native"
+      "tier": "supported"
     },
     {
       "path": "pmkt.resolution.kalshi.KalshiResolutionResolver",
-      "tier": "retained_native"
+      "tier": "supported"
     },
     {
       "path": "pmkt.resolution.evm.PolygonCtfClient",
-      "tier": "retained_native"
+      "tier": "supported"
     },
     {
       "path": "pmkt.resolution.evm.EvmRpcError",
-      "tier": "retained_native"
+      "tier": "supported"
     }
   ]
 }

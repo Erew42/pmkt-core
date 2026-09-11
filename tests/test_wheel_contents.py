@@ -385,6 +385,32 @@ assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sy
         "volume_contracts": 12.5,
     }
 
+    resolution_example = tmp_path / "resolution_example.py"
+    resolution_example.write_bytes(
+        (ROOT / "scripts" / resolution_example.name).read_bytes()
+    )
+    resolution_example_runtime = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            example_runtime_script,
+            str(installed),
+            str(resolution_example),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert resolution_example_runtime.returncode == 0, resolution_example_runtime.stderr
+    assert json.loads(resolution_example_runtime.stdout) == {
+        "canonical_source": "polygon_ctf",
+        "market_key": "offline-market",
+        "payouts": ["1", "0"],
+        "resolver_version": "market_resolution_resolver.v3",
+        "winner": "yes",
+    }
+
     positive = tmp_path / "catalog_positive.py"
     positive.write_text(
         """\
@@ -395,6 +421,7 @@ from pmkt.config import PmktConfig, RequestPolicy
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrumentRef, KalshiMarket, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
 from pmkt.records import BookSnapshot, CandleHistoryResult, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
+from pmkt.resolution import KalshiResolutionResolver, PolygonCtfClient, PolymarketResolutionResolver, ResolutionRecord
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
@@ -406,6 +433,9 @@ policy = RequestPolicy(max_attempts=2)
 gamma = AsyncGammaClient(config=config, timeout_s=5.0, request_policy=policy)
 clob = AsyncClobClient(config=config, timeout_s=5.0, request_policy=policy)
 kalshi = AsyncKalshiClient(config=config, timeout_s=5.0, request_policy=policy)
+ctf = PolygonCtfClient("https://rpc.example")
+poly_resolver = PolymarketResolutionResolver(gamma_client=gamma, clob_client=clob, ctf_client=ctf)
+kalshi_resolver = KalshiResolutionResolver(client=kalshi)
 poly_market = PolymarketMarketRef("market", condition_id="condition")
 poly_instrument = PolymarketInstrumentRef("token", market=poly_market, outcome_index=0)
 market: MarketRef = poly_market
@@ -413,6 +443,11 @@ instrument: InstrumentRef = poly_instrument
 kalshi_instrument: InstrumentRef = KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes")
 
 async def polymarket_workflow() -> None:
+    resolution: ResolutionRecord = await poly_resolver.resolve(
+        PolymarketMarketRef("market", condition_id="0xabc"),
+        snapshot={"market_id": "market", "condition_id": "0xabc"},
+        deadline_s=None,
+    )
     discovery: DiscoveryResult[PolymarketMarket] = await gamma.discover_markets(
         filters=PolymarketFilter(condition_ids=("condition",), closed=False),
         max_markets=1,
@@ -437,6 +472,9 @@ async def polymarket_workflow() -> None:
     history.to_pandas()
 
 async def kalshi_workflow() -> None:
+    resolution: ResolutionRecord = await kalshi_resolver.resolve(
+        KalshiMarketRef("ticker"), deadline_s=5.0
+    )
     discovery: DiscoveryResult[KalshiMarket] = await kalshi.discover_markets(
         filters=KalshiFilter(
             tickers=("ticker",), status="open", mve_filter="exclude"
@@ -475,6 +513,7 @@ from pmkt.catalog import CatalogSnapshot
 from pmkt.config import PmktConfig
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketInstrumentRef, PolymarketMarketRef
+from pmkt.resolution import KalshiResolutionResolver, PolymarketResolutionResolver
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 snapshot.query("SELECT 1", params=())
@@ -540,6 +579,14 @@ async def invalid_kalshi_calls() -> None:
         source="archive",
         deadline_s=None,
     )
+
+async def invalid_resolution_calls() -> None:
+    polymarket = PolymarketResolutionResolver()
+    kalshi = KalshiResolutionResolver()
+    await polymarket.resolve(KalshiMarketRef("ticker"))
+    await kalshi.resolve(PolymarketMarketRef("market"))
+    await polymarket.resolve(PolymarketMarketRef("market"), deadline_s="slow")
+    await kalshi.resolve(KalshiMarketRef("ticker"), 5.0)
 """,
         encoding="utf-8",
     )
@@ -597,3 +644,23 @@ async def invalid_kalshi_calls() -> None:
     assert 'Argument "period_minutes" to "get_candles"' in rejected.stdout
     assert 'Argument "source" to "get_candles"' in rejected.stdout
     assert 'Argument "deadline_s" to "get_candles"' in rejected.stdout
+    assert (
+        'No overload variant of "resolve" of "PolymarketResolutionResolver" '
+        'matches argument type "KalshiMarketRef"'
+        in rejected.stdout
+    )
+    assert (
+        'No overload variant of "resolve" of "KalshiResolutionResolver" '
+        'matches argument type "PolymarketMarketRef"'
+        in rejected.stdout
+    )
+    assert (
+        'No overload variant of "resolve" of "PolymarketResolutionResolver" '
+        'matches argument types "PolymarketMarketRef", "str"'
+        in rejected.stdout
+    )
+    assert (
+        'No overload variant of "resolve" of "KalshiResolutionResolver" '
+        'matches argument types "KalshiMarketRef", "float"'
+        in rejected.stdout
+    )

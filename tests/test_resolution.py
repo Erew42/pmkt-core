@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import httpx
 import pandas as pd
 import pytest
 
+from pmkt._http import RequestPolicy
+from pmkt._operation import OperationExpiry
 from pmkt.data.canonical import (
     kalshi_market_snapshot_v2_row,
     market_resolution_row,
@@ -13,14 +16,25 @@ from pmkt.data.canonical import (
 )
 from pmkt.data.normalize import extract_market_rows
 from pmkt.data.validation import validate_frame
+from pmkt.errors import OperationTimeoutError
+from pmkt.exchanges.kalshi import AsyncKalshiClient
 from pmkt.exchanges.kalshi.client import normalize_kalshi_market
+from pmkt.exchanges.polymarket import AsyncGammaClient
+from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
+from pmkt.records import KalshiMarketRef, PolymarketMarketRef
+from pmkt.resolution import (
+    EvmRpcError as ExportedEvmRpcError,
+    KalshiResolutionResolver as ExportedKalshiResolutionResolver,
+    PolygonCtfClient as ExportedPolygonCtfClient,
+    PolymarketResolutionResolver as ExportedPolymarketResolutionResolver,
+)
 from pmkt.resolution.cache import resolve_market_resolution_cache
 from pmkt.resolution.evm import EvmRpcError, PolygonCtfClient
 from pmkt.resolution.kalshi import (
     KalshiResolutionResolver,
     kalshi_resolution_from_payload,
 )
-from pmkt.resolution.models import RESOLVER_VERSION
+from pmkt.resolution.models import RESOLVER_VERSION, error_record
 from pmkt.resolution.polymarket import PolymarketResolutionResolver, _clob_tokens
 
 
@@ -640,7 +654,7 @@ async def test_kalshi_resolver_live_final_preserves_historical_error_observation
 
 
 @pytest.mark.asyncio
-async def test_kalshi_resolver_records_generic_historical_error_observation() -> None:
+async def test_kalshi_resolver_records_historical_transport_error_observation() -> None:
     class FakeKalshi:
         async def market(self, ticker: str):
             return {
@@ -650,7 +664,12 @@ async def test_kalshi_resolver_records_generic_historical_error_observation() ->
             }
 
         async def historical_market(self, ticker: str):
-            raise RuntimeError("historical transport failed")
+            raise httpx.ConnectError(
+                "historical transport failed",
+                request=httpx.Request(
+                    "GET", f"https://kalshi.test/historical/markets/{ticker}"
+                ),
+            )
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
 
@@ -663,8 +682,10 @@ async def test_kalshi_resolver_records_generic_historical_error_observation() ->
         if observation.source == "kalshi_historical_rest"
     ]
     assert len(historical_errors) == 1
-    assert historical_errors[0].error_type == "RuntimeError"
-    assert historical_errors[0].error_message == "historical transport failed"
+    assert historical_errors[0].error_type == "ConnectError"
+    assert historical_errors[0].error_message == (
+        "kalshi_historical_rest request failed (ConnectError)"
+    )
 
 
 @pytest.mark.asyncio
@@ -961,7 +982,10 @@ def test_polymarket_clob_tokens_parse_official_compressed_entries() -> None:
 async def test_polymarket_resolver_retains_gamma_failure_observation() -> None:
     class FakeGamma:
         async def market(self, market_key: str):
-            raise RuntimeError(f"gamma unavailable for {market_key}")
+            raise httpx.ConnectError(
+                "gamma unavailable",
+                request=httpx.Request("GET", f"https://gamma.test/{market_key}"),
+            )
 
     record = await PolymarketResolutionResolver(gamma_client=FakeGamma()).resolve(
         "pm-1",
@@ -974,7 +998,7 @@ async def test_polymarket_resolver_retains_gamma_failure_observation() -> None:
     ]
     observation = record.source_observations[0]
     assert observation.confidence == "unavailable"
-    assert observation.error_type == "RuntimeError"
+    assert observation.error_type == "ConnectError"
     assert observation.evidence == {"market_key": "pm-1", "status": "failure"}
 
 
@@ -982,7 +1006,10 @@ async def test_polymarket_resolver_retains_gamma_failure_observation() -> None:
 async def test_polymarket_resolver_retains_clob_failure_observation() -> None:
     class FakeClob:
         async def clob_market_info(self, condition_id: str):
-            raise RuntimeError(f"clob unavailable for {condition_id}")
+            raise httpx.ConnectError(
+                "clob unavailable",
+                request=httpx.Request("GET", f"https://clob.test/{condition_id}"),
+            )
 
     record = await PolymarketResolutionResolver(clob_client=FakeClob()).resolve(
         "pm-1",
@@ -999,7 +1026,7 @@ async def test_polymarket_resolver_retains_clob_failure_observation() -> None:
     ]
     observation = record.source_observations[0]
     assert observation.confidence == "unavailable"
-    assert observation.error_type == "RuntimeError"
+    assert observation.error_type == "ConnectError"
     assert observation.evidence == {
         "market_key": "pm-1",
         "condition_id": "0xabc",
@@ -1078,6 +1105,23 @@ async def test_polymarket_resolver_near_certain_prices_are_non_authoritative() -
     assert record.winner is None
     assert record.payouts == []
     assert record.source_observations[0].source == "polymarket_diagnostics"
+
+
+@pytest.mark.asyncio
+async def test_polymarket_oversized_sourced_price_is_ignored_as_invalid_evidence() -> None:
+    record = await PolymarketResolutionResolver().resolve(
+        "pm-1",
+        snapshot={
+            "market_id": "pm-1",
+            "condition_id": "0xabc",
+            "outcome_labels_json": ["yes", "no"],
+            "outcome_prices_json": [10**400, 0],
+        },
+    )
+
+    assert record.resolution_state == "open"
+    assert record.canonical_source is None
+    assert record.source_observations == []
 
 
 @pytest.mark.asyncio
@@ -1322,6 +1366,724 @@ async def test_polygon_ctf_client_rejects_wrong_chain() -> None:
     with pytest.raises(EvmRpcError):
         await client.ensure_polygon()
     await client.close()
+
+
+def test_resolution_facade_exports_supported_single_resolution_types() -> None:
+    assert ExportedPolymarketResolutionResolver is PolymarketResolutionResolver
+    assert ExportedKalshiResolutionResolver is KalshiResolutionResolver
+    assert ExportedPolygonCtfClient is PolygonCtfClient
+    assert ExportedEvmRpcError is EvmRpcError
+    assert RESOLVER_VERSION == "market_resolution_resolver.v3"
+
+
+@pytest.mark.asyncio
+async def test_single_resolvers_accept_typed_refs_and_legacy_keyword_calls() -> None:
+    polymarket = await PolymarketResolutionResolver().resolve(
+        market_key=PolymarketMarketRef("pm-1", condition_id="0xabc"),
+        snapshot={
+            "market_id": "pm-1",
+            "slug": "a-slug-is-not-the-market-id",
+            "conditionId": "0xabc",
+            "outcomes": ["Yes", "No"],
+        },
+    )
+    kalshi = await KalshiResolutionResolver().resolve(
+        market_key=KalshiMarketRef("KXRAIN", series_ticker="KXRAIN"),
+        snapshot={
+            "ticker": "KXRAIN",
+            "series_ticker": "KXRAIN",
+            "status": "finalized",
+            "settlement_value_dollars": "1",
+        },
+    )
+    legacy = await KalshiResolutionResolver().resolve(
+        market_key="KXLEGACY",
+        snapshot={"ticker": "KXLEGACY", "status": "open"},
+    )
+
+    assert (polymarket.market_key, polymarket.input_identifier) == ("pm-1", "pm-1")
+    assert polymarket.canonical_source is None
+    assert (kalshi.market_key, kalshi.input_identifier) == ("KXRAIN", "KXRAIN")
+    assert kalshi.resolution_state == "metadata_only"
+    assert legacy.market_key == "KXLEGACY"
+
+
+@pytest.mark.asyncio
+async def test_typed_ref_validation_happens_before_io() -> None:
+    calls = 0
+
+    class FakeGamma:
+        async def market(self, market_key: str):
+            nonlocal calls
+            calls += 1
+            return {"id": market_key}
+
+    resolver = PolymarketResolutionResolver(gamma_client=FakeGamma())
+    with pytest.raises(TypeError, match="PolymarketMarketRef"):
+        await resolver.resolve(KalshiMarketRef("KXWRONG"))  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="does not match"):
+        await resolver.resolve(
+            PolymarketMarketRef("pm-1", condition_id="0xabc"),
+            snapshot={"market_id": "pm-other", "condition_id": "0xabc"},
+        )
+    with pytest.raises(ValueError, match="contradictory condition"):
+        await resolver.resolve(
+            PolymarketMarketRef("pm-1"),
+            snapshot={
+                "market_id": "pm-1",
+                "condition_id": "0xabc",
+                "conditionId": "0xdef",
+            },
+        )
+    with pytest.raises(ValueError, match="non-empty string"):
+        await resolver.resolve(
+            PolymarketMarketRef("pm-1"),
+            snapshot={"market_id": 1},
+        )
+    class FakeCtf:
+        async def ensure_polygon(self) -> None:
+            raise AssertionError("invalid condition must fail before CTF I/O")
+
+        async def payout_vector(self, condition_id: str, outcome_count: int):
+            raise AssertionError("invalid condition must fail before CTF I/O")
+
+    with pytest.raises(ValueError, match="condition_id is not hex"):
+        await PolymarketResolutionResolver(
+            gamma_client=FakeGamma(), ctf_client=FakeCtf()
+        ).resolve(
+            PolymarketMarketRef("pm-1", condition_id="not-hex")
+        )
+    kalshi_resolver = KalshiResolutionResolver(FakeGamma())
+    with pytest.raises(TypeError, match="KalshiMarketRef"):
+        await kalshi_resolver.resolve(  # type: ignore[arg-type]
+            PolymarketMarketRef("pm-wrong")
+        )
+    with pytest.raises(ValueError, match="contradictory series"):
+        await kalshi_resolver.resolve(
+            KalshiMarketRef("KXRAIN"),
+            snapshot={
+                "ticker": "KXRAIN",
+                "series_ticker": "SERIES-A",
+                "seriesTicker": "SERIES-B",
+            },
+        )
+    assert calls == 0
+
+
+@pytest.mark.asyncio
+async def test_returned_typed_identity_conflicts_are_source_evidence() -> None:
+    class FakeGamma:
+        async def market(self, market_key: str):
+            return {
+                "id": market_key,
+                "market_id": "pm-other",
+                "conditionId": "0xabc",
+            }
+
+    class FakeKalshi:
+        async def market(self, ticker: str):
+            return {"ticker": ticker, "market_key": "OTHER"}
+
+        async def historical_market(self, ticker: str):
+            return {"ticker": ticker, "series_ticker": "OTHER-SERIES"}
+
+    class ContradictoryGamma:
+        async def market(self, market_key: str):
+            return {
+                "id": market_key,
+                "condition_id": "0xabc",
+                "conditionId": "0xdef",
+            }
+
+    polymarket = await PolymarketResolutionResolver(
+        gamma_client=FakeGamma()
+    ).resolve(PolymarketMarketRef("pm-1"))
+    contradictory_condition = await PolymarketResolutionResolver(
+        gamma_client=ContradictoryGamma()
+    ).resolve(PolymarketMarketRef("pm-1"))
+    kalshi = await KalshiResolutionResolver(FakeKalshi()).resolve(
+        KalshiMarketRef("KXRAIN", series_ticker="SERIES")
+    )
+
+    assert polymarket.resolution_state == "unavailable"
+    assert polymarket.source_observations[0].error_type == (
+        "InvalidResolutionEvidenceError"
+    )
+    assert contradictory_condition.source_observations[0].error_type == (
+        "InvalidResolutionEvidenceError"
+    )
+    assert kalshi.resolution_state == "unavailable"
+    assert {
+        observation.error_type for observation in kalshi.source_observations
+    } == {"InvalidResolutionEvidenceError"}
+
+
+@pytest.mark.asyncio
+async def test_programmer_errors_escape_single_resolvers() -> None:
+    class BrokenGamma:
+        async def market(self, market_key: str):
+            raise RuntimeError("injected gamma bug")
+
+    class BrokenKalshi:
+        async def market(self, ticker: str):
+            raise AttributeError("injected kalshi bug")
+
+        async def historical_market(self, ticker: str):
+            return {"ticker": ticker}
+
+    class BrokenCtf:
+        async def ensure_polygon(self) -> None:
+            raise AssertionError("injected CTF bug")
+
+        async def payout_vector(self, condition_id: str, outcome_count: int):
+            return 1, [1, 0]
+
+    with pytest.raises(RuntimeError, match="injected gamma bug"):
+        await PolymarketResolutionResolver(gamma_client=BrokenGamma()).resolve("pm-1")
+    with pytest.raises(AttributeError, match="injected kalshi bug"):
+        await KalshiResolutionResolver(BrokenKalshi()).resolve("KXRAIN")
+    with pytest.raises(AssertionError, match="injected CTF bug"):
+        await PolymarketResolutionResolver(ctf_client=BrokenCtf()).resolve(
+            "pm-1",
+            snapshot={
+                "market_id": "pm-1",
+                "condition_id": "0xabc",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+
+
+@pytest.mark.asyncio
+async def test_kalshi_read_auth_signal_escapes_but_http_403_is_evidence() -> None:
+    class MissingAuth:
+        def headers_for_get(self, path: str) -> dict[str, str]:
+            raise ReadAuthenticationRequiredError("auth marker secret")
+
+    def should_not_run(request: httpx.Request) -> httpx.Response:
+        raise AssertionError("network must not run after read-auth failure")
+
+    auth_client = AsyncKalshiClient(
+        base_url="https://kalshi.test",
+        auth=MissingAuth(),
+        transport=httpx.MockTransport(should_not_run),
+    )
+    try:
+        with pytest.raises(ReadAuthenticationRequiredError):
+            await KalshiResolutionResolver(auth_client).resolve("KXRAIN")
+    finally:
+        await auth_client.close()
+
+    def forbidden(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403, content=b"REMOTE-BODY-MARKER")
+
+    http_client = AsyncKalshiClient(
+        base_url="https://user:password@kalshi.test/private-path?query=QUERY-MARKER",
+        transport=httpx.MockTransport(forbidden),
+        request_policy=RequestPolicy(max_attempts=1),
+    )
+    try:
+        record = await KalshiResolutionResolver(http_client).resolve("KXRAIN")
+    finally:
+        await http_client.close()
+
+    serialized = json.dumps(record.to_row(), default=str)
+    assert record.error_type == "HTTPStatusError"
+    assert record.error_message == "kalshi_historical_rest returned HTTP 403"
+    for marker in ("password", "private-path", "QUERY-MARKER", "REMOTE-BODY-MARKER"):
+        assert marker not in serialized
+
+
+@pytest.mark.asyncio
+async def test_invalid_json_and_malformed_gamma_condition_are_source_evidence() -> None:
+    def invalid_json(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"not-json")
+
+    client = AsyncGammaClient(
+        base_url="https://gamma.test",
+        transport=httpx.MockTransport(invalid_json),
+        request_policy=RequestPolicy(max_attempts=1),
+    )
+    try:
+        invalid = await PolymarketResolutionResolver(gamma_client=client).resolve(
+            PolymarketMarketRef("pm-1")
+        )
+    finally:
+        await client.close()
+
+    class MalformedGamma:
+        async def market(self, market_key: str):
+            return {
+                "id": market_key,
+                "conditionId": "not-hex",
+                "outcomes": ["Yes", "No"],
+            }
+
+    class UnusedCtf:
+        async def ensure_polygon(self) -> None:
+            raise AssertionError("malformed Gamma condition must block CTF I/O")
+
+        async def payout_vector(self, condition_id: str, outcome_count: int):
+            raise AssertionError("malformed Gamma condition must block CTF I/O")
+
+    malformed = await PolymarketResolutionResolver(
+        gamma_client=MalformedGamma(),
+        ctf_client=UnusedCtf(),
+    ).resolve(PolymarketMarketRef("pm-2"))
+
+    assert invalid.source_observations[0].error_type == "JSONDecodeError"
+    assert malformed.source_observations[0].error_type == (
+        "InvalidResolutionEvidenceError"
+    )
+
+
+def test_resolution_error_record_sanitizes_external_exception_text() -> None:
+    request = httpx.Request(
+        "GET", "https://user:password@example.test/private?token=QUERY-MARKER"
+    )
+    response = httpx.Response(500, request=request, content=b"BODY-MARKER")
+    error = httpx.HTTPStatusError(
+        "remote message marker", request=request, response=response
+    )
+
+    record = error_record(
+        platform="kalshi",
+        market_key="KXRAIN",
+        input_identifier="KXRAIN",
+        error=error,
+    )
+    serialized = json.dumps(record.to_row(), default=str)
+
+    assert record.error_message == "kalshi returned HTTP 500"
+    for marker in (
+        "password",
+        "private",
+        "QUERY-MARKER",
+        "BODY-MARKER",
+        "remote message marker",
+    ):
+        assert marker not in serialized
+
+
+@pytest.mark.asyncio
+async def test_persisted_rpc_error_does_not_include_rpc_url_or_remote_body() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, content=b"RPC-BODY-MARKER")
+
+    client = PolygonCtfClient(
+        "https://user:password@rpc.test/private-path?token=RPC-QUERY-MARKER",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        record = await PolymarketResolutionResolver(ctf_client=client).resolve(
+            "pm-1",
+            snapshot={
+                "market_id": "pm-1",
+                "condition_id": "0xabc",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+    finally:
+        await client.close()
+
+    serialized = json.dumps(record.to_row(), default=str)
+    assert record.canonical_source is None
+    assert record.source_observations[0].error_message == (
+        "polygon_ctf returned HTTP 500"
+    )
+    for marker in (
+        "password",
+        "private-path",
+        "RPC-QUERY-MARKER",
+        "RPC-BODY-MARKER",
+    ):
+        assert marker not in serialized
+
+
+@pytest.mark.parametrize(
+    ("payload_kind", "expected_type", "expected_message"),
+    [
+        ("rpc_error", "EvmRpcError", "polygon_ctf failed (EvmRpcError)"),
+        ("invalid_encoding", "UnicodeDecodeError", "polygon_ctf returned invalid JSON"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_persisted_rpc_decode_errors_are_sanitized(
+    payload_kind: str,
+    expected_type: str,
+    expected_message: str,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if payload_kind == "invalid_encoding":
+            return httpx.Response(200, content=bytes([255]))
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={
+                "jsonrpc": "2.0",
+                "id": payload["id"],
+                "error": {
+                    "message": "RPC-ERROR-BODY-MARKER",
+                    "data": "RPC-HEADER-MARKER",
+                },
+            },
+        )
+
+    client = PolygonCtfClient(
+        "https://user:password@rpc.test/private?token=RPC-QUERY-MARKER",
+        transport=httpx.MockTransport(handler),
+    )
+    client._client.headers["Authorization"] = "RPC-AUTH-HEADER-MARKER"
+    try:
+        record = await PolymarketResolutionResolver(ctf_client=client).resolve(
+            "pm-1",
+            snapshot={
+                "market_id": "pm-1",
+                "condition_id": "0xabc",
+                "outcomes": ["Yes", "No"],
+            },
+        )
+    finally:
+        await client.close()
+
+    [observation] = record.source_observations
+    serialized = json.dumps(record.to_row(), default=str)
+    assert observation.error_type == expected_type
+    assert observation.error_message == expected_message
+    for marker in (
+        "password",
+        "private",
+        "RPC-QUERY-MARKER",
+        "RPC-ERROR-BODY-MARKER",
+        "RPC-HEADER-MARKER",
+        "RPC-AUTH-HEADER-MARKER",
+    ):
+        assert marker not in serialized
+
+
+@pytest.mark.asyncio
+async def test_single_deadline_expires_while_waiting_for_limiter_without_request() -> None:
+    entered = asyncio.Event()
+    drained = asyncio.Event()
+    block = False
+    request_count = 0
+
+    class ControlledLimiter:
+        async def __aenter__(self) -> None:
+            if not block:
+                return
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                drained.set()
+                raise
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            return None
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(200, json={"id": "pm-1"})
+
+    client = AsyncGammaClient(
+        base_url="https://gamma.test",
+        limiter=ControlledLimiter(),  # type: ignore[arg-type]
+        transport=httpx.MockTransport(handler),
+        request_policy=RequestPolicy(max_attempts=1),
+    )
+    resolver = PolymarketResolutionResolver(gamma_client=client)
+    try:
+        await resolver.resolve("pm-1", deadline_s=1.0)  # warm the HTTP client
+        block = True
+        with pytest.raises(OperationTimeoutError):
+            await resolver.resolve("pm-1", deadline_s=0.05)
+        assert entered.is_set()
+        assert drained.is_set()
+        assert request_count == 1
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_single_deadline_expires_in_retry_backoff_without_second_attempt() -> None:
+    fail = False
+    request_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        if fail:
+            return httpx.Response(503, headers={"Retry-After": "1"})
+        return httpx.Response(200, json={"id": "pm-1"})
+
+    client = AsyncGammaClient(
+        base_url="https://gamma.test",
+        transport=httpx.MockTransport(handler),
+        request_policy=RequestPolicy(max_attempts=2),
+    )
+    resolver = PolymarketResolutionResolver(gamma_client=client)
+    try:
+        await resolver.resolve("pm-1", deadline_s=1.0)
+        fail = True
+        with pytest.raises(OperationTimeoutError):
+            await resolver.resolve("pm-1", deadline_s=0.05)
+        await asyncio.sleep(0)
+        assert request_count == 2
+        fail = False
+        record = await resolver.resolve("pm-1", deadline_s=1.0)
+    finally:
+        await client.close()
+
+    assert record.market_key == "pm-1"
+
+
+@pytest.mark.parametrize("failure", ["timeout", "caller_cancel"])
+@pytest.mark.asyncio
+async def test_transport_cleanup_completes_before_failure_and_client_reuses(
+    failure: str,
+) -> None:
+    entered = asyncio.Event()
+    drained = asyncio.Event()
+    block = False
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if block:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                drained.set()
+                raise
+        return httpx.Response(200, json={"id": "pm-1"})
+
+    client = AsyncGammaClient(
+        base_url="https://gamma.test",
+        transport=httpx.MockTransport(handler),
+        request_policy=RequestPolicy(max_attempts=1),
+    )
+    resolver = PolymarketResolutionResolver(gamma_client=client)
+    try:
+        await resolver.resolve("pm-1", deadline_s=1.0)
+        block = True
+        task = asyncio.create_task(
+            resolver.resolve(
+                "pm-1",
+                deadline_s=0.05 if failure == "timeout" else None,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        if failure == "caller_cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OperationTimeoutError):
+                await task
+        assert drained.is_set()
+        block = False
+        record = await resolver.resolve("pm-1", deadline_s=1.0)
+    finally:
+        await client.close()
+
+    assert record.market_key == "pm-1"
+
+
+@pytest.mark.parametrize("stage", ["chain", "payout"])
+@pytest.mark.parametrize("failure", ["timeout", "caller_cancel"])
+@pytest.mark.asyncio
+async def test_rpc_failure_drains_owned_await_and_client_is_reusable(
+    stage: str,
+    failure: str,
+) -> None:
+    entered = asyncio.Event()
+    drained = asyncio.Event()
+    block = True
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        method = payload["method"]
+        should_block = (stage == "chain" and method == "eth_chainId") or (
+            stage == "payout" and method == "eth_call"
+        )
+        if block and should_block:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(0)
+                drained.set()
+                raise
+        data = (
+            payload.get("params", [{}])[0].get("data", "")
+            if method == "eth_call"
+            else ""
+        )
+        if method == "eth_chainId":
+            result = "0x89"
+        elif data.startswith("0xdd34de67") or data.endswith("0" * 64):
+            result = "0x1"
+        else:
+            result = "0x0"
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+        )
+
+    client = PolygonCtfClient(
+        "https://rpc.test",
+        transport=httpx.MockTransport(handler),
+    )
+    resolver = PolymarketResolutionResolver(ctf_client=client)
+    snapshot = {
+        "market_id": "pm-1",
+        "condition_id": "0xabc",
+        "outcomes": ["Yes", "No"],
+    }
+    try:
+        task = asyncio.create_task(
+            resolver.resolve(
+                "pm-1",
+                snapshot=snapshot,
+                deadline_s=0.05 if failure == "timeout" else None,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        if failure == "caller_cancel":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            with pytest.raises(OperationTimeoutError):
+                await task
+        assert drained.is_set()
+        assert resolver._ctf_chain_checked is (stage == "payout")
+        block = False
+        record = await resolver.resolve("pm-1", snapshot=snapshot, deadline_s=1.0)
+    finally:
+        await client.close()
+
+    assert resolver._ctf_chain_checked is True
+    assert record.canonical_source == "polygon_ctf"
+
+
+@pytest.mark.asyncio
+async def test_ctf_chain_success_is_cached_only_after_expiry_checkpoint() -> None:
+    now = 0.0
+
+    class Ctf:
+        async def ensure_polygon(self) -> None:
+            nonlocal now
+            now = 2.0
+
+        async def payout_vector(self, condition_id: str, outcome_count: int):
+            raise AssertionError("expired chain validation must stop payout reads")
+
+    resolver = PolymarketResolutionResolver(ctf_client=Ctf())
+    expiry = OperationExpiry.after(1.0, clock=lambda: now)
+
+    with pytest.raises(OperationTimeoutError):
+        await resolver._resolve_with_expiry(
+            "pm-1",
+            snapshot={
+                "market_id": "pm-1",
+                "condition_id": "0xabc",
+                "outcomes": ["Yes", "No"],
+            },
+            expiry=expiry,
+        )
+
+    assert resolver._ctf_chain_checked is False
+
+
+@pytest.mark.asyncio
+async def test_late_normalization_checkpoint_uses_original_expiry() -> None:
+    now = 0.0
+
+    class SlowFloat:
+        def __float__(self) -> float:
+            nonlocal now
+            now = 2.0
+            return 0.5
+
+    class Gamma:
+        async def market(self, market_key: str):
+            return {
+                "id": market_key,
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": [SlowFloat(), 0.5],
+            }
+
+    resolver = PolymarketResolutionResolver(gamma_client=Gamma())
+    expiry = OperationExpiry.after(1.0, clock=lambda: now)
+
+    with pytest.raises(OperationTimeoutError):
+        await resolver._resolve_with_expiry(
+            "pm-1",
+            snapshot=None,
+            expiry=expiry,
+        )
+
+
+@pytest.mark.asyncio
+async def test_native_client_subclass_overrides_remain_in_resolution_call_path() -> None:
+    gamma_called = False
+    ctf_calls: list[str] = []
+
+    class Gamma(AsyncGammaClient):
+        async def market(self, market_id: str | int) -> dict[str, object]:
+            nonlocal gamma_called
+            gamma_called = True
+            return {
+                "id": str(market_id),
+                "conditionId": "0xabc",
+                "outcomes": ["Yes", "No"],
+            }
+
+    class Ctf(PolygonCtfClient):
+        async def ensure_polygon(self) -> None:
+            ctf_calls.append("chain")
+
+        async def payout_vector(
+            self, condition_id: str, outcome_count: int
+        ) -> tuple[int, list[int]]:
+            ctf_calls.append("payout")
+            return 1, [1, 0]
+
+    gamma = Gamma(base_url="https://gamma.test")
+    ctf = Ctf("https://rpc.test")
+    try:
+        record = await PolymarketResolutionResolver(
+            gamma_client=gamma, ctf_client=ctf
+        ).resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)
+    finally:
+        await gamma.close()
+        await ctf.close()
+
+    assert gamma_called
+    assert ctf_calls == ["chain", "payout"]
+    assert record.canonical_source == "polygon_ctf"
+
+
+@pytest.mark.asyncio
+async def test_polygon_ctf_malformed_uint_result_is_evm_error() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        return httpx.Response(
+            200,
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": "0xnope"},
+        )
+
+    client = PolygonCtfClient(
+        "https://rpc.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        with pytest.raises(EvmRpcError, match="malformed uint256"):
+            await client.payout_denominator("0xabc")
+    finally:
+        await client.close()
 
 
 @pytest.mark.asyncio

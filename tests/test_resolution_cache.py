@@ -101,6 +101,8 @@ def _resolution_row(
     state: str = STATE_FINAL,
     confidence: str = CONFIDENCE_CANONICAL,
     resolver_version: str | None = RESOLVER_VERSION,
+    canonical_source: str = "test",
+    payouts_json: str = "[]",
 ) -> dict[str, Any]:
     return market_resolution_row(
         platform=platform,
@@ -109,10 +111,10 @@ def _resolution_row(
         resolution_state=state,
         result_type=RESULT_TYPE_BINARY if state == STATE_FINAL else RESULT_TYPE_UNKNOWN,
         confidence=confidence,
-        canonical_source="test",
+        canonical_source=canonical_source,
         result=result,
         winner=result if state == STATE_FINAL else None,
-        payouts_json="[]",
+        payouts_json=payouts_json,
         source_observations_json="[]",
         observed_at_utc="2026-01-01T00:00:00+00:00",
         resolver_version=resolver_version,
@@ -171,6 +173,7 @@ async def test_cache_reuse_is_universe_and_resolver_version_aware(
         polymarket_path,
         [
             {"schema_version": "polymarket_market_snapshot.v1", "market_id": "pm-keep", "question": "Keep?"},
+            {"schema_version": "polymarket_market_snapshot.v1", "market_id": "pm-v3", "question": "V3?"},
             {"schema_version": "polymarket_market_snapshot.v1", "market_id": "pm-old", "question": "Old?"},
             {"schema_version": "polymarket_market_snapshot.v1", "market_id": "pm-out", "question": "Out?"},
         ],
@@ -179,14 +182,21 @@ async def test_cache_reuse_is_universe_and_resolver_version_aware(
     pd.DataFrame(
         [
             {"polymarket_market_key": "pm-keep"},
+            {"polymarket_market_key": "pm-v3"},
             {"polymarket_market_key": "pm-old"},
         ]
     ).to_parquet(matches_path, index=False)
     _write_existing(
         output_dir,
         [
-            _resolution_row(platform="polymarket", market_key="pm-keep", result="yes"),
+            _resolution_row(
+                platform="polymarket",
+                market_key="pm-keep",
+                result="yes",
+                resolver_version="market_resolution_resolver.v2",
+            ),
             _resolution_row(platform="polymarket", market_key="pm-out", result="yes"),
+            _resolution_row(platform="polymarket", market_key="pm-v3", result="no"),
             _resolution_row(
                 platform="polymarket",
                 market_key="pm-old",
@@ -218,10 +228,13 @@ async def test_cache_reuse_is_universe_and_resolver_version_aware(
     )
 
     written = pd.read_parquet(output_dir / "market_resolutions.parquet")
-    assert set(written["market_key"]) == {"pm-keep", "pm-old"}
+    assert set(written["market_key"]) == {"pm-keep", "pm-old", "pm-v3"}
     assert calls == ["pm-old"]
     results = written.set_index("market_key")["result"].to_dict()
-    assert results == {"pm-keep": "yes", "pm-old": "no"}
+    assert results == {"pm-keep": "yes", "pm-old": "no", "pm-v3": "no"}
+    versions = written.set_index("market_key")["resolver_version"].to_dict()
+    assert versions["pm-keep"] == "market_resolution_resolver.v2"
+    assert versions["pm-v3"] == RESOLVER_VERSION
 
 
 @pytest.mark.asyncio
@@ -612,6 +625,7 @@ async def test_cache_refresh_carries_current_final_over_weak_downgrade(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    retained_payouts = '[{"outcome":"yes","payout":"1"},{"outcome":"no","payout":"0"}]'
     polymarket_path = tmp_path / "polymarket.parquet"
     kalshi_path = tmp_path / "kalshi.parquet"
     output_dir = tmp_path / "out"
@@ -627,7 +641,19 @@ async def test_cache_refresh_carries_current_final_over_weak_downgrade(
             }
         ],
     )
-    _write_existing(output_dir, [_resolution_row(platform="kalshi", market_key="KXFINAL", result="yes")])
+    _write_existing(
+        output_dir,
+        [
+            _resolution_row(
+                platform="kalshi",
+                market_key="KXFINAL",
+                result="yes",
+                resolver_version="market_resolution_resolver.v2",
+                canonical_source="kalshi_rest",
+                payouts_json=retained_payouts,
+            )
+        ],
+    )
 
     class FakeKalshiResolver:
         def __init__(self, client: Any | None = None) -> None:
@@ -659,6 +685,9 @@ async def test_cache_refresh_carries_current_final_over_weak_downgrade(
     assert row["resolution_state"] == STATE_FINAL
     assert row["confidence"] == CONFIDENCE_CANONICAL
     assert row["result"] == "yes"
+    assert row["canonical_source"] == "kalshi_rest"
+    assert row["payouts_json"] == retained_payouts
+    assert row["resolver_version"] == "market_resolution_resolver.v2"
 
 
 @pytest.mark.asyncio
@@ -741,7 +770,17 @@ async def test_cache_refresh_marks_conflicting_canonical_finals_inconsistent(
             }
         ],
     )
-    _write_existing(output_dir, [_resolution_row(platform="kalshi", market_key="KXCONFLICT", result="yes")])
+    _write_existing(
+        output_dir,
+        [
+            _resolution_row(
+                platform="kalshi",
+                market_key="KXCONFLICT",
+                result="yes",
+                resolver_version="market_resolution_resolver.v2",
+            )
+        ],
+    )
 
     class FakeKalshiResolver:
         def __init__(self, client: Any | None = None) -> None:
@@ -766,6 +805,7 @@ async def test_cache_refresh_marks_conflicting_canonical_finals_inconsistent(
     assert row["resolution_state"] == STATE_INCONSISTENT
     assert row["confidence"] == CONFIDENCE_INCONSISTENT
     assert row["error_type"] == "MarketResolutionCacheConflict"
+    assert row["resolver_version"] == RESOLVER_VERSION
     assert "yes" in row["error_message"]
     assert "no" in row["error_message"]
 
@@ -917,6 +957,7 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
                 ),
                 "error_type": "MarketResolutionCacheConflict",
                 "error_message": "Existing canonical result yes conflicts with refreshed canonical result no",
+                "resolver_version": "market_resolution_resolver.v2",
             }
         ],
     )
@@ -944,6 +985,7 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
     assert row["resolution_state"] == STATE_INCONSISTENT
     assert row["confidence"] == CONFIDENCE_INCONSISTENT
     assert row["error_type"] == "MarketResolutionCacheConflict"
+    assert row["resolver_version"] == "market_resolution_resolver.v2"
 
 
 @pytest.mark.asyncio
@@ -979,7 +1021,7 @@ async def test_cache_resolver_failure_isolated_to_market(
 
         async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
             if market_key == "KXFAIL":
-                raise RuntimeError("boom")
+                raise RuntimeError("SECRET-CACHE-FAILURE-MARKER")
             return _final_record("kalshi", market_key, "yes")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -998,6 +1040,8 @@ async def test_cache_resolver_failure_isolated_to_market(
     assert written.loc["KXOK", "resolution_state"] == STATE_FINAL
     assert written.loc["KXFAIL", "resolution_state"] == "unavailable"
     assert written.loc["KXFAIL", "error_type"] == "RuntimeError"
+    assert written.loc["KXFAIL", "error_message"] == "kalshi failed (RuntimeError)"
+    assert written.loc["KXFAIL", "resolver_version"] == RESOLVER_VERSION
 
 
 @pytest.mark.asyncio

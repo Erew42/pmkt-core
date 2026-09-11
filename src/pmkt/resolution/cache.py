@@ -18,6 +18,7 @@ from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.resolution.evm import PolygonCtfClient
 from pmkt.resolution.kalshi import KalshiResolutionResolver
 from pmkt.resolution.models import (
+    COMPATIBLE_RESOLVER_VERSIONS,
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
     CONFIDENCE_METADATA_ONLY,
@@ -259,7 +260,7 @@ def _existing_current_rows(
         return {}
     if "resolver_version" not in existing.columns:
         return {}
-    current_version = existing["resolver_version"] == RESOLVER_VERSION
+    current_version = existing["resolver_version"].isin(COMPATIBLE_RESOLVER_VERSIONS)
     canonical_final = (existing["resolution_state"] == STATE_FINAL) & (
         existing["confidence"] == CONFIDENCE_CANONICAL
     )
