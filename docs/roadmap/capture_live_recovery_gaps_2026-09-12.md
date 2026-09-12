@@ -143,3 +143,17 @@ Both manifests passed full artifact validation with no errors. Polymarket tape
 contains 140 reconnect invalidations (20 instruments x 7 transport retries);
 Kalshi has none. These do not originate from missing-initialization recovery.
 PR remains draft; no merge or scaling was performed.
+
+25-market follow-up (`full@3`, 50 PM tokens + 25 Kalshi tickers, same host):
+
+| Revision | PM reconnects | PM cadence | KX reconnects | KX snapshots |
+|---|---:|---|---:|---|
+| `24122ba` (PING reply only) | 13 | ~43s | 1 | 24/25 |
+| `13a3250` (PONG expiry on reader) | 13 | ~43s | 0 | 24/25 |
+| `6fb5cf7` (no outbound-PING deadline) | **6** | 67–139s, irregular | **0** | **25/25** |
+
+The 43s loop was our keepalive PING arming a 20s deadline that data frames
+enforced even when the venue never PONGed. Remaining six Polymarket reconnects
+are a slower, irregular transport pattern (`socket_recovery_count=2`). Kalshi
+targeted refresh stayed healthy (4/4 successful). Host peak ~82% CPU / 509 MB
+RSS; not resource-bound.
