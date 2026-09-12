@@ -684,3 +684,23 @@ async def test_legacy_signature_request_override_still_serves_request_json() -> 
         ("POST", "/orders"),
     ]
     assert seen[1][2] == {"X-Caller": "yes"}
+
+
+def test_from_values_builds_subclass_instances_with_subclass_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consumers subclass ``PmktConfig``; ``from_values`` must honor ``cls``."""
+
+    class _ResearchConfig(PmktConfig):
+        research_mode: str = "offline"
+
+    monkeypatch.setenv("PMKT_RESEARCH_MODE", "poisoned")
+    monkeypatch.setenv("PMKT_GAMMA_API_URL", "https://poisoned.test")
+
+    config = _ResearchConfig.from_values(research_mode="live")
+    assert isinstance(config, _ResearchConfig)
+    assert config.research_mode == "live"
+    assert config.gamma_api_url == "https://gamma-api.polymarket.com"
+    assert _ResearchConfig.from_values().research_mode == "offline"
+    assert type(_ResearchConfig.from_values()) is type(config)
+    assert not isinstance(PmktConfig.from_values(), _ResearchConfig)

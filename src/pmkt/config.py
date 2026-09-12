@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar, cast
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from pmkt._http import RequestPolicy
+
+
+_ConfigT = TypeVar("_ConfigT", bound="PmktConfig")
 
 
 KALSHI_ENDPOINTS = {
@@ -64,10 +67,14 @@ class PmktConfig(BaseSettings):
         super().__init__(**values)
 
     @classmethod
-    def from_values(cls, **values: Any) -> "PmktConfig":
-        """Build independent settings from arguments and declared defaults only."""
+    def from_values(cls: type[_ConfigT], **values: Any) -> _ConfigT:
+        """Build independent settings from arguments and declared defaults only.
 
-        return _InitOnlyPmktConfig(**values)
+        The result is an instance of ``cls`` (including subclasses), so
+        subclass fields are validated instead of being silently ignored.
+        """
+
+        return _init_only_variant(cls)(**values)
 
     @classmethod
     def from_env(cls, **values: Any) -> "PmktConfig":
@@ -84,22 +91,46 @@ class PmktConfig(BaseSettings):
         return self.kalshi_ws_url or KALSHI_ENDPOINTS[self.kalshi_env]["ws"]
 
 
-class _InitOnlyPmktConfig(PmktConfig):
-    def __init__(self, **values: Any) -> None:
-        values.pop("_env_file", None)
-        BaseSettings.__init__(self, _env_file=None, **values)
+_INIT_ONLY_VARIANTS: dict[type[PmktConfig], type[PmktConfig]] = {}
 
-    @classmethod
+
+def _init_only_variant(cls: type[_ConfigT]) -> type[_ConfigT]:
+    """Return a cached subclass of ``cls`` whose only settings source is init."""
+
+    cached = _INIT_ONLY_VARIANTS.get(cls)
+    if cached is not None:
+        return cast("type[_ConfigT]", cached)
+
+    def __init__(self: PmktConfig, **values: Any) -> None:
+        # Run the full constructor chain of ``cls`` with dotenv discovery
+        # disabled; ``settings_customise_sources`` below drops the OS
+        # environment and dotenv sources regardless of ``_env_file``.
+        values["_env_file"] = None
+        cls.__init__(self, **values)
+
     def settings_customise_sources(
-        cls,
+        klass: type[BaseSettings],
         settings_cls: type[BaseSettings],
         init_settings: Any,
         env_settings: Any,
         dotenv_settings: Any,
         file_secret_settings: Any,
     ) -> tuple[Any, ...]:
-        del settings_cls, env_settings, dotenv_settings, file_secret_settings
+        del klass, settings_cls, env_settings, dotenv_settings, file_secret_settings
         return (init_settings,)
+
+    variant = type(
+        f"_InitOnly{cls.__name__}",
+        (cls,),
+        {
+            "__init__": __init__,
+            "__module__": cls.__module__,
+            "__qualname__": f"_InitOnly{cls.__qualname__}",
+            "settings_customise_sources": classmethod(settings_customise_sources),
+        },
+    )
+    _INIT_ONLY_VARIANTS[cls] = variant
+    return cast("type[_ConfigT]", variant)
 
 
 _config: PmktConfig | None = None
