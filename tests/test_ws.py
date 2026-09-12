@@ -71,24 +71,17 @@ async def no_sleep(_: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pong_deadline_is_not_extended_by_ping_and_reconnect_resets() -> None:
+async def test_outbound_ping_does_not_arm_pong_deadline() -> None:
     now = [100.0]
-    sockets = deque([FakeWebSocket(), FakeWebSocket()])
-
-    async def connect_factory(_):
-        return sockets.popleft()
-
-    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=None, heartbeat_clock=lambda: now[0])
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: FakeWebSocket(),
+        heartbeat_interval=None,
+        heartbeat_clock=lambda: now[0],
+    )
     await client.connect()
     await client.ping()
-    now[0] += 10
-    await client.ping()
-    assert client._pending_ping_since == 100
-    now[0] += 10
-    with pytest.raises(asyncio.TimeoutError, match="PONG"):
-        client._check_pong_deadline()
-    await client.reconnect()
+    now[0] += 30
     assert client._pending_ping_since is None
     client._check_pong_deadline()
     await client.close()
@@ -96,9 +89,16 @@ async def test_pong_deadline_is_not_extended_by_ping_and_reconnect_resets() -> N
 
 
 @pytest.mark.asyncio
-async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None:
+async def test_missing_client_pong_does_not_expire_while_data_arrives() -> None:
     class BusySocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+
         async def __anext__(self):
+            self.n += 1
+            if self.n > 25:
+                raise StopAsyncIteration
             await asyncio.sleep(0.002)
             return '{"event_type":"last_trade_price","asset_id":"a"}'
 
@@ -111,11 +111,10 @@ async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None
         heartbeat_interval=0.01, pong_timeout_seconds=0.02)
     seen = []
     async with client:
-        with pytest.raises(asyncio.TimeoutError, match="PONG"):
-            async for message in client.iter_messages(reconnect=False):
-                seen.append(message)
-    assert seen
-    assert ws.closed
+        async for message in client.iter_messages(reconnect=False):
+            seen.append(message)
+    assert len(seen) == 25
+    assert client._heartbeat_error is None
     assert client._heartbeat_task is None
 
 
@@ -516,10 +515,11 @@ async def test_iter_messages_clears_pong_deadline_for_padded_pong() -> None:
         connect_factory=connect_factory,
     )
     await client.connect()
-    await client.ping()
+    client._pending_ping_since = 100.0
     now[0] += 19
     async for _ in client.iter_messages(reconnect=False):
         break
+    assert client._pending_ping_since is None
     client._check_pong_deadline()
     await client.close()
 

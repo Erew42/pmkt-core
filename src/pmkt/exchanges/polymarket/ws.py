@@ -721,8 +721,9 @@ class AsyncMarketWebSocketClient:
         ws = self._ws
         if ws is None:
             raise RuntimeError("WebSocket is not connected.")
-        if self._pending_ping_since is None:
-            self._pending_ping_since = self._heartbeat_clock()
+        # Outbound PING is keepalive only. The venue may never PONG it; data
+        # frames still prove liveness. The 20s deadline applies to unanswered
+        # venue PINGs, which are answered in iter_messages.
         await ws.send("PING")
 
     async def iter_messages(
@@ -760,12 +761,11 @@ class AsyncMarketWebSocketClient:
                         if heartbeat == "PONG":
                             self._pending_ping_since = None
                         elif heartbeat == "PING":
-                            # Venue PINGs must be answered before later commits
-                            # delay the iterator; they do not extend our PONG deadline.
+                            if self._pending_ping_since is None:
+                                self._pending_ping_since = self._heartbeat_clock()
                             await ws.send("PONG")
+                            self._pending_ping_since = None
                         continue
-                    # Data frames do not extend an outstanding PONG deadline.
-                    self._check_pong_deadline()
                     # Stamp application dequeue BEFORE decoding. Messages 2..N
                     # of a frame would otherwise inherit processing time spent
                     # on their predecessors, including synchronous commits.
