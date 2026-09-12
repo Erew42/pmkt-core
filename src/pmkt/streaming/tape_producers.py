@@ -308,9 +308,7 @@ class PolymarketTapeProducer:
                 continue
             if event_type != "price_change":
                 continue
-            # A delta cannot establish the first reconstruction baseline. Keep
-            # existing post-reconnect invalid audit events when a prior checkpoint
-            # exists; the collector retains pre-initialization observations.
+            # Skip first-baseline deltas; keep post-reconnect audit when an epoch already exists.
             if not state.initial_snapshot_received and book_id not in self._epochs.generations:
                 continue
             open_epoch = self._epochs.open_epochs.get(book_id)

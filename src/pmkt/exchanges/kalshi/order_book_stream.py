@@ -1217,7 +1217,7 @@ async def stream_kalshi_order_book_data(
                                                 actions=[FeedRecoveryAction(
                                                     action="request_snapshot", venue="kalshi",
                                                     shard_id=capture_shard_id,
-                                                    reasons=("book_integrity_or_initialization",),
+                                                    reasons=("book_integrity",),
                                                     instruments=tuple(unique_tickers),
                                                 )],
                                                 observed_at_utc=_utc_now().isoformat(),

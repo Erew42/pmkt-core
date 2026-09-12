@@ -115,9 +115,10 @@ implementation revision's source and exited 0 after reaching their deadlines.
 
 Polymarket recorded zero supervisor recovery actions across 1,158 evaluations.
 Six final-attempt instruments lacked valid initial snapshot evidence. Its seven
-reconnects came through the transport retry path; the underlying exceptions were
-not persisted, so their exact causes are unresolved. This is evidence for the
-initialization fix, not a claim of transport stability or readiness to scale.
+reconnects came through the transport retry path on a ~43s cadence after 4.6
+minutes. The collector ignored inbound application `PING` frames (the venue
+requires `PONG` within 20s) while sending its own pings. That protocol gap is
+the next transport fix; this record is not a claim of transport stability.
 Kalshi issued no targeted refreshes and finalized v3 without a commit failure.
 Both conservative capture verdicts remain `partial`, with eligibility reporting
 and missing-snapshot reasons preserved independently.

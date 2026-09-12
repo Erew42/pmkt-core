@@ -123,6 +123,18 @@ def market_operation_payload(
     return payload
 
 
+def application_heartbeat_token(raw: Any) -> str | None:
+    """Return PING or PONG for an application heartbeat frame, else None."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    if not isinstance(raw, str):
+        return None
+    token = raw.strip().upper()
+    if token in {"PING", "PONG"}:
+        return token
+    return None
+
+
 def decode_market_messages(raw: Any) -> list[dict[str, Any]]:
     """Decode a raw websocket frame into market message dictionaries."""
     if isinstance(raw, bytes):
@@ -744,8 +756,15 @@ class AsyncMarketWebSocketClient:
                     if self._heartbeat_error is not None:
                         raise self._heartbeat_error
                     self._check_pong_deadline()
-                    if raw in ("PONG", b"PONG") and ws is self._ws:
-                        self._pending_ping_since = None
+                    heartbeat = application_heartbeat_token(raw)
+                    if heartbeat is not None and ws is self._ws:
+                        if heartbeat == "PONG":
+                            self._pending_ping_since = None
+                        elif heartbeat == "PING":
+                            # Venue PINGs must be answered before later commits
+                            # delay the iterator; they do not extend our PONG deadline.
+                            await ws.send("PONG")
+                        continue
                     # Stamp application dequeue BEFORE decoding. Messages 2..N
                     # of a frame would otherwise inherit processing time spent
                     # on their predecessors, including synchronous commits.

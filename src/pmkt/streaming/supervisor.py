@@ -1248,9 +1248,7 @@ class LiveFeedSupervisor:
                     if state.initial_snapshot_received and not state.book_integrity_valid
                     and "reconnect" not in state.quality_flags
                 }
-                # Initialization is coverage evidence, not proof that the socket
-                # is broken. Keep overdue instruments tracked without resetting
-                # initialized peers or spending the transport retry budget.
+                # Missing initial snapshots are not a socket-recovery reason.
                 reasons = ("book_integrity",) if broken else ()
                 instruments = tuple(sorted(broken))
             if not reasons:

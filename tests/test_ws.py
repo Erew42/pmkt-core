@@ -12,6 +12,7 @@ from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
     MarketBookState,
     MarketStreamSnapshot,
+    application_heartbeat_token,
     apply_market_message,
     collect_market_snapshots,
     decode_market_messages,
@@ -414,6 +415,68 @@ async def test_iter_messages_decodes_json_and_skips_heartbeats() -> None:
         seen = [message async for message in client.iter_messages(reconnect=False)]
 
     assert [message["event_type"] for message in seen] == ["book", "best_bid_ask"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "token"),
+    [
+        ("PING", "PING"),
+        ("pong", "PONG"),
+        (" PING\n", "PING"),
+        (b"PONG", "PONG"),
+        ('{"event_type":"book"}', None),
+    ],
+)
+def test_application_heartbeat_token_normalizes_control_frames(raw: Any, token: str | None) -> None:
+    assert application_heartbeat_token(raw) == token
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_answers_venue_ping_immediately() -> None:
+    fake = FakeWebSocket(
+        [
+            "PING",
+            " ping\n",
+            b"PING",
+            json.dumps({"event_type": "book", "asset_id": "a1", "bids": [], "asks": []}),
+        ]
+    )
+
+    async def connect_factory(_: str) -> FakeWebSocket:
+        return fake
+
+    async with AsyncMarketWebSocketClient(
+        ["a1"],
+        heartbeat_interval=None,
+        connect_factory=connect_factory,
+    ) as client:
+        seen = [message async for message in client.iter_messages(reconnect=False)]
+
+    assert [message["event_type"] for message in seen] == ["book"]
+    assert fake.sent.count("PONG") == 3
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_clears_pong_deadline_for_padded_pong() -> None:
+    now = [100.0]
+    fake = FakeWebSocket([" PONG\n"])
+
+    async def connect_factory(_: str) -> FakeWebSocket:
+        return fake
+
+    client = AsyncMarketWebSocketClient(
+        ["a1"],
+        heartbeat_interval=None,
+        heartbeat_clock=lambda: now[0],
+        connect_factory=connect_factory,
+    )
+    await client.connect()
+    await client.ping()
+    now[0] += 19
+    async for _ in client.iter_messages(reconnect=False):
+        break
+    client._check_pong_deadline()
+    await client.close()
 
 
 @pytest.mark.asyncio
