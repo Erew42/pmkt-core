@@ -755,7 +755,6 @@ class AsyncMarketWebSocketClient:
                 async for raw in ws:
                     if self._heartbeat_error is not None:
                         raise self._heartbeat_error
-                    self._check_pong_deadline()
                     heartbeat = application_heartbeat_token(raw)
                     if heartbeat is not None and ws is self._ws:
                         if heartbeat == "PONG":
@@ -765,6 +764,8 @@ class AsyncMarketWebSocketClient:
                             # delay the iterator; they do not extend our PONG deadline.
                             await ws.send("PONG")
                         continue
+                    # Data frames do not extend an outstanding PONG deadline.
+                    self._check_pong_deadline()
                     # Stamp application dequeue BEFORE decoding. Messages 2..N
                     # of a frame would otherwise inherit processing time spent
                     # on their predecessors, including synchronous commits.
@@ -838,12 +839,9 @@ class AsyncMarketWebSocketClient:
             return
         try:
             while self.is_connected:
-                wait = float(interval)
-                if self._pending_ping_since is not None:
-                    wait = min(wait, max(0.0, self.pong_timeout_seconds -
-                        (self._heartbeat_clock() - self._pending_ping_since)))
-                await self._sleep(wait)
-                self._check_pong_deadline()
+                await self._sleep(float(interval))
+                # Expire PONG only on the reader: a reply may already be queued
+                # while capture is blocked in a commit.
                 if self.is_connected:
                     await self.ping()
         except asyncio.CancelledError:

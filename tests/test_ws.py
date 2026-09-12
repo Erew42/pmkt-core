@@ -120,6 +120,51 @@ async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None
 
 
 @pytest.mark.asyncio
+async def test_queued_pong_survives_reader_stall_past_deadline() -> None:
+    class StallSocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.responses: asyncio.Queue[Any] = asyncio.Queue()
+            self.responses.put_nowait(
+                json.dumps({"event_type": "last_trade_price", "asset_id": "a"})
+            )
+
+        async def send(self, payload: str) -> None:
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+
+        async def __anext__(self):
+            return await self.responses.get()
+
+    ws = StallSocket()
+
+    async def connect_factory(_: str) -> StallSocket:
+        return ws
+
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=connect_factory,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.02,
+    )
+    async with client:
+        agen = client.iter_messages(reconnect=False)
+        first = await agen.__anext__()
+        assert first["event_type"] == "last_trade_price"
+        await asyncio.sleep(0.08)
+        assert client._heartbeat_error is None
+        assert ws.closed is False
+        await ws.responses.put(
+            json.dumps({"event_type": "book", "asset_id": "a", "bids": [], "asks": []})
+        )
+        second = await asyncio.wait_for(agen.__anext__(), timeout=1)
+        assert second["event_type"] == "book"
+        await agen.aclose()
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
 async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -> None:
     class ResponsiveSocket(FakeWebSocket):
         def __init__(self):
