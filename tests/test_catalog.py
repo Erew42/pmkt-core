@@ -152,6 +152,32 @@ def _rewrite_manifest_and_pointer(
     _write_json(pointer_path, pointer)
 
 
+@pytest.mark.parametrize(
+    "names",
+    [
+        ("date=2026-08/x.parquet", "date=2026-08-22/y.parquet"),
+        ("a/x.parquet", "a-b/y.parquet", "a.b/z.parquet"),
+        ("bucket=10/part-000000.parquet", "bucket=1/part-000000.parquet"),
+    ],
+)
+def test_reader_tree_hash_orders_files_like_publisher(
+    tmp_path: Path, names: tuple[str, ...]
+) -> None:
+    from pmkt.data.market_catalog.fs import tree_sha256
+    from pmkt.data.market_catalog.reader import _hash_tree, _resolved_parquet_files
+
+    root = tmp_path / "artifact.parquet"
+    for index, name in enumerate(names):
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(bytes([index]))
+
+    files, relative_files = _resolved_parquet_files(
+        root, containment_base=tmp_path.resolve(), artifact_name="demo"
+    )
+    assert _hash_tree(files, relative_files) == tree_sha256(root)
+
+
 def _make_directory_link(link: Path, target: Path) -> None:
     if os.name == "nt":
         created = subprocess.run(

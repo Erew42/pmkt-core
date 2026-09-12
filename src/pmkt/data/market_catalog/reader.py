@@ -268,7 +268,12 @@ def _resolved_parquet_files(
                     )
                 seen_files.add(resolved_entry)
                 files.append((relative.replace("\\", "/"), resolved_entry))
-    files.sort(key=lambda item: item[0])
+    # ``fs.tree_sha256`` hashes files in ``sorted(Path)`` order, which compares
+    # path components rather than the joined string. Sorting the joined string
+    # diverges when one directory name is a prefix of a sibling followed by a
+    # character below "/" (for example ``date=2026-08`` and ``date=2026-08-22``),
+    # so the declared tree hash would be rejected for a valid artifact.
+    files.sort(key=lambda item: PurePath(item[0]))
     if not files:
         raise CatalogError(f"history artifact {artifact_name} contains no Parquet")
     return tuple(path for _relative, path in files), tuple(
