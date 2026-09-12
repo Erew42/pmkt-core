@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from pmkt.data.time import parse_utc_timestamp
 
 from .types import CatalogError
 
@@ -34,8 +35,23 @@ def parse_timestamp(value: Any) -> datetime | None:
             return datetime.fromtimestamp(numeric, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
+    text = str(value).strip()
+    # Venues emit RFC 3339 fractions of any width (Gamma and Kalshi use five
+    # digits). Python 3.10's fromisoformat accepts only three or six, so route
+    # explicit-offset text through the canonical parser, which normalizes the
+    # fraction before parsing. Anything it declines (naive text, date-only
+    # values) keeps the retained fromisoformat fallback below.
+    parsed = parse_utc_timestamp(text)
+    if parsed is not None:
+        # Wider-than-microsecond input comes back as a pandas Timestamp; keep
+        # the catalog contract at plain microsecond datetimes so manifests and
+        # comparisons stay version-independent.
+        to_pydatetime = getattr(parsed, "to_pydatetime", None)
+        if to_pydatetime is not None:
+            parsed = to_pydatetime(warn=False)
+        return parsed.astimezone(timezone.utc)
     try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:
