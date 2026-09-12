@@ -119,6 +119,12 @@ def _init_only_variant(cls: type[_ConfigT]) -> type[_ConfigT]:
         del klass, settings_cls, env_settings, dotenv_settings, file_secret_settings
         return (init_settings,)
 
+    def __reduce__(self: PmktConfig) -> tuple[Any, ...]:
+        # The variant class is created at runtime and cannot be found by name
+        # when unpickling, so rebuild it from the public class instead. The
+        # restore path sets pydantic state directly and never reads settings.
+        return (_restore_init_only, (cls, self.__getstate__()))
+
     variant = type(
         f"_InitOnly{cls.__name__}",
         (cls,),
@@ -127,10 +133,20 @@ def _init_only_variant(cls: type[_ConfigT]) -> type[_ConfigT]:
             "__module__": cls.__module__,
             "__qualname__": f"_InitOnly{cls.__qualname__}",
             "settings_customise_sources": classmethod(settings_customise_sources),
+            "__reduce__": __reduce__,
         },
     )
     _INIT_ONLY_VARIANTS[cls] = variant
     return cast("type[_ConfigT]", variant)
+
+
+def _restore_init_only(cls: type[_ConfigT], state: dict[Any, Any]) -> _ConfigT:
+    """Unpickle an init-only config without consulting any settings source."""
+
+    variant = _init_only_variant(cls)
+    instance = variant.__new__(variant)
+    instance.__setstate__(state)
+    return instance
 
 
 _config: PmktConfig | None = None

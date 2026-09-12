@@ -704,3 +704,47 @@ def test_from_values_builds_subclass_instances_with_subclass_fields(
     assert _ResearchConfig.from_values().research_mode == "offline"
     assert type(_ResearchConfig.from_values()) is type(config)
     assert not isinstance(PmktConfig.from_values(), _ResearchConfig)
+
+
+class _PicklableResearchConfig(PmktConfig):
+    research_mode: str = "offline"
+
+
+def test_from_values_instances_pickle_without_rereading_settings() -> None:
+    """Runtime variants must stay picklable, including into a fresh process."""
+
+    import os
+    import pickle
+    import subprocess
+    import sys
+
+    base = PmktConfig.from_values(gamma_api_url="https://explicit.test")
+    restored = pickle.loads(pickle.dumps(base))
+    assert type(restored) is type(base)
+    assert restored.model_dump() == base.model_dump()
+
+    sub = _PicklableResearchConfig.from_values(research_mode="live")
+    restored_sub = pickle.loads(pickle.dumps(sub))
+    assert type(restored_sub) is type(sub)
+    assert isinstance(restored_sub, _PicklableResearchConfig)
+    assert restored_sub.research_mode == "live"
+
+    env = {**os.environ, "PMKT_GAMMA_API_URL": "https://poisoned.test"}
+    code = (
+        "import pickle, sys; from pmkt.config import PmktConfig; "
+        "c = pickle.loads(sys.stdin.buffer.read()); "
+        "print(type(c).__name__, isinstance(c, PmktConfig), c.gamma_api_url)"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", code],
+        input=pickle.dumps(base),
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    assert completed.stdout.decode().split() == [
+        "_InitOnlyPmktConfig",
+        "True",
+        "https://explicit.test",
+    ]
