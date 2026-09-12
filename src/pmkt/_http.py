@@ -380,8 +380,8 @@ class HttpClient:
         params: dict[str, Any] | None,
         json: Any | None,
         headers: dict[str, str] | None,
-        expiry: OperationExpiry | None,
-        trace: _RequestTrace | None,
+        expiry: OperationExpiry | None = None,
+        trace: _RequestTrace | None = None,
     ) -> httpx.Response:
         async def send() -> httpx.Response:
             timeout = (
@@ -418,14 +418,27 @@ class HttpClient:
         *,
         expiry: OperationExpiry | None = None,
     ) -> Any:
-        response = await self._request(
-            method,
-            path,
-            params=params,
-            json=json,
-            headers=headers,
-            expiry=expiry,
-        )
+        # Forward the expiry only when one was supplied. Subclasses that override
+        # ``_request`` with the pre-workflow signature (no ``expiry``/``trace``
+        # keywords) must keep serving the retained native methods, which never
+        # pass an expiry.
+        if expiry is None:
+            response = await self._request(
+                method,
+                path,
+                params=params,
+                json=json,
+                headers=headers,
+            )
+        else:
+            response = await self._request(
+                method,
+                path,
+                params=params,
+                json=json,
+                headers=headers,
+                expiry=expiry,
+            )
         return await self._decode_response(response, expiry=expiry)
 
     async def request_json_observed(

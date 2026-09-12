@@ -639,3 +639,48 @@ class _FirstRequestBlocksTransport(httpx.AsyncBaseTransport):
                 await asyncio.sleep(0)
                 self.cancelled.set()
         return httpx.Response(200, request=request, json={"ok": True})
+
+
+@pytest.mark.asyncio
+async def test_legacy_signature_request_override_still_serves_request_json() -> None:
+    """Consumers override ``_request`` with the pre-workflow signature."""
+
+    seen: list[tuple[str, str, dict[str, str] | None]] = []
+
+    class LegacyHttpClient(HttpClient):
+        async def _request(  # type: ignore[override]
+            self,
+            method: str,
+            path: str,
+            params: dict[str, object] | None,
+            json: object | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> httpx.Response:
+            seen.append((method, path, headers))
+            return await super()._request(
+                method,
+                path,
+                params=params,
+                json=json,
+                headers={**(headers or {}), "X-Legacy": "1"},
+            )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["X-Legacy"] == "1"
+        return httpx.Response(200, request=request, json={"ok": True})
+
+    client = LegacyHttpClient(
+        "https://example.test", transport=httpx.MockTransport(handler)
+    )
+    try:
+        assert await client.request_json("GET", "/markets") == {"ok": True}
+        assert await client.request_json(
+            "POST", "/orders", None, {"size": 1}, {"X-Caller": "yes"}
+        ) == {"ok": True}
+    finally:
+        await client.close()
+    assert [(method, path) for method, path, _ in seen] == [
+        ("GET", "/markets"),
+        ("POST", "/orders"),
+    ]
+    assert seen[1][2] == {"X-Caller": "yes"}
