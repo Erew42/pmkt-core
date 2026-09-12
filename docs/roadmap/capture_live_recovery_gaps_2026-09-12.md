@@ -178,3 +178,36 @@ venue best-price hints. It does not establish whether a deletion was missing,
 delayed, or incorrectly applied. Replay evidence is retained beside that
 probe as `crossed_replay.json`. Investigate this separately before changing
 corruption policy; best-price hints must not invent depth.
+
+
+Instrumented follow-up at `927e6f565ec5ec3bde2d5966a12ef2bd96879cb2`:
+
+- Same 50-token / 25-ticker selection, SHA-256
+  `5a883ea2c9dac100b68da232358d6c2b54399fb39da3ecceda5741c7e3b952bb`.
+- Isolated checkout `/home/erike/pmkt-core-pr5-liveness`; both imports verified.
+  Started 2026-09-12 21:31:58 UTC, requested 600 seconds, `full@3`.
+- Both exited 0 at their deadlines. Polymarket recorded 8,453 events and
+  28/50 final-attempt initial snapshots; Kalshi recorded 3,562 events and 25/25
+  initial snapshots. Both remain `partial` with eligibility `unevaluated`.
+- Polymarket had six reconnects, all six from supervisor `book_integrity`
+  recovery, with no transport exception or heartbeat failure. The triggering
+  rows are locked books at sequences 1326, 2483, 4213, 5483, 7115 and 8343.
+  Kalshi had zero reconnects and zero targeted refresh requests in this run.
+- All six persisted retry records reconcile exactly with the manifest. Each
+  records receive backpressure and a full 64-frame application queue. Maximum
+  control-plane lateness was 12.83 seconds. This is evidence of local pressure;
+  aggregate resource headroom cannot rule it out.
+- Both finalized manifests passed full artifact validation with zero errors
+  (Polymarket 218 seconds; Kalshi 21 seconds). Results are in `validation.json`.
+- Artifact directory:
+  `/home/erike/pmkt-core-pr5-liveness/tmp/pr5-live-25x25/`.
+  The four transport retries in the older run were not reproduced; their
+  historical causes remain unknown. This is not a scaling acceptance claim.
+- Local full suite: 1,385 passed, 2 skipped; final heartbeat/retry coverage:
+  105 passed. Hygiene, lane coverage, Ruff, mypy and public API contracts passed.
+  All 17 CI checks passed on `927e6f5`, including Python 3.10-3.12 test lanes.
+
+Next work should isolate the first depth/best-price disagreement from raw
+messages and measure commit work that blocks the event loop. Preserve strict
+locked-book integrity, subscription evidence and current corruption recovery
+until a separate change has reproduction-backed semantics. PR remains draft.
