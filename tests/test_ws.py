@@ -121,9 +121,23 @@ async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None
 @pytest.mark.asyncio
 async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -> None:
     class ResponsiveSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.responses = asyncio.Queue()
+            self.delivered = 0
+            self.three_pongs = asyncio.Event()
+
+        async def send(self, payload):
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+
         async def __anext__(self):
-            await asyncio.sleep(0.004)
-            return "PONG"
+            response = await self.responses.get()
+            self.delivered += 1
+            if self.delivered == 3:
+                self.three_pongs.set()
+            return response
 
     ws = ResponsiveSocket()
 
@@ -131,13 +145,17 @@ async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -
         return ws
 
     client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.02)
+        heartbeat_interval=0.01, pong_timeout_seconds=0.02,
+        heartbeat_clock=lambda: 100.0)
     state = MarketBookState("a")
     async with client:
         task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
-        await asyncio.sleep(0.065)
+        # Deadline expiry is tested separately with an advancing clock. Here,
+        # synchronize on actual replies rather than Windows timer granularity.
+        await asyncio.wait_for(ws.three_pongs.wait(), timeout=2)
         assert not task.done()
         assert client._heartbeat_error is None
+        assert client._pending_ping_since is None
         assert not state.initial_snapshot_received
         assert not state.book_integrity_valid
         task.cancel()

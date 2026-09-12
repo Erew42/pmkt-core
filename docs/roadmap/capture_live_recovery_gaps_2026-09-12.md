@@ -1,7 +1,7 @@
 # Live capture recovery gaps (2026-09-12)
 
-Status: implementation in PR #5; validation pending. Keep the PR draft until
-required checks and the 10-minute dual-venue probe have completed.
+Status: implemented and validated in PR #5. The PR remains draft for review;
+no merge or scaling has been performed.
 
 ## Original evidence
 
@@ -94,3 +94,37 @@ its evidence; use deterministic tests for that condition.
 Broader corruption isolation, catalog eligibility acquisition, REST preflight
 selection, quarantine, and scaling are deferred. Volume or liquidity alone does
 not establish present activity or eligibility.
+
+## PR #5 validation record
+
+Implementation revision: `98fea1427ef1979c9a668301ac9d3b1a3777b653`.
+Local verification: 1,369 tests passed, 2 skipped; hygiene, pytest-lane coverage,
+Ruff, mypy, and the public API contract check passed. CI also passed on Python
+3.10, 3.11, and 3.12. The PONG regression test was made independent of Windows
+sub-20ms timer scheduling using actual reply synchronization and an injected
+clock; production transport behavior was not changed.
+
+The 600-second probe on `erik-pc1` used the previous 20-token / 10-ticker
+selection, `full@3`, and an isolated checkout. Both collectors imported the
+implementation revision's source and exited 0 after reaching their deadlines.
+
+| Venue | Events | Final-attempt initial snapshots | Socket recoveries | Transport reconnects | Eligibility |
+|---|---:|---:|---:|---:|---|
+| Polymarket | 9,983 | 14/20 | 0 | 7 | unevaluated (20 unknown) |
+| Kalshi | 1,111 | 10/10 | 0 | 0 | unevaluated (10 unknown) |
+
+Polymarket recorded zero supervisor recovery actions across 1,158 evaluations.
+Six final-attempt instruments lacked valid initial snapshot evidence. Its seven
+reconnects came through the transport retry path; the underlying exceptions were
+not persisted, so their exact causes are unresolved. This is evidence for the
+initialization fix, not a claim of transport stability or readiness to scale.
+Kalshi issued no targeted refreshes and finalized v3 without a commit failure.
+Both conservative capture verdicts remain `partial`, with eligibility reporting
+and missing-snapshot reasons preserved independently.
+
+Probe metadata, selection, logs, manifests, and artifact-validation results are
+retained under `/home/erike/pmkt-core-pr5-98fea14/tmp/pr5-live/`.
+Both manifests passed full artifact validation with no errors. Polymarket tape
+contains 140 reconnect invalidations (20 instruments x 7 transport retries);
+Kalshi has none. These do not originate from missing-initialization recovery.
+PR remains draft; no merge or scaling was performed.
