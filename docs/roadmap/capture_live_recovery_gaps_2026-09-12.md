@@ -123,6 +123,20 @@ Kalshi issued no targeted refreshes and finalized v3 without a commit failure.
 Both conservative capture verdicts remain `partial`, with eligibility reporting
 and missing-snapshot reasons preserved independently.
 
+Follow-up revision: `c1f62e67073547a8a29576ba932714faa27c2fac` answers inbound
+Polymarket application `PING` with `PONG` before later commits delay the
+iterator. A second 600-second `full@3` probe on `erik-pc1` with the same
+selection imported that revision and exited 0:
+
+| Venue | Events | Final-attempt initial snapshots | Socket recoveries | Transport reconnects | Eligibility |
+|---|---:|---:|---:|---:|---|
+| Polymarket | 4,273 | 12/20 | 0 | 0 | unevaluated (20 unknown) |
+| Kalshi | 3,127 | 10/10 | 0 | 0 | unevaluated (10 unknown) |
+
+Polymarket tape had zero `reconnect` controls. Supervisor recovery actions
+remained 0. Remaining missing snapshots are coverage (book-less ids in the
+stale selection), not socket recovery.
+
 Probe metadata, selection, logs, manifests, and artifact-validation results are
 retained under `/home/erike/pmkt-core-pr5-98fea14/tmp/pr5-live/`.
 Both manifests passed full artifact validation with no errors. Polymarket tape
