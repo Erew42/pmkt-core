@@ -9,8 +9,10 @@ and CI checks every listed lazy and eager export.
 ## Compatibility tiers
 
 - **Supported workflow** means a delivered high-level workflow with explicit
-  result types and error semantics. The pinned history catalog and the
-  Polymarket and Kalshi discovery-to-book paths described below are in this tier.
+  result types and error semantics. The pinned history catalog, the Polymarket
+  and Kalshi discovery-to-book paths, the sampled CLOB and Kalshi candle
+  history workflows, and the typed single and batch resolution workflows
+  described below are in this tier.
 - **Retained native** means an existing venue method, model, or canonical
   schema/storage contract kept under its current lifecycle. These APIs remain
   compatible, but do not acquire the guarantees of a future high-level
@@ -83,11 +85,16 @@ close lifetime on one owned worker thread. Unsupported saved view-contract
 versions raise instead of being reinterpreted. Fixed catalog and parameter
 inputs also do not make unordered, random, or time-dependent SQL deterministic.
 
-The locally qualified dependency floor is DuckDB 1.5.5 with PyArrow 14.0.0.
-The catalog compatibility workflow is configured to exercise DuckDB 1.5.5 on
-Windows and Linux with Python 3.10 through 3.12, using both PyArrow 14.0.0 with
-NumPy 1.26.4 and PyArrow 25.0.1 with NumPy 2.2.6; those matrix results remain a
-CI acceptance check rather than local evidence.
+The qualified dependency floor is DuckDB 1.5.5 with PyArrow 14.0.0. The
+catalog compatibility workflow exercises DuckDB 1.5.5 on Windows and Linux with
+Python 3.10 through 3.12, using both PyArrow 14.0.0 with NumPy 1.26.4 and
+PyArrow 25.0.1 with NumPy 2.2.6, and is a required CI gate for catalog and
+history changes.
+
+Every artifact descriptor in the pointer and manifest must declare its
+canonical `schema`. Releases published before the publisher wrote that key
+(core history before 2026-08-23) are rejected with `unsupported schema: None`
+and must be republished before this reader can open them.
 
 The pinned view contract provides these grains:
 
@@ -268,7 +275,8 @@ side. Quantities are shares. Counts distinguish the native ladder, the
 validated pre-trim ladder, and returned levels. Empty sides remain a valid
 response payload but set quality flags and make `valid_state=False`; a crossed
 book is also flagged. The exchange timestamp is UTC when the response supplies
-a valid millisecond timestamp, otherwise it is absent.
+a millisecond timestamp; an absent timestamp leaves the field empty, and a
+malformed one raises `InvalidDataError`.
 
 The CLOB response `market` field is a condition ID. It is compared only with a
 supplied condition-ID enrichment and is never interpreted as the Gamma market
