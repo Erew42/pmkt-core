@@ -41,7 +41,14 @@ class TapeCaptureEmission:
             coordinator.add("tape_event", batch.event)
         for control in self.controls:
             coordinator.add("tape_control", control)
-        if self.barrier_cause is not None:
+        request_checkpoint = getattr(coordinator, "request_checkpoint_commit", None)
+        if self.barrier_cause in {
+            CaptureCommitCause.CHECKPOINT_STARTUP,
+            CaptureCommitCause.CHECKPOINT_RESYNC,
+            CaptureCommitCause.CHECKPOINT_PERIODIC,
+        } and request_checkpoint is not None:
+            request_checkpoint(self.barrier_cause)
+        elif self.barrier_cause is not None:
             coordinator.commit(cause=self.barrier_cause, force=True)
         elif coordinator.barrier_due():
             coordinator.commit()

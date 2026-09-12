@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
 from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
     MarketBookState,
@@ -19,6 +20,39 @@ from pmkt.exchanges.polymarket.ws import (
     market_operation_payload,
     market_subscription_payload,
 )
+
+
+@pytest.mark.parametrize("failure", ["time", "traffic", "hash", "cross", "uninitialized"])
+def test_complementary_recovery_has_strict_bounds(failure):
+    state = MarketBookState(asset_id="A", market="m")
+    state.apply_book({"bids": [{"price": "0.17", "size": "10"}],
+                      "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}]})
+    change = {"asset_id": "A", "side": "BUY", "price": "0.18", "size": "20",
+              "best_bid": "0.18", "best_ask": "0.19", "hash": "paired"}
+    message = {"event_type": "price_change", "timestamp": "1789240000000", "price_changes": [change]}
+    if failure == "cross":
+        change["price"] = "0.20"
+    state.apply_price_change(change, message)
+    if failure == "uninitialized":
+        state.initial_snapshot_received = False
+    recovery = ComplementaryDeltaRecovery()
+    recovery.observe(message, {"A": state}, {"A"}, message_count=1)
+    if failure in {"cross", "uninitialized"}:
+        assert not recovery.defer("A", message_count=1, now_ns=0)
+        return
+    # A slow synchronous commit before the first decision consumes no grace.
+    assert recovery.defer("A", message_count=1, now_ns=12_000_000_000)
+    if failure == "hash":
+        change["hash"] = "different"
+        recovery.observe(message, {"A": state}, set(), message_count=2)
+        assert not recovery.defer("A", message_count=2, now_ns=12_000_000_001)
+    elif failure == "time":
+        assert not recovery.defer("A", message_count=2, now_ns=12_250_000_000)
+    else:
+        for sequence in range(2, 17):
+            recovery.observe({"event_type": "trade"}, {"A": state}, set(), message_count=sequence)
+            assert recovery.defer("A", message_count=sequence, now_ns=12_000_000_001)
+        assert not recovery.defer("A", message_count=17, now_ns=12_000_000_001)
 
 
 class FakeWebSocket:

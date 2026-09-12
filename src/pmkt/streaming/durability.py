@@ -283,6 +283,10 @@ class DurableCaptureCoordinator:
         self.commit_interval_seconds = effective_durability.effective_segment_seconds
         self._buffers: dict[str, list[dict[str, Any]]] = defaultdict(list)
         self._buffered_rows = 0
+        # Profile runtimes opt in; explicit commit(force=True) never defers.
+        self.checkpoint_coalesce_seconds = 0.0
+        self._pending_checkpoint: tuple[float, CaptureCommitCause] | None = None
+        self._checkpoint_requests = 0
         self._group_index = 0
         self._last_commit_monotonic = time.monotonic()
         self._first_pending_monotonic: float | None = None
@@ -363,6 +367,27 @@ class DurableCaptureCoordinator:
                 batch_rows = 0
         return added
 
+    def request_checkpoint_commit(self, cause: CaptureCommitCause) -> None:
+        """Stage a bounded checkpoint barrier, before durable acceptance.
+
+        Hard barriers use commit(force=True) and drain this same buffer. No
+        checkpoint is acknowledged as durable until the journal is published.
+        """
+        if cause not in {
+            CaptureCommitCause.CHECKPOINT_STARTUP,
+            CaptureCommitCause.CHECKPOINT_RESYNC,
+            CaptureCommitCause.CHECKPOINT_PERIODIC,
+        }:
+            raise ValueError("only checkpoint barriers may be staged")
+        if self.checkpoint_coalesce_seconds <= 0:
+            self.commit(cause=cause, force=True)
+            return
+        self._checkpoint_requests += 1
+        if self._pending_checkpoint is None:
+            self._pending_checkpoint = (time.monotonic(), cause)
+        if self.barrier_due():
+            self.commit()
+
     @property
     def has_pending_rows(self) -> bool:
         return self._buffered_rows > 0
@@ -372,6 +397,9 @@ class DurableCaptureCoordinator:
             return None
         if self._buffered_rows >= self.segment_row_limit:
             return CaptureCommitCause.THRESHOLD_ROWS
+        if (self._pending_checkpoint is not None and
+                time.monotonic() - self._pending_checkpoint[0] >= self.checkpoint_coalesce_seconds):
+            return self._pending_checkpoint[1]
         if (
             time.monotonic() - self._last_commit_monotonic
             >= self.commit_interval_seconds
@@ -420,6 +448,7 @@ class DurableCaptureCoordinator:
         for artifact in artifacts:
             self._role_row_counts[artifact.role] += artifact.row_count
             self._committed_roles.add(artifact.role)
+        self._pending_checkpoint = None
         self._buffers.clear()
         self._buffered_rows = 0
         self._first_pending_monotonic = None
@@ -557,6 +586,11 @@ class DurableCaptureCoordinator:
         return {
             "configuration": self.durability_settings.to_mapping(),
             "metrics": {
+                "checkpoint_publication": {
+                    "policy": "bounded-checkpoints.v1" if self.checkpoint_coalesce_seconds > 0 else "immediate",
+                    "coalesce_seconds": self.checkpoint_coalesce_seconds,
+                    "requests_staged": self._checkpoint_requests,
+                },
                 "groups_accepted": self._groups_accepted,
                 "groups_published": self._groups_published,
                 "groups_discarded": self._groups_accepted - self._groups_published,

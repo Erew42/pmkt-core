@@ -207,7 +207,93 @@ Instrumented follow-up at `927e6f565ec5ec3bde2d5966a12ef2bd96879cb2`:
   105 passed. Hygiene, lane coverage, Ruff, mypy and public API contracts passed.
   All 17 CI checks passed on `927e6f5`, including Python 3.10-3.12 test lanes.
 
-Next work should isolate the first depth/best-price disagreement from raw
-messages and measure commit work that blocks the event loop. Preserve strict
-locked-book integrity, subscription evidence and current corruption recovery
-until a separate change has reproduction-backed semantics. PR remains draft.
+## Complementary deltas and checkpoint publication
+
+A separate 180-second raw-only capture, without supervisor recovery or Parquet
+commits, received 12,710 messages. Ten instrument locks (five complementary
+pairs) all resolved in the next message and frame, within 0.251 ms. Each
+correction shared the first update's timestamp and per-instrument hash and
+explicitly deleted the opposite level. For example, BUY 0.18 temporarily
+locked a 0.17/0.18 book; the following SELL 0.18 with size zero exposed the
+existing 0.19 ask. This reproduces a transient intermediate state. It does not
+prove the contents of frames discarded by earlier reconnects, or establish a
+universal venue transaction boundary.
+
+Polymarket now separates that intermediate invalid state from the recovery
+decision. An already initialized, intact book qualifies only when a positive
+delta produces a lock, `crossed_book` is its sole failure, and the delta carries
+a hash, timestamp and an unlocked best-price hint. Recovery may wait for
+250 ms from its first decision after synchronous writes, or 16 subsequent
+messages. Neither bound renews; a changed hash/timestamp or additional failure
+ends the deferral. Deadline enforcement occurs when the collector next runs.
+Other corruption and transport causes retain immediate recovery. This does
+not change missing-initialization handling or infer depth from top-price hints.
+
+The locked row stays invalid and closes its tape epoch. A corrective delta
+updates actual stored levels; the existing tape producer then emits a validated
+resync checkpoint and recovery control. Raw source messages and the invalid
+interval remain visible. Manifest `complementary_delta_recovery` counters make
+candidates, resolutions and expirations inspectable.
+
+The identical 1,000-message replay of the earlier full probe took 78.193 seconds
+without profiling. Its 118 native book messages forced 118 checkpoint groups
+(32 startup, 86 resync), plus termination and shutdown. The resync count did
+not mean 86 reconnects. Validation consumed 27.049 seconds; role writes about
+29.90 seconds. A separate cProfile run attributed about 91% of elapsed time to
+commit calls; its slower absolute timing is not the baseline.
+
+Version-3 Parquet profiles now stage routine checkpoint barriers using the
+existing one-second coalescing window before durable acceptance. All checkpoint
+rows are retained. Row/time thresholds, invalidations, termination and explicit
+forced commits can drain earlier; strict prewrite and readback validation are
+unchanged. Legacy profiles and SQLite preserve immediate checkpoint behavior.
+The capture runbook documents the additional pending-row crash window and
+additive publication metrics. This reduces forced publication frequency;
+synchronous publication can still stall the event loop. Async publication and
+broader scaling remain deferred. PR remains draft.
+
+Reproduction and profiler artifacts:
+`/home/erike/pmkt-core-pr5-liveness/tmp/pr5-root-cause/`.
+
+### Pre-commit candidate capture and replay
+
+The candidate ran before commit or push, from base
+`a7b445d3d828471b29925c1236d826735ce67c11` plus patch SHA-256
+`d35bc1b57766d579721cf77cc4030d59d69ddd037dc2aa0f936fbcfcf07a70b0`.
+The five changed source files were hash-matched to the local tested tree;
+subsequent edits added only tests and documentation. Both venue imports pointed
+to `/home/erike/pmkt-core-pr5-complementary/src`.
+
+The same selection and 600-second `full@3` capture started at
+2026-09-12 22:56:43 UTC on `erik-pc1`. Both collectors exited 0 at their deadlines:
+
+| Venue | Events | Initial snapshots received | Reconnects | Maximum control lag |
+|---|---:|---:|---:|---:|
+| Polymarket | 6,407 | 24/50 | 0 | 1.286 s |
+| Kalshi | 7,444 | 25/25 | 0 | 0.708 s |
+
+Kalshi requested no targeted refreshes. Empty-side observations remain tracked:
+the legacy usable-snapshot counts were 18 for Polymarket and zero for Kalshi,
+which are distinct from received initialization. Both captures remain partial,
+eligibility unevaluated and acceptance false. Polymarket retained 26 missing
+initial snapshots without recovery. No lock/correction candidates occurred in
+this live run; lower/different activity means reconnect and lag changes alone
+are not a controlled throughput comparison or scaling acceptance.
+
+The identical 1,000-message replay took 20.274 seconds versus 78.193 seconds,
+about 74% less elapsed time. All 118 checkpoints remained, while commit groups
+fell from 120 to 6. Tape event states, source hashes, quality flags, native
+levels and non-health row counts matched; health emissions fell from 73 to 43
+because processing time changed. The 12,710-message raw reproduction also
+resolved all ten identified candidates with no expiration or other invalid
+books. Invalid intermediate rows and recovery checkpoints are covered by the
+end-to-end regression, including a simulated 12-second commit stall.
+
+Local verification: full suite 1,398 passed and 2 skipped; final focused suite
+165 passed, including actual child-process crashes at the staged, pre-journal
+and post-journal boundaries. Hygiene, lane coverage, Ruff, mypy and public API
+contracts passed. Probe metadata, manifests, patch/source hashes, raw-lock
+replay and replay parity are retained under
+`/home/erike/pmkt-core-pr5-complementary/tmp/pr5-candidate/`.
+Both live manifests passed full artifact validation with zero errors before
+commit or push (Polymarket 102.74 seconds; Kalshi 2.61 seconds).

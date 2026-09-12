@@ -29,6 +29,7 @@ from pmkt.streaming.durability import (
 from pmkt.streaming.health_emission import SlimHealthEmitter
 from pmkt.streaming.profiles import StorageProfileOverrides, select_storage_profile
 from pmkt.streaming.storage_backends import CaptureStorageBackend
+from pmkt.streaming.recovery_contracts import CaptureCommitCause
 from pmkt.streaming.topbook_emission import TopbookEmissionTracker
 
 
@@ -2232,3 +2233,87 @@ async def test_missing_peer_does_not_reset_initialized_polymarket_book(tmp_path,
         assert peer_tape.iloc[0]["event_kind"] == "checkpoint"
     controls = pd.read_parquet(tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"])
     assert "reconnect" not in set(controls["control_type"])
+
+
+@pytest.mark.asyncio
+async def test_complementary_delta_survives_commit_stall_and_reopens_tape(tmp_path, monkeypatch):
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+    original_commit = DurableCaptureCoordinator.commit
+
+    def slow_commit(self, *args, **kwargs):
+        result = original_commit(self, *args, **kwargs)
+        if kwargs.get("cause") == CaptureCommitCause.INVALIDATION:
+            clock.advance_seconds(12)
+        return result
+
+    monkeypatch.setattr(DurableCaptureCoordinator, "commit", slow_commit)
+    frames = [
+        {"event_type": "book", "asset_id": "A", "market": "m",
+         "bids": [{"price": "0.17", "size": "10"}],
+         "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "20"}]},
+        {"event_type": "book", "asset_id": "B", "market": "m",
+         "bids": [{"price": "0.4", "size": "10"}], "asks": [{"price": "0.6", "size": "10"}]},
+    ]
+    for side, size in [("BUY", "268.06"), ("SELL", "0")]:
+        frames.append({"event_type": "price_change", "market": "m", "timestamp": "1789240000000",
+            "price_changes": [{"asset_id": "A", "side": side, "size": size, "price": "0.18",
+                               "best_bid": "0.18", "best_ask": "0.19", "hash": "paired"}]})
+    fake = FakeWebSocket([json.dumps(frame) for frame in frames])
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    manifest = await stream_order_book_data(
+        ["A", "B"], output_root=tmp_path, run_name="paired", duration_s=30,
+        max_messages=4, capture_intent="smoke", heartbeat_interval=None,
+        max_reconnects=0, connect_factory=connect_factory, monotonic_ns=clock,
+        storage_profile=select_storage_profile("full", profile_version="3"))
+    assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    assert manifest["complementary_delta_recovery"]["resolved"] == 1
+    assert manifest["complementary_delta_recovery"]["pending"] == 0
+    run_dir = tmp_path / "paired"
+    assert validate_run_manifest(run_dir / "manifest.json").ok
+    tape = pd.read_parquet(run_dir / manifest["dataset_artifacts"]["tape_event"]["path"])
+    a_tape = tape[tape["venue_book_id"] == "A"]
+    assert a_tape["event_kind"].tolist() == ["checkpoint", "delta", "checkpoint"]
+    assert a_tape["reconstructible"].tolist() == [True, False, True]
+    assert a_tape["book_integrity_valid"].tolist() == [True, False, True]
+    assert clock() >= 13_000_000_000
+    controls = pd.read_parquet(run_dir / manifest["dataset_artifacts"]["tape_control"]["path"])
+    assert "reconnect" not in set(controls["reason"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price", ["0.18", "0.20"])
+async def test_unresolved_lock_and_true_cross_still_require_recovery(tmp_path, price):
+    class ThenSilent(FakeWebSocket):
+        async def __anext__(self):
+            if self.messages:
+                return await super().__anext__()
+            await asyncio.sleep(3600)
+            raise StopAsyncIteration
+
+    frames = [
+        {"event_type": "book", "asset_id": "A", "market": "m",
+         "bids": [{"price": "0.17", "size": "10"}],
+         "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "20"}]},
+        {"event_type": "price_change", "market": "m", "timestamp": "1789240000000",
+         "price_changes": [{"asset_id": "A", "side": "BUY", "size": "20", "price": price,
+                            "best_bid": "0.18", "best_ask": "0.19", "hash": "paired"}]},
+    ]
+    fake = ThenSilent([json.dumps(frame) for frame in frames])
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    with pytest.raises(RuntimeError, match="recovery retry budget exhausted"):
+        await stream_order_book_data(
+            ["A"], output_root=tmp_path, run_name="unresolved", duration_s=10,
+            capture_intent="smoke", heartbeat_interval=None, max_reconnects=0,
+            connect_factory=connect_factory,
+            storage_profile=select_storage_profile("full", profile_version="3"))
+    manifest = json.loads((tmp_path / "unresolved" / "manifest.json").read_text())
+    metrics = manifest["complementary_delta_recovery"]
+    assert metrics["candidates"] == (1 if price == "0.18" else 0)
+    assert metrics["expired"] == (1 if price == "0.18" else 0)
+    assert manifest["reconnect_count"] == 0

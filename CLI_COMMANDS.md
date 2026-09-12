@@ -73,3 +73,16 @@ inside each run directory and in the optional manifest `reconnect_diagnostics`
 list. Each replacement attempt records its origin and cause before book-state
 invalidation. Polymarket includes heartbeat activity and bounded receive-queue
 metrics; both venues include control-plane lag. No new CLI option is needed.
+
+Polymarket manifests also record `complementary_delta_recovery`: bounded
+deferrals for an initialized book that becomes locked during a price update
+whose advertised top remains unlocked. The invalid row remains invalid; a
+follow-up has at most 250 ms from the first recovery decision or 16 messages
+before recovery is reconsidered. Missing initialization never enters this path.
+
+Version-3 Parquet captures batch routine checkpoint publication using the
+existing durability coalescing window (one second by default). Pending rows
+are not crash-durable until journal publication. Invalidations, termination,
+and explicit forced commits still publish synchronously. See the
+[capture runbook](docs/storage_profile_capture_runbook.md) for the exact boundary
+and the additive `capture_durability.metrics.checkpoint_publication` diagnostics.

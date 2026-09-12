@@ -63,6 +63,7 @@ from pmkt.streaming.capture_completeness import (
     CaptureIntent,
     CaptureTerminationReason,
 )
+from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
 from pmkt.exchanges.ws_transport import (
     WebSocketDeadlineExceeded,
     WebSocketRetryBudget,
@@ -521,6 +522,7 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
     level_count: int = 0
     topbook_count: int = 0
     depth_count: int = 0
+    complementary_recovery: ComplementaryDeltaRecovery = field(default_factory=ComplementaryDeltaRecovery)
     socket_recovery_count: int = 0
     sequence_gap_count: int = 0
     quality_counter: Counter[str] = field(default_factory=Counter)
@@ -532,6 +534,7 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
         return {asset_id: self.states[asset_id] for asset_id in self.instrument_ids}
 
     def mark_reconnect(self) -> None:
+        self.complementary_recovery.clear()
         self.reconnect_count += 1
         if self.storage_profile is not None:
             self.sequence += 1
@@ -748,6 +751,7 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
                 "files": self.outputs.files,
                 "reconnect_count": self.reconnect_count,
                 "socket_recovery_count": self.socket_recovery_count,
+                "complementary_delta_recovery": self.complementary_recovery.metrics(),
                 "reconnect_diagnostics": self.reconnect_diagnostics,
                 "subscription_plan": (
                     dict(self.subscription_plan_metadata)
@@ -1114,6 +1118,16 @@ async def stream_order_book_data(
                                 now_monotonic_ns=now_monotonic_ns,
                                 venue="polymarket",
                             )
+                        # Only the identified intermediate lock may wait. Any
+                        # other instrument/cause still requests recovery now.
+                        recovery_actions = [action for action in recovery_actions if not (
+                            set(action.reasons) == {"book_integrity"}
+                            and action.instruments
+                            and all(session.complementary_recovery.defer(
+                                asset, message_count=message_count,
+                                now_ns=session.monotonic_ns(),
+                            ) for asset in action.instruments)
+                        )]
                         if not recovery_actions:
                             return False
                         if session.reconnect_count >= session.max_reconnects:
@@ -1141,6 +1155,7 @@ async def stream_order_book_data(
                         await retry_budget.run(
                             ws.reconnect, retry_first=True, immediate_first=True,
                         )
+                        session.complementary_recovery.clear()
                         session.socket_recovery_count += 1
                         connected_at = session.monotonic_ns()
                         for shard in session.health_shards:
@@ -1292,10 +1307,15 @@ async def stream_order_book_data(
                                 )
                                 if row.get("asset_id") in requested_assets
                             ]
+                            previously_intact = {asset for asset, state in session.states.items() if state.book_integrity_valid}
                             snapshots = apply_market_message(
                                 session.states,
                                 message,
                                 allowed_asset_ids=requested_assets,
+                            )
+                            session.complementary_recovery.observe(
+                                message, session.states, previously_intact,
+                                message_count=message_count,
                             )
                             if not snapshots:
                                 message_asset = str(message.get("asset_id") or "")
