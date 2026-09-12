@@ -1180,7 +1180,8 @@ async def stream_kalshi_order_book_data(
                             return False
 
                         targeted = not expired and all(
-                            set(action.reasons) <= {"missing_instrument_books", "book_integrity"}
+                            action.action == "reconnect_socket"
+                            and set(action.reasons) == {"book_integrity"}
                             for action in recovery_actions
                         )
                         snapshot_targets: dict[int, list[str]] = {}

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
+from pmkt.streaming.capture_completeness import eligibility_evaluation_status
 from pmkt.streaming.connection_partitions import ConnectionPartition
 from pmkt.streaming.durability import file_sha256, write_json_atomic_fsync
 from pmkt.streaming.profiles import (
@@ -351,6 +352,12 @@ async def run_connection_partition_group(
     total_missing_snapshots = 0
     total_reconnects = 0
     total_recoveries = 0
+    eligibility_counts = {
+        "eligible_instrument_count": 0,
+        "excluded_instrument_count": 0,
+        "unknown_instrument_count": 0,
+        "eligible_initial_snapshot_count": 0,
+    }
     statuses: list[str] = []
     for partition, manifest in zip(partitions, manifests, strict=True):
         manifest_path = Path(str(manifest["run_dir"])) / "manifest.json"
@@ -363,6 +370,11 @@ async def run_connection_partition_group(
                 value or 0
             )
         completeness = manifest.get("capture_completeness") or {}
+        child_eligibility = {
+            key: int(completeness.get(key) or 0) for key in eligibility_counts
+        }
+        for key, value in child_eligibility.items():
+            eligibility_counts[key] += value
         requested = int(completeness.get("requested_instrument_count") or 0)
         initial_snapshots = int(completeness.get("initial_snapshot_count") or 0)
         missing_snapshots = int(
@@ -391,6 +403,12 @@ async def run_connection_partition_group(
                     str(key): int(value or 0) for key, value in row_counts.items()
                 },
                 "capture_summary": {
+                    **child_eligibility,
+                    "eligibility_evaluation_status": eligibility_evaluation_status(
+                        classified=child_eligibility["eligible_instrument_count"]
+                        + child_eligibility["excluded_instrument_count"],
+                        unknown=child_eligibility["unknown_instrument_count"],
+                    ),
                     "requested_instrument_count": requested,
                     "initial_snapshot_count": initial_snapshots,
                     "missing_initial_snapshot_count": missing_snapshots,
@@ -418,6 +436,12 @@ async def run_connection_partition_group(
         "counts": total_counts,
         "row_counts": total_row_counts,
         "capture_summary": {
+            **eligibility_counts,
+            "eligibility_evaluation_status": eligibility_evaluation_status(
+                classified=eligibility_counts["eligible_instrument_count"]
+                + eligibility_counts["excluded_instrument_count"],
+                unknown=eligibility_counts["unknown_instrument_count"],
+            ),
             "requested_instrument_count": total_requested,
             "initial_snapshot_count": total_initial_snapshots,
             "missing_initial_snapshot_count": total_missing_snapshots,

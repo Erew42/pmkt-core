@@ -6,6 +6,7 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, Iterable, Mapping, Sequence
 
+from pmkt.data.books import UNRESOLVED_BOOK_FAILURE_FLAGS
 from pmkt.data.registry import (
     CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION,
     BOOK_TAPE_CONTROL_SCHEMA_VERSION,
@@ -622,7 +623,9 @@ def add_book_integrity(
 ) -> dict[str, Any]:
     if selection is not None and selection.definition.profile_version == "3":
         return {**row, "schema_version": INTEGRITY_SCHEMA_VERSIONS[str(row["schema_version"])],
-                "book_integrity_valid": integrity}
+                "book_integrity_valid": integrity and not bool(
+                    UNRESOLVED_BOOK_FAILURE_FLAGS.intersection(row.get("quality_flags") or ())
+                )}
     return row
 
 

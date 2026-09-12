@@ -308,6 +308,11 @@ class PolymarketTapeProducer:
                 continue
             if event_type != "price_change":
                 continue
+            # A delta cannot establish the first reconstruction baseline. Keep
+            # existing post-reconnect invalid audit events when a prior checkpoint
+            # exists; the collector retains pre-initialization observations.
+            if not state.initial_snapshot_received and book_id not in self._epochs.generations:
+                continue
             open_epoch = self._epochs.open_epochs.get(book_id)
             invalid_reason = _polymarket_invalidation_reason(state, integrity_evidence=self.integrity_evidence)
             if invalid_reason is not None and open_epoch is not None:
@@ -740,6 +745,8 @@ class KalshiTapeProducer:
                 _emission_barrier((batch,), snapshot_controls),
             )
         if event_type != "orderbook_delta":
+            return TapeCaptureEmission()
+        if not state.initial_snapshot_received and book_id not in self._epochs.generations:
             return TapeCaptureEmission()
         controls: list[Mapping[str, Any]] = []
         open_epoch = self._epochs.open_epochs.get(book_id)

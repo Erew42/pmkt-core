@@ -1288,92 +1288,33 @@ async def test_stream_order_book_data_marks_silent_feed_stale(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("connect_failures", [0, 2])
-async def test_stream_order_book_data_recovers_missing_initialization_with_shared_budget(
-    tmp_path,
-    monkeypatch,
-    connect_failures,
-) -> None:
-    import pmkt.exchanges.polymarket.order_book_stream as stream_module
-    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
-
-    delays = []
-
-    async def no_sleep(delay):
-        delays.append(delay)
-
-    monkeypatch.setattr(
-        stream_module, "WebSocketRetryBudget",
-        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
-    )
-    first = SilentWebSocket()
-    second = FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "token-1",
-                    "market": "0xabc",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                    "hash": "hash-after-reconnect",
-                }
-            )
-        ]
-    )
-    sockets = deque([first, *[socket.gaierror(11001, "DNS failed")] * connect_failures, second])
+async def test_polymarket_missing_initialization_does_not_reconnect(tmp_path):
+    fake = SilentWebSocket()
     calls = 0
 
-    async def connect_factory(_: str) -> FakeWebSocket:
+    async def connect_factory(*args, **kwargs):
         nonlocal calls
         calls += 1
-        result = sockets.popleft()
-        if isinstance(result, BaseException):
-            raise result
-        return result
+        return fake
 
-    supervisor = LiveFeedSupervisor(
-        [
-            FeedShardHealth(
-                venue="polymarket",
-                shard_id="pm-plan",
-                subscribed_instruments=("token-1",),
-            )
-        ],
-        max_message_age_ms=20,
-        max_valid_book_age_ms=20,
-    )
-
-    supervisor.initialization_sla_ms = 20  # Short deterministic test SLA; production remains 30 seconds.
-
+    supervisor = LiveFeedSupervisor([FeedShardHealth(
+        venue="polymarket", shard_id="silent", subscribed_instruments=("token-1",),
+    )])
+    supervisor.initialization_sla_ms = 1
     manifest = await stream_order_book_data(
-        ["token-1"],
-        output_root=tmp_path,
-        run_name="silent-recovery-run",
-        duration_s=1.0,
-        max_messages=1,
-        capture_intent="smoke",
+        ["token-1"], output_root=tmp_path, run_name="silent",
+        duration_s=0.15, capture_intent="smoke", max_reconnects=0,
+        connect_factory=connect_factory, feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version="3"),
         heartbeat_interval=None,
-        max_reconnects=3,
-        connect_factory=connect_factory,
-        feed_supervisor=supervisor,
     )
-
-    run_dir = tmp_path / "silent-recovery-run"
-    topbook = pd.read_parquet(run_dir / "topbook_v1.parquet")
-    health = pd.read_parquet(run_dir / "feed_health.parquet")
-
-    assert first.closed is True
-    assert json.loads(second.sent[0])["assets_ids"] == ["token-1"]
-    assert manifest["row_counts"]["events"] == 1
-    assert manifest["reconnect_count"] == 1 + connect_failures
-    assert calls == 2 + connect_failures
-    assert delays == ([1.0, 1.5] if connect_failures else [])
-    assert manifest["socket_recovery_count"] == 1
-    assert topbook["valid_state"].tolist() == [True]
-    assert "stale" in health["connection_state"].tolist()
-    assert health["connection_state"].tolist()[-1] == "connected"
-    assert validate_run_manifest(run_dir / "manifest.json").ok
+    assert calls == 1
+    assert manifest["reconnect_count"] == 0
+    assert manifest["socket_recovery_count"] == 0
+    assert manifest["capture_completeness"]["initial_snapshot_count"] == 0
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 1
+    assert not any("get_snapshot" in payload for payload in fake.sent)
+    assert manifest["capture_completeness"]["unexplained_missing_instrument_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -2214,3 +2155,61 @@ async def test_invalid_polymarket_snapshot_is_diagnostic_not_coverage(
             "max_queue_frames": 128,
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer", ["silent", "deltas", "empty", "late"])
+async def test_missing_peer_does_not_reset_initialized_polymarket_book(tmp_path, peer):
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+
+    def book(token, empty=False):
+        return json.dumps({"event_type": "book", "asset_id": token, "market": "m",
+            "bids": [] if empty else [{"price": "0.4", "size": "10"}],
+            "asks": [] if empty else [{"price": "0.6", "size": "10"}]})
+
+    def delta(token):
+        return json.dumps({"event_type": "price_change", "market": "m",
+            "price_changes": [{"asset_id": token, "price": "0.41",
+                              "size": "12", "side": "BUY"}]})
+
+    messages = [book("A"), 31.0]
+    if peer == "deltas":
+        messages += [delta("B")] * 100
+    elif peer in {"empty", "late"}:
+        if peer == "late":
+            messages += [delta("B")]
+        messages += [book("B", empty=peer == "empty")]
+    messages += [delta("A")]
+    fake = ClockDrivenFakeWebSocket(messages, clock)
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    supervisor = LiveFeedSupervisor([FeedShardHealth(
+        venue="polymarket", shard_id="shared", subscribed_instruments=("A", "B"))])
+    manifest = await stream_order_book_data(
+        ["A", "B"], output_root=tmp_path, run_name=peer, duration_s=1,
+        max_messages=sum(isinstance(m, str) for m in messages), capture_intent="smoke",
+        heartbeat_interval=None, max_reconnects=0, connect_factory=connect_factory,
+        monotonic_ns=clock, feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version="3"))
+    assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    shard = supervisor.shard("polymarket", "shared")
+    assert shard.instrument_health["A"].book_integrity_valid
+    assert "reconnect" not in shard.instrument_health["A"].quality_flags
+    if peer in {"silent", "deltas"}:
+        assert supervisor._overdue_initial_instruments[("polymarket", "shared")] == {"B"}
+    else:
+        assert shard.instrument_health["B"].initial_snapshot_received
+        assert shard.instrument_health["B"].book_integrity_valid
+    if peer == "deltas":
+        assert not shard.instrument_health["B"].initial_snapshot_received
+        assert not shard.instrument_health["B"].book_integrity_valid
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 2
+    tape = pd.read_parquet(tmp_path / peer / manifest["dataset_artifacts"]["tape_event"]["path"])
+    peer_tape = tape[tape["venue_book_id"] == "B"]
+    assert peer_tape.empty == (peer in {"silent", "deltas"})
+    if peer == "late":
+        assert peer_tape.iloc[0]["event_kind"] == "checkpoint"
+    controls = pd.read_parquet(tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"])
+    assert "reconnect" not in set(controls["control_type"])

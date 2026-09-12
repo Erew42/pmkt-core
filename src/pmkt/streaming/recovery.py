@@ -945,6 +945,7 @@ def _recovered_capture_completeness(
 ) -> dict[str, Any] | None:
     if state.profile_version not in {"2", "3"}:
         return None
+    from pmkt.streaming.capture_completeness import eligibility_evaluation_status
     from pmkt.streaming.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
         CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
@@ -972,6 +973,10 @@ def _recovered_capture_completeness(
         "acceptance_eligible": False,
         "execution_status": "failed",
         "capture_status": "partial",
+        "eligibility_evaluation_status": eligibility_evaluation_status(
+            classified=summary.eligible_instrument_count + summary.excluded_instrument_count,
+            unknown=summary.unknown_instrument_count,
+        ),
         "legacy_status": "partial",
         **summary.as_manifest_mapping(),
         "evidence_artifact_role": CAPTURE_INSTRUMENT_EVIDENCE_ROLE,

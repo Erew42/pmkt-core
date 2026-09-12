@@ -1,124 +1,96 @@
 # Live capture recovery gaps (2026-09-12)
 
-Status: open. Evidence from two 10-minute live probes on a single always-on host.
-Do not treat this note as a completeness or thesis acceptance record.
+Status: implementation in PR #5; validation pending. Keep the PR draft until
+required checks and the 10-minute dual-venue probe have completed.
 
-Related: PR #1 (`3690f5b` / `a6165f5`) already split conservative quote
-validity (`valid_state`) from initialized-book integrity
-(`book_integrity_valid`) and bounded WebSocket retry. One-sided CLOB books
-must not, by themselves, reconnect a shard. That path is still considered
-fixed. This note covers what the live probes showed **after** that split.
+## Original evidence
 
-## Probe summary
+Two 10-minute probes on `erik-pc1` followed PR #1 (`3690f5b` / `a6165f5`),
+which separated conservative quote validity from initialized-book integrity.
+The original probe artifacts have not been re-audited as part of the diagnosis.
 
-| Run | Selection | Profile | Result |
-|---|---|---|---|
-| 5 PM + 5 Kalshi | PM by `liquidityNum`; Kalshi by 24h volume | PM `full@3`; Kalshi `full@3` then `full@v2` | PM 0 reconnects, 381 events. Kalshi `@3` crashed on commit; `@v2` completed 33,599 events |
-| 10 PM + 10 Kalshi | 24h volume, unique events | both `full@v2` | PM 7,834 events, **11 reconnects / 3 socket recoveries**, 18/20 initial snapshots. Kalshi 682 events, 0 reconnects, 8/10 snapshots |
+| Selection | Profile | Reported result |
+|---|---|---|
+| 5 PM + 5 Kalshi | PM `full@3`; Kalshi `full@3`, then `full@2` | PM 0 reconnects, 381 events; Kalshi v3 commit failure, v2 completed 33,599 events |
+| 10 PM + 10 Kalshi, 24h volume and unique events | both `full@2` | PM 7,834 events, 11 reconnects / 3 socket recoveries, 18/20 snapshots; Kalshi 682 events, 0 reconnects, 8/10 snapshots |
 
-Host was not CPU- or RAM-bound (peak ~67% / ~400 MB RSS, ~13 GB free). Scaling
-the universe is the wrong next step.
+The previous 10x10 selection is stored on the host at
+`/home/erike/pmkt-trading/runs/ws-probe/selection-active-10.json`.
 
-## Issue 1 — Polymarket: missing initial book still reconnects the whole socket
+## Initialization is instrument coverage
 
-**Symptom.** `socket_recovery_count=3`, `reconnect_count=11`, 220 tape
-`reconnect` controls (20 instruments × 11). First recovery at ~28 s (SLA is
-30 s). Both tokens of one dead LoL market never received `event_type=book`.
-Eighteen other live tokens were reset with them.
+Subscription tracking, book initialization, and connection health are separate
+concerns. Missing initial snapshots remain visible in subscription/evidence
+tracking, overdue-SLA accounting, and completeness. They no longer generate
+socket recovery actions, even when every instrument on a connected shard is
+uninitialized. Missing snapshots consume no reconnect budget and do not reset
+healthy peers or emit reconnect tape controls.
 
-**What is already fixed.** `empty_bid` / `empty_ask` are excluded from
-`book_integrity_valid`. Stale quotes flip `valid_state` only.
-`test_stream_order_book_data_does_not_recover_for_quietness_while_peer_is_active`
-asserts `socket_recovery_count == 0` for a quiet *initialized* peer.
+This applies to both venues. Kalshi no longer sends automatic targeted refresh
+requests solely for overdue initialization, removing their timeout-to-reconnect
+path. Targeted refresh and escalation for initialized books with proven integrity
+failures are preserved, as are transport-disconnection recovery and retry bounds.
+No quarantine, dropping, or new Polymarket refresh mechanism is introduced.
 
-**What is not fixed.** `LiveFeedSupervisor.current_recovery_actions` still
-emits `action="reconnect_socket"` when any subscribed id is in
-`_overdue_initial_instruments` (`missing_instrument_books`). Polymarket
-`maybe_recover_socket` honors **any** recovery action with `ws.reconnect` and
-`mark_reconnect()` on every `MarketBookState`.
+An explicit empty snapshot initializes a book; deltas alone do not. A later
+snapshot initializes the existing tracked instrument normally. Before that
+snapshot, deltas remain capture observations but cannot enter the reconstruction
+tape: there is no checkpoint against which to apply them. Raw/parsed observations
+remain available when enabled by the profile, and instrument evidence remains
+available in profiles v2/v3. No synthetic initial checkpoint is created.
 
-Kalshi already intercepts the same reasons and calls `request_snapshot` for
-those tickers only (`test_targeted_refresh_matches_one_sided_and_new_sibling_responses`).
-Polymarket has no equivalent.
+## Kalshi projected-row integrity
 
-`apply_price_change` does not set `initial_snapshot_received`. A token that
-only sees deltas (or a resolved/empty book) stays overdue forever. Health
-`missing_instrument_count` is `subscribed - tracked`, so it can read 0 while
-the SLA set is still non-empty.
+The reported v3 failure was `book_integrity_valid cannot accompany unresolved
+book failures`. The confirmed local reproduction is a locked book with YES and
+NO bids both at 0.50: native state integrity is true, while canonical topbook
+construction flags both rows as `crossed_book`. The state checks strict crossing;
+topbook construction also flags equality. The original live payload has not been
+verified, so a NO-only crossing is not asserted as its established cause.
 
-**Intended fix.**
+Stored row integrity is now upstream integrity AND absence of unresolved failures
+on the emitted row, using the same flag definition as validation. Locked/crossed
+rows remain flagged and have false row integrity. Empty-side and stale-only flags
+do not invalidate an otherwise intact book. Upstream initialization, sequence,
+and other integrity failures cannot be promoted to valid by projection.
 
-1. Do not reconnect the Polymarket shard solely for `missing_instrument_books`
-   / per-instrument `book_integrity` while other instruments are initialized
-   and the socket is up.
-2. Prefer a targeted book request or isolate/drop the overdue ids. If the
-   venue cannot refresh one asset, record coverage loss; do not wipe peers.
-3. Keep `reconnect_socket` for transport death, `hash_mismatch` at shard
-   scope, and exhausted targeted refresh.
+Durability validation remains strict; rows are corrected before writing. Native
+book integrity and recovery decisions retain their existing semantics. No
+canonical schema version or price-normalization policy changes.
 
-**Regression test.** Two tokens on one shard: token-1 gets `book` + deltas;
-token-2 gets only `price_change` for >30 s; `max_reconnects=0`. Assert
-`socket_recovery_count == 0` and token-1 state is not `mark_reconnect`'d.
+## Eligibility reporting
 
-## Issue 2 — Kalshi `full@3` commit suicide on per-outcome flags
+Completeness reports, recovered reports, and connection-group summaries add
+`eligibility_evaluation_status`:
 
-**Symptom.** `ValueError: invalid topbook_main capture segment:
-book_integrity_valid cannot accompany unresolved book failures`. Process
-exit; journal recoverable as `CaptureCrash`. Same five sports tickers
-completed on `full@v2`.
+- `unevaluated`: no classified instruments or no evidence summary;
+- `partial`: classified instruments and unknown verdicts coexist;
+- `evaluated`: a nonempty classified set has no unknown verdicts.
 
-**Cause.** Market-level `KalshiOrderBookState.book_integrity_valid` ignores
-only `empty_bid` / `empty_ask`. `kalshi_ws_snapshot_to_topbook` then splits
-YES/NO and `compute_topbook` can add `crossed_book` / `negative_spread` on
-the NO row (NO bid vs complement of YES bid) even when the YES view is not
-crossed. `add_book_integrity(..., integrity=snapshot.book_integrity_valid)`
-stamps **True** onto both rows. `validation.py` rejects that combination.
+Eligible and ineligible (excluded) verdicts count as classified. Existing
+`capture_status`, execution status, legacy status, coverage denominators,
+acceptance gates, and CLI exit behavior are unchanged. Unknown eligibility can
+still make the conservative capture verdict partial; the independent label
+explains why. It never hides persistence failures or missing eligible snapshots.
 
-**Intended fix.** Stamp integrity from the **emitted row's** flags, or
-recompute `book_integrity_valid` after per-outcome topbook construction.
-Fail closed in the collector (flag the row) rather than aborting the process.
-Keep the invariant for truly inconsistent rows.
+CLI summaries show eligibility evaluation, unknown count, and eligible snapshot
+coverage separately from total snapshot coverage. Older manifests without the
+new field retain their previous display. No catalog calls or CLI flags are added.
 
-**Regression test.** Fixture where market-level integrity is true and the NO
-complement is crossed; `full@3` must finalize (or mark that row invalid)
-without raising in durability commit.
+## Acceptance and deferred work
 
-## Issue 3 — Ad-hoc CLI captures cannot become complete
+Deterministic coverage includes silent/delta-only peers beyond the 30-second SLA,
+high delta traffic before initialization, late/empty snapshots, and unchanged
+transport/corrupt-book recovery. Storage tests cover locked, crossed, one-sided,
+and normal books in full and checkpoint profiles. Reporting tests cover unknown,
+mixed, classified, absent evidence, and failure cases.
 
-**Symptom.** Every probe finalized `capture_status=partial` with
-`N instrument eligibility verdicts are unknown`.
+Run repository hygiene, test-lane coverage, Ruff, mypy, full pytest, and contract
+checks. Then repeat the 600-second dual-venue probe on `erik-pc1` using `full@3`
+and the recorded 10x10 selection; retain commit, selection, manifests, counters,
+and recovery causes. Do not claim that a live run exercised a fault absent from
+its evidence; use deterministic tests for that condition.
 
-**Cause.** `stream-books --token-id` / `stream-kalshi-books --ticker` do not
-pass `instrument_eligibility`. `_normalized_evidence` then yields `UNKNOWN` /
-`MISSING_EVIDENCE`. Completeness treats unknown as part of the denominator.
-
-This is documented as provisional policy, but the CLI does not say so.
-Live-probe operators cannot tell collector loss from “we never asserted
-these ids were live.”
-
-**Intended fix (small).** For ad-hoc captures, label coverage `unevaluated`
-or inject eligibility from a live catalog snapshot when one is provided.
-Do not call unknown-eligibility `partial` in the same bucket as missing
-snapshots on eligible ids. Plan-mode remains the path to `eligible`.
-
-## Issue 4 — Selection vs activity (operational, not a code defect)
-
-24h volume and `liquidityNum` are poor proxies for “ticking now.” Dead LoL
-maps and next-day gas strikes produced missing snapshots; TVL-heavy Fed
-books produced almost no WS events. A REST book preflight (2–3 s) before
-subscribe would have dropped the LoL Game 2 pair. Optional follow-up, not
-required to close issues 1–3.
-
-## Validation on the always-on host
-
-After code lands on this branch, re-run the 10-minute dual-venue probe on
-the same host with the same 10×10 activity selection (or a refreshed
-in-play set):
-
-- Polymarket: one known book-less token must not reset peers;
-  `socket_recovery_count` should stay 0 unless the transport actually dies.
-- Kalshi `full@3` must not crash the process on crossed NO complements.
-- Completeness reasons should distinguish unknown eligibility from missing
-  eligible snapshots.
-
-Do not scale instrument count until those hold.
+Broader corruption isolation, catalog eligibility acquisition, REST preflight
+selection, quarantine, and scaling are deferred. Volume or liquidity alone does
+not establish present activity or eligibility.

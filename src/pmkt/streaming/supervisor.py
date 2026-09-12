@@ -1248,14 +1248,11 @@ class LiveFeedSupervisor:
                     if state.initial_snapshot_received and not state.book_integrity_valid
                     and "reconnect" not in state.quality_flags
                 }
-                missing = self._overdue_initial_instruments[(shard.venue, shard.shard_id)]
-                instrument_reasons: list[str] = []
-                if broken:
-                    instrument_reasons.append("book_integrity")
-                if missing:
-                    instrument_reasons.append("missing_instrument_books")
-                reasons = tuple(instrument_reasons)
-                instruments = tuple(sorted(set(broken) | missing))
+                # Initialization is coverage evidence, not proof that the socket
+                # is broken. Keep overdue instruments tracked without resetting
+                # initialized peers or spending the transport retry budget.
+                reasons = ("book_integrity",) if broken else ()
+                instruments = tuple(sorted(broken))
             if not reasons:
                 continue
             actions.append(

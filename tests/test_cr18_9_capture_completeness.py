@@ -55,6 +55,7 @@ def _evaluate(**overrides):
 
 def test_established_capture_passes():
     assert _evaluate().ok is True
+    assert _evaluate().eligibility_evaluation_status == "unevaluated"
 
 
 def test_zero_snapshots_fails_closed():

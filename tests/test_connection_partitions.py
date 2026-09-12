@@ -10,6 +10,42 @@ from pmkt.streaming.connection_partitions import (
 )
 
 
+@pytest.mark.asyncio
+async def test_connection_group_aggregates_eligibility_evidence(tmp_path):
+    import json
+    from pmkt.streaming.capture_group import run_connection_partition_group
+
+    supervisor = LiveFeedSupervisor([FeedShardHealth(
+        venue="polymarket", shard_id="s", subscribed_instruments=("a", "b"))])
+    partitions = build_connection_partitions(supervisor, venue="polymarket",
+        instruments=("a", "b"), max_instruments=1)
+
+    async def collector(instruments, *, output_root, run_name, **kwargs):
+        known = instruments == ["a"]
+        run_dir = output_root / run_name
+        run_dir.mkdir()
+        manifest = {"run_dir": str(run_dir), "status": "partial",
+            "capture_completeness": {
+                "requested_instrument_count": 1, "initial_snapshot_count": int(known),
+                "eligible_instrument_count": int(known), "excluded_instrument_count": 0,
+                "unknown_instrument_count": int(not known),
+                "eligible_initial_snapshot_count": int(known)}}
+        (run_dir / "manifest.json").write_text(json.dumps(manifest))
+        return manifest
+
+    manifest = await run_connection_partition_group(
+        venue="polymarket", partitions=partitions, collector=collector,
+        output_dir=tmp_path, run_name="group", start_stagger_seconds=0,
+        collector_kwargs={})
+    summary = manifest["capture_summary"]
+    assert summary["eligibility_evaluation_status"] == "partial"
+    assert summary["unknown_instrument_count"] == 1
+    assert summary["eligible_instrument_count"] == 1
+    assert summary["eligible_initial_snapshot_count"] == 1
+    assert [c["capture_summary"]["eligibility_evaluation_status"]
+            for c in manifest["children"]] == ["evaluated", "unevaluated"]
+
+
 def test_connection_partitions_preserve_existing_plan_shards() -> None:
     supervisor = LiveFeedSupervisor(
         [
