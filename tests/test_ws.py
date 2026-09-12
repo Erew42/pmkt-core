@@ -71,7 +71,7 @@ async def no_sleep(_: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_outbound_ping_does_not_arm_pong_deadline() -> None:
+async def test_outbound_ping_arms_but_does_not_renew_silence_deadline() -> None:
     now = [100.0]
     client = AsyncMarketWebSocketClient(
         ["a"],
@@ -82,8 +82,10 @@ async def test_outbound_ping_does_not_arm_pong_deadline() -> None:
     await client.connect()
     await client.ping()
     now[0] += 30
-    assert client._pending_ping_since is None
-    client._check_pong_deadline()
+    await client.ping()
+    assert client._pending_ping_since == 100.0
+    with pytest.raises(asyncio.TimeoutError):
+        client._check_pong_deadline()
     await client.close()
     assert client._heartbeat_task is None
 
@@ -190,8 +192,7 @@ async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -
         return ws
 
     client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.02,
-        heartbeat_clock=lambda: 100.0)
+        heartbeat_interval=0.01, pong_timeout_seconds=1.0)
     state = MarketBookState("a")
     async with client:
         task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
@@ -385,26 +386,13 @@ async def test_default_connector_disables_protocol_keepalive(monkeypatch) -> Non
 @pytest.mark.asyncio
 async def test_heartbeat_sends_text_ping() -> None:
     fake = FakeWebSocket()
-    ticks = 0
-
-    async def connect_factory(_: str) -> FakeWebSocket:
-        return fake
-
-    async def fast_sleep(_: float) -> None:
-        nonlocal ticks
-        ticks += 1
-        await asyncio.sleep(0)
-        if ticks > 1:
-            fake.closed = True
-
     async with AsyncMarketWebSocketClient(
-        ["asset-a"],
-        heartbeat_interval=0.01,
-        connect_factory=connect_factory,
-        sleep=fast_sleep,
+        ["asset-a"], heartbeat_interval=0.01, connect_factory=lambda _: fake,
     ):
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+        async def wait_for_ping():
+            while "PING" not in fake.sent:
+                await asyncio.sleep(0.001)
+        await asyncio.wait_for(wait_for_ping(), timeout=2)
 
     assert "PING" in fake.sent
 
@@ -934,3 +922,111 @@ def test_decode_market_messages_handles_dict_list_bytes_and_control_frames() -> 
         {"event_type": "price_change"}
     ]
     assert decode_market_messages("bad-json") == []
+
+
+@pytest.mark.asyncio
+async def test_silent_socket_expires_even_when_sends_succeed() -> None:
+    class SilentSocket(FakeWebSocket):
+        async def __anext__(self):
+            await asyncio.Future()
+    ws = SilentSocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: ws,
+        heartbeat_interval=0.01, pong_timeout_seconds=0.1,
+    )
+    async with client:
+        with pytest.raises(asyncio.TimeoutError, match="heartbeat silence"):
+            await asyncio.wait_for(client.iter_messages(reconnect=False).__anext__(), 2)
+    assert ws.closed
+    assert client._receive_task is None
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_receiver_backpressure_is_not_remote_silence() -> None:
+    from pmkt.exchanges.ws_transport import WebSocketTransportSettings
+    class BusySocket(FakeWebSocket):
+        async def __anext__(self):
+            return '{"event_type":"last_trade_price","asset_id":"a"}'
+    ws = BusySocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: ws,
+        heartbeat_interval=0.01, pong_timeout_seconds=0.04,
+        transport_settings=WebSocketTransportSettings(max_queue_frames=2),
+    )
+    async with client:
+        iterator = client.iter_messages(reconnect=False)
+        await iterator.__anext__()
+        await asyncio.sleep(0.12)
+        assert client._frames.qsize() == 2
+        assert client._receive_blocked
+        assert client._heartbeat_error is None
+        assert not ws.closed
+        await iterator.aclose()
+    assert client._receive_task is None
+
+
+@pytest.mark.asyncio
+async def test_event_loop_stall_grants_receiver_time_to_drain_pong() -> None:
+    import time
+    class ReplySocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.responses = asyncio.Queue()
+        async def send(self, payload):
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+        async def __anext__(self):
+            return await self.responses.get()
+    ws = ReplySocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: ws,
+        heartbeat_interval=0.01, pong_timeout_seconds=0.05,
+    )
+    async with client:
+        waiter = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
+        await asyncio.sleep(0.02)
+        await client.ping()
+        time.sleep(0.12)
+        await asyncio.sleep(0.12)
+        assert not ws.closed
+        assert client._heartbeat_error is None
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_send_preserves_concurrent_outer_cancellation():
+    parent = None
+    class CancellingSocket(FakeWebSocket):
+        async def send(self, payload):
+            if payload == "PING":
+                parent.cancel()
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: CancellingSocket(), heartbeat_interval=None,
+    )
+    async with client:
+        parent = asyncio.create_task(client.ping())
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_send_timeout_cancels_blocked_send():
+    stopped = asyncio.Event()
+    class BlockedSocket(FakeWebSocket):
+        async def send(self, payload):
+            if payload == "PING":
+                try:
+                    await asyncio.Future()
+                finally:
+                    stopped.set()
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: BlockedSocket(), heartbeat_interval=None,
+        pong_timeout_seconds=0.03,
+    )
+    async with client:
+        with pytest.raises(asyncio.TimeoutError, match="send deadline"):
+            await client.ping()
+    assert stopped.is_set()

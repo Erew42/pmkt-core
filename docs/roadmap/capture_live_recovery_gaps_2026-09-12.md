@@ -116,9 +116,10 @@ implementation revision's source and exited 0 after reaching their deadlines.
 Polymarket recorded zero supervisor recovery actions across 1,158 evaluations.
 Six final-attempt instruments lacked valid initial snapshot evidence. Its seven
 reconnects came through the transport retry path on a ~43s cadence after 4.6
-minutes. The collector ignored inbound application `PING` frames (the venue
-requires `PONG` within 20s) while sending its own pings. That protocol gap is
-the next transport fix; this record is not a claim of transport stability.
+minutes. The initial diagnosis confused the market and sports heartbeat
+protocols. Market clients send `PING` and receive `PONG`; the former
+server-PING explanation is withdrawn. These runs do not establish transport
+stability or prove why any particular reply was delayed.
 Kalshi issued no targeted refreshes and finalized v3 without a commit failure.
 Both conservative capture verdicts remain `partial`, with eligibility reporting
 and missing-snapshot reasons preserved independently.
@@ -134,8 +135,8 @@ selection imported that revision and exited 0:
 | Kalshi | 3,127 | 10/10 | 0 | 0 | unevaluated (10 unknown) |
 
 Polymarket tape had zero `reconnect` controls. Supervisor recovery actions
-remained 0. Remaining missing snapshots are coverage (book-less ids in the
-stale selection), not socket recovery.
+remained 0. Missing snapshots remain coverage gaps; absence alone does not establish
+that these instruments have no book or are inactive.
 
 Probe metadata, selection, logs, manifests, and artifact-validation results are
 retained under `/home/erike/pmkt-core-pr5-98fea14/tmp/pr5-live/`.
@@ -152,8 +153,28 @@ PR remains draft; no merge or scaling was performed.
 | `13a3250` (PONG expiry on reader) | 13 | ~43s | 0 | 24/25 |
 | `6fb5cf7` (no outbound-PING deadline) | **6** | 67–139s, irregular | **0** | **25/25** |
 
-The 43s loop was our keepalive PING arming a 20s deadline that data frames
-enforced even when the venue never PONGed. Remaining six Polymarket reconnects
-are a slower, irregular transport pattern (`socket_recovery_count=2`). Kalshi
-targeted refresh stayed healthy (4/4 successful). Host peak ~82% CPU / 509 MB
-RSS; not resource-bound.
+Removing the outbound-PING deadline removed the regular cadence, but also
+removed bounded silence detection. It did not establish that the market venue
+does not answer PING. Of the remaining six reconnects, two followed supervisor
+`crossed_book` controls; four took the transport retry path without a persisted
+cause. Kalshi targeted refresh stayed healthy (4/4 successful). Aggregate
+CPU/RSS did not show exhaustion, but 12.47 seconds of control-plane lag prevents
+ruling out local blocking or backpressure.
+
+The follow-up restores bounded transport liveness with a separate bounded
+receive task, stall-aware silence detection, and persisted retry diagnostics.
+Missing initialization still causes no recovery. Corruption recovery policy
+is unchanged pending replay evidence. The market-channel heartbeat reference
+is https://docs.polymarket.com/api-reference/wss/market; the sports-channel
+reference is https://docs.polymarket.com/api-reference/wss/sports.
+
+
+Replay of the `6fb5cf7` raw log reproduces the two supervisor recoveries at
+sequences 2880 and 4280. The first pair becomes `0.50/0.50`; the second becomes
+`0.88/0.88` and `0.12/0.12`. These are local locked books, while the triggering
+deltas advertise unlocked best prices (`0.50/0.51`, `0.49/0.50`, `0.88/0.889`,
+and `0.111/0.12`). This confirms disagreement between reconstructed depth and
+venue best-price hints. It does not establish whether a deletion was missing,
+delayed, or incorrectly applied. Replay evidence is retained beside that
+probe as `crossed_replay.json`. Investigate this separately before changing
+corruption policy; best-price hints must not invent depth.

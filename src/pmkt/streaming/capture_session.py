@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
@@ -57,6 +60,26 @@ class _CaptureSessionBookkeeping:
     instrument_evidence_staged: bool = False
     terminal_reason: CaptureTerminationReason | None = None
     completeness_report_holder: dict[str, Any] = field(default_factory=dict)
+
+    reconnect_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+    def record_reconnect_diagnostic(self, run_dir: Path, event: dict[str, Any]) -> None:
+        record = {
+            **event,
+            "venue": self.venue,
+            "observed_at_utc": datetime.now(timezone.utc).isoformat(),
+            "local_sequence": self.sequence,
+            "event_count": self.event_count,
+            "feed_control_plane": self.feed_control_scheduler.manifest_metrics()
+            if self.feed_control_scheduler is not None else None,
+        }
+        # Persist before peer invalidation and before the next connection clears
+        # last_error. This sidecar survives an interrupted or failed capture.
+        with (run_dir / "reconnect_diagnostics.jsonl").open("a", encoding="utf-8") as out:
+            out.write(json.dumps(record, sort_keys=True) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+        self.reconnect_diagnostics.append(record)
 
     def begin_instrument_subscription_attempt(self) -> None:
         if self.instrument_evidence_tracker is not None:

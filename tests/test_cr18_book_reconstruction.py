@@ -1904,8 +1904,12 @@ class Socket:
     async def __anext__(self):
         if self.seen:
             journal = Path(root) / "crashed" / "capture_commit_journal.v2.jsonl"
-            if journal.exists() and journal.stat().st_size:
-                os._exit(92)
+            # Receiving the next frame no longer implies the collector has
+            # processed the previous one. Kill at the durable boundary itself.
+            for _ in range(500):
+                if journal.exists() and journal.stat().st_size:
+                    os._exit(92)
+                await asyncio.sleep(0.01)
             raise RuntimeError("capture did not journal its initial snapshot")
         self.seen = True
         if venue == "polymarket":

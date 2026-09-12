@@ -66,3 +66,10 @@ Ad-hoc ids without evidence retain unknown verdicts and the existing conservativ
 capture status. Missing snapshots, persistence failures, acceptance gates, and
 exit codes are unchanged. Missing initialization alone no longer reconnects a
 connected socket on either venue; instruments remain tracked for coverage.
+
+
+Capture reconnect diagnostics are retained in `reconnect_diagnostics.jsonl`
+inside each run directory and in the optional manifest `reconnect_diagnostics`
+list. Each replacement attempt records its origin and cause before book-state
+invalidation. Polymarket includes heartbeat activity and bounded receive-queue
+metrics; both venues include control-plane lag. No new CLI option is needed.

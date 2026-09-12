@@ -414,3 +414,43 @@ async def test_outer_cancellation_during_deadline_cleanup_is_not_suppressed():
     with pytest.raises(asyncio.CancelledError):
         await task
     assert budget.used == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_diagnostic_precedes_invalidation_and_error_clear():
+    from websockets.exceptions import ConnectionClosedError
+    from websockets.frames import Close
+    observed = []
+    budget = WebSocketRetryBudget(
+        backoff=0,
+        on_retry=lambda event: observed.append(event),
+        on_reconnect=lambda: observed.append("invalidated"),
+    )
+    budget.last_error = ConnectionClosedError(Close(1011, "server restart"), None)
+    budget.retry_context = {"origin": "transport", "reason": "receive_failure"}
+    async def connected():
+        assert observed[0]["received_close_code"] == 1011
+        assert observed[0]["received_close_reason"] == "server restart"
+        assert observed[1] == "invalidated"
+    await budget.run(connected, retry_first=True)
+    assert observed[0]["exception_type"] == "ConnectionClosedError"
+    assert observed[0]["replacement_attempt"] == 1
+    assert budget.last_error is None
+    assert budget.retry_context == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["receive", "clean"])
+async def test_client_retry_records_actual_cause(retry_client, failure):
+    records = []
+    sockets = iter([RetrySocket(failure), RetrySocket()])
+    budget = WebSocketRetryBudget(backoff=0, on_retry=records.append)
+    client = retry_client(lambda *args: next(sockets), retry_budget=budget)
+    async with client:
+        iterator = client.iter_messages()
+        await iterator.__anext__()
+        await iterator.aclose()
+    assert len(records) == 1
+    assert records[0]["origin"] == "transport"
+    assert records[0]["reason"] == ("receive_failure" if failure == "receive" else "clean_close")
+    assert records[0]["exception_type"] == ("OSError" if failure == "receive" else None)

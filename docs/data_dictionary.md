@@ -970,9 +970,26 @@ request per connection generation and instrument, batched by subscription ID,
 with a fixed 30-second response deadline. Only a matching intact snapshot clears
 its request. Counts distinguish batch sends, instrument targets, responses,
 successful responses, timeouts and shared-budget reconnect attempts.
-Polymarket sends application PING every 10 seconds and requires a PONG within
-20 seconds of the oldest outstanding PING. Data and later PINGs cannot extend
-that deadline. Kalshi retains its control-frame keepalive.
+The Polymarket market-channel client sends application `PING` every 10 seconds;
+its documented reply is `PONG`. This differs from the sports channel's
+server-initiated heartbeat. The local watchdog bounds silence to 20 seconds
+while receive processing can progress: PONG clears an outstanding ping, and
+incoming data also proves connection activity. Later outbound pings do not
+renew the silence deadline. A bounded receive task handles control frames
+independently of the collector, with at most `max_queue_frames` additional
+market frames plus one in-flight frame. Full queues suspend silence expiry;
+after backpressure or a substantial event-loop stall, the receiver gets one
+fresh timeout window to drain replies. These transport decisions never
+initialize a book. Kalshi retains its control-frame keepalive.
+
+Both collectors append `reconnect_diagnostics.jsonl` before each replacement
+attempt invalidates peer state, and project the records into the additive
+manifest `reconnect_diagnostics` list. Records distinguish transport receive
+failures, clean closes, connection setup failures, and supervisor reasons.
+They contain exception type/errno, received close code/reason, attempt number,
+sequence, and feed-control lag metrics; Polymarket also records inbound/ping
+ages and queue/backpressure metrics. Readers may omit this optional field for
+older manifests. No canonical table schema changes are involved.
 
 ## Feed health schema: `feed_health.v1`
 

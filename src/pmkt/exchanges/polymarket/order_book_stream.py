@@ -748,6 +748,7 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
                 "files": self.outputs.files,
                 "reconnect_count": self.reconnect_count,
                 "socket_recovery_count": self.socket_recovery_count,
+                "reconnect_diagnostics": self.reconnect_diagnostics,
                 "subscription_plan": (
                     dict(self.subscription_plan_metadata)
                     if self.subscription_plan_metadata is not None
@@ -1028,6 +1029,7 @@ async def stream_order_book_data(
     retry_budget = WebSocketRetryBudget(
         session.max_reconnects,
         on_reconnect=session.mark_reconnect,
+        on_retry=lambda event: session.record_reconnect_diagnostic(session.run_dir, event),
         deadline=deadline,
     )
 
@@ -1129,6 +1131,13 @@ async def stream_order_book_data(
                             with contextlib.suppress(asyncio.CancelledError):
                                 await next_message_task
                         next_message_task = None
+                        retry_budget.last_error = None
+                        retry_budget.retry_context = {
+                            "origin": "supervisor",
+                            "reasons": sorted({reason for action in recovery_actions for reason in action.reasons}),
+                            "instruments": sorted({instrument for action in recovery_actions for instrument in action.instruments}),
+                            **ws.heartbeat_diagnostics(),
+                        }
                         await retry_budget.run(
                             ws.reconnect, retry_first=True, immediate_first=True,
                         )

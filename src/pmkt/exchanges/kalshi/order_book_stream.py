@@ -768,6 +768,7 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
                 "files": self.outputs.files,
                 "reconnect_count": self.reconnect_count,
                 "socket_recovery_count": self.socket_recovery_count,
+                "reconnect_diagnostics": self.reconnect_diagnostics,
                 "snapshot_resync_request_count": self.snapshot_resync_request_count,
                 "kalshi_feed_recovery": {
                     "transport_liveness_probe_count": (
@@ -1078,6 +1079,7 @@ async def stream_kalshi_order_book_data(
     retry_budget = WebSocketRetryBudget(
         session.max_reconnects,
         on_reconnect=session.mark_reconnect,
+        on_retry=lambda event: session.record_reconnect_diagnostic(session.run_dir, event),
         deadline=deadline,
     )
 
@@ -1184,6 +1186,7 @@ async def stream_kalshi_order_book_data(
                             and set(action.reasons) == {"book_integrity"}
                             for action in recovery_actions
                         )
+                        snapshot_request_error: BaseException | None = None
                         snapshot_targets: dict[int, list[str]] = {}
                         if targeted:
                             for action in recovery_actions:
@@ -1222,7 +1225,8 @@ async def stream_kalshi_order_book_data(
                                                 )],
                                                 observed_at_utc=_utc_now().isoformat(),
                                             )
-                                except (ConnectionClosed, OSError, RuntimeError, asyncio.TimeoutError):
+                                except (ConnectionClosed, OSError, RuntimeError, asyncio.TimeoutError) as exc:
+                                    snapshot_request_error = exc
                                     session.targeted_snapshot_refresh_failure_count += 1
                                 else:
                                     return False
@@ -1249,6 +1253,13 @@ async def stream_kalshi_order_book_data(
                             with contextlib.suppress(asyncio.CancelledError):
                                 await next_message_task
                         next_message_task = None
+                        retry_budget.last_error = snapshot_request_error
+                        retry_budget.retry_context = {
+                            "origin": "supervisor",
+                            "reason": "snapshot_request_failed" if snapshot_request_error is not None else "recovery_action",
+                            "reasons": ["snapshot_response_timeout"] if expired else sorted({reason for action in recovery_actions for reason in action.reasons}),
+                            "instruments": sorted(set(expired) | {instrument for action in recovery_actions for instrument in action.instruments}),
+                        }
                         await retry_budget.run(
                             ws.reconnect, retry_first=True, immediate_first=True,
                         )

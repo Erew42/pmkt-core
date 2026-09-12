@@ -617,6 +617,14 @@ class AsyncMarketWebSocketClient:
         self._ws: Any | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
         self._heartbeat_error: BaseException | None = None
+        self._receive_task: asyncio.Task[None] | None = None
+        self._frames: asyncio.Queue[Any] = asyncio.Queue(
+            maxsize=self.transport_settings.max_queue_frames
+        )
+        self._last_inbound: float | None = None
+        self._receive_blocked = False
+        self._liveness_grace_until = 0.0
+        self._max_heartbeat_lag_seconds = 0.0
 
     @property
     def is_connected(self) -> bool:
@@ -658,11 +666,19 @@ class AsyncMarketWebSocketClient:
                     isoformat_source_timestamp(time.time(), epoch_unit="seconds")
                     or sent_at_utc,
                 )
+        self._frames = asyncio.Queue(maxsize=self.transport_settings.max_queue_frames)
+        self._last_inbound = None
+        self._receive_blocked = False
+        self._liveness_grace_until = 0.0
         self._start_heartbeat()
         logger.info("Connected to Polymarket market websocket at %s", self.ws_url)
 
     async def close(self) -> None:
         await self._stop_heartbeat()
+        receiver, self._receive_task = self._receive_task, None
+        if receiver is not None:
+            receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
         self._pending_ping_since = None
         ws, self._ws = self._ws, None
         if ws is not None:
@@ -721,10 +737,78 @@ class AsyncMarketWebSocketClient:
         ws = self._ws
         if ws is None:
             raise RuntimeError("WebSocket is not connected.")
-        # Outbound PING is keepalive only. The venue may never PONG it; data
-        # frames still prove liveness. The 20s deadline applies to unanswered
-        # venue PINGs, which are answered in iter_messages.
-        await ws.send("PING")
+        # Market-channel clients send PING; PONG or incoming data proves
+        # transport activity. Repeated sends must not renew a silent deadline.
+        if self._pending_ping_since is None:
+            self._pending_ping_since = self._heartbeat_clock()
+        await self._send_heartbeat(ws, "PING")
+
+    async def _send_heartbeat(self, ws: Any, token: str) -> None:
+        task = asyncio.ensure_future(ws.send(token))
+        try:
+            # Preserve outer cancellation on Python 3.10 even if send finishes
+            # concurrently; wait_for can lose that cancellation.
+            done, _ = await asyncio.wait({task}, timeout=self.pong_timeout_seconds)
+            if not done:
+                raise asyncio.TimeoutError("Polymarket heartbeat send deadline exceeded")
+            task.result()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def heartbeat_diagnostics(self) -> dict[str, Any]:
+        now = self._heartbeat_clock()
+        return {
+            "inbound_age_seconds": None if self._last_inbound is None else now - self._last_inbound,
+            "pending_ping_age_seconds": None if self._pending_ping_since is None else now - self._pending_ping_since,
+            "receive_queue_frames": self._frames.qsize(),
+            "receive_backpressure": self._receive_blocked,
+            "max_heartbeat_lag_seconds": self._max_heartbeat_lag_seconds,
+            "heartbeat_error_type": type(self._heartbeat_error).__name__ if self._heartbeat_error is not None else None,
+        }
+
+    async def _receive_frames(self, ws: Any) -> None:
+        # One bounded application buffer, in addition to the transport buffer.
+        # Heartbeat replies don't wait for downstream market-data processing.
+        async for raw in ws:
+            self._last_inbound = self._heartbeat_clock()
+            heartbeat = application_heartbeat_token(raw)
+            if heartbeat == "PONG":
+                self._pending_ping_since = None
+                continue
+            if heartbeat == "PING":
+                await self._send_heartbeat(ws, "PONG")
+                continue
+            blocked = self._frames.full()
+            self._receive_blocked = blocked
+            try:
+                await self._frames.put(raw)
+            finally:
+                self._receive_blocked = False
+                if blocked:
+                    self._liveness_grace_until = self._heartbeat_clock() + self.pong_timeout_seconds
+
+    async def _incoming_frames(self) -> AsyncIterator[Any]:
+        receiver = self._receive_task
+        if receiver is None:
+            return
+        while True:
+            if self._heartbeat_error is not None:
+                raise self._heartbeat_error
+            if not self._frames.empty():
+                yield self._frames.get_nowait()
+                continue
+            if receiver.done():
+                receiver.result()
+                return
+            get_frame = asyncio.create_task(self._frames.get())
+            try:
+                await asyncio.wait({get_frame, receiver}, return_when=asyncio.FIRST_COMPLETED)
+                if get_frame.done():
+                    yield get_frame.result()
+            finally:
+                get_frame.cancel()
+                await asyncio.gather(get_frame, return_exceptions=True)
 
     async def iter_messages(
         self,
@@ -753,19 +837,11 @@ class AsyncMarketWebSocketClient:
                     raise error
                 if ws is None:
                     return
-                async for raw in ws:
+                if self._receive_task is None:
+                    self._receive_task = asyncio.create_task(self._receive_frames(ws))
+                async for raw in self._incoming_frames():
                     if self._heartbeat_error is not None:
                         raise self._heartbeat_error
-                    heartbeat = application_heartbeat_token(raw)
-                    if heartbeat is not None and ws is self._ws:
-                        if heartbeat == "PONG":
-                            self._pending_ping_since = None
-                        elif heartbeat == "PING":
-                            if self._pending_ping_since is None:
-                                self._pending_ping_since = self._heartbeat_clock()
-                            await ws.send("PONG")
-                            self._pending_ping_since = None
-                        continue
                     # Stamp application dequeue BEFORE decoding. Messages 2..N
                     # of a frame would otherwise inherit processing time spent
                     # on their predecessors, including synchronous commits.
@@ -785,11 +861,14 @@ class AsyncMarketWebSocketClient:
                 if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
                     raise
                 budget.last_error = exc
+                budget.retry_context = {"origin": "transport", "reason": "receive_failure", **self.heartbeat_diagnostics()}
                 with contextlib.suppress(Exception):
                     await self.close()
                 if not reconnect or not budget.available:
                     raise
             else:
+                budget.last_error = None
+                budget.retry_context = {"origin": "transport", "reason": "clean_close", **self.heartbeat_diagnostics()}
                 with contextlib.suppress(ConnectionClosed, OSError, asyncio.TimeoutError):
                     await self.close()
                 if not reconnect:
@@ -829,26 +908,43 @@ class AsyncMarketWebSocketClient:
             await task
 
     def _check_pong_deadline(self) -> None:
-        if (self._pending_ping_since is not None
-                and self._heartbeat_clock() - self._pending_ping_since >= self.pong_timeout_seconds):
-            raise asyncio.TimeoutError("Polymarket application PONG response deadline exceeded")
+        if self._pending_ping_since is None or self._receive_blocked:
+            return
+        now = self._heartbeat_clock()
+        activity = max(self._pending_ping_since, self._last_inbound or self._pending_ping_since)
+        if now >= self._liveness_grace_until and now - activity >= self.pong_timeout_seconds:
+            raise asyncio.TimeoutError("Polymarket application heartbeat silence deadline exceeded")
 
     async def _heartbeat_loop(self) -> None:
         interval = self.heartbeat_interval
         if interval is None or interval <= 0:
             return
+        tick = min(float(interval), self.pong_timeout_seconds / 2)
+        next_ping = self._heartbeat_clock() + interval
         try:
             while self.is_connected:
-                await self._sleep(float(interval))
-                # Expire PONG only on the reader: a reply may already be queued
-                # while capture is blocked in a commit.
+                expected = self._heartbeat_clock() + tick
+                await self._sleep(tick)
+                now = self._heartbeat_clock()
+                lag = max(0.0, now - expected)
+                self._max_heartbeat_lag_seconds = max(self._max_heartbeat_lag_seconds, lag)
+                if lag > max(0.05, tick * 0.1):
+                    # A blocked event loop cannot establish remote silence.
+                    # Give the receiver a full deadline to drain queued replies.
+                    self._liveness_grace_until = now + self.pong_timeout_seconds
+                await asyncio.sleep(0)
                 if self.is_connected:
-                    await self.ping()
+                    self._check_pong_deadline()
+                    if now >= next_ping:
+                        await self.ping()
+                        next_ping = now + interval
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             logger.warning("Polymarket websocket heartbeat failed: %s", exc)
             self._heartbeat_error = exc
+            if self._receive_task is not None:
+                self._receive_task.cancel()
             ws = self._ws
             self._ws = None
             if ws is not None:

@@ -104,11 +104,14 @@ class ClockDrivenFakeWebSocket(FakeWebSocket):
     def __init__(self, messages: list[Any], clock: ManualMonotonicClock) -> None:
         super().__init__(messages)
         self._clock = clock
+        self.before_advance = lambda: True
 
     async def __anext__(self):
         while self.messages:
             item = self.messages.popleft()
             if isinstance(item, float):
+                while not self.before_advance():
+                    await asyncio.sleep(0)
                 self._clock.advance_seconds(item)
                 await asyncio.sleep(0)
                 continue
@@ -1456,6 +1459,12 @@ async def test_stream_order_book_data_emits_complete_same_shard_stale_transition
         max_valid_book_age_ms=20,
     )
 
+    # Wait for application processing, not socket read-ahead, before aging books.
+    fake.before_advance = lambda: len(supervisor.shard("polymarket", "pm-shared").instrument_health) == 2 and all(
+        health.book_integrity_valid
+        for health in supervisor.shard("polymarket", "pm-shared").instrument_health.values()
+    )
+
     await stream_order_book_data(
         ["token-1", "token-2"],
         output_root=tmp_path,
@@ -2019,6 +2028,13 @@ async def test_stream_order_book_data_marks_reconnect_invalid_until_snapshot(
     assert topbook["valid_state"].tolist() == [True, False]
     assert "reconnect" in topbook.loc[1, "quality_flags"]
     assert manifest["reconnect_count"] == 1
+    records = [json.loads(line) for line in (
+        tmp_path / "reconnect-run" / "reconnect_diagnostics.jsonl"
+    ).read_text().splitlines()]
+    assert records == manifest["reconnect_diagnostics"]
+    assert records[0]["origin"] == "transport"
+    assert records[0]["exception_type"] == "OSError"
+    assert records[0]["local_sequence"] == 1
     assert manifest["quality_flag_counts"]["reconnect"] >= 1
     assert depth["valid_state"].tolist()[-1] == False  # noqa: E712
     assert "reconnect" in depth["quality_flags"].tolist()[-1]
@@ -2187,6 +2203,9 @@ async def test_missing_peer_does_not_reset_initialized_polymarket_book(tmp_path,
 
     supervisor = LiveFeedSupervisor([FeedShardHealth(
         venue="polymarket", shard_id="shared", subscribed_instruments=("A", "B"))])
+    fake.before_advance = lambda: "A" in supervisor.shard("polymarket", "shared").instrument_health and supervisor.shard(
+        "polymarket", "shared"
+    ).instrument_health["A"].book_integrity_valid
     manifest = await stream_order_book_data(
         ["A", "B"], output_root=tmp_path, run_name=peer, duration_s=1,
         max_messages=sum(isinstance(m, str) for m in messages), capture_intent="smoke",
