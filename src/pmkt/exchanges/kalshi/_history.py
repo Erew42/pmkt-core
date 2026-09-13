@@ -463,9 +463,12 @@ def _live_price(value: object) -> tuple[CandleOHLC, float | None, float | None]:
         raise UnsupportedCandleLayoutError(
             "Kalshi live candle price must be an object"
         )
-    if not value:
-        return CandleOHLC(None, None, None, None), None, None
-    ohlc = _ohlc(value, suffix="_dollars")
+    # Live no-trade periods can contain only previous_dollars. Missing traded
+    # prices remain null; this does not relax the separate bid/ask contract.
+    ohlc = _ohlc(
+        {f"{name}_dollars": value.get(f"{name}_dollars") for name in _OHLC},
+        suffix="_dollars",
+    )
     mean = _optional_probability(value.get("mean_dollars", None), "mean_dollars")
     previous = _optional_probability(
         value.get("previous_dollars", None), "previous_dollars"
@@ -509,7 +512,7 @@ def _preflight_candle_layout(
             f"Kalshi {dataset} candle price must be an object"
         )
     suffix = "_dollars" if dataset == "live" else ""
-    if price or dataset == "historical":
+    if dataset == "historical":
         _require_ohlc_layout(price, suffix=suffix)
     if dataset == "historical" and (
         "mean" not in price or "previous" not in price

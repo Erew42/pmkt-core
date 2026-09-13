@@ -1390,3 +1390,74 @@ async def test_explicit_source_404_never_switches() -> None:
                 source="historical",
             )
     assert len(paths) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("invalid_rows", ["raise", "report"])
+@pytest.mark.parametrize(
+    "price,expected,flag",
+    [
+        (
+            {"previous_dollars": "0.4000"},
+            CandleOHLC(None, None, None, None),
+            "no_traded_price_ohlc",
+        ),
+        (
+            {"previous_dollars": "0.4000", "mean_dollars": "0.4200"},
+            CandleOHLC(None, None, None, None),
+            "no_traded_price_ohlc",
+        ),
+        (
+            {"close_dollars": "0.4100"},
+            CandleOHLC(None, None, None, 0.41),
+            "partial_traded_price_ohlc",
+        ),
+    ],
+)
+async def test_live_sparse_trade_prices_preserve_quotes_and_missing_evidence(
+    invalid_rows, price, expected, flag
+):
+    # Synthetic regression for the previous-only live shape observed on 2026-09-12.
+    row = _live_row(BASE + timedelta(hours=1))
+    row["price"] = price
+    row["volume_fp"] = "0.00"
+    result = await _explicit_live(
+        {"ticker": TICKER, "candlesticks": [row]}, invalid_rows=invalid_rows
+    )
+    (candle,) = result.candles
+    assert candle.traded_price == expected
+    assert candle.traded_price_previous == (
+        0.4 if "previous_dollars" in price else None
+    )
+    assert candle.traded_price_mean == (0.42 if "mean_dollars" in price else None)
+    assert candle.quality_flags == (flag,)
+    assert candle.yes_bid.close == 0.35
+    assert candle.yes_ask.close == 0.45
+    assert candle.volume_contracts == 0
+    assert candle.native_payload["price"] == price
+    assert result.coverage.rejected_rows == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("component", ["yes_bid", "yes_ask"])
+async def test_sparse_price_does_not_relax_quote_layout(component):
+    row = _live_row(BASE + timedelta(hours=1))
+    row["price"] = {"previous_dollars": "0.4"}
+    row[component].pop("open_dollars")
+    with pytest.raises(InvalidDataError, match="missing required open_dollars"):
+        await _explicit_live(
+            {"ticker": TICKER, "candlesticks": [row]}, invalid_rows="report"
+        )
+
+
+@pytest.mark.asyncio
+async def test_sparse_price_invalid_value_still_obeys_row_policy():
+    bad = _live_row(BASE + timedelta(hours=1))
+    bad["price"] = {"previous_dollars": "1.5"}
+    good = _live_row(BASE + timedelta(hours=2))
+    payload = {"ticker": TICKER, "candlesticks": [bad, good]}
+    with pytest.raises(InvalidDataError, match="previous_dollars"):
+        await _explicit_live(payload)
+    result = await _explicit_live(payload, invalid_rows="report")
+    assert len(result.candles) == 1
+    assert result.coverage.rejected_rows == 1
