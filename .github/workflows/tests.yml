@@ -84,6 +84,7 @@ jobs:
               tests/test_venue_adapter.py
           - name: feeds-streaming
             paths: >-
+              tests/test_book_grid_benchmark.py
               tests/test_capture_storage_backends.py
               tests/test_connection_partitions.py
               tests/test_cr18_9_capture_completeness.py

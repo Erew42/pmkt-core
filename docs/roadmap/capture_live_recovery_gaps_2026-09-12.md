@@ -316,3 +316,27 @@ only PONG leaves `last_frame_sequence` at zero, and that the receiver survives
 application-waiter cancellation but is cancelled on client closure. Preserve the
 other #5 tests. #4 remains independent; this integration check does not replace
 its own review. Neither draft branch was changed by these isolated checks.
+
+### Follow-up: causal state-grid storage experiment
+
+The fresh active-market stress selection subsequently initialized all 50 PM
+tokens and 25 Kalshi tickers, while PM still accumulated substantial processing
+backlog. An offline storage experiment on unchanged `de30b34` therefore tested
+causal 0.1/0.25/0.5/1-second grids and separate raw/tape retention choices.
+
+At 0.25 seconds, PM depth rows fell 90.3%, and the same five-second input took
+15.61 seconds instead of 39.87 seconds. Full tape production/validation remained
+expensive: a roughly 40-second window took 102.63 seconds with sampled states
+and full tape, versus 16.95 seconds with sampled states and losslessly archived
+source messages. Exact tape reconstruction from that archive was verified.
+
+This is an experimental harness, not a changed `full@3` capture contract or a
+live acceptance result. In particular, 28 invalid intermediate PM observations
+fell between grid points; event evidence must remain independent of sampled
+state validity. The next storage candidate needs an explicit sampled-frame
+contract and crash-safe source journal, followed by a live test. Missing
+initialization remains unrelated to recovery decisions.
+
+See [the storage experiment](../book_grid_storage_experiment.md) for reproducible
+commands, retention tradeoffs, validation and complete measurements. Remote
+artifacts: `/home/erike/pr5-grid-storage-final-de30b34/`.

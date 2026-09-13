@@ -102,3 +102,14 @@ are not crash-durable until journal publication. Invalidations, termination,
 and explicit forced commits still publish synchronously. See the
 [capture runbook](docs/storage_profile_capture_runbook.md) for the exact boundary
 and the additive `capture_durability.metrics.checkpoint_publication` diagnostics.
+
+## Offline book-grid storage experiment
+
+`python scripts/benchmark_book_grid.py --help` documents an offline storage
+comparison for recorded single-segment public book traffic. Configure
+`--interval 0.25` (or `0` for dense) and
+`--retention all|no-sidecar|tape|states|raw-archive`. This is a repository experiment, not a
+`pmkt stream-books` option or a replacement capture contract. See
+[`docs/book_grid_storage_experiment.md`](docs/book_grid_storage_experiment.md)
+for timestamp semantics, input requirements, measurements and reconstruction
+limits. Generated outputs belong under ignored `tmp/` paths.
