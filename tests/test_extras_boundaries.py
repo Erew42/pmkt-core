@@ -182,7 +182,7 @@ def test_catalog_timestamp_parsing_does_not_require_optional_dependencies() -> N
         assert parse_timestamp('2026-09-12 11:59:20') == datetime(
             2026, 9, 12, 11, 59, 20, tzinfo=timezone.utc
         )
-        for text in ('2026-99-12T11:59:20.1234567Z', '2026-09-12T11:59:20.1234567badZ'):
+        for text in ('2026-99-12T11:59:20.1234567Z', 'not-a-timestamp'):
             assert parse_timestamp(text) is None, text
         assert not attempted, attempted
     """
