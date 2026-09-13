@@ -24,6 +24,7 @@ from pmkt.config import PmktConfig
 from pmkt.config import RequestPolicy as ConfigRequestPolicy
 from pmkt.errors import (
     InvalidDataError,
+    MarketNotFoundError,
     OperationTimeoutError,
     ReadAuthenticationRequiredError,
 )
@@ -34,6 +35,23 @@ from pmkt.exchanges.polymarket.subgraph import AsyncSubgraphClient
 from pmkt.exchanges.read_auth import (
     ReadAuthenticationRequiredError as CanonicalReadAuthenticationRequiredError,
 )
+
+
+def test_market_not_found_error_survives_pickle_and_copy() -> None:
+    import copy
+    import pickle
+
+    error = MarketNotFoundError(
+        venue="kalshi", identifier="KX-ONE", lookup_scope="live"
+    )
+    error.request_id = "request-1"
+    for restored in (
+        pickle.loads(pickle.dumps(error)), copy.copy(error), copy.deepcopy(error)
+    ):
+        assert type(restored) is MarketNotFoundError
+        assert restored is not error
+        assert restored.args == error.args
+        assert restored.__dict__ == error.__dict__
 
 
 def test_from_values_bypasses_os_dotenv_discovery_and_cache(

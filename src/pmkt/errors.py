@@ -43,6 +43,21 @@ class MarketNotFoundError(LookupError):
             f"{venue} identifier {identifier!r} was not found in {lookup_scope}"
         )
 
+    def __reduce__(self) -> tuple[Any, ...]:
+        # Exception.args contains the message, not this keyword-only constructor's
+        # arguments. Preserve both lookup identity and any attached error context.
+        return (
+            _restore_market_not_found,
+            (type(self), self.venue, self.identifier, self.lookup_scope),
+            self.__dict__,
+        )
+
+
+def _restore_market_not_found(
+    cls: type[MarketNotFoundError], venue: str, identifier: str, lookup_scope: str
+) -> MarketNotFoundError:
+    return cls(venue=venue, identifier=identifier, lookup_scope=lookup_scope)
+
 
 def __getattr__(name: str) -> Any:
     if name == "CatalogError":
