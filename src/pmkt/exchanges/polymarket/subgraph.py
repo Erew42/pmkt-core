@@ -5,10 +5,10 @@ from typing import Any, AsyncIterator
 import httpx
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient
+from pmkt._http import HttpClient, RequestPolicy
 
 
-from pmkt.config import get_config
+from pmkt.config import PmktConfig, get_config
 
 
 class AsyncSubgraphClient:
@@ -19,13 +19,29 @@ class AsyncSubgraphClient:
         base_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
+        *,
+        config: PmktConfig | None = None,
+        timeout_s: float = 10.0,
+        request_policy: RequestPolicy | None = None,
     ) -> None:
-        self.base_url = base_url or get_config().subgraph_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.subgraph_api_url
+            if config is not None
+            else get_config().subgraph_api_url
+        )
         self.transport = transport
         # The Graph rate limits can be strict, default to 10 req/s to be safe
         self.limiter = limiter or AsyncLimiter(10, 1)
         self._http = HttpClient(
-            base_url=self.base_url, transport=self.transport, limiter=self.limiter
+            base_url=self.base_url,
+            transport=self.transport,
+            limiter=self.limiter,
+            timeout_s=timeout_s,
+            request_policy=request_policy,
+            source_venue="polymarket",
+            source_service="subgraph",
         )
 
     async def close(self) -> None:

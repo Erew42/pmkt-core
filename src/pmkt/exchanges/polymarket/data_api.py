@@ -7,8 +7,8 @@ from typing import Any, Mapping, Sequence
 import httpx
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient
-from pmkt.config import get_config
+from pmkt._http import HttpClient, RequestPolicy
+from pmkt.config import PmktConfig, get_config
 
 
 MAX_OPEN_INTEREST_MARKETS = 25
@@ -102,8 +102,18 @@ class AsyncPolymarketDataClient:
         base_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
+        *,
+        config: PmktConfig | None = None,
+        timeout_s: float = 30.0,
+        request_policy: RequestPolicy | None = None,
     ) -> None:
-        self.base_url = base_url or get_config().polymarket_data_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.polymarket_data_api_url
+            if config is not None
+            else get_config().polymarket_data_api_url
+        )
         self.limiter = limiter or AsyncLimiter(
             DEFAULT_DATA_API_MAX_RATE,
             DEFAULT_DATA_API_PERIOD_SECONDS,
@@ -112,7 +122,10 @@ class AsyncPolymarketDataClient:
             base_url=self.base_url,
             transport=transport,
             limiter=self.limiter,
-            timeout_s=30.0,
+            timeout_s=timeout_s,
+            request_policy=request_policy,
+            source_venue="polymarket",
+            source_service="data_api",
         )
 
     async def __aenter__(self) -> "AsyncPolymarketDataClient":

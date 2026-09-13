@@ -48,7 +48,9 @@ jobs:
               tests/test_public_boundary.py
               tests/test_public_api_inventory.py
               tests/test_provenance.py
+              tests/test_records.py
               tests/test_repo_hygiene.py
+              tests/test_runtime.py
               tests/test_source_archive_builder.py
               tests/test_time.py
               tests/test_wheel_contents.py

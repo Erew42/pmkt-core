@@ -1,7 +1,21 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pmkt.exchanges.polymarket.clob import (
+        AsyncClobClient as AsyncClobClient,
+        ClobClient as ClobClient,
+    )
+    from pmkt.exchanges.polymarket.gamma import (
+        AsyncGammaClient as AsyncGammaClient,
+        GammaClient as GammaClient,
+    )
+    from pmkt.records import (
+        PolymarketInstrumentRef as PolymarketInstrumentRef,
+        PolymarketMarketRef as PolymarketMarketRef,
+    )
 
 _LAZY_MODULES: dict[str, str] = {
     "clob": "pmkt.exchanges.polymarket.clob",
@@ -41,6 +55,8 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "GammaClient": ("pmkt.exchanges.polymarket.gamma", "GammaClient"),
     "MarketBookState": ("pmkt.exchanges.polymarket.ws", "MarketBookState"),
     "MarketStreamSnapshot": ("pmkt.exchanges.polymarket.ws", "MarketStreamSnapshot"),
+    "PolymarketInstrumentRef": ("pmkt.records", "PolymarketInstrumentRef"),
+    "PolymarketMarketRef": ("pmkt.records", "PolymarketMarketRef"),
     "SubgraphClient": ("pmkt.exchanges.polymarket.subgraph", "SubgraphClient"),
     "WebSocketProtocolError": ("pmkt.exchanges.polymarket.ws", "WebSocketProtocolError"),
     "apply_market_message": ("pmkt.exchanges.polymarket.ws", "apply_market_message"),

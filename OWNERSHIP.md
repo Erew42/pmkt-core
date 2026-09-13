@@ -9,7 +9,7 @@ the public repository by accident.
 
 The following paths are owned by `pmkt-core`:
 
-- `src/pmkt/{__init__,_http,catalog,config,errors,models,pagination,tokens}.py` and
+- `src/pmkt/{__init__,_http,_observations,_operation,catalog,config,errors,models,pagination,records,tokens}.py` and
   `src/pmkt/py.typed`.
 - `src/pmkt/data/**`, except semantic sports-corpus and matching-policy code.
 - `src/pmkt/exchanges/**`, except credential/private-key loaders, generic signed

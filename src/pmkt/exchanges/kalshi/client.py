@@ -8,7 +8,8 @@ import httpx
 from aiolimiter import AsyncLimiter
 
 from pmkt._http import HttpClient, RequestPolicy
-from pmkt.config import get_config
+from pmkt._operation import OperationExpiry
+from pmkt.config import PmktConfig, get_config
 from pmkt.data.canonical import KALSHI_MARKET_SNAPSHOT_COLUMNS
 from pmkt.data.normalize_kalshi import normalize_kalshi_market
 from pmkt.data.prices import complement_probability as _price_complement
@@ -195,6 +196,8 @@ class KalshiHttpClient(HttpClient):
             max_retries=max_retries,
             limiter=limiter,
             request_policy=request_policy,
+            source_venue="kalshi",
+            source_service="kalshi",
         )
         self.header_provider = auth
 
@@ -205,6 +208,9 @@ class KalshiHttpClient(HttpClient):
         params: dict[str, Any] | None,
         json: Any | None = None,
         headers: dict[str, str] | None = None,
+        *,
+        expiry: OperationExpiry | None = None,
+        trace: Any | None = None,
     ) -> httpx.Response:
         if method.upper() != "GET":
             raise ReadOnlyRequestError(
@@ -217,6 +223,8 @@ class KalshiHttpClient(HttpClient):
                 params=params,
                 json=json,
                 headers=headers,
+                expiry=expiry,
+                trace=trace,
             )
         parsed_path = urlparse(path)
         if parsed_path.scheme or parsed_path.netloc:
@@ -236,6 +244,8 @@ class KalshiHttpClient(HttpClient):
             params=params,
             json=json,
             headers=request_headers,
+            expiry=expiry,
+            trace=trace,
         )
 
 
@@ -250,8 +260,16 @@ class AsyncKalshiClient:
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
+        config: PmktConfig | None = None,
+        timeout_s: float = 10.0,
     ) -> None:
-        self.base_url = base_url or get_config().resolved_kalshi_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.resolved_kalshi_api_url
+            if config is not None
+            else get_config().resolved_kalshi_api_url
+        )
         self.header_provider = auth
         self.transport = transport
         self.limiter = limiter or AsyncLimiter(10, 1)
@@ -261,6 +279,7 @@ class AsyncKalshiClient:
             transport=self.transport,
             limiter=self.limiter,
             request_policy=request_policy,
+            timeout_s=timeout_s,
         )
 
     async def close(self) -> None:

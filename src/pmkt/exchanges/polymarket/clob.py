@@ -5,8 +5,8 @@ from typing import Any, Literal, Sequence
 import httpx
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient
-from pmkt.config import get_config
+from pmkt._http import HttpClient, RequestPolicy
+from pmkt.config import PmktConfig, get_config
 from pmkt.models import OrderBook, PriceHistory
 from pmkt.tokens import extract_token_ids
 
@@ -19,12 +19,29 @@ class AsyncClobClient:
         base_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
+        *,
+        config: PmktConfig | None = None,
+        timeout_s: float = 10.0,
+        request_policy: RequestPolicy | None = None,
     ) -> None:
-        self.base_url = base_url or get_config().clob_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.clob_api_url
+            if config is not None
+            else get_config().clob_api_url
+        )
         self.transport = transport
         self.limiter = limiter or AsyncLimiter(10, 1)
         self._http = HttpClient(
-            base_url=self.base_url, transport=self.transport, limiter=self.limiter
+            base_url=self.base_url,
+            transport=self.transport,
+            limiter=self.limiter,
+            timeout_s=timeout_s,
+            request_policy=request_policy,
+            retryable_post_paths={"/books", "/batch-prices-history"},
+            source_venue="polymarket",
+            source_service="clob",
         )
 
     async def close(self) -> None:

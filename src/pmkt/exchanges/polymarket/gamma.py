@@ -11,7 +11,7 @@ from pmkt.models import Event, Market
 from pmkt.pagination import normalize_polymarket_cursor, polymarket_cursor_stop_reason
 
 
-from pmkt.config import get_config
+from pmkt.config import PmktConfig, get_config
 
 
 class AsyncGammaClient:
@@ -23,8 +23,17 @@ class AsyncGammaClient:
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
+        *,
+        config: PmktConfig | None = None,
+        timeout_s: float = 10.0,
     ) -> None:
-        self.base_url = base_url or get_config().gamma_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.gamma_api_url
+            if config is not None
+            else get_config().gamma_api_url
+        )
         self.transport = transport
         # Default to 10 requests per second if not provided
         self.limiter = limiter or AsyncLimiter(10, 1)
@@ -33,6 +42,9 @@ class AsyncGammaClient:
             transport=self.transport,
             limiter=self.limiter,
             request_policy=request_policy,
+            timeout_s=timeout_s,
+            source_venue="polymarket",
+            source_service="gamma",
         )
 
     async def close(self) -> None:

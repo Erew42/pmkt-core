@@ -143,6 +143,48 @@ performs the full live census, and promotion is local. The CLI options were
 checked, but the live acquisition sequence was not run as part of the offline
 catalog qualification.
 
+## Shared references and request runtime
+
+`pmkt.records` exports frozen Polymarket and Kalshi market/instrument
+references plus `MarketRef` and `InstrumentRef` union aliases. Native lookup
+identity determines equality and hashing; optional condition, series, parent,
+and outcome-index enrichment does not. Constructors reject empty identifiers,
+wrong parent-reference classes, non-YES/NO Kalshi sides, booleans and negative
+outcome indexes before any venue request. The venue facades reexport their own
+reference classes.
+
+`PmktConfig.from_values(...)` creates independent endpoint settings from only
+its arguments and declared defaults. It does not read OS variables, dotenv
+files, or the process-wide legacy cache. `PmktConfig.from_env(...)` and direct
+`PmktConfig(...)` construction retain environment-aware behavior. REST client
+endpoint precedence is an explicit `base_url`, then a supplied `config`, then
+the legacy cached configuration. REST clients accept compatible keyword-only
+`config`, `timeout_s`, and `request_policy` arguments while retaining existing
+positional meanings.
+
+`RequestPolicy(max_attempts=N)` is the preferred spelling for the existing
+total-attempt count. `max_retries=N` remains compatible and still means `N`
+total attempts. Supplying both names is an error. CLOB retries read-only POSTs
+only for `/books` and `/batch-prices-history`; arbitrary POST behavior and the
+Kalshi pre-authentication GET-only boundary remain unchanged.
+
+The private HTTP runtime accepts one monotonic expiry passed explicitly through
+each nested call. It covers limiter acquisition, retry waits, transport, and
+JSON parsing checkpoints, and caps each dispatched request timeout to the
+remaining operation budget. The state is per call, so future workflow methods
+can safely borrow one client with different concurrent expiries. Timeout and
+caller cancellation drain owned work before returning, and the borrowed client
+remains reusable. `OperationTimeoutError` reports expiry without converting
+unrelated worker errors. Retained native methods remain unbounded when they do
+not supply an expiry.
+
+`RequestObservation` stores sanitized operation-local request provenance.
+Only explicit endpoint templates and adapter-allowlisted effective parameters
+are accepted; headers, raw bodies, URL credentials, queries, and raw dynamic
+paths are not retained. Known secure default Gamma, CLOB, and Kalshi endpoints
+receive conservative production/demo scope. Injected transports, custom paths,
+ports, insecure endpoints, and unrecognized redirect targets remain unknown.
+
 ## Retained native venue clients
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
@@ -218,8 +260,9 @@ Native REST methods use `ValueError` for invalid caller parameters, `TypeError`
 or `ValueError` for malformed upstream payloads, and propagate `httpx` request
 and HTTP status exceptions. WebSocket helpers additionally use
 `WebSocketProtocolError` or their documented frame/state errors. `pmkt.errors`
-exports `CatalogError`, `OptionalDependencyError`, and
-`ResultLimitExceededError` for the supported catalog workflow.
+exports `CatalogError`, `OptionalDependencyError`,
+`ResultLimitExceededError`, `OperationTimeoutError`, and the compatible
+`ReadAuthenticationRequiredError` reexport.
 
 ## Canonical data and storage contracts
 

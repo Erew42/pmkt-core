@@ -125,7 +125,7 @@ assert json.loads(output.read_text())["pmkt_core_commit"] == identity.commit
     assert result.returncode == 0, result.stderr
 
 
-def test_installed_catalog_api_has_positive_and_negative_typing_evidence(
+def test_installed_public_api_has_positive_and_negative_typing_evidence(
     tmp_path: Path,
 ) -> None:
     wheel = _build_wheel(tmp_path / "wheel")
@@ -167,12 +167,25 @@ def test_installed_catalog_api_has_positive_and_negative_typing_evidence(
         """\
 from pathlib import Path
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
+from pmkt.config import PmktConfig, RequestPolicy
+from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
+from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketInstrumentRef, PolymarketMarketRef
+from pmkt.records import InstrumentRef, MarketRef
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
     "SELECT ? AS n", parameters=(1,), max_result_rows=1, max_result_bytes=1024
 )
 table = result.to_arrow()
+config = PmktConfig.from_values()
+policy = RequestPolicy(max_attempts=2)
+gamma = AsyncGammaClient(config=config, timeout_s=5.0, request_policy=policy)
+clob = AsyncClobClient(config=config, timeout_s=5.0, request_policy=policy)
+kalshi = AsyncKalshiClient(config=config, timeout_s=5.0, request_policy=policy)
+poly_market = PolymarketMarketRef("market", condition_id="condition")
+market: MarketRef = poly_market
+instrument: InstrumentRef = PolymarketInstrumentRef("token", market=poly_market, outcome_index=0)
+kalshi_instrument: InstrumentRef = KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes")
 """,
         encoding="utf-8",
     )
@@ -181,10 +194,19 @@ table = result.to_arrow()
         """\
 from pathlib import Path
 from pmkt.catalog import CatalogSnapshot
+from pmkt.config import PmktConfig
+from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
+from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketMarketRef
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 snapshot.query("SELECT 1", params=())
 snapshot.query("SELECT ?", parameters=(object(),))
+config = PmktConfig.from_values()
+PolymarketMarketRef(ticker="wrong")
+KalshiInstrumentRef(KalshiMarketRef("ticker"), "buy")
+AsyncGammaClient(config=config, unsupported=True)
+AsyncClobClient(config=config, timeout_s="slow")
+AsyncKalshiClient(config=config, request_policy="bad")
 """,
         encoding="utf-8",
     )
@@ -218,3 +240,8 @@ snapshot.query("SELECT ?", parameters=(object(),))
     assert rejected.returncode != 0
     assert "[call-arg]" in rejected.stdout
     assert "[arg-type]" in rejected.stdout
+    assert 'Unexpected keyword argument "ticker" for "PolymarketMarketRef"' in rejected.stdout
+    assert 'Argument 2 to "KalshiInstrumentRef" has incompatible type' in rejected.stdout
+    assert 'Unexpected keyword argument "unsupported" for "AsyncGammaClient"' in rejected.stdout
+    assert 'Argument "timeout_s" to "AsyncClobClient" has incompatible type "str"' in rejected.stdout
+    assert 'Argument "request_policy" to "AsyncKalshiClient" has incompatible type "str"' in rejected.stdout

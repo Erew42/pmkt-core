@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from pmkt._http import RequestPolicy
+
 
 KALSHI_ENDPOINTS = {
     "prod": {
@@ -61,6 +63,18 @@ class PmktConfig(BaseSettings):
             values["_env_file"] = resolve_default_env_files()
         super().__init__(**values)
 
+    @classmethod
+    def from_values(cls, **values: Any) -> "PmktConfig":
+        """Build independent settings from arguments and declared defaults only."""
+
+        return _InitOnlyPmktConfig(**values)
+
+    @classmethod
+    def from_env(cls, **values: Any) -> "PmktConfig":
+        """Build settings through the legacy OS environment and dotenv sources."""
+
+        return cls(**values)
+
     @property
     def resolved_kalshi_api_url(self) -> str:
         return self.kalshi_api_url or KALSHI_ENDPOINTS[self.kalshi_env]["api"]
@@ -68,6 +82,24 @@ class PmktConfig(BaseSettings):
     @property
     def resolved_kalshi_ws_url(self) -> str:
         return self.kalshi_ws_url or KALSHI_ENDPOINTS[self.kalshi_env]["ws"]
+
+
+class _InitOnlyPmktConfig(PmktConfig):
+    def __init__(self, **values: Any) -> None:
+        values.pop("_env_file", None)
+        BaseSettings.__init__(self, _env_file=None, **values)
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: Any,
+        env_settings: Any,
+        dotenv_settings: Any,
+        file_secret_settings: Any,
+    ) -> tuple[Any, ...]:
+        del settings_cls, env_settings, dotenv_settings, file_secret_settings
+        return (init_settings,)
 
 
 _config: PmktConfig | None = None
@@ -102,6 +134,7 @@ def _find_source_root(cwd: Path) -> Path | None:
 __all__ = [
     "KALSHI_ENDPOINTS",
     "PmktConfig",
+    "RequestPolicy",
     "get_config",
     "resolve_default_env_files",
 ]

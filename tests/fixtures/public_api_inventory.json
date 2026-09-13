@@ -12,6 +12,20 @@
         "__version__"
       ]
     },
+    "pmkt.config": {
+      "default_tier": "inherited",
+      "exports": [
+        "KALSHI_ENDPOINTS",
+        "PmktConfig",
+        "RequestPolicy",
+        "get_config",
+        "resolve_default_env_files"
+      ],
+      "tier_overrides": {
+        "PmktConfig": "supported",
+        "RequestPolicy": "supported"
+      }
+    },
     "pmkt.catalog": {
       "default_tier": "supported",
       "exports": [
@@ -187,8 +201,25 @@
       "default_tier": "supported",
       "exports": [
         "CatalogError",
+        "OperationTimeoutError",
         "OptionalDependencyError",
+        "ReadAuthenticationRequiredError",
         "ResultLimitExceededError"
+      ]
+    },
+    "pmkt.records": {
+      "default_tier": "supported",
+      "exports": [
+        "DataScope",
+        "InstrumentRef",
+        "KalshiInstrumentRef",
+        "KalshiMarketRef",
+        "MarketRef",
+        "PolymarketInstrumentRef",
+        "PolymarketMarketRef",
+        "RequestObservation",
+        "RequestOutcome",
+        "TransportOrigin"
       ]
     },
     "pmkt.data.market_catalog": {
@@ -257,6 +288,8 @@
         "GammaClient",
         "MarketBookState",
         "MarketStreamSnapshot",
+        "PolymarketInstrumentRef",
+        "PolymarketMarketRef",
         "SubgraphClient",
         "WebSocketProtocolError",
         "apply_market_message",
@@ -270,7 +303,9 @@
         "AsyncClobClient": "retained_native",
         "ClobClient": "retained_native",
         "AsyncGammaClient": "retained_native",
-        "GammaClient": "retained_native"
+        "GammaClient": "retained_native",
+        "PolymarketInstrumentRef": "supported",
+        "PolymarketMarketRef": "supported"
       }
     },
     "pmkt.exchanges.kalshi": {
@@ -282,6 +317,8 @@
         "KalshiBookSnapshot",
         "KalshiClient",
         "KalshiConnectFactory",
+        "KalshiInstrumentRef",
+        "KalshiMarketRef",
         "KalshiOrderBookState",
         "KalshiSubscriptionAck",
         "KalshiTickerUpdate",
@@ -304,7 +341,9 @@
       ],
       "tier_overrides": {
         "AsyncKalshiClient": "retained_native",
-        "KalshiClient": "retained_native"
+        "KalshiClient": "retained_native",
+        "KalshiInstrumentRef": "supported",
+        "KalshiMarketRef": "supported"
       }
     },
     "pmkt.market_structure": {
@@ -388,6 +427,14 @@
   },
   "direct_imports": [
     {
+      "path": "pmkt.config.PmktConfig",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.config.RequestPolicy",
+      "tier": "supported"
+    },
+    {
       "path": "pmkt.catalog.CatalogQueryResult",
       "tier": "supported"
     },
@@ -412,12 +459,36 @@
       "tier": "supported"
     },
     {
+      "path": "pmkt.errors.OperationTimeoutError",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.errors.ReadAuthenticationRequiredError",
+      "tier": "supported"
+    },
+    {
       "path": "pmkt.errors.ResultLimitExceededError",
       "tier": "supported"
     },
     {
-      "path": "pmkt.config.PmktConfig",
-      "tier": "retained_native"
+      "path": "pmkt.records.PolymarketMarketRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.PolymarketInstrumentRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.KalshiMarketRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.KalshiInstrumentRef",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.RequestObservation",
+      "tier": "supported"
     },
     {
       "path": "pmkt.models.Event",
