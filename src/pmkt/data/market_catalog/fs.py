@@ -8,10 +8,18 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 from typing import Any
 
+from pmkt.data.time import parse_utc_timestamp
 
 from .types import CatalogError
+
+
+_WIDE_TIMESTAMP_FRACTION_RE = re.compile(
+    r"^(?P<microseconds>\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}\.\d{6})"
+    r"\d+(?P<offset>[Zz]|[+-]\d{2}(?::?\d{2})?)$"
+)
 
 
 def utc_now() -> datetime:
@@ -34,8 +42,15 @@ def parse_timestamp(value: Any) -> datetime | None:
             return datetime.fromtimestamp(numeric, tz=timezone.utc)
         except (OverflowError, OSError, ValueError):
             return None
+    text = str(value).strip()
+    # Catalog timestamps have microsecond precision. Truncate wider fractions
+    # before canonical parsing to avoid its optional pandas dependency.
+    text = _WIDE_TIMESTAMP_FRACTION_RE.sub(r"\g<microseconds>\g<offset>", text)
+    parsed = parse_utc_timestamp(text)
+    if parsed is not None:
+        return parsed
     try:
-        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
     if parsed.tzinfo is None:

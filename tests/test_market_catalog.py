@@ -1618,3 +1618,82 @@ def test_catalog_module_has_no_trading_or_order_submission_imports() -> None:
         for name in imported
     )
     assert "submit_order" not in "\n".join(sources)
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        # Live Gamma keyset createdAt values observed 2026-09-12T12:00Z: five digits.
+        (
+            "2026-09-12T11:59:20.83112Z",
+            datetime(2026, 9, 12, 11, 59, 20, 831120, tzinfo=timezone.utc),
+        ),
+        (
+            "2026-09-12T11:57:37.41664Z",
+            datetime(2026, 9, 12, 11, 57, 37, 416640, tzinfo=timezone.utc),
+        ),
+        # Live Kalshi /markets created_time observed the same day.
+        (
+            "2026-09-12T11:45:22.71663Z",
+            datetime(2026, 9, 12, 11, 45, 22, 716630, tzinfo=timezone.utc),
+        ),
+        ("2026-09-12T11:59:20.8Z", datetime(2026, 9, 12, 11, 59, 20, 800000, tzinfo=timezone.utc)),
+        ("2026-09-12T13:59:20+0200", datetime(2026, 9, 12, 11, 59, 20, tzinfo=timezone.utc)),
+    ],
+)
+def test_parse_timestamp_accepts_any_rfc3339_fraction_width(
+    text: str, expected: datetime
+) -> None:
+    """Python 3.10's fromisoformat accepts only 3- or 6-digit fractions."""
+
+    parsed = market_catalog_fs.parse_timestamp(text)
+    assert parsed == expected
+    assert type(parsed) is datetime
+    assert parsed.utcoffset() == timedelta(0)
+
+
+def test_parse_timestamp_retains_epoch_naive_and_rejection_behavior() -> None:
+    parse = market_catalog_fs.parse_timestamp
+    assert parse(1755892800) == datetime(2025, 8, 22, 20, 0, tzinfo=timezone.utc)
+    assert parse(1755892800123) == datetime(
+        2025, 8, 22, 20, 0, 0, 123000, tzinfo=timezone.utc
+    )
+    assert parse("2026-09-12 11:59:20") == datetime(
+        2026, 9, 12, 11, 59, 20, tzinfo=timezone.utc
+    )
+    assert parse("2026-08-22") == datetime(2026, 8, 22, tzinfo=timezone.utc)
+    for value in (None, "", True, "not-a-time"):
+        assert parse(value) is None
+    wide = parse("2026-09-12T11:59:20.8311201Z")
+    assert wide == datetime(2026, 9, 12, 11, 59, 20, 831120, tzinfo=timezone.utc)
+    assert type(wide) is datetime
+
+
+@pytest.mark.asyncio
+async def test_polymarket_discovery_resolves_five_digit_fraction_created_at() -> None:
+    """The 2026-09-08 discovery run failed closed on exactly this payload shape."""
+
+    row = {**_pm("five"), "createdAt": "2026-08-23T11:59:20.83112Z"}
+    client = FakeGamma({(False, None): {"markets": [row], "next_cursor": ""}})
+    result = await collect_polymarket_discovery(client, cutoff=NOW - timedelta(hours=1))
+    assert [item["id"] for item in result.rows] == ["five"]
+    assert result.details["lanes"]["open"]["timestamp_retry_requests"] == 0
+    assert result.details["lanes"]["open"]["target_reads"] == 0
+    assert result.high_watermark == datetime(
+        2026, 8, 23, 11, 59, 20, 831120, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.asyncio
+async def test_kalshi_discovery_resolves_five_digit_fraction_created_time() -> None:
+    from pmkt.data.market_catalog.collect import collect_kalshi_discovery
+
+    row = {**_kx("KXFIVE-1"), "created_time": "2026-08-23T11:45:22.71663Z"}
+    client = FakeKalshi({("exclude", None): [row]})
+    result = await collect_kalshi_discovery(
+        client, cutoff=NOW - timedelta(hours=1), native_family="kalshi_conventional"
+    )
+    assert [item["ticker"] for item in result.rows] == ["KXFIVE-1"]
+    assert result.high_watermark == datetime(
+        2026, 8, 23, 11, 45, 22, 716630, tzinfo=timezone.utc
+    )
