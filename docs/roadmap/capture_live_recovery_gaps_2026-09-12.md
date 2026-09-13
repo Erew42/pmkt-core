@@ -1,6 +1,6 @@
 # PR #5: capture initialization, recovery, and coverage
 
-Status: implemented and verified; PR remains draft for final review. Grid sampling,
+Status: implemented; PR is ready for review. Grid sampling,
 raw/tape reduction, and further storage architecture work remain separate.
 
 ## The problem and the resulting model
@@ -278,3 +278,41 @@ was stopped and superseded; it is not the final verification run.
 
 Both complete manifest/artifact validations passed with zero errors before
 commit or push: Polymarket in 318.62 seconds and Kalshi in 42.04 seconds.
+
+### Cancellation handoff follow-up
+
+Review of the bounded Polymarket receiver exposed a cancellation race: a helper
+could dequeue frame A, then the application consumer could be cancelled before
+receiving it. A later iterator on the same connection would begin with frame B.
+The helper now waits on a readiness event without consuming a frame; dequeue
+and delivery remain together in the consumer. Socket replacement still discards
+the old connection's queue, and the buffer remains bounded.
+
+Four deterministic cases cancel before readiness or at the ready handoff, then
+either resume the same connection or reconnect. The ready/resume case reproduced
+frame loss on Python 3.10 before the fix. The prior live probe records the source
+that became `7b36a21`; it does not exercise this subsequent cancellation fix.
+
+Follow-up validation on Python 3.10: **1,425 passed, 2 skipped**. Repository
+hygiene, pytest-lane coverage, Ruff, mypy, and public book/price/midpoint/history
+contract checks passed.
+
+Full-tree integration checks used main `fd8a375`, draft #3 at `6b6d121`, and
+draft #4 at `afd0a91`, with the cancellation fix applied to each combined tree:
+
+| Combined tree | Integration | Full Python 3.10 suite |
+|---|---|---:|
+| #5 + #3 | One conflict in the quiet-PONG test; resolved as below | 1,823 passed, 2 skipped |
+| #5 + #4 | Clean merge | 1,433 passed, 2 skipped |
+
+Both combined trees also passed hygiene, pytest-lane coverage, Ruff, and mypy.
+The #3 combination passed the public API contracts. Its full suite includes
+feeds, durability, reconstruction, public workflows, installed-wheel behavior,
+API inventory, and optional-dependency boundaries.
+
+After #5 merges, synchronize #3 with main and retain its deterministic
+clock/event orchestration in the shared heartbeat test. Assert that receiving
+only PONG leaves `last_frame_sequence` at zero, and that the receiver survives
+application-waiter cancellation but is cancelled on client closure. Preserve the
+other #5 tests. #4 remains independent; this integration check does not replace
+its own review. Neither draft branch was changed by these isolated checks.

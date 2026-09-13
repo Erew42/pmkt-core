@@ -621,6 +621,7 @@ class AsyncMarketWebSocketClient:
         self._frames: asyncio.Queue[Any] = asyncio.Queue(
             maxsize=self.transport_settings.max_queue_frames
         )
+        self._frames_available = asyncio.Event()
         self._last_inbound: float | None = None
         self._receive_blocked = False
         self._liveness_grace_until = 0.0
@@ -667,6 +668,7 @@ class AsyncMarketWebSocketClient:
                     or sent_at_utc,
                 )
         self._frames = asyncio.Queue(maxsize=self.transport_settings.max_queue_frames)
+        self._frames_available = asyncio.Event()
         self._last_inbound = None
         self._receive_blocked = False
         self._liveness_grace_until = 0.0
@@ -792,6 +794,7 @@ class AsyncMarketWebSocketClient:
             self._receive_blocked = blocked
             try:
                 await self._frames.put(raw)
+                self._frames_available.set()
             finally:
                 self._receive_blocked = False
                 if blocked:
@@ -812,16 +815,18 @@ class AsyncMarketWebSocketClient:
             if receiver.done():
                 receiver.result()
                 return
-            get_frame = asyncio.create_task(self._frames.get())
+            # Wait for readiness without removing a frame in another task.
+            # Cancellation must leave the oldest frame queued for a later read.
+            # No await separates the empty check above from clearing the signal.
+            self._frames_available.clear()
+            ready = asyncio.create_task(self._frames_available.wait())
             try:
                 await asyncio.wait(
-                    {get_frame, receiver}, return_when=asyncio.FIRST_COMPLETED
+                    {ready, receiver}, return_when=asyncio.FIRST_COMPLETED
                 )
-                if get_frame.done():
-                    yield get_frame.result()
             finally:
-                get_frame.cancel()
-                await asyncio.gather(get_frame, return_exceptions=True)
+                ready.cancel()
+                await asyncio.gather(ready, return_exceptions=True)
 
     async def iter_messages(
         self,

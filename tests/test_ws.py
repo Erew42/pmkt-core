@@ -1171,3 +1171,76 @@ async def test_heartbeat_send_timeout_cancels_blocked_send():
         with pytest.raises(asyncio.TimeoutError, match="send deadline"):
             await client.ping()
     assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["waiting", "ready"])
+@pytest.mark.parametrize("next_action", ["resume", "reconnect"])
+async def test_cancelled_frame_handoff_preserves_order_until_reconnect(
+    monkeypatch, cancel_at, next_action
+):
+    class ControlledSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+
+        async def __anext__(self):
+            return await self.incoming.get()
+
+    sockets = deque([ControlledSocket(), ControlledSocket()])
+    first_socket, second_socket = sockets
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: sockets.popleft(), heartbeat_interval=None
+    )
+    original_wait = asyncio.wait
+    waiting = asyncio.Event()
+    read_task = None
+
+    async def cancel_at_ready_handoff(futures, **kwargs):
+        if asyncio.current_task() is not read_task:
+            return await original_wait(futures, **kwargs)
+        waiting.set()
+        result = await original_wait(futures, **kwargs)
+        if cancel_at == "ready":
+            # Force cancellation after readiness but before the consumer can
+            # deliver a frame. No wall-clock timing or copied client code.
+            read_task.cancel()
+            await asyncio.sleep(0)
+        return result
+
+    monkeypatch.setattr(asyncio, "wait", cancel_at_ready_handoff)
+    async with client:
+        interrupted = client.iter_messages(reconnect=False)
+        read_task = asyncio.create_task(interrupted.__anext__())
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        receiver = client._receive_task
+        if cancel_at == "waiting":
+            read_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+        for marker in ("A", "B"):
+            first_socket.incoming.put_nowait(json.dumps({"marker": marker}))
+        if cancel_at == "ready":
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+        assert client.is_connected
+        assert client._receive_task is receiver
+        assert not receiver.done()
+        assert client.last_frame_sequence == 0
+        await interrupted.aclose()
+
+        if next_action == "reconnect":
+            await client.reconnect()
+            assert first_socket.closed
+            assert receiver.done()
+            second_socket.incoming.put_nowait(json.dumps({"marker": "C"}))
+            expected = ("C",)
+        else:
+            expected = ("A", "B")
+        resumed = client.iter_messages(reconnect=False)
+        for marker in expected:
+            message = await asyncio.wait_for(resumed.__anext__(), timeout=1)
+            assert message["marker"] == marker
+        await resumed.aclose()
+    assert client._receive_task is None
+    assert client._heartbeat_task is None
