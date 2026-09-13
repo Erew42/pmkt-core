@@ -88,13 +88,23 @@ inputs also do not make unordered, random, or time-dependent SQL deterministic.
 The qualified dependency floor is DuckDB 1.5.5 with PyArrow 14.0.0. The
 catalog compatibility workflow exercises DuckDB 1.5.5 on Windows and Linux with
 Python 3.10 through 3.12, using both PyArrow 14.0.0 with NumPy 1.26.4 and
-PyArrow 25.0.1 with NumPy 2.2.6, and is a required CI gate for catalog and
-history changes.
+PyArrow 25.0.1 with NumPy 2.2.6. It runs in CI for catalog and history changes;
+whether passing checks are required to merge is a separate repository-rules
+setting, not an API guarantee.
 
-Every artifact descriptor in the pointer and manifest must declare its
-canonical `schema`. Releases published before the publisher wrote that key
-(core history before 2026-08-23) are rejected with `unsupported schema: None`
-and must be republished before this reader can open them.
+New publishers declare each artifact's canonical `schema`. Older descriptors
+with no `schema` key are accepted using the expected schema for that artifact
+role, provided every Parquet file has exactly the canonical column names, with
+no duplicates. Both validation modes check columns. A present but wrong schema,
+including explicit null, is rejected. Pointer and manifest descriptors must
+still agree; inference never rewrites their hashed bytes. The validation report
+records each `legacy_schema_inferred_from_columns:<artifact>` check and skipped
+`artifact_schema_declaration:<artifact>`. Full validation still checks canonical
+values and content hashes; metadata mode does not establish value validity.
+The legacy `parquet_file` descriptor is accepted for an actual single file
+without a schema declaration. If that descriptor omits `parquet_file_count`,
+the reader infers one and records the missing declaration in its report.
+Partitioned datasets and current descriptors still require explicit file counts.
 
 The pinned view contract provides these grains:
 
@@ -164,9 +174,13 @@ its arguments and declared defaults. It does not read OS variables, dotenv
 files, or the process-wide legacy cache. `PmktConfig.from_env(...)` and direct
 `PmktConfig(...)` construction retain environment-aware behavior. REST client
 endpoint precedence is an explicit `base_url`, then a supplied `config`, then
-the legacy cached configuration. REST clients accept compatible keyword-only
+the legacy cached configuration. Pickling `from_values` settings restores the
+stored values without rereading settings sources, including for importable
+module-level subclasses. REST clients accept keyword-only
 `config`, `timeout_s`, and `request_policy` arguments while retaining existing
-positional meanings.
+positional meanings. `timeout_s` must be a finite positive number; `None`, zero,
+booleans and `httpx.Timeout` objects are not accepted. Native callers that
+previously relied on httpx accepting those values must update their configuration.
 
 `RequestPolicy(max_attempts=N)` is the preferred spelling for the existing
 total-attempt count. `max_retries=N` remains compatible and still means `N`
@@ -247,6 +261,10 @@ prices are reported without inventing or discarding an otherwise valid
 label-to-token mapping. `instrument_for_label(...)` uses exact, case-sensitive
 label equality and fails when the mapping is unavailable, the label is absent,
 or the label is ambiguous.
+
+Condition-ID matching is case-insensitive for discovery filters and CLOB book
+and history identity checks. Requests, references and response evidence retain
+their original spelling; market IDs and token IDs remain exact identifiers.
 
 Fetch a known market by Gamma market ID with
 `await gamma.get_market(market_id=..., deadline_s=...)`. The ID is encoded as
@@ -452,9 +470,13 @@ Live and historical payloads have separate contracts. Live fields use
 strings plus `volume` and `open_interest`, and receive no invented flag. The
 result keeps traded-price OHLC separate from YES bid and ask OHLC, with native
 mean, previous, volume, open interest, dataset, end label, and defensive native
-payload. Empty live price objects and historical null trade OHLC with valid
-quotes are retained as legitimate missing trade series. Values are never
-scaled by magnitude, filled, zeroed, or complemented into NO trades.
+payload. Live traded-price OHLC keys may be absent, including a price object
+containing only `previous_dollars`. Missing fields become null while supplied
+mean and previous values remain intact. All-null traded OHLC carries
+`no_traded_price_ohlc`; partly absent OHLC carries `partial_traded_price_ohlc`.
+Bid and ask OHLC layouts remain strict. Historical null trade OHLC with valid
+quotes is also retained. Values are never scaled by magnitude, filled from
+previous prices, zeroed, or complemented into NO trades.
 
 The versioned `kalshi_market_candles.v1` interpretation treats a 1440-minute
 bar as a fixed 86,400-second interval whose inferred start must be midnight in
@@ -470,6 +492,9 @@ includes `tzdata>=2026.3` so this rule is available on Windows without pandas.
 reads need no live metadata, event, or series lookup. Auto routing retains the
 historical `market_settled_ts` cutoff and a normalized routing market: a market
 settled strictly before the cutoff uses the archive, while equality stays live.
+Routing timestamps require explicit UTC offsets and at most six fractional
+digits. Finer precision is rejected rather than silently truncated at a
+live/archive routing boundary; this differs from catalog timestamp ingestion.
 Live series identity comes only from verified market or event evidence; ticker
 splitting and unverified caller hints are rejected. A live metadata 404 may
 trigger one archive existence lookup. A selected candle endpoint 404 may
@@ -597,8 +622,11 @@ all nested source requests, and normalization. Expected per-market evidence
 failures still occupy their result slots. Expiry, caller cancellation,
 `ReadAuthenticationRequiredError`, and unexpected implementation errors raise
 only after the resolver has cancelled and drained its owned workers. Borrowed
-clients remain open and reusable. The offline ordered and duplicate-preserving
-flow is executable in
+clients remain open and reusable. A whole-batch failure returns no partial list,
+even if some markets completed before the final deadline check. For durable
+incremental progress, callers can resolve and save smaller batches; their
+orchestration must enforce any deadline spanning those batches. The offline
+ordered and duplicate-preserving flow is executable in
 [`scripts/resolution_batch_example.py`](../scripts/resolution_batch_example.py).
 
 To materialize results, including an empty batch, with stable canonical
