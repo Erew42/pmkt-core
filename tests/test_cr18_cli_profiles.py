@@ -23,6 +23,39 @@ def _normalized_cli_output(value: str) -> str:
     return "".join(_ANSI_ESCAPE_RE.sub("", value).split())
 
 
+@pytest.mark.parametrize("key", ["capture_summary", "capture_completeness"])
+def test_capture_summary_separates_eligibility_and_coverage(key):
+    summary = {"requested_instrument_count": 3, "initial_snapshot_count": 1,
+               "reconnect_count": 0, "eligibility_evaluation_status": "partial",
+               "unknown_instrument_count": 1, "eligible_instrument_count": 2,
+               "eligible_initial_snapshot_count": 1}
+    suffix = streaming_cli._capture_summary_suffix({key: summary})
+    assert "1/3 initial snapshots" in suffix
+    assert "eligibility partial (1 unknown)" in suffix
+    assert "1/2 eligible initial snapshots" in suffix
+    del summary["eligibility_evaluation_status"]
+    assert streaming_cli._capture_summary_suffix({key: summary}) == (
+        ", 1/3 initial snapshots, 0 reconnects")
+
+
+@pytest.mark.parametrize("schema", ["topbook.v1", "depth.v1"])
+@pytest.mark.parametrize("flag", [
+    "seq_gap", "no_initial_snapshot", "malformed_book", "missing_sequence",
+    "sid_changed", "delta_before_snapshot", "hash_mismatch", "reconnect",
+    "crossed_book", "negative_spread", "empty_bid", "empty_ask", "stale_quotes",
+])
+def test_integrity_projection_preserves_upstream_failures(schema, flag):
+    from pmkt.streaming.profiles import add_book_integrity, select_storage_profile
+    row = {"schema_version": schema, "quality_flags": [flag]}
+    selection = select_storage_profile("full", profile_version="3")
+    assert not add_book_integrity(row, integrity=False, selection=selection)["book_integrity_valid"]
+    projected = add_book_integrity(row, integrity=True, selection=selection)
+    assert projected["book_integrity_valid"] == (flag in {"empty_bid", "empty_ask", "stale_quotes"})
+    assert add_book_integrity(row, integrity=True, selection=None) == row
+    assert add_book_integrity(row, integrity=True,
+        selection=select_storage_profile("full", profile_version="2")) == row
+
+
 def test_stream_profile_validation_precedes_output_side_effects(tmp_path: Path) -> None:
     output = tmp_path / "runs"
     result = CliRunner().invoke(

@@ -160,7 +160,17 @@ def _capture_summary_suffix(manifest: Mapping[str, Any]) -> str:
     )
     if requested <= 0:
         return ""
-    return f", {initial}/{requested} initial snapshots, {reconnects} reconnects"
+    suffix = f", {initial}/{requested} initial snapshots, {reconnects} reconnects"
+    eligibility = summary.get("eligibility_evaluation_status")
+    if eligibility is not None:
+        unknown = int(summary.get("unknown_instrument_count") or 0)
+        eligible = int(summary.get("eligible_instrument_count") or 0)
+        eligible_snapshots = int(summary.get("eligible_initial_snapshot_count") or 0)
+        suffix += (
+            f", eligibility {eligibility} ({unknown} unknown)"
+            f", {eligible_snapshots}/{eligible} eligible initial snapshots"
+        )
+    return suffix
 
 
 def _storage_profile_selection(

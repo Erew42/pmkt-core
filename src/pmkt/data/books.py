@@ -5,6 +5,12 @@ from typing import Any, Iterable
 
 from pmkt.data.types import parse_float
 
+UNRESOLVED_BOOK_FAILURE_FLAGS = frozenset({
+    "crossed_book", "negative_spread", "seq_gap", "reconnect",
+    "no_initial_snapshot", "malformed_book", "missing_sequence",
+    "sid_changed", "delta_before_snapshot", "hash_mismatch",
+})
+
 
 @dataclass(frozen=True)
 class PriceLevel:

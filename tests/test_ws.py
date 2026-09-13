@@ -8,16 +8,125 @@ from typing import Any
 
 import pytest
 
+from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
 from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
     MarketBookState,
     MarketStreamSnapshot,
+    application_heartbeat_token,
     apply_market_message,
     collect_market_snapshots,
     decode_market_messages,
     market_operation_payload,
     market_subscription_payload,
 )
+
+
+@pytest.mark.parametrize(
+    "failure", ["time", "traffic", "hash", "cross", "uninitialized"]
+)
+def test_complementary_recovery_has_strict_bounds(failure):
+    state = MarketBookState(asset_id="A", market="m")
+    state.apply_book(
+        {
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
+        }
+    )
+    change = {
+        "asset_id": "A",
+        "side": "BUY",
+        "price": "0.18",
+        "size": "20",
+        "best_bid": "0.18",
+        "best_ask": "0.19",
+        "hash": "paired",
+    }
+    message = {
+        "event_type": "price_change",
+        "timestamp": "1789240000000",
+        "price_changes": [change],
+    }
+    if failure == "cross":
+        change["price"] = "0.20"
+    state.apply_price_change(change, message)
+    if failure == "uninitialized":
+        state.initial_snapshot_received = False
+    recovery = ComplementaryDeltaRecovery()
+    recovery.observe(message, {"A": state}, {"A"}, message_count=1)
+    if failure in {"cross", "uninitialized"}:
+        assert not recovery.defer("A", message_count=1, now_ns=0)
+        return
+    # A slow synchronous commit before the first decision consumes no grace.
+    assert recovery.defer("A", message_count=1, now_ns=12_000_000_000)
+    if failure == "hash":
+        change["hash"] = "different"
+        recovery.observe(message, {"A": state}, set(), message_count=2)
+        assert not recovery.defer("A", message_count=2, now_ns=12_000_000_001)
+    elif failure == "time":
+        assert not recovery.defer("A", message_count=2, now_ns=12_250_000_000)
+    else:
+        for sequence in range(2, 17):
+            recovery.observe(
+                {"event_type": "trade"}, {"A": state}, set(), message_count=sequence
+            )
+            assert recovery.defer("A", message_count=sequence, now_ns=12_000_000_001)
+        assert not recovery.defer("A", message_count=17, now_ns=12_000_000_001)
+
+
+@pytest.mark.parametrize("event_key", ["event_type", "type"])
+def test_complementary_recovery_checks_only_touched_books(event_key):
+    touched = MarketBookState(asset_id="A", market="m")
+    touched.apply_book(
+        {
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
+        }
+    )
+    lookups = []
+
+    class LookupOnlyStates(dict):
+        def items(self):
+            raise AssertionError("recovery must not scan unrelated instruments")
+
+        def __iter__(self):
+            raise AssertionError("recovery must not scan unrelated instruments")
+
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    states = LookupOnlyStates(
+        A=touched, untouched=MarketBookState(asset_id="untouched")
+    )
+    recovery = ComplementaryDeltaRecovery()
+    message = {
+        event_key: "price_change",
+        "timestamp": "1789240000000",
+        "price_changes": [
+            {
+                "asset_id": "A",
+                "side": "BUY",
+                "price": "0.18",
+                "size": "20",
+                "best_bid": "0.18",
+                "best_ask": "0.19",
+                "hash": "paired",
+            }
+        ],
+    }
+    before = recovery.intact_changed_assets(message, states)
+    assert before == {"A"}
+    assert lookups == ["A"]
+    apply_market_message(states, message)
+    recovery.observe(message, states, before, message_count=1)
+    assert recovery.defer("A", message_count=1, now_ns=0)
+    lookups.clear()
+    assert (
+        recovery.intact_changed_assets({"event_type": "last_trade_price"}, states)
+        == set()
+    )
+    assert lookups == []
 
 
 class FakeWebSocket:
@@ -70,34 +179,36 @@ async def no_sleep(_: float) -> None:
 
 
 @pytest.mark.asyncio
-async def test_pong_deadline_is_not_extended_by_ping_and_reconnect_resets() -> None:
+async def test_outbound_ping_arms_but_does_not_renew_silence_deadline() -> None:
     now = [100.0]
-    sockets = deque([FakeWebSocket(), FakeWebSocket()])
-
-    async def connect_factory(_):
-        return sockets.popleft()
-
-    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=None, heartbeat_clock=lambda: now[0])
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: FakeWebSocket(),
+        heartbeat_interval=None,
+        heartbeat_clock=lambda: now[0],
+    )
     await client.connect()
     await client.ping()
-    now[0] += 10
+    now[0] += 30
     await client.ping()
-    assert client._pending_ping_since == 100
-    now[0] += 10
-    with pytest.raises(asyncio.TimeoutError, match="PONG"):
+    assert client._pending_ping_since == 100.0
+    with pytest.raises(asyncio.TimeoutError):
         client._check_pong_deadline()
-    await client.reconnect()
-    assert client._pending_ping_since is None
-    client._check_pong_deadline()
     await client.close()
     assert client._heartbeat_task is None
 
 
 @pytest.mark.asyncio
-async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None:
+async def test_missing_client_pong_does_not_expire_while_data_arrives() -> None:
     class BusySocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.n = 0
+
         async def __anext__(self):
+            self.n += 1
+            if self.n > 25:
+                raise StopAsyncIteration
             await asyncio.sleep(0.002)
             return '{"event_type":"last_trade_price","asset_id":"a"}'
 
@@ -110,34 +221,99 @@ async def test_missing_pong_expires_while_ordinary_data_keeps_arriving() -> None
         heartbeat_interval=0.01, pong_timeout_seconds=0.02)
     seen = []
     async with client:
-        with pytest.raises(asyncio.TimeoutError, match="PONG"):
-            async for message in client.iter_messages(reconnect=False):
-                seen.append(message)
-    assert seen
-    assert ws.closed
+        async for message in client.iter_messages(reconnect=False):
+            seen.append(message)
+    assert len(seen) == 25
+    assert client._heartbeat_error is None
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_queued_pong_survives_reader_stall_past_deadline() -> None:
+    class StallSocket(FakeWebSocket):
+        def __init__(self) -> None:
+            super().__init__()
+            self.responses: asyncio.Queue[Any] = asyncio.Queue()
+            self.responses.put_nowait(
+                json.dumps({"event_type": "last_trade_price", "asset_id": "a"})
+            )
+
+        async def send(self, payload: str) -> None:
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+
+        async def __anext__(self):
+            return await self.responses.get()
+
+    ws = StallSocket()
+
+    async def connect_factory(_: str) -> StallSocket:
+        return ws
+
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=connect_factory,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.02,
+    )
+    async with client:
+        agen = client.iter_messages(reconnect=False)
+        first = await agen.__anext__()
+        assert first["event_type"] == "last_trade_price"
+        await asyncio.sleep(0.08)
+        assert client._heartbeat_error is None
+        assert ws.closed is False
+        await ws.responses.put(
+            json.dumps({"event_type": "book", "asset_id": "a", "bids": [], "asks": []})
+        )
+        second = await asyncio.wait_for(agen.__anext__(), timeout=1)
+        assert second["event_type"] == "book"
+        await agen.aclose()
     assert client._heartbeat_task is None
 
 
 @pytest.mark.asyncio
 async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -> None:
     class ResponsiveSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.responses = asyncio.Queue()
+            self.delivered = 0
+            self.three_pongs = asyncio.Event()
+
+        async def send(self, payload):
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+
         async def __anext__(self):
-            await asyncio.sleep(0.004)
-            return "PONG"
+            response = await self.responses.get()
+            self.delivered += 1
+            if self.delivered == 3:
+                self.three_pongs.set()
+            return response
 
     ws = ResponsiveSocket()
 
     async def connect_factory(_):
         return ws
 
-    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.02)
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=connect_factory,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=1.0,
+    )
     state = MarketBookState("a")
     async with client:
         task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
-        await asyncio.sleep(0.065)
+        # Deadline expiry is tested separately with an advancing clock. Here,
+        # synchronize on actual replies rather than Windows timer granularity.
+        await asyncio.wait_for(ws.three_pongs.wait(), timeout=2)
         assert not task.done()
         assert client._heartbeat_error is None
+        assert client._pending_ping_since is None
         assert not state.initial_snapshot_received
         assert not state.book_integrity_valid
         task.cancel()
@@ -322,26 +498,17 @@ async def test_default_connector_disables_protocol_keepalive(monkeypatch) -> Non
 @pytest.mark.asyncio
 async def test_heartbeat_sends_text_ping() -> None:
     fake = FakeWebSocket()
-    ticks = 0
-
-    async def connect_factory(_: str) -> FakeWebSocket:
-        return fake
-
-    async def fast_sleep(_: float) -> None:
-        nonlocal ticks
-        ticks += 1
-        await asyncio.sleep(0)
-        if ticks > 1:
-            fake.closed = True
-
     async with AsyncMarketWebSocketClient(
         ["asset-a"],
         heartbeat_interval=0.01,
-        connect_factory=connect_factory,
-        sleep=fast_sleep,
+        connect_factory=lambda _: fake,
     ):
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
+
+        async def wait_for_ping():
+            while "PING" not in fake.sent:
+                await asyncio.sleep(0.001)
+
+        await asyncio.wait_for(wait_for_ping(), timeout=2)
 
     assert "PING" in fake.sent
 
@@ -396,6 +563,73 @@ async def test_iter_messages_decodes_json_and_skips_heartbeats() -> None:
         seen = [message async for message in client.iter_messages(reconnect=False)]
 
     assert [message["event_type"] for message in seen] == ["book", "best_bid_ask"]
+
+
+@pytest.mark.parametrize(
+    ("raw", "token"),
+    [
+        ("PING", "PING"),
+        ("pong", "PONG"),
+        (" PING\n", "PING"),
+        (b"PONG", "PONG"),
+        ('{"event_type":"book"}', None),
+    ],
+)
+def test_application_heartbeat_token_normalizes_control_frames(
+    raw: Any, token: str | None
+) -> None:
+    assert application_heartbeat_token(raw) == token
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_answers_venue_ping_immediately() -> None:
+    fake = FakeWebSocket(
+        [
+            "PING",
+            " ping\n",
+            b"PING",
+            json.dumps(
+                {"event_type": "book", "asset_id": "a1", "bids": [], "asks": []}
+            ),
+        ]
+    )
+
+    async def connect_factory(_: str) -> FakeWebSocket:
+        return fake
+
+    async with AsyncMarketWebSocketClient(
+        ["a1"],
+        heartbeat_interval=None,
+        connect_factory=connect_factory,
+    ) as client:
+        seen = [message async for message in client.iter_messages(reconnect=False)]
+
+    assert [message["event_type"] for message in seen] == ["book"]
+    assert fake.sent.count("PONG") == 3
+
+
+@pytest.mark.asyncio
+async def test_iter_messages_clears_pong_deadline_for_padded_pong() -> None:
+    now = [100.0]
+    fake = FakeWebSocket([" PONG\n"])
+
+    async def connect_factory(_: str) -> FakeWebSocket:
+        return fake
+
+    client = AsyncMarketWebSocketClient(
+        ["a1"],
+        heartbeat_interval=None,
+        heartbeat_clock=lambda: now[0],
+        connect_factory=connect_factory,
+    )
+    await client.connect()
+    client._pending_ping_since = 100.0
+    now[0] += 19
+    async for _ in client.iter_messages(reconnect=False):
+        break
+    assert client._pending_ping_since is None
+    client._check_pong_deadline()
+    await client.close()
 
 
 @pytest.mark.asyncio
@@ -808,3 +1042,205 @@ def test_decode_market_messages_handles_dict_list_bytes_and_control_frames() -> 
         {"event_type": "price_change"}
     ]
     assert decode_market_messages("bad-json") == []
+
+
+@pytest.mark.asyncio
+async def test_silent_socket_expires_even_when_sends_succeed() -> None:
+    class SilentSocket(FakeWebSocket):
+        async def __anext__(self):
+            await asyncio.Future()
+
+    ws = SilentSocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.1,
+    )
+    async with client:
+        with pytest.raises(asyncio.TimeoutError, match="heartbeat silence"):
+            await asyncio.wait_for(client.iter_messages(reconnect=False).__anext__(), 2)
+    assert ws.closed
+    assert client._receive_task is None
+    assert client._heartbeat_task is None
+
+
+@pytest.mark.asyncio
+async def test_bounded_receiver_backpressure_is_not_remote_silence() -> None:
+    from pmkt.exchanges.ws_transport import WebSocketTransportSettings
+
+    class BusySocket(FakeWebSocket):
+        async def __anext__(self):
+            return '{"event_type":"last_trade_price","asset_id":"a"}'
+
+    ws = BusySocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.04,
+        transport_settings=WebSocketTransportSettings(max_queue_frames=2),
+    )
+    async with client:
+        iterator = client.iter_messages(reconnect=False)
+        await iterator.__anext__()
+        await asyncio.sleep(0.12)
+        assert client._frames.qsize() == 2
+        assert client._receive_blocked
+        assert client._heartbeat_error is None
+        assert not ws.closed
+        await iterator.aclose()
+    assert client._receive_task is None
+
+
+@pytest.mark.asyncio
+async def test_event_loop_stall_grants_receiver_time_to_drain_pong() -> None:
+    import time
+
+    class ReplySocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.responses = asyncio.Queue()
+
+        async def send(self, payload):
+            await super().send(payload)
+            if payload == "PING":
+                self.responses.put_nowait("PONG")
+
+        async def __anext__(self):
+            return await self.responses.get()
+
+    ws = ReplySocket()
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.05,
+    )
+    async with client:
+        waiter = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
+        await asyncio.sleep(0.02)
+        await client.ping()
+        time.sleep(0.12)
+        await asyncio.sleep(0.12)
+        assert not ws.closed
+        assert client._heartbeat_error is None
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_send_preserves_concurrent_outer_cancellation():
+    parent = None
+
+    class CancellingSocket(FakeWebSocket):
+        async def send(self, payload):
+            if payload == "PING":
+                parent.cancel()
+
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: CancellingSocket(),
+        heartbeat_interval=None,
+    )
+    async with client:
+        parent = asyncio.create_task(client.ping())
+        with pytest.raises(asyncio.CancelledError):
+            await parent
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_send_timeout_cancels_blocked_send():
+    stopped = asyncio.Event()
+
+    class BlockedSocket(FakeWebSocket):
+        async def send(self, payload):
+            if payload == "PING":
+                try:
+                    await asyncio.Future()
+                finally:
+                    stopped.set()
+
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=lambda _: BlockedSocket(),
+        heartbeat_interval=None,
+        pong_timeout_seconds=0.03,
+    )
+    async with client:
+        with pytest.raises(asyncio.TimeoutError, match="send deadline"):
+            await client.ping()
+    assert stopped.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["waiting", "ready"])
+@pytest.mark.parametrize("next_action", ["resume", "reconnect"])
+async def test_cancelled_frame_handoff_preserves_order_until_reconnect(
+    monkeypatch, cancel_at, next_action
+):
+    class ControlledSocket(FakeWebSocket):
+        def __init__(self):
+            super().__init__()
+            self.incoming = asyncio.Queue()
+
+        async def __anext__(self):
+            return await self.incoming.get()
+
+    sockets = deque([ControlledSocket(), ControlledSocket()])
+    first_socket, second_socket = sockets
+    client = AsyncMarketWebSocketClient(
+        ["a"], connect_factory=lambda _: sockets.popleft(), heartbeat_interval=None
+    )
+    original_wait = asyncio.wait
+    waiting = asyncio.Event()
+    read_task = None
+
+    async def cancel_at_ready_handoff(futures, **kwargs):
+        if asyncio.current_task() is not read_task:
+            return await original_wait(futures, **kwargs)
+        waiting.set()
+        result = await original_wait(futures, **kwargs)
+        if cancel_at == "ready":
+            # Force cancellation after readiness but before the consumer can
+            # deliver a frame. No wall-clock timing or copied client code.
+            read_task.cancel()
+            await asyncio.sleep(0)
+        return result
+
+    monkeypatch.setattr(asyncio, "wait", cancel_at_ready_handoff)
+    async with client:
+        interrupted = client.iter_messages(reconnect=False)
+        read_task = asyncio.create_task(interrupted.__anext__())
+        await asyncio.wait_for(waiting.wait(), timeout=1)
+        receiver = client._receive_task
+        if cancel_at == "waiting":
+            read_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+        for marker in ("A", "B"):
+            first_socket.incoming.put_nowait(json.dumps({"marker": marker}))
+        if cancel_at == "ready":
+            with pytest.raises(asyncio.CancelledError):
+                await read_task
+        assert client.is_connected
+        assert client._receive_task is receiver
+        assert not receiver.done()
+        assert client.last_frame_sequence == 0
+        await interrupted.aclose()
+
+        if next_action == "reconnect":
+            await client.reconnect()
+            assert first_socket.closed
+            assert receiver.done()
+            second_socket.incoming.put_nowait(json.dumps({"marker": "C"}))
+            expected = ("C",)
+        else:
+            expected = ("A", "B")
+        resumed = client.iter_messages(reconnect=False)
+        for marker in expected:
+            message = await asyncio.wait_for(resumed.__anext__(), timeout=1)
+            assert message["marker"] == marker
+        await resumed.aclose()
+    assert client._receive_task is None
+    assert client._heartbeat_task is None

@@ -77,6 +77,44 @@ def _evidence(status: str, *, observed_at: datetime = _NOW) -> dict[str, object]
     }
 
 
+@pytest.mark.parametrize("statuses,expected", [
+    (["unknown", "unknown"], "unevaluated"),
+    (["eligible", "unknown"], "partial"),
+    (["ineligible", "unknown"], "partial"),
+    (["eligible", "ineligible"], "evaluated"),
+    (["ineligible"], "evaluated"),
+])
+@pytest.mark.parametrize("terminal", ["deadline_reached", "persistence_error"])
+@pytest.mark.parametrize("snapshots", [False, True])
+def test_eligibility_reporting_preserves_capture_verdicts(statuses, expected, terminal, snapshots):
+    ids = [str(i) for i in range(len(statuses))]
+    tracker = CaptureInstrumentEvidenceTracker(
+        collector_run_id="eligibility", venue="polymarket", shard_id="s",
+        instrument_ids=ids, now_utc=lambda: _NOW,
+        eligibility_evidence={i: _evidence(status) for i, status in zip(ids, statuses)
+                              if status != "unknown"})
+    tracker.begin_subscription_attempt()
+    tracker.mark_subscription_established(established_at_utc=_NOW.isoformat())
+    if snapshots:
+        for instrument in ids:
+            tracker.record_valid_snapshot(instrument, observed_at_utc=_NOW.isoformat())
+    summary = tracker.summary(terminal)
+    report = evaluate_capture_completeness(
+        venue="polymarket", instruments_with_snapshots=0, event_count=0,
+        reconnect_count=0, duration_seconds_actual=60, duration_seconds_requested=60,
+        instrument_evidence_summary=summary, terminal_reason=terminal)
+    assert report.eligibility_evaluation_status == expected
+    assert report.as_manifest_mapping()["eligibility_evaluation_status"] == expected
+    assert not report.acceptance_eligible
+    if terminal == "persistence_error" or (not snapshots and any(s != "ineligible" for s in statuses)):
+        assert report.capture_status is CaptureStatus.FAILED
+        assert report.reasons
+    elif "unknown" in statuses:
+        assert report.capture_status is CaptureStatus.PARTIAL
+    else:
+        assert report.capture_status is CaptureStatus.COMPLETE
+
+
 def test_v3_recovered_evidence_stays_partial_and_provisional(tmp_path):
     from types import SimpleNamespace
     from pmkt.streaming.recovery import _recovered_capture_completeness

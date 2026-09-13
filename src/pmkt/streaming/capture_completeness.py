@@ -80,6 +80,13 @@ class CaptureStatus(str, Enum):
     FAILED = "failed"
 
 
+def eligibility_evaluation_status(*, classified: int, unknown: int) -> str:
+    """Describe eligibility evidence independently of capture success."""
+    if classified == 0:
+        return "unevaluated"
+    return "partial" if unknown else "evaluated"
+
+
 class CaptureCompletenessError(RuntimeError):
     """Raised when a capture finished without usable market-data evidence."""
 
@@ -124,6 +131,7 @@ class CaptureCompletenessReport:
     evidence_artifact_role: str | None = None
     evidence_artifact_hash: str | None = None
     evidence_artifact_reconciled: bool = False
+    eligibility_evaluation_status: str = "unevaluated"
 
     def as_manifest_mapping(self) -> dict[str, Any]:
         return {
@@ -132,6 +140,7 @@ class CaptureCompletenessReport:
             "evaluated": self.evaluated,
             "acceptance_eligible": self.acceptance_eligible,
             "policy_status": self.policy_status,
+            "eligibility_evaluation_status": self.eligibility_evaluation_status,
             "execution_status": self.execution_status.value,
             "capture_status": self.capture_status.value,
             "legacy_status": self.legacy_status,
@@ -413,6 +422,11 @@ def evaluate_capture_completeness(
         evidence_artifact_role=evidence_artifact_role,
         evidence_artifact_hash=evidence_artifact_hash,
         evidence_artifact_reconciled=evidence_artifact_reconciled,
+        eligibility_evaluation_status=eligibility_evaluation_status(
+            classified=summary_mapping.get("eligible_instrument_count", 0)
+            + summary_mapping.get("excluded_instrument_count", 0),
+            unknown=summary_mapping.get("unknown_instrument_count", 0),
+        ),
     )
 
 

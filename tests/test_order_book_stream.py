@@ -29,6 +29,7 @@ from pmkt.streaming.durability import (
 from pmkt.streaming.health_emission import SlimHealthEmitter
 from pmkt.streaming.profiles import StorageProfileOverrides, select_storage_profile
 from pmkt.streaming.storage_backends import CaptureStorageBackend
+from pmkt.streaming.recovery_contracts import CaptureCommitCause
 from pmkt.streaming.topbook_emission import TopbookEmissionTracker
 
 
@@ -104,11 +105,14 @@ class ClockDrivenFakeWebSocket(FakeWebSocket):
     def __init__(self, messages: list[Any], clock: ManualMonotonicClock) -> None:
         super().__init__(messages)
         self._clock = clock
+        self.before_advance = lambda: True
 
     async def __anext__(self):
         while self.messages:
             item = self.messages.popleft()
             if isinstance(item, float):
+                while not self.before_advance():
+                    await asyncio.sleep(0)
                 self._clock.advance_seconds(item)
                 await asyncio.sleep(0)
                 continue
@@ -1288,92 +1292,44 @@ async def test_stream_order_book_data_marks_silent_feed_stale(tmp_path) -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("connect_failures", [0, 2])
-async def test_stream_order_book_data_recovers_missing_initialization_with_shared_budget(
-    tmp_path,
-    monkeypatch,
-    connect_failures,
-) -> None:
-    import pmkt.exchanges.polymarket.order_book_stream as stream_module
-    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
-
-    delays = []
-
-    async def no_sleep(delay):
-        delays.append(delay)
-
-    monkeypatch.setattr(
-        stream_module, "WebSocketRetryBudget",
-        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
-    )
-    first = SilentWebSocket()
-    second = FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "token-1",
-                    "market": "0xabc",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                    "hash": "hash-after-reconnect",
-                }
-            )
-        ]
-    )
-    sockets = deque([first, *[socket.gaierror(11001, "DNS failed")] * connect_failures, second])
+async def test_polymarket_missing_initialization_does_not_reconnect(tmp_path):
+    fake = SilentWebSocket()
     calls = 0
 
-    async def connect_factory(_: str) -> FakeWebSocket:
+    async def connect_factory(*args, **kwargs):
         nonlocal calls
         calls += 1
-        result = sockets.popleft()
-        if isinstance(result, BaseException):
-            raise result
-        return result
+        return fake
 
     supervisor = LiveFeedSupervisor(
         [
             FeedShardHealth(
                 venue="polymarket",
-                shard_id="pm-plan",
+                shard_id="silent",
                 subscribed_instruments=("token-1",),
             )
-        ],
-        max_message_age_ms=20,
-        max_valid_book_age_ms=20,
+        ]
     )
-
-    supervisor.initialization_sla_ms = 20  # Short deterministic test SLA; production remains 30 seconds.
-
+    supervisor.initialization_sla_ms = 1
     manifest = await stream_order_book_data(
         ["token-1"],
         output_root=tmp_path,
-        run_name="silent-recovery-run",
-        duration_s=1.0,
-        max_messages=1,
+        run_name="silent",
+        duration_s=0.15,
         capture_intent="smoke",
-        heartbeat_interval=None,
-        max_reconnects=3,
+        max_reconnects=0,
         connect_factory=connect_factory,
         feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version="3"),
+        heartbeat_interval=None,
     )
-
-    run_dir = tmp_path / "silent-recovery-run"
-    topbook = pd.read_parquet(run_dir / "topbook_v1.parquet")
-    health = pd.read_parquet(run_dir / "feed_health.parquet")
-
-    assert first.closed is True
-    assert json.loads(second.sent[0])["assets_ids"] == ["token-1"]
-    assert manifest["row_counts"]["events"] == 1
-    assert manifest["reconnect_count"] == 1 + connect_failures
-    assert calls == 2 + connect_failures
-    assert delays == ([1.0, 1.5] if connect_failures else [])
-    assert manifest["socket_recovery_count"] == 1
-    assert topbook["valid_state"].tolist() == [True]
-    assert "stale" in health["connection_state"].tolist()
-    assert health["connection_state"].tolist()[-1] == "connected"
-    assert validate_run_manifest(run_dir / "manifest.json").ok
+    assert calls == 1
+    assert manifest["reconnect_count"] == 0
+    assert manifest["socket_recovery_count"] == 0
+    assert manifest["capture_completeness"]["initial_snapshot_count"] == 0
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 1
+    assert not any("get_snapshot" in payload for payload in fake.sent)
+    assert manifest["capture_completeness"]["unexplained_missing_instrument_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -1513,6 +1469,17 @@ async def test_stream_order_book_data_emits_complete_same_shard_stale_transition
         ],
         max_message_age_ms=20,
         max_valid_book_age_ms=20,
+    )
+
+    # Wait for application processing, not socket read-ahead, before aging books.
+    fake.before_advance = lambda: (
+        len(supervisor.shard("polymarket", "pm-shared").instrument_health) == 2
+        and all(
+            health.book_integrity_valid
+            for health in supervisor.shard(
+                "polymarket", "pm-shared"
+            ).instrument_health.values()
+        )
     )
 
     await stream_order_book_data(
@@ -2078,6 +2045,16 @@ async def test_stream_order_book_data_marks_reconnect_invalid_until_snapshot(
     assert topbook["valid_state"].tolist() == [True, False]
     assert "reconnect" in topbook.loc[1, "quality_flags"]
     assert manifest["reconnect_count"] == 1
+    records = [
+        json.loads(line)
+        for line in (tmp_path / "reconnect-run" / "reconnect_diagnostics.jsonl")
+        .read_text()
+        .splitlines()
+    ]
+    assert records == manifest["reconnect_diagnostics"]
+    assert records[0]["origin"] == "transport"
+    assert records[0]["exception_type"] == "OSError"
+    assert records[0]["local_sequence"] == 1
     assert manifest["quality_flag_counts"]["reconnect"] >= 1
     assert depth["valid_state"].tolist()[-1] == False  # noqa: E712
     assert "reconnect" in depth["quality_flags"].tolist()[-1]
@@ -2214,3 +2191,375 @@ async def test_invalid_polymarket_snapshot_is_diagnostic_not_coverage(
             "max_queue_frames": 128,
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer", ["silent", "deltas", "empty", "late"])
+@pytest.mark.parametrize("version", ["2", "3"])
+async def test_missing_peer_does_not_reset_initialized_polymarket_book(
+    tmp_path, peer, version
+):
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+
+    def book(token, empty=False):
+        return json.dumps(
+            {
+                "event_type": "book",
+                "asset_id": token,
+                "market": "m",
+                "bids": [] if empty else [{"price": "0.4", "size": "10"}],
+                "asks": [] if empty else [{"price": "0.6", "size": "10"}],
+            }
+        )
+
+    def delta(token):
+        return json.dumps(
+            {
+                "event_type": "price_change",
+                "market": "m",
+                "price_changes": [
+                    {"asset_id": token, "price": "0.41", "size": "12", "side": "BUY"}
+                ],
+            }
+        )
+
+    messages = [book("A"), 31.0]
+    if peer == "deltas":
+        messages += [delta("B")] * 100
+    elif peer in {"empty", "late"}:
+        if peer == "late":
+            messages += [delta("B")]
+        messages += [book("B", empty=peer == "empty")]
+    messages += [delta("A")]
+    fake = ClockDrivenFakeWebSocket(messages, clock)
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    supervisor = LiveFeedSupervisor(
+        [
+            FeedShardHealth(
+                venue="polymarket", shard_id="shared", subscribed_instruments=("A", "B")
+            )
+        ]
+    )
+    fake.before_advance = lambda: (
+        "A" in supervisor.shard("polymarket", "shared").instrument_health
+        and supervisor.shard("polymarket", "shared")
+        .instrument_health["A"]
+        .book_integrity_valid
+    )
+    manifest = await stream_order_book_data(
+        ["A", "B"],
+        output_root=tmp_path,
+        run_name=peer,
+        duration_s=1,
+        max_messages=sum(isinstance(m, str) for m in messages),
+        capture_intent="smoke",
+        heartbeat_interval=None,
+        max_reconnects=0,
+        connect_factory=connect_factory,
+        monotonic_ns=clock,
+        feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version=version),
+    )
+    assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    shard = supervisor.shard("polymarket", "shared")
+    assert shard.instrument_health["A"].book_integrity_valid
+    assert "reconnect" not in shard.instrument_health["A"].quality_flags
+    if peer in {"silent", "deltas"}:
+        assert supervisor._overdue_initial_instruments[("polymarket", "shared")] == {
+            "B"
+        }
+    else:
+        assert shard.instrument_health["B"].initial_snapshot_received
+        assert shard.instrument_health["B"].book_integrity_valid
+    if peer == "deltas":
+        assert not shard.instrument_health["B"].initial_snapshot_received
+        assert not shard.instrument_health["B"].book_integrity_valid
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 2
+    tape = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_event"]["path"]
+    )
+    peer_tape = tape[tape["venue_book_id"] == "B"]
+    assert peer_tape.empty == (peer in {"silent", "deltas"})
+    if peer == "late":
+        assert peer_tape.iloc[0]["event_kind"] == "checkpoint"
+    controls = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"]
+    )
+    assert "reconnect" not in set(controls["control_type"])
+    assert validate_run_manifest(tmp_path / peer / "manifest.json").ok
+
+
+@pytest.mark.asyncio
+async def test_complementary_delta_survives_commit_stall_and_reopens_tape(
+    tmp_path, monkeypatch
+):
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+    original_commit = DurableCaptureCoordinator.commit
+
+    def slow_commit(self, *args, **kwargs):
+        result = original_commit(self, *args, **kwargs)
+        if kwargs.get("cause") == CaptureCommitCause.INVALIDATION:
+            clock.advance_seconds(12)
+        return result
+
+    monkeypatch.setattr(DurableCaptureCoordinator, "commit", slow_commit)
+    frames = [
+        {
+            "event_type": "book",
+            "asset_id": "A",
+            "market": "m",
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "20"}],
+        },
+        {
+            "event_type": "book",
+            "asset_id": "B",
+            "market": "m",
+            "bids": [{"price": "0.4", "size": "10"}],
+            "asks": [{"price": "0.6", "size": "10"}],
+        },
+    ]
+    for side, size in [("BUY", "268.06"), ("SELL", "0")]:
+        frames.append(
+            {
+                "event_type": "price_change",
+                "market": "m",
+                "timestamp": "1789240000000",
+                "price_changes": [
+                    {
+                        "asset_id": "A",
+                        "side": side,
+                        "size": size,
+                        "price": "0.18",
+                        "best_bid": "0.18",
+                        "best_ask": "0.19",
+                        "hash": "paired",
+                    }
+                ],
+            }
+        )
+    fake = FakeWebSocket([json.dumps(frame) for frame in frames])
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    manifest = await stream_order_book_data(
+        ["A", "B"],
+        output_root=tmp_path,
+        run_name="paired",
+        duration_s=30,
+        max_messages=4,
+        capture_intent="smoke",
+        heartbeat_interval=None,
+        max_reconnects=0,
+        connect_factory=connect_factory,
+        monotonic_ns=clock,
+        storage_profile=select_storage_profile("full", profile_version="3"),
+    )
+    assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    assert manifest["complementary_delta_recovery"]["resolved"] == 1
+    assert manifest["complementary_delta_recovery"]["pending"] == 0
+    run_dir = tmp_path / "paired"
+    assert validate_run_manifest(run_dir / "manifest.json").ok
+    tape = pd.read_parquet(
+        run_dir / manifest["dataset_artifacts"]["tape_event"]["path"]
+    )
+    a_tape = tape[tape["venue_book_id"] == "A"]
+    assert a_tape["event_kind"].tolist() == ["checkpoint", "delta", "checkpoint"]
+    assert a_tape["reconstructible"].tolist() == [True, False, True]
+    assert a_tape["book_integrity_valid"].tolist() == [True, False, True]
+    assert clock() >= 13_000_000_000
+    controls = pd.read_parquet(
+        run_dir / manifest["dataset_artifacts"]["tape_control"]["path"]
+    )
+    assert "reconnect" not in set(controls["reason"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("price", ["0.18", "0.20"])
+@pytest.mark.parametrize("profile", [None, "3"])
+async def test_unresolved_lock_and_true_cross_still_require_recovery(
+    tmp_path, price, profile
+):
+    class ThenSilent(FakeWebSocket):
+        async def __anext__(self):
+            if self.messages:
+                return await super().__anext__()
+            await asyncio.sleep(3600)
+            raise StopAsyncIteration
+
+    frames = [
+        {
+            "event_type": "book",
+            "asset_id": "A",
+            "market": "m",
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "20"}],
+        },
+        {
+            "event_type": "price_change",
+            "market": "m",
+            "timestamp": "1789240000000",
+            "price_changes": [
+                {
+                    "asset_id": "A",
+                    "side": "BUY",
+                    "size": "20",
+                    "price": price,
+                    "best_bid": "0.18",
+                    "best_ask": "0.19",
+                    "hash": "paired",
+                }
+            ],
+        },
+    ]
+    fake = ThenSilent([json.dumps(frame) for frame in frames])
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    with pytest.raises(RuntimeError, match="recovery retry budget exhausted"):
+        await stream_order_book_data(
+            ["A"],
+            output_root=tmp_path,
+            run_name="unresolved",
+            duration_s=10,
+            capture_intent="smoke",
+            heartbeat_interval=None,
+            max_reconnects=0,
+            connect_factory=connect_factory,
+            storage_profile=(
+                select_storage_profile("full", profile_version=profile)
+                if profile is not None
+                else None
+            ),
+        )
+    manifest = json.loads((tmp_path / "unresolved" / "manifest.json").read_text())
+    metrics = manifest["complementary_delta_recovery"]
+    assert metrics["candidates"] == (1 if price == "0.18" else 0)
+    assert metrics["expired"] == (1 if price == "0.18" else 0)
+    assert manifest["reconnect_count"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", ["traffic", "time", "changed_hash"])
+@pytest.mark.parametrize("retries", [0, 1])
+async def test_late_correction_cannot_bypass_complementary_recovery_bound(
+    tmp_path, monkeypatch, bound, retries
+):
+    from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
+
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+    original_defer = ComplementaryDeltaRecovery.defer
+
+    def defer_then_delay(self, *args, **kwargs):
+        result = original_defer(self, *args, **kwargs)
+        if result and bound == "time":
+            # The grace was already granted. A later scheduling delay must not
+            # let a correction erase the expired pending failure before checking it.
+            clock.advance_seconds(0.3)
+        return result
+
+    monkeypatch.setattr(ComplementaryDeltaRecovery, "defer", defer_then_delay)
+    frames = [
+        {
+            "event_type": "book",
+            "asset_id": "A",
+            "market": "m",
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "20"}],
+        }
+    ]
+
+    def delta(side, size):
+        return {
+            "event_type": "price_change",
+            "market": "m",
+            "timestamp": "1789240000000",
+            "price_changes": [
+                {
+                    "asset_id": "A",
+                    "side": side,
+                    "size": size,
+                    "price": "0.18",
+                    "best_bid": "0.18",
+                    "best_ask": "0.19",
+                    "hash": "paired",
+                }
+            ],
+        }
+
+    frames.append(delta("BUY", "20"))
+    observation = {
+        "event_type": "best_bid_ask",
+        "asset_id": "A",
+        "market": "m",
+        "best_bid": "0.18",
+        "best_ask": "0.19",
+    }
+    if bound == "traffic":
+        # No semantic health transition or timer tick forces a recovery check.
+        frames.extend([observation] * 20)
+    elif bound == "changed_hash":
+        changed = delta("BUY", "21")
+        changed["price_changes"][0]["hash"] = "another-update"
+        frames.append(changed)
+    frames.extend([delta("SELL", "0"), observation])
+    sockets = deque(
+        [
+            FakeWebSocket([json.dumps(frame) for frame in frames]),
+            FakeWebSocket([json.dumps(frames[0])]),
+        ]
+    )
+
+    async def capture():
+        return await stream_order_book_data(
+            ["A"],
+            output_root=tmp_path,
+            run_name=bound,
+            duration_s=30,
+            # Includes the frame discarded at the bound and a fresh snapshot
+            # from the replacement connection when a retry is permitted.
+            max_messages=19 if bound == "traffic" else 4,
+            capture_intent="smoke",
+            heartbeat_interval=None,
+            max_reconnects=retries,
+            connect_factory=lambda _: sockets.popleft(),
+            monotonic_ns=clock,
+            storage_profile=select_storage_profile("full", profile_version="3"),
+        )
+
+    if retries:
+        await capture()
+    else:
+        with pytest.raises(RuntimeError, match="recovery retry budget exhausted"):
+            await capture()
+    manifest = json.loads((tmp_path / bound / "manifest.json").read_text())
+    assert manifest["complementary_delta_recovery"]["expired"] == (
+        bound != "changed_hash"
+    )
+    assert manifest["complementary_delta_recovery"]["resolved"] == 0
+    assert manifest["reconnect_count"] == retries
+    if retries:
+        assert not sockets
+        diagnostic = manifest["reconnect_diagnostics"][0]
+        assert diagnostic["origin"] == "supervisor"
+        assert diagnostic["reason"] == "recovery_action"
+        assert diagnostic["reasons"] == ["book_integrity"]
+        assert diagnostic["instruments"] == ["A"]
+        assert diagnostic["exception_type"] is None
+        assert validate_run_manifest(tmp_path / bound / "manifest.json").ok
+        tape = pd.read_parquet(
+            tmp_path / bound / manifest["dataset_artifacts"]["tape_event"]["path"]
+        )
+        # The old connection's late correction never reaches the new book.
+        invalid_count = 2 if bound == "changed_hash" else 1
+        assert tape["event_kind"].tolist() == ["checkpoint"] + [
+            "delta"
+        ] * invalid_count + ["checkpoint"]
+        assert tape["book_integrity_valid"].tolist() == [True] + [
+            False
+        ] * invalid_count + [True]

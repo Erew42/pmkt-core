@@ -13,6 +13,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from pmkt.data.canonical import canonical_fixed_decimal
+from pmkt.data.books import UNRESOLVED_BOOK_FAILURE_FLAGS
 from pmkt.data.schemas import topbook_evidence_id
 from pmkt.data.types import parse_int
 from pmkt.data.registry import TableSpec, get_table_spec, infer_table_spec
@@ -468,11 +469,9 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
     errors.extend(_price_invariant_errors(df, spec))
     errors.extend(_flag_token_errors(df, spec))
     if spec.version in {"topbook.v2", "depth.v2", "book_tape_event.v2"} and "book_integrity_valid" in df:
-        broken = _quality_flag_series(df).map(lambda value: bool(set(_flags(value)) & {
-            "crossed_book", "negative_spread", "seq_gap", "reconnect",
-            "no_initial_snapshot", "malformed_book", "missing_sequence",
-            "sid_changed", "delta_before_snapshot", "hash_mismatch",
-        }))
+        broken = _quality_flag_series(df).map(
+            lambda value: bool(set(_flags(value)) & UNRESOLVED_BOOK_FAILURE_FLAGS)
+        )
         if (_parsed_bool_mask(df["book_integrity_valid"]) & broken).any():
             errors.append("book_integrity_valid cannot accompany unresolved book failures")
     if spec.version == MARKET_RESOLUTION_SCHEMA_VERSION:

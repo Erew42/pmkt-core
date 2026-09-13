@@ -21,8 +21,11 @@ distinct failures:
 
 Raising these bounds is containment, not a fix for the underlying blocking; it
 removes a hard functional ceiling and widens the margin before flow control
-engages.  Memory is bounded by ``max_queue`` frames, so the queue is sized to a
-reviewed default and may be raised only through explicit capture configuration.
+engages. ``max_queue`` bounds the transport receive buffer. Polymarket also
+uses a bounded application queue with the same capacity; it is not a total
+connection memory limit. Decoding, in-flight messages, and book/storage state
+add memory beyond both queues. Bounds may be raised only through explicit
+capture configuration.
 """
 
 from __future__ import annotations
@@ -50,12 +53,15 @@ class WebSocketRetryBudget:
         *,
         backoff: float = 0.5,
         on_reconnect: Callable[[], None] | None = None,
+        on_retry: Callable[[dict[str, Any]], None] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         deadline: float | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.max_reconnects = max_reconnects
         self.backoff = backoff
+        self.on_retry = on_retry
+        self.retry_context: dict[str, Any] = {}
         self.on_reconnect = on_reconnect
         self.sleep = sleep
         self.deadline = deadline
@@ -116,6 +122,24 @@ class WebSocketRetryBudget:
                 if not self.available:
                     raise ConnectionError("websocket reconnect budget exhausted")
                 self.used += 1
+                if self.on_retry is not None:
+                    exc = self.last_error
+                    close = getattr(exc, "rcvd", None)
+                    self.on_retry(
+                        {
+                            **self.retry_context,
+                            "replacement_attempt": self.used,
+                            "exception_type": type(exc).__name__
+                            if exc is not None
+                            else None,
+                            "errno": getattr(exc, "errno", None),
+                            "received_close_code": getattr(close, "code", None),
+                            "received_close_reason": str(getattr(close, "reason", ""))[
+                                :256
+                            ]
+                            or None,
+                        }
+                    )
                 if self.on_reconnect is not None:
                     self.on_reconnect()
                 if not immediate_first:
@@ -125,6 +149,7 @@ class WebSocketRetryBudget:
             try:
                 await self._bounded(operation)
                 self.last_error = None
+                self.retry_context = {}
                 return
             except WebSocketDeadlineExceeded:
                 raise
@@ -132,6 +157,10 @@ class WebSocketRetryBudget:
                 if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
                     raise
                 self.last_error = exc
+                self.retry_context = {
+                    "origin": "connection_setup",
+                    "reason": "connect_failure",
+                }
                 if not allow_retry or not self.available:
                     raise
                 needs_retry = True

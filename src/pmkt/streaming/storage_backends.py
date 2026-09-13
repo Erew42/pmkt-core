@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import PurePosixPath, PureWindowsPath
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
-from pmkt.streaming.recovery_contracts import RunStateV1
+from pmkt.streaming.recovery_contracts import CaptureCommitCause, RunStateV1
 
 CAPTURE_STORAGE_FORMAT = "capture_storage.v1"
 SQLITE_CAPTURE_NAME = "capture.sqlite3"
@@ -129,6 +129,8 @@ class CaptureCoordinator(Protocol):
     def due_cause(self) -> Any: ...
 
     def barrier_due(self) -> bool: ...
+
+    def request_checkpoint_commit(self, cause: CaptureCommitCause) -> None: ...
 
     def commit(self, *, cause: Any = None, force: bool = False) -> Any: ...
 

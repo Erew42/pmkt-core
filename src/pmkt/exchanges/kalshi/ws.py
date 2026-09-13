@@ -937,11 +937,14 @@ class AsyncKalshiWebSocketClient:
                 if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
                     raise
                 budget.last_error = exc
+                budget.retry_context = {"origin": "transport", "reason": "receive_failure"}
                 with contextlib.suppress(Exception):
                     await self.close()
                 if not reconnect or not budget.available:
                     raise
             else:
+                budget.last_error = None
+                budget.retry_context = {"origin": "transport", "reason": "clean_close"}
                 with contextlib.suppress(ConnectionClosed, OSError, asyncio.TimeoutError):
                     await self.close()
                 if not reconnect:

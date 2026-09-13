@@ -84,6 +84,52 @@ from pmkt.streaming.venue_tape import (
 _UTC = "2026-07-19T10:00:00.000000Z"
 
 
+def test_staged_checkpoint_deadline_does_not_renew_and_crash_keeps_journal_authority(tmp_path, monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(durability_module.time, "monotonic", lambda: clock[0])
+    coordinator = _tape_coordinator(tmp_path)
+    coordinator.checkpoint_coalesce_seconds = 1.0
+    _add_tape_batch(coordinator, _checkpoint_batch())
+    coordinator.request_checkpoint_commit(CaptureCommitCause.CHECKPOINT_STARTUP)
+    assert coordinator.has_pending_rows
+    assert not (tmp_path / COMMIT_JOURNAL_V2_NAME).exists()
+    # A crash here has no authoritative checkpoint despite staged full levels.
+    assert recover_stream_run(tmp_path).valid_group_count == 0
+    clock[0] += 0.75
+    coordinator.request_checkpoint_commit(CaptureCommitCause.CHECKPOINT_RESYNC)
+    assert not coordinator.barrier_due()
+    clock[0] += 0.25
+    assert coordinator.due_cause() == CaptureCommitCause.CHECKPOINT_STARTUP
+    coordinator.commit()
+    assert not coordinator.has_pending_rows
+    assert recover_stream_run(tmp_path).valid_group_count == 1
+
+
+@pytest.mark.parametrize("cause", [CaptureCommitCause.INVALIDATION, CaptureCommitCause.TERMINATION,
+                                  CaptureCommitCause.CLEAN_SHUTDOWN])
+def test_hard_barrier_drains_staged_checkpoint_immediately(tmp_path, cause):
+    coordinator = _tape_coordinator(tmp_path)
+    coordinator.checkpoint_coalesce_seconds = 30.0
+    _add_tape_batch(coordinator, _checkpoint_batch())
+    coordinator.request_checkpoint_commit(CaptureCommitCause.CHECKPOINT_STARTUP)
+    record = coordinator.commit(cause=cause, force=True)
+    assert record.cause == cause
+    assert not coordinator.has_pending_rows
+    assert recover_stream_run(tmp_path).valid_group_count == 1
+
+
+def test_staged_checkpoint_validation_failure_is_not_acknowledged(tmp_path):
+    coordinator = _tape_coordinator(tmp_path)
+    coordinator.checkpoint_coalesce_seconds = 1.0
+    batch = _checkpoint_batch()
+    coordinator.add("tape_event", batch.event)  # Missing companion levels.
+    coordinator.request_checkpoint_commit(CaptureCommitCause.CHECKPOINT_STARTUP)
+    with pytest.raises(ValueError):
+        coordinator.commit(cause=CaptureCommitCause.CLEAN_SHUTDOWN, force=True)
+    assert not (tmp_path / COMMIT_JOURNAL_V2_NAME).exists()
+    assert coordinator.has_pending_rows
+
+
 def _coordinate(*, sequence: int = 1, subsequence: int = 1) -> CaptureCoordinate:
     return CaptureCoordinate(
         collector_run_id="run-1",
@@ -1502,7 +1548,7 @@ def test_external_file_directory_is_synced_before_journal(
 
 @pytest.mark.parametrize(
     ("crash_point", "valid_groups", "orphan_count"),
-    [("before_journal", 0, 1), ("after_journal_fsync", 1, 0)],
+    [("staged_checkpoint", 0, 0), ("before_journal", 0, 1), ("after_journal_fsync", 1, 0)],
 )
 def test_real_child_process_crash_respects_journal_boundary(
     tmp_path: Path,
@@ -1517,7 +1563,7 @@ def test_real_child_process_crash_respects_journal_boundary(
         import sys
         import pyarrow as pa
         from pmkt.streaming.durability import DurableCaptureCoordinator
-        from pmkt.streaming.recovery_contracts import RunStateV1
+        from pmkt.streaming.recovery_contracts import RunStateV1, CaptureCommitCause
 
         run_dir, crash_point = sys.argv[1:]
         state = RunStateV1(
@@ -1533,9 +1579,13 @@ def test_real_child_process_crash_respects_journal_boundary(
             run_state=state,
             role_schema_versions={"probe": "legacy.probe.v1"},
             role_schemas={"probe": pa.schema([pa.field("value", pa.int64(), nullable=False)])},
-            segment_row_limit=1,
+            segment_row_limit=100,
         )
+        coordinator.checkpoint_coalesce_seconds = 30.0
         coordinator.add("probe", {"value": 1})
+        coordinator.request_checkpoint_commit(CaptureCommitCause.CHECKPOINT_STARTUP)
+        if crash_point == "staged_checkpoint":
+            os._exit(90)
         if crash_point == "before_journal":
             coordinator._append_journal_record = lambda record: os._exit(91)
         coordinator.commit(cause="checkpoint_startup", force=True)
@@ -1547,7 +1597,7 @@ def test_real_child_process_crash_respects_journal_boundary(
         cwd=Path.cwd(),
         check=False,
     )
-    assert completed.returncode in {91, 92}
+    assert completed.returncode in {90, 91, 92}
     report = recover_stream_run(run_dir)
     assert report.valid_group_count == valid_groups
     assert len(report.orphan_paths) == orphan_count

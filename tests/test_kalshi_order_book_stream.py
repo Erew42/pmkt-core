@@ -26,6 +26,77 @@ from pmkt.streaming.storage_backends import CaptureStorageBackend
 from pmkt.streaming.topbook_emission import TopbookEmissionTracker
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "yes,no,expected",
+    [
+        ("0.5", "0.5", False),
+        ("0.7", "0.6", False),
+        ("0.4", None, True),
+        ("0.4", "0.4", True),
+    ],
+)
+@pytest.mark.parametrize("version", ["2", "3"])
+@pytest.mark.parametrize("profile", ["full", "book-tape"])
+async def test_kalshi_profile_finalizes_projected_integrity(
+    tmp_path, yes, no, expected, version, profile
+):
+    from pmkt.data.validation import validate_frame
+
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+    payload = {
+        "market_ticker": "A",
+        "yes_dollars_fp": [[yes, "10"]],
+        "no_dollars_fp": [] if no is None else [[no, "10"]],
+    }
+    # Repeat the same book after the checkpoint interval to exercise both sinks.
+    messages = [
+        json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 1, "msg": payload}),
+        31.0,
+        json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 2, "msg": payload}),
+    ]
+    fake = ClockDrivenFakeWebSocket(messages, clock)
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    manifest = await stream_kalshi_order_book_data(
+        ["A"],
+        output_root=tmp_path,
+        run_name="projected",
+        duration_s=1,
+        max_messages=2,
+        capture_intent="smoke",
+        connect_factory=connect_factory,
+        auth=FakeReadAuth(),
+        monotonic_ns=clock,
+        use_yes_price=False,
+        storage_profile=select_storage_profile(
+            profile, profile_version=version, topbook_checkpoint_interval_seconds=1
+        ),
+    )
+    assert manifest["socket_recovery_count"] == 0
+    roles = (
+        ["topbook_main", "depth_main"]
+        if profile == "full"
+        else ["topbook_main", "topbook_checkpoint"]
+    )
+    for role in roles:
+        artifact = manifest["dataset_artifacts"][role]
+        rows = pd.read_parquet(tmp_path / "projected" / artifact["path"])
+        assert not rows.empty
+        assert validate_frame(rows, str(rows.iloc[0]["schema_version"]), strict=True).ok
+        if version == "3":
+            if role.startswith("topbook"):
+                assert rows["book_integrity_valid"].tolist() == [expected] * len(rows)
+            else:
+                # Depth preserves upstream integrity: a locked topbook is a
+                # stricter projected-row failure, not a native book failure.
+                assert rows["book_integrity_valid"].all() == (yes != "0.7")
+        else:
+            assert "book_integrity_valid" not in rows
+
+
 class FakeReadAuth:
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self.calls: list[str] = []
@@ -826,94 +897,44 @@ async def test_stream_kalshi_order_book_data_marks_silent_feed_stale(tmp_path) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("connect_failures", [0, 2])
-async def test_stream_kalshi_order_book_data_recovers_missing_initialization_with_shared_budget(
-    tmp_path,
-    monkeypatch,
-    connect_failures,
-) -> None:
-    import pmkt.exchanges.kalshi.order_book_stream as stream_module
-    from pmkt.exchanges.ws_transport import WebSocketRetryBudget
-
-    delays = []
-
-    async def no_sleep(delay):
-        delays.append(delay)
-
-    monkeypatch.setattr(
-        stream_module, "WebSocketRetryBudget",
-        lambda *args, **kwargs: WebSocketRetryBudget(*args, sleep=no_sleep, **kwargs),
-    )
-    first = SilentWebSocket()
-    second = FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "type": "orderbook_snapshot",
-                    "sid": 1,
-                    "seq": 1,
-                    "msg": {
-                        "market_ticker": "KXTEST",
-                        "yes_dollars_fp": [["0.40", "10.00"]],
-                        "no_dollars_fp": [["0.65", "5.00"]],
-                    },
-                }
-            )
-        ]
-    )
-    sockets = deque([first, *[socket.gaierror(11001, "DNS failed")] * connect_failures, second])
+async def test_kalshi_missing_initialization_does_not_reconnect(tmp_path):
+    fake = SilentWebSocket()
     calls = 0
 
-    async def connect_factory(_: str, __: dict[str, str]) -> FakeWebSocket:
+    async def connect_factory(*args, **kwargs):
         nonlocal calls
         calls += 1
-        result = sockets.popleft()
-        if isinstance(result, BaseException):
-            raise result
-        return result
+        return fake
 
     supervisor = LiveFeedSupervisor(
         [
             FeedShardHealth(
                 venue="kalshi",
-                shard_id="kx-plan",
+                shard_id="silent",
                 subscribed_instruments=("KXTEST",),
             )
-        ],
-        max_message_age_ms=20,
-        max_valid_book_age_ms=20,
+        ]
     )
-
-    supervisor.initialization_sla_ms = 20  # Short deterministic test SLA; production remains 30 seconds.
-
+    supervisor.initialization_sla_ms = 1
     manifest = await stream_kalshi_order_book_data(
         ["KXTEST"],
         output_root=tmp_path,
-        run_name="kalshi-silent-recovery-run",
-        duration_s=1.0,
-        max_messages=1,
+        run_name="silent",
+        duration_s=0.15,
         capture_intent="smoke",
-        max_reconnects=3,
+        max_reconnects=0,
         connect_factory=connect_factory,
-        auth=FakeReadAuth(),
         feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version="3"),
+        auth=FakeReadAuth(),
     )
-
-    run_dir = tmp_path / "kalshi-silent-recovery-run"
-    topbook = pd.read_parquet(run_dir / "topbook_v1.parquet")
-    health = pd.read_parquet(run_dir / "feed_health.parquet")
-
-    assert first.closed is True
-    assert json.loads(second.sent[0])["params"]["market_tickers"] == ["KXTEST"]
-    assert manifest["row_counts"]["events"] == 1
-    assert manifest["reconnect_count"] == 1 + connect_failures
-    assert calls == 2 + connect_failures
-    assert delays == ([1.0, 1.5] if connect_failures else [])
-    assert manifest["socket_recovery_count"] == 1
-    assert topbook["valid_state"].tolist() == [True, True]
-    assert "stale" in health["connection_state"].tolist()
-    assert health["connection_state"].tolist()[-1] == "connected"
-    assert validate_run_manifest(run_dir / "manifest.json").ok
+    assert calls == 1
+    assert manifest["reconnect_count"] == 0
+    assert manifest["socket_recovery_count"] == 0
+    assert manifest["capture_completeness"]["initial_snapshot_count"] == 0
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 1
+    assert not any("get_snapshot" in payload for payload in fake.sent)
+    assert manifest["capture_completeness"]["unexplained_missing_instrument_count"] == 1
 
 
 @pytest.mark.asyncio
@@ -2280,3 +2301,88 @@ async def test_invalid_kalshi_snapshot_is_diagnostic_not_coverage(tmp_path) -> N
     assert completeness["capture_intent"] == "smoke"
     assert completeness["terminal_reason"] == "max_messages_reached"
     assert completeness["acceptance_eligible"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("peer", ["silent", "deltas", "empty", "late"])
+@pytest.mark.parametrize("version", ["2", "3"])
+async def test_missing_peer_does_not_reset_initialized_kalshi_book(
+    tmp_path, peer, version
+):
+    clock = ManualMonotonicClock(start_ns=1_000_000_000)
+    sequence = count(1)
+
+    def message(ticker, kind="orderbook_snapshot", empty=False):
+        payload = {"market_ticker": ticker}
+        if kind == "orderbook_snapshot":
+            payload.update(
+                yes_dollars_fp=[] if empty else [["0.4", "10"]],
+                no_dollars_fp=[] if empty else [["0.4", "10"]],
+            )
+        else:
+            payload.update(side="yes", price_dollars="0.4", delta_fp="1")
+        return json.dumps(
+            {"type": kind, "sid": 1, "seq": next(sequence), "msg": payload}
+        )
+
+    messages = [message("A"), 31.0]
+    if peer == "deltas":
+        messages += [message("B", "orderbook_delta") for _ in range(100)]
+    elif peer in {"empty", "late"}:
+        if peer == "late":
+            messages += [message("B", "orderbook_delta")]
+        messages += [message("B", empty=peer == "empty")]
+    messages += [message("A", "orderbook_delta")]
+    fake = ClockDrivenFakeWebSocket(messages, clock)
+
+    async def connect_factory(*args, **kwargs):
+        return fake
+
+    supervisor = LiveFeedSupervisor(
+        [
+            FeedShardHealth(
+                venue="kalshi", shard_id="shared", subscribed_instruments=("A", "B")
+            )
+        ]
+    )
+    manifest = await stream_kalshi_order_book_data(
+        ["A", "B"],
+        output_root=tmp_path,
+        run_name=peer,
+        duration_s=1,
+        max_messages=sum(isinstance(m, str) for m in messages),
+        capture_intent="smoke",
+        max_reconnects=0,
+        connect_factory=connect_factory,
+        auth=FakeReadAuth(),
+        monotonic_ns=clock,
+        feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version=version),
+    )
+    assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    assert manifest["kalshi_feed_recovery"]["targeted_snapshot_refresh_count"] == 0
+    assert not any("get_snapshot" in payload for payload in fake.sent)
+    shard = supervisor.shard("kalshi", "shared")
+    assert shard.instrument_health["A"].book_integrity_valid
+    assert "reconnect" not in shard.instrument_health["A"].quality_flags
+    if peer in {"silent", "deltas"}:
+        assert supervisor._overdue_initial_instruments[("kalshi", "shared")] == {"B"}
+    else:
+        assert shard.instrument_health["B"].initial_snapshot_received
+        assert shard.instrument_health["B"].book_integrity_valid
+    if peer == "deltas":
+        assert not shard.instrument_health["B"].initial_snapshot_received
+        assert not shard.instrument_health["B"].book_integrity_valid
+    assert manifest["capture_completeness"]["requested_instrument_count"] == 2
+    tape = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_event"]["path"]
+    )
+    peer_tape = tape[tape["venue_book_id"] == "B"]
+    assert peer_tape.empty == (peer in {"silent", "deltas"})
+    if peer == "late":
+        assert peer_tape.iloc[0]["event_kind"] == "checkpoint"
+    controls = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"]
+    )
+    assert "reconnect" not in set(controls["control_type"])
+    assert validate_run_manifest(tmp_path / peer / "manifest.json").ok

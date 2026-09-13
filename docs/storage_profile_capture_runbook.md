@@ -69,15 +69,32 @@ orphan segment back into a committed role manually.
 The worst-case uncommitted window is the first **effective** row/time threshold,
 capped at 30 seconds. Where a requested limit differs from the enforced one, the
 manifest records both and the reason. Row threshold wins if both thresholds are
-due together. Startup, resync, and periodic checkpoints, compact recovery
-controls, invalidations, termination, and shutdown force barriers earlier.
+due together. Version-3 Parquet captures stage startup, resync, and periodic
+checkpoints for at most the existing `barrier_coalesce_seconds` window (one
+second by default), measured from the first pending checkpoint without renewal.
+The collector checks the deadline as it processes messages and health ticks;
+synchronous work can delay those checks. Row/time thresholds can publish earlier.
+Every checkpoint and its companion rows remain in the group. Staging is not
+durable acceptance: a crash can lose these pending rows. Invalidations,
+termination, shutdown, and explicit forced commits still drain synchronously.
+Setting the window to zero preserves immediate checkpoint publication, as do
+legacy profiles and SQLite captures. Compact recovery controls retain their
+existing behavior.
+
+When the staged checkpoint deadline triggers publication, the journal cause is
+the first pending checkpoint's cause. For example, startup followed by resync
+requests may share a group labeled `checkpoint_startup`. A row/time threshold
+or hard barrier that drains earlier records its own publishing cause.
 
 Journal-v2 runs persist publication mode, coalescing window, the fixed
 15-second publication deadline, queue capacity, segment thresholds, journal
 version, and requested/effective adjustments. The initial publication mode is
-`inline`; the recorded coalescing and queue fields do not relax synchronous
-barriers until the separate async canary is accepted. Inline mode reports zero
-queue depth and queue-full waits.
+`inline`; checkpoint batching occurs before group acceptance, with publication
+and strict readback validation still synchronous. The additive
+`capture_durability.metrics.checkpoint_publication` records its policy, window, and
+number of staged requests. The publication deadline starts at group acceptance,
+not checkpoint staging. Inline mode reports zero queue depth and queue-full
+waits; this change does not enable an asynchronous publisher.
 
 Recovery guarantees **child-process crash consistency**: if the capture process
 dies while the operating system keeps running, only complete journaled groups
