@@ -135,6 +135,68 @@ def test_minimal_core_imports_do_not_require_optional_dependencies() -> None:
     assert result.returncode == 0, result.stderr
 
 
+def test_catalog_timestamp_parsing_does_not_require_optional_dependencies() -> None:
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = str(ROOT / "src")
+    code = f"""
+        import importlib.abc
+        import sys
+        from datetime import datetime, timedelta, timezone
+
+        blocked = {OPTIONAL_IMPORT_ROOTS!r}
+        attempted = []
+
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname.split('.', 1)[0] in blocked:
+                    attempted.append(fullname)
+                    raise ModuleNotFoundError(fullname, name=fullname)
+                return None
+
+        sys.meta_path.insert(0, Blocker())
+        from pmkt.data.market_catalog.fs import parse_timestamp
+
+        fractions = (
+            ('1', 100000), ('12', 120000), ('123', 123000),
+            ('1234', 123400), ('12345', 123450), ('123456', 123456),
+            ('1234567', 123456), ('12345678', 123456),
+            ('123456789', 123456), ('123456789012', 123456),
+            ('999999999', 999999),
+        )
+        offsets = (
+            ('Z', timedelta()), ('z', timedelta()),
+            ('+02:00', timedelta(hours=2)), ('+0200', timedelta(hours=2)),
+            ('+02', timedelta(hours=2)), ('-05:30', -timedelta(hours=5, minutes=30)),
+        )
+        for fraction, microseconds in fractions:
+            for offset, delta in offsets:
+                text = '2026-09-12T11:59:20.' + fraction + offset
+                expected = datetime(
+                    2026, 9, 12, 11, 59, 20, microseconds, tzinfo=timezone.utc
+                ) - delta
+                parsed = parse_timestamp(text)
+                assert parsed == expected, (text, parsed, expected)
+                assert type(parsed) is datetime
+
+        assert parse_timestamp('2026-09-12') == datetime(2026, 9, 12, tzinfo=timezone.utc)
+        assert parse_timestamp('2026-09-12 11:59:20') == datetime(
+            2026, 9, 12, 11, 59, 20, tzinfo=timezone.utc
+        )
+        for text in ('2026-99-12T11:59:20.1234567Z', '2026-09-12T11:59:20.1234567badZ'):
+            assert parse_timestamp(text) is None, text
+        assert not attempted, attempted
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", textwrap.dedent(code)],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=environment,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_base_console_help_does_not_require_optional_dependencies() -> None:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(ROOT / "src")
