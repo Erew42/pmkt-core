@@ -1,299 +1,280 @@
-# Live capture recovery gaps (2026-09-12)
+# PR #5: capture initialization, recovery, and coverage
 
-Status: implemented and validated in PR #5. The PR remains draft for review;
-no merge or scaling has been performed.
+Status: implemented and verified; PR remains draft for final review. Grid sampling,
+raw/tape reduction, and further storage architecture work remain separate.
 
-## Original evidence
+## The problem and the resulting model
 
-Two 10-minute probes on `erik-pc1` followed PR #1 (`3690f5b` / `a6165f5`),
-which separated conservative quote validity from initialized-book integrity.
-The original probe artifacts have not been re-audited as part of the diagnosis.
+The original capture path mixed several different questions: whether an
+instrument had sent its first snapshot, whether its current book was intact,
+whether a projected output row was valid, whether the socket was alive, and
+whether the instrument was eligible for the capture's acceptance policy.
+Treating missing initialization as connection failure reset healthy peers and
+spent reconnect budgets without establishing any additional evidence.
 
-| Selection | Profile | Reported result |
-|---|---|---|
-| 5 PM + 5 Kalshi | PM `full@3`; Kalshi `full@3`, then `full@2` | PM 0 reconnects, 381 events; Kalshi v3 commit failure, v2 completed 33,599 events |
-| 10 PM + 10 Kalshi, 24h volume and unique events | both `full@2` | PM 7,834 events, 11 reconnects / 3 socket recoveries, 18/20 snapshots; Kalshi 682 events, 0 reconnects, 8/10 snapshots |
+PR #5 keeps those decisions separate while reusing existing subscription,
+book, supervisor, evidence, and durability structures.
 
-The previous 10x10 selection is stored on the host at
-`/home/erike/pmkt-trading/runs/ws-probe/selection-active-10.json`.
+| Question | Evidence and resulting action |
+|---|---|
+| Did this instrument initialize? | An authoritative snapshot, including an explicitly empty one. Keep missing/overdue evidence; silence and deltas alone do not trigger recovery. |
+| Is an initialized native book intact? | State-level integrity and its actual failure cause. Preserve corruption recovery and venue-specific escalation. |
+| Is this emitted row intact? | Upstream integrity AND absence of unresolved failures on that row. Projection must never promote an invalid upstream book. |
+| Is the connection alive? | Transport activity, bounded heartbeat checks, and socket errors. Reconnect with a recorded cause. |
+| Was eligibility evaluated? | Existing eligible/excluded/unknown verdict counts. Report the evaluation separately from capture success. |
+| Which stored data survived a crash? | Published journal groups. Pending checkpoints do not become durable merely because they were staged. |
 
-## Initialization is instrument coverage
+## 1. Instrument initialization and recovery
 
-Subscription tracking, book initialization, and connection health are separate
-concerns. Missing initial snapshots remain visible in subscription/evidence
-tracking, overdue-SLA accounting, and completeness. They no longer generate
-socket recovery actions, even when every instrument on a connected shard is
-uninitialized. Missing snapshots consume no reconnect budget and do not reset
-healthy peers or emit reconnect tape controls.
+Both venues retain every subscribed instrument, including silent instruments
+and those sending only deltas. Subscription attempts, the initialization SLA,
+overdue flags, and completeness denominators stay in place. A connected shard
+with no initialized instruments also remains connected solely with respect to
+that missing initialization. Existing zero-snapshot completion failures remain.
 
-This applies to both venues. Kalshi no longer sends automatic targeted refresh
-requests solely for overdue initialization, removing their timeout-to-reconnect
-path. Targeted refresh and escalation for initialized books with proven integrity
-failures are preserved, as are transport-disconnection recovery and retry bounds.
-No quarantine, dropping, or new Polymarket refresh mechanism is introduced.
+The shared supervisor no longer emits recovery actions for missing initial
+snapshots. Such absence consumes no reconnect budget, invalidates no healthy
+peer, and emits no reconnect tape controls. Kalshi consequently no longer sends
+automatic snapshot requests just because initialization is overdue, removing
+that request-timeout route to reconnecting the socket.
 
-An explicit empty snapshot initializes a book; deltas alone do not. A later
-snapshot initializes the existing tracked instrument normally. Before that
-snapshot, deltas remain capture observations but cannot enter the reconstruction
-tape: there is no checkpoint against which to apply them. Raw/parsed observations
-remain available when enabled by the profile, and instrument evidence remains
-available in profiles v2/v3. No synthetic initial checkpoint is created.
+Real disconnections and initialized-book corruption still recover. Kalshi
+retains targeted snapshot refresh for integrity failures and its existing
+request-failure/response-timeout escalation. Polymarket adds no refresh request.
+There is no quarantine, automatic dropping, or inference of inactivity.
 
-## Kalshi projected-row integrity
+An empty authoritative snapshot establishes initialization and can have intact
+native-book state even though its quotes are unusable. Deltas before the first
+snapshot establish neither initialization nor integrity. A late snapshot updates
+the already tracked instrument normally.
 
-The reported v3 failure was `book_integrity_valid cannot accompany unresolved
-book failures`. The confirmed local reproduction is a locked book with YES and
-NO bids both at 0.50: native state integrity is true, while canonical topbook
-construction flags both rows as `crossed_book`. The state checks strict crossing;
-topbook construction also flags equality. The original live payload has not been
-verified, so a NO-only crossing is not asserted as its established cause.
+Both tape profile versions omit deltas before the first baseline when no prior
+epoch exists. This also affects v2 tape row population: restoring those rows in
+review reproduced a strict commit failure on both venues, because a delta had
+no committed checkpoint. The validator is unchanged. Raw/parsed observations
+retain the messages when those roles are enabled, and v2/v3 instrument evidence
+retains missing initialization. Post-reconnect delta audit remains available
+when an earlier epoch exists. No synthetic checkpoint is fabricated.
 
-Stored row integrity is now upstream integrity AND absence of unresolved failures
-on the emitted row, using the same flag definition as validation. Locked/crossed
-rows remain flagged and have false row integrity. Empty-side and stale-only flags
-do not invalidate an otherwise intact book. Upstream initialization, sequence,
-and other integrity failures cannot be promoted to valid by projection.
+## 2. Kalshi native integrity and projected-row integrity
 
-Durability validation remains strict; rows are corrected before writing. Native
-book integrity and recovery decisions retain their existing semantics. No
-canonical schema version or price-normalization policy changes.
+The reproduced `full@3` commit error was a locked native book with YES and NO
+bids both at 0.50. Native state considers strict crossing invalid; the canonical
+topbook also flags equality as `crossed_book`. Copying native integrity directly
+onto that projected row produced true integrity alongside an unresolved failure,
+which strict durability validation correctly rejected.
 
-## Eligibility reporting
+The shared version-3 stamping helper now computes:
 
-Completeness reports, recovered reports, and connection-group summaries add
-`eligibility_evaluation_status`:
+```text
+row.book_integrity_valid = upstream_book_integrity
+                           AND no_unresolved_failure_on_this_row
+```
 
-- `unevaluated`: no classified instruments or no evidence summary;
-- `partial`: classified instruments and unknown verdicts coexist;
-- `evaluated`: a nonempty classified set has no unknown verdicts.
+The helper reuses `UNRESOLVED_BOOK_FAILURE_FLAGS`, the validator's own definition.
+It covers affected topbook, checkpoint, and depth paths without a competing flag
+list. A locked topbook remains flagged and has false row integrity. A native
+depth row without the projection-only failure can retain true integrity.
+Empty-side and stale-quote flags alone do not invalidate native integrity.
+Sequence and initialization failures remain false throughout projection.
 
-Eligible and ineligible (excluded) verdicts count as classified. Existing
-`capture_status`, execution status, legacy status, coverage denominators,
-acceptance gates, and CLI exit behavior are unchanged. Unknown eligibility can
-still make the conservative capture verdict partial; the independent label
-explains why. It never hides persistence failures or missing eligible snapshots.
+This corrects emitted rows before writing. It does not suppress validation
+errors, relax canonical lock semantics, or feed stricter projected-row validity
+back into native socket-recovery decisions. Existing legacy-profile row
+semantics and canonical table schema versions are preserved. The original live
+payload causing the first reported Kalshi crash was not verified; the locked
+fixture is the confirmed reproduction, not proof of every historical live cause.
 
-CLI summaries show eligibility evaluation, unknown count, and eligible snapshot
-coverage separately from total snapshot coverage. Older manifests without the
-new field retain their previous display. No catalog calls or CLI flags are added.
+## 3. Eligibility reporting
 
-## Acceptance and deferred work
+Completeness, recovered manifests, and connection-group summaries add
+`eligibility_evaluation_status` derived from existing evidence counts:
 
-Deterministic coverage includes silent/delta-only peers beyond the 30-second SLA,
-high delta traffic before initialization, late/empty snapshots, and unchanged
-transport/corrupt-book recovery. Storage tests cover locked, crossed, one-sided,
-and normal books in full and checkpoint profiles. Reporting tests cover unknown,
-mixed, classified, absent evidence, and failure cases.
+| Value | Meaning |
+|---|---|
+| `unevaluated` | No classified instruments, including no evidence summary. |
+| `partial` | Classified instruments and unknown verdicts coexist. |
+| `evaluated` | A nonempty classified set has no unknown verdicts. |
 
-Run repository hygiene, test-lane coverage, Ruff, mypy, full pytest, and contract
-checks. Then repeat the 600-second dual-venue probe on `erik-pc1` using `full@3`
-and the recorded 10x10 selection; retain commit, selection, manifests, counters,
-and recovery causes. Do not claim that a live run exercised a fault absent from
-its evidence; use deterministic tests for that condition.
+Eligible and excluded verdicts are classified. Traffic, snapshot arrival, and
+external probe selection do not manufacture canonical eligibility evidence.
+CLI summaries display total initialization, eligibility evaluation, unknown
+count, and eligible snapshot coverage separately. Older manifests without the
+field retain their previous display.
 
-Broader corruption isolation, catalog eligibility acquisition, REST preflight
-selection, quarantine, and scaling are deferred. Volume or liquidity alone does
-not establish present activity or eligibility.
+The existing complete/partial/failed verdict rules, CLI exit behavior,
+denominators, and acceptance gates are unchanged. For example, every instrument
+can initialize while eligibility remains unevaluated and the conservative
+capture verdict stays partial. A persistence failure remains a failure even
+when eligibility is unevaluated. No catalog calls or CLI options are added.
 
-## PR #5 validation record
+## 4. Polymarket transport liveness and diagnostics
 
-Implementation revision: `98fea1427ef1979c9a668301ac9d3b1a3777b653`.
-Local verification: 1,369 tests passed, 2 skipped; hygiene, pytest-lane coverage,
-Ruff, mypy, and the public API contract check passed. CI also passed on Python
-3.10, 3.11, and 3.12. The PONG regression test was made independent of Windows
-sub-20ms timer scheduling using actual reply synchronization and an injected
-clock; production transport behavior was not changed.
+The market-channel client sends application `PING`; incoming `PONG` or data
+provides transport-activity evidence. An inbound application `PING` is answered
+with `PONG` as well. The earlier explanation that the market venue need not
+answer client PING confused market and sports protocols and is withdrawn.
+See the venue's [market WebSocket documentation](https://docs.polymarket.com/api-reference/wss/market).
 
-The 600-second probe on `erik-pc1` used the previous 20-token / 10-ticker
-selection, `full@3`, and an isolated checkout. Both collectors imported the
-implementation revision's source and exited 0 after reaching their deadlines.
+The receiver now runs as a separate task with a bounded application queue. It
+handles heartbeat frames before handing market data to the collector while
+queue capacity is available. Synchronous collector work still blocks the same
+event loop; a full queue also prevents reading subsequent heartbeat frames.
+The reader therefore improves separation but does not make capture independent
+of downstream processing speed.
 
-| Venue | Events | Final-attempt initial snapshots | Socket recoveries | Transport reconnects | Eligibility |
-|---|---:|---:|---:|---:|---|
-| Polymarket | 9,983 | 14/20 | 0 | 7 | unevaluated (20 unknown) |
-| Kalshi | 1,111 | 10/10 | 0 | 0 | unevaluated (10 unknown) |
+A pending client ping establishes a bounded silence check; repeated sends do
+not renew it. Incoming data refreshes activity. Detectable event-loop stalls
+and queue backpressure grant the receiver time to drain instead of declaring
+remote silence from local blocking. Heartbeat sends are bounded, and task
+cleanup preserves cancellation on Python 3.10 through 3.12.
 
-Polymarket recorded zero supervisor recovery actions across 1,158 evaluations.
-Six final-attempt instruments lacked valid initial snapshot evidence. Its seven
-reconnects came through the transport retry path on a ~43s cadence after 4.6
-minutes. The initial diagnosis confused the market and sports heartbeat
-protocols. Market clients send `PING` and receive `PONG`; the former
-server-PING explanation is withdrawn. These runs do not establish transport
-stability or prove why any particular reply was delayed.
-Kalshi issued no targeted refreshes and finalized v3 without a commit failure.
-Both conservative capture verdicts remain `partial`, with eligibility reporting
-and missing-snapshot reasons preserved independently.
+The configured transport receive bound and the application queue are separate
+buffers with the same configured capacity. `websocket_transport.effective`
+describes transport settings, not total process memory. Decoding, in-flight
+messages, book state, and persistence buffers add further memory.
 
-Follow-up revision: `c1f62e67073547a8a29576ba932714faa27c2fac` answers inbound
-Polymarket application `PING` with `PONG` before later commits delay the
-iterator. A second 600-second `full@3` probe on `erik-pc1` with the same
-selection imported that revision and exited 0:
+Both venues persist a retry record before peer invalidation and before a new
+connection clears the triggering error. `reconnect_diagnostics.jsonl` is flushed
+and fsynced; the manifest projects the same records. Fields distinguish
+transport, connection setup, and supervisor recovery, including exception type,
+errno, received close details, affected instruments, and control-plane metrics.
+Polymarket adds heartbeat and receive-queue observations. A missing received
+close code does not establish which endpoint or network component caused failure.
 
-| Venue | Events | Final-attempt initial snapshots | Socket recoveries | Transport reconnects | Eligibility |
-|---|---:|---:|---:|---:|---|
-| Polymarket | 4,273 | 12/20 | 0 | 0 | unevaluated (20 unknown) |
-| Kalshi | 3,127 | 10/10 | 0 | 0 | unevaluated (10 unknown) |
+A sidecar write failure deliberately stops capture as a persistence failure;
+it does not silently continue without the promised recovery evidence. Tests
+cover this policy on both venues. Records describe attempted replacements;
+a final error after the retry budget is exhausted is reported by the failed
+capture manifest and need not have a replacement record.
 
-Polymarket tape had zero `reconnect` controls. Supervisor recovery actions
-remained 0. Missing snapshots remain coverage gaps; absence alone does not establish
-that these instruments have no book or are inactive.
+## 5. Narrow complementary-delta recovery delay
 
-Probe metadata, selection, logs, manifests, and artifact-validation results are
-retained under `/home/erike/pmkt-core-pr5-98fea14/tmp/pr5-live/`.
-Both manifests passed full artifact validation with no errors. Polymarket tape
-contains 140 reconnect invalidations (20 instruments x 7 transport retries);
-Kalshi has none. These do not originate from missing-initialization recovery.
-PR remains draft; no merge or scaling was performed.
+A 180-second raw-only reproduction received 12,710 messages. Ten temporary
+instrument locks resolved in the next message/frame within 0.251 ms, with the
+same timestamp and instrument hash. Actual opposite-side deletions exposed
+existing depth; best-price hints alone did not establish the missing levels.
 
-25-market follow-up (`full@3`, 50 PM tokens + 25 Kalshi tickers, same host):
+A delay is permitted only for an already initialized, previously intact book
+when a positive price delta creates equality at the changed price, the sole
+failure is `crossed_book`, and the message contains a timestamp, hash, and an
+unlocked best-price hint in the valid price range. Other failures retain their
+existing recovery behavior. Another broken peer on the shard prevents deferral.
 
-| Revision | PM reconnects | PM cadence | KX reconnects | KX snapshots |
-|---|---:|---|---:|---|
-| `24122ba` (PING reply only) | 13 | ~43s | 1 | 24/25 |
-| `13a3250` (PONG expiry on reader) | 13 | ~43s | 0 | 24/25 |
-| `6fb5cf7` (no outbound-PING deadline) | **6** | 67–139s, irregular | **0** | **25/25** |
+The wait is bounded by 250 ms from the first recovery decision after synchronous
+writes, or 16 following messages. Neither bound renews. The first commit cannot
+consume the entire receive opportunity. Once armed, bounds are checked before
+applying a later message, and the next pending deadline also caps an idle wait.
+A late correction cannot erase an expired failure. A changed hash/timestamp or
+new authoritative snapshot that leaves the book invalid withdraws the delay
+and forces a control decision even if the health flags themselves are unchanged.
+Synchronous work can still delay when the collector runs that decision.
 
-Removing the outbound-PING deadline removed the regular cadence, but also
-removed bounded silence detection. It did not establish that the market venue
-does not answer PING. Of the remaining six reconnects, two followed supervisor
-`crossed_book` controls; four took the transport retry path without a persisted
-cause. Kalshi targeted refresh stayed healthy (4/4 successful). Aggregate
-CPU/RSS did not show exhaustion, but 12.47 seconds of control-plane lag prevents
-ruling out local blocking or backpressure.
+The invalid row stays invalid and closes its tape epoch. An actual update or
+snapshot restoring the native book produces a validated resync checkpoint.
+No depth is inferred from hints. Manifest counters record candidates, restored
+books (`resolved`, including authoritative snapshots), expired bounds, and
+pending candidates. Withdrawal of a delay or a socket reset can remove a
+candidate without counting a bound expiration; these counters are not a full
+partition of candidate outcomes. On socket replacement, already queued
+old-connection data is discarded and the replacement book must initialize again.
 
-The follow-up restores bounded transport liveness with a separate bounded
-receive task, stall-aware silence detection, and persisted retry diagnostics.
-Missing initialization still causes no recovery. Corruption recovery policy
-is unchanged pending replay evidence. The market-channel heartbeat reference
-is https://docs.polymarket.com/api-reference/wss/market; the sports-channel
-reference is https://docs.polymarket.com/api-reference/wss/sports.
+The final review reproduced and repaired timer, message-count, and changed-hash
+bypasses in the collector. Tests cover both exhausted budgets and successful
+replacement, legacy idle capture, and preservation of the 12-second commit-stall
+grace. The pre-update integrity lookup now visits only assets named in the
+delta, avoiding a full subscription-universe scan for every received message.
 
+## 6. Bounded checkpoint publication
 
-Replay of the `6fb5cf7` raw log reproduces the two supervisor recoveries at
-sequences 2880 and 4280. The first pair becomes `0.50/0.50`; the second becomes
-`0.88/0.88` and `0.12/0.12`. These are local locked books, while the triggering
-deltas advertise unlocked best prices (`0.50/0.51`, `0.49/0.50`, `0.88/0.889`,
-and `0.111/0.12`). This confirms disagreement between reconstructed depth and
-venue best-price hints. It does not establish whether a deletion was missing,
-delayed, or incorrectly applied. Replay evidence is retained beside that
-probe as `crossed_replay.json`. Investigate this separately before changing
-corruption policy; best-price hints must not invent depth.
+A fixed 1,000-message replay previously forced 118 native checkpoint groups plus
+termination/shutdown. It took 78.193 seconds, dominated by synchronous validation
+and writing. Version-3 Parquet profiles now stage routine startup, resync, and
+periodic checkpoint barriers within the existing one-second coalescing window.
+Every checkpoint and companion row remains present; this is not sampling.
 
+The first pending checkpoint starts the window and supplies the staged cause;
+later requests do not renew it. The journal records the barrier that actually
+publishes the group, so a first startup request followed by resync requests can
+publish with `checkpoint_startup`. Row/time thresholds can publish earlier.
+Invalidations, termination, shutdown, and explicit forced commits still drain
+synchronously. Legacy profiles and SQLite retain immediate checkpoints.
 
-Instrumented follow-up at `927e6f565ec5ec3bde2d5966a12ef2bd96879cb2`:
+Staging occurs before durable acceptance. Strict prewrite validation, artifact
+write/readback validation, and journal publication are unchanged. A crash can
+lose pending rows; only journaled groups are authoritative. Tests exercise actual
+child-process crashes at staging, pre-journal, and post-journal boundaries.
+The coordinator protocol now explicitly declares checkpoint requests rather than
+using an optional runtime-method lookup. See the
+[capture runbook](../storage_profile_capture_runbook.md) for durability boundaries.
 
-- Same 50-token / 25-ticker selection, SHA-256
-  `5a883ea2c9dac100b68da232358d6c2b54399fb39da3ecceda5741c7e3b952bb`.
-- Isolated checkout `/home/erike/pmkt-core-pr5-liveness`; both imports verified.
-  Started 2026-09-12 21:31:58 UTC, requested 600 seconds, `full@3`.
-- Both exited 0 at their deadlines. Polymarket recorded 8,453 events and
-  28/50 final-attempt initial snapshots; Kalshi recorded 3,562 events and 25/25
-  initial snapshots. Both remain `partial` with eligibility `unevaluated`.
-- Polymarket had six reconnects, all six from supervisor `book_integrity`
-  recovery, with no transport exception or heartbeat failure. The triggering
-  rows are locked books at sequences 1326, 2483, 4213, 5483, 7115 and 8343.
-  Kalshi had zero reconnects and zero targeted refresh requests in this run.
-- All six persisted retry records reconcile exactly with the manifest. Each
-  records receive backpressure and a full 64-frame application queue. Maximum
-  control-plane lateness was 12.83 seconds. This is evidence of local pressure;
-  aggregate resource headroom cannot rule it out.
-- Both finalized manifests passed full artifact validation with zero errors
-  (Polymarket 218 seconds; Kalshi 21 seconds). Results are in `validation.json`.
-- Artifact directory:
-  `/home/erike/pmkt-core-pr5-liveness/tmp/pr5-live-25x25/`.
-  The four transport retries in the older run were not reproduced; their
-  historical causes remain unknown. This is not a scaling acceptance claim.
-- Local full suite: 1,385 passed, 2 skipped; final heartbeat/retry coverage:
-  105 passed. Hygiene, lane coverage, Ruff, mypy and public API contracts passed.
-  All 17 CI checks passed on `927e6f5`, including Python 3.10-3.12 test lanes.
+The identical replay fell to 20.274 seconds and six commit groups, retaining all
+118 checkpoints and matching non-health data semantics. This is useful bounded
+improvement, not proof that synchronous `full@3` sustains every live workload.
 
-## Complementary deltas and checkpoint publication
+## Verification and remaining limits
 
-A separate 180-second raw-only capture, without supervisor recovery or Parquet
-commits, received 12,710 messages. Ten instrument locks (five complementary
-pairs) all resolved in the next message and frame, within 0.251 ms. Each
-correction shared the first update's timestamp and per-instrument hash and
-explicitly deleted the opposite level. For example, BUY 0.18 temporarily
-locked a 0.17/0.18 book; the following SELL 0.18 with size zero exposed the
-existing 0.19 ask. This reproduces a transient intermediate state. It does not
-prove the contents of frames discarded by earlier reconnects, or establish a
-universal venue transaction boundary.
+Earlier artifacts remain on `erik-pc1`:
 
-Polymarket now separates that intermediate invalid state from the recovery
-decision. An already initialized, intact book qualifies only when a positive
-delta produces a lock, `crossed_book` is its sole failure, and the delta carries
-a hash, timestamp and an unlocked best-price hint. Recovery may wait for
-250 ms from its first decision after synchronous writes, or 16 subsequent
-messages. Neither bound renews; a changed hash/timestamp or additional failure
-ends the deferral. Deadline enforcement occurs when the collector next runs.
-Other corruption and transport causes retain immediate recovery. This does
-not change missing-initialization handling or infer depth from top-price hints.
+| Evidence | Artifact directory |
+|---|---|
+| Original probes and the 25+25 heartbeat iterations | `/home/erike/pmkt-core-pr5-98fea14/tmp/` |
+| Recorded recovery causes and raw complementary-lock reproduction | `/home/erike/pmkt-core-pr5-liveness/tmp/` |
+| Checkpoint replay parity and pre-commit dual-venue probe | `/home/erike/pmkt-core-pr5-complementary/tmp/pr5-candidate/` |
+| Fresh active 25-market/25-ticker stress run at `de30b34` | `/home/erike/pr5-stress-fresh-de30b34/` |
 
-The locked row stays invalid and closes its tape epoch. A corrective delta
-updates actual stored levels; the existing tape producer then emits a validated
-resync checkpoint and recovery control. Raw source messages and the invalid
-interval remain visible. Manifest `complementary_delta_recovery` counters make
-candidates, resolutions and expirations inspectable.
+The fresh 600-second stress run initialized all 50 Polymarket tokens and all
+25 Kalshi tickers. Polymarket captured 40,125 events with three reconnects;
+Kalshi captured 28,957 with no reconnect and one successful targeted refresh.
+Both finalized artifacts passed strict validation. Polymarket nevertheless
+accumulated about 370 seconds of additional backlog relative to the raw-screen
+clock baseline; control-plane lateness reached 11.51 seconds (Kalshi 9.94).
+One PM recovery involved a true cross outside the lock-only rule; two were
+transport errors without a received close cause. Aggregate memory headroom did
+not establish sufficient single-event-loop processing capacity.
 
-The identical 1,000-message replay of the earlier full probe took 78.193 seconds
-without profiling. Its 118 native book messages forced 118 checkpoint groups
-(32 startup, 86 resync), plus termination and shutdown. The resync count did
-not mean 86 reconnects. Validation consumed 27.049 seconds; role writes about
-29.90 seconds. A separate cProfile run attributed about 91% of elapsed time to
-commit calls; its slower absolute timing is not the baseline.
+This remains a correctness and bounded-recovery PR, not scaling acceptance for
+hundreds or thousands of active instruments. Configurable state grids, raw/tape
+reduction, asynchronous publication, broader corruption isolation, and
+eligibility acquisition remain separate work. PR #5 should not expand to absorb
+those investigations.
 
-Version-3 Parquet profiles now stage routine checkpoint barriers using the
-existing one-second coalescing window before durable acceptance. All checkpoint
-rows are retained. Row/time thresholds, invalidations, termination and explicit
-forced commits can drain earlier; strict prewrite and readback validation are
-unchanged. Legacy profiles and SQLite preserve immediate checkpoint behavior.
-The capture runbook documents the additional pending-row crash window and
-additive publication metrics. This reduces forced publication frequency;
-synchronous publication can still stall the event loop. Async publication and
-broader scaling remain deferred. PR remains draft.
+### Final review verification
 
-Reproduction and profiler artifacts:
-`/home/erike/pmkt-core-pr5-liveness/tmp/pr5-root-cause/`.
+Local full suite: **1,421 passed, 2 skipped**. Repository hygiene, pytest-lane
+coverage, Ruff, mypy, and public book/price/midpoint/history contracts passed.
+Independent read-only reviews covered the full `fd8a375` through `de30b34` diff;
+Codex reproduced material findings before deciding which changes to implement.
 
-### Pre-commit candidate capture and replay
+The final pre-commit probe used base `de30b34` plus source patch SHA-256
+`f92838de45c7b45532ee641bec841703d15e52a7f5747e2d39ae51713a9aa0a6`.
+All 11 changed source files were hash-matched in the isolated checkout; both
+venue imports resolved there. The fixed 50-token/25-ticker selection SHA-256 was
+`b1a3cd5bc98e8bfb61150d520f276c77dd5b9c34e9a29eb24fc622d2d8d8e496`.
+The requested duration was 600 seconds with `full@3`, starting at recorded host
+time `2026-09-13T01:38:03Z`. Both collectors exited 0 at their deadlines.
 
-The candidate ran before commit or push, from base
-`a7b445d3d828471b29925c1236d826735ce67c11` plus patch SHA-256
-`d35bc1b57766d579721cf77cc4030d59d69ddd037dc2aa0f936fbcfcf07a70b0`.
-The five changed source files were hash-matched to the local tested tree;
-subsequent edits added only tests and documentation. Both venue imports pointed
-to `/home/erike/pmkt-core-pr5-complementary/src`.
-
-The same selection and 600-second `full@3` capture started at
-2026-09-12 22:56:43 UTC on `erik-pc1`. Both collectors exited 0 at their deadlines:
-
-| Venue | Events | Initial snapshots received | Reconnects | Maximum control lag |
+| Venue | Events | Initial snapshots | Reconnects | Maximum control lag |
 |---|---:|---:|---:|---:|
-| Polymarket | 6,407 | 24/50 | 0 | 1.286 s |
-| Kalshi | 7,444 | 25/25 | 0 | 0.708 s |
+| Polymarket | 31,229 | 40/50 | 0 | 5.676 s |
+| Kalshi | 6,537 | 25/25 | 0 | 3.058 s |
 
-Kalshi requested no targeted refreshes. Empty-side observations remain tracked:
-the legacy usable-snapshot counts were 18 for Polymarket and zero for Kalshi,
-which are distinct from received initialization. Both captures remain partial,
-eligibility unevaluated and acceptance false. Polymarket retained 26 missing
-initial snapshots without recovery. No lock/correction candidates occurred in
-this live run; lower/different activity means reconnect and lag changes alone
-are not a controlled throughput comparison or scaling acceptance.
+Polymarket resolved all six qualifying temporary locks, with no expired or
+pending candidates. Ten missing initial snapshots caused no reconnect. Kalshi
+completed one targeted snapshot refresh successfully without escalation. Both
+captures remain partial with eligibility unevaluated and acceptance false;
+Polymarket additionally retains its ten missing-initialization reasons.
 
-The identical 1,000-message replay took 20.274 seconds versus 78.193 seconds,
-about 74% less elapsed time. All 118 checkpoints remained, while commit groups
-fell from 120 to 6. Tape event states, source hashes, quality flags, native
-levels and non-health row counts matched; health emissions fell from 73 to 43
-because processing time changed. The 12,710-message raw reproduction also
-resolved all ten identified candidates with no expiration or other invalid
-books. Invalid intermediate rows and recovery checkpoints are covered by the
-end-to-end regression, including a simulated 12-second commit stall.
+This run verifies the candidate under live traffic but is not a controlled
+comparison with the earlier stress run: 38 PM tokens and 18 Kalshi tickers sent
+deltas, and total workload differed. Multi-second control stalls remain. Bound
+expiry and revoked-delay faults are established by deterministic regression
+tests, not claimed to have occurred in this live run.
 
-Local verification: full suite 1,398 passed and 2 skipped; final focused suite
-165 passed, including actual child-process crashes at the staged, pre-journal
-and post-journal boundaries. Hygiene, lane coverage, Ruff, mypy and public API
-contracts passed. Probe metadata, manifests, patch/source hashes, raw-lock
-replay and replay parity are retained under
-`/home/erike/pmkt-core-pr5-complementary/tmp/pr5-candidate/`.
-Both live manifests passed full artifact validation with zero errors before
-commit or push (Polymarket 102.74 seconds; Kalshi 2.61 seconds).
+Probe metadata, selection, exact patch/source hashes, manifests, raw events,
+resource observations, summaries, and strict validation outputs are retained in
+`/home/erike/pr5-final-review-2/` on `erik-pc1`. An earlier review candidate probe
+was stopped and superseded; it is not the final verification run.
+
+Both complete manifest/artifact validations passed with zero errors before
+commit or push: Polymarket in 318.62 seconds and Kalshi in 42.04 seconds.

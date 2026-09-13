@@ -397,8 +397,11 @@ class DurableCaptureCoordinator:
             return None
         if self._buffered_rows >= self.segment_row_limit:
             return CaptureCommitCause.THRESHOLD_ROWS
-        if (self._pending_checkpoint is not None and
-                time.monotonic() - self._pending_checkpoint[0] >= self.checkpoint_coalesce_seconds):
+        if (
+            self._pending_checkpoint is not None
+            and time.monotonic() - self._pending_checkpoint[0]
+            >= self.checkpoint_coalesce_seconds
+        ):
             return self._pending_checkpoint[1]
         if (
             time.monotonic() - self._last_commit_monotonic
@@ -587,7 +590,9 @@ class DurableCaptureCoordinator:
             "configuration": self.durability_settings.to_mapping(),
             "metrics": {
                 "checkpoint_publication": {
-                    "policy": "bounded-checkpoints.v1" if self.checkpoint_coalesce_seconds > 0 else "immediate",
+                    "policy": "bounded-checkpoints.v1"
+                    if self.checkpoint_coalesce_seconds > 0
+                    else "immediate",
                     "coalesce_seconds": self.checkpoint_coalesce_seconds,
                     "requests_staged": self._checkpoint_requests,
                 },

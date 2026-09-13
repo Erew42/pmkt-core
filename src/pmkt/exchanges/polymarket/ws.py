@@ -750,7 +750,9 @@ class AsyncMarketWebSocketClient:
             # concurrently; wait_for can lose that cancellation.
             done, _ = await asyncio.wait({task}, timeout=self.pong_timeout_seconds)
             if not done:
-                raise asyncio.TimeoutError("Polymarket heartbeat send deadline exceeded")
+                raise asyncio.TimeoutError(
+                    "Polymarket heartbeat send deadline exceeded"
+                )
             task.result()
         finally:
             task.cancel()
@@ -759,17 +761,24 @@ class AsyncMarketWebSocketClient:
     def heartbeat_diagnostics(self) -> dict[str, Any]:
         now = self._heartbeat_clock()
         return {
-            "inbound_age_seconds": None if self._last_inbound is None else now - self._last_inbound,
-            "pending_ping_age_seconds": None if self._pending_ping_since is None else now - self._pending_ping_since,
+            "inbound_age_seconds": None
+            if self._last_inbound is None
+            else now - self._last_inbound,
+            "pending_ping_age_seconds": None
+            if self._pending_ping_since is None
+            else now - self._pending_ping_since,
             "receive_queue_frames": self._frames.qsize(),
             "receive_backpressure": self._receive_blocked,
             "max_heartbeat_lag_seconds": self._max_heartbeat_lag_seconds,
-            "heartbeat_error_type": type(self._heartbeat_error).__name__ if self._heartbeat_error is not None else None,
+            "heartbeat_error_type": type(self._heartbeat_error).__name__
+            if self._heartbeat_error is not None
+            else None,
         }
 
     async def _receive_frames(self, ws: Any) -> None:
         # One bounded application buffer, in addition to the transport buffer.
-        # Heartbeat replies don't wait for downstream market-data processing.
+        # Handle heartbeats ahead of the collector while this queue has room.
+        # Once full, downstream backpressure also delays later heartbeat frames.
         async for raw in ws:
             self._last_inbound = self._heartbeat_clock()
             heartbeat = application_heartbeat_token(raw)
@@ -786,7 +795,9 @@ class AsyncMarketWebSocketClient:
             finally:
                 self._receive_blocked = False
                 if blocked:
-                    self._liveness_grace_until = self._heartbeat_clock() + self.pong_timeout_seconds
+                    self._liveness_grace_until = (
+                        self._heartbeat_clock() + self.pong_timeout_seconds
+                    )
 
     async def _incoming_frames(self) -> AsyncIterator[Any]:
         receiver = self._receive_task
@@ -803,7 +814,9 @@ class AsyncMarketWebSocketClient:
                 return
             get_frame = asyncio.create_task(self._frames.get())
             try:
-                await asyncio.wait({get_frame, receiver}, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    {get_frame, receiver}, return_when=asyncio.FIRST_COMPLETED
+                )
                 if get_frame.done():
                     yield get_frame.result()
             finally:
@@ -861,14 +874,22 @@ class AsyncMarketWebSocketClient:
                 if isinstance(exc, AttributeError) and not is_transport_teardown_race(exc):
                     raise
                 budget.last_error = exc
-                budget.retry_context = {"origin": "transport", "reason": "receive_failure", **self.heartbeat_diagnostics()}
+                budget.retry_context = {
+                    "origin": "transport",
+                    "reason": "receive_failure",
+                    **self.heartbeat_diagnostics(),
+                }
                 with contextlib.suppress(Exception):
                     await self.close()
                 if not reconnect or not budget.available:
                     raise
             else:
                 budget.last_error = None
-                budget.retry_context = {"origin": "transport", "reason": "clean_close", **self.heartbeat_diagnostics()}
+                budget.retry_context = {
+                    "origin": "transport",
+                    "reason": "clean_close",
+                    **self.heartbeat_diagnostics(),
+                }
                 with contextlib.suppress(ConnectionClosed, OSError, asyncio.TimeoutError):
                     await self.close()
                 if not reconnect:
@@ -911,9 +932,16 @@ class AsyncMarketWebSocketClient:
         if self._pending_ping_since is None or self._receive_blocked:
             return
         now = self._heartbeat_clock()
-        activity = max(self._pending_ping_since, self._last_inbound or self._pending_ping_since)
-        if now >= self._liveness_grace_until and now - activity >= self.pong_timeout_seconds:
-            raise asyncio.TimeoutError("Polymarket application heartbeat silence deadline exceeded")
+        activity = max(
+            self._pending_ping_since, self._last_inbound or self._pending_ping_since
+        )
+        if (
+            now >= self._liveness_grace_until
+            and now - activity >= self.pong_timeout_seconds
+        ):
+            raise asyncio.TimeoutError(
+                "Polymarket application heartbeat silence deadline exceeded"
+            )
 
     async def _heartbeat_loop(self) -> None:
         interval = self.heartbeat_interval
@@ -927,7 +955,9 @@ class AsyncMarketWebSocketClient:
                 await self._sleep(tick)
                 now = self._heartbeat_clock()
                 lag = max(0.0, now - expected)
-                self._max_heartbeat_lag_seconds = max(self._max_heartbeat_lag_seconds, lag)
+                self._max_heartbeat_lag_seconds = max(
+                    self._max_heartbeat_lag_seconds, lag
+                )
                 if lag > max(0.05, tick * 0.1):
                     # A blocked event loop cannot establish remote silence.
                     # Give the receiver a full deadline to drain queued replies.

@@ -81,6 +81,11 @@ Setting the window to zero preserves immediate checkpoint publication, as do
 legacy profiles and SQLite captures. Compact recovery controls retain their
 existing behavior.
 
+When the staged checkpoint deadline triggers publication, the journal cause is
+the first pending checkpoint's cause. For example, startup followed by resync
+requests may share a group labeled `checkpoint_startup`. A row/time threshold
+or hard barrier that drains earlier records its own publishing cause.
+
 Journal-v2 runs persist publication mode, coalescing window, the fixed
 15-second publication deadline, queue capacity, segment thresholds, journal
 version, and requested/effective adjustments. The initial publication mode is

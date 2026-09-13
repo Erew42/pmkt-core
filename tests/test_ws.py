@@ -22,14 +22,31 @@ from pmkt.exchanges.polymarket.ws import (
 )
 
 
-@pytest.mark.parametrize("failure", ["time", "traffic", "hash", "cross", "uninitialized"])
+@pytest.mark.parametrize(
+    "failure", ["time", "traffic", "hash", "cross", "uninitialized"]
+)
 def test_complementary_recovery_has_strict_bounds(failure):
     state = MarketBookState(asset_id="A", market="m")
-    state.apply_book({"bids": [{"price": "0.17", "size": "10"}],
-                      "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}]})
-    change = {"asset_id": "A", "side": "BUY", "price": "0.18", "size": "20",
-              "best_bid": "0.18", "best_ask": "0.19", "hash": "paired"}
-    message = {"event_type": "price_change", "timestamp": "1789240000000", "price_changes": [change]}
+    state.apply_book(
+        {
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
+        }
+    )
+    change = {
+        "asset_id": "A",
+        "side": "BUY",
+        "price": "0.18",
+        "size": "20",
+        "best_bid": "0.18",
+        "best_ask": "0.19",
+        "hash": "paired",
+    }
+    message = {
+        "event_type": "price_change",
+        "timestamp": "1789240000000",
+        "price_changes": [change],
+    }
     if failure == "cross":
         change["price"] = "0.20"
     state.apply_price_change(change, message)
@@ -50,9 +67,66 @@ def test_complementary_recovery_has_strict_bounds(failure):
         assert not recovery.defer("A", message_count=2, now_ns=12_250_000_000)
     else:
         for sequence in range(2, 17):
-            recovery.observe({"event_type": "trade"}, {"A": state}, set(), message_count=sequence)
+            recovery.observe(
+                {"event_type": "trade"}, {"A": state}, set(), message_count=sequence
+            )
             assert recovery.defer("A", message_count=sequence, now_ns=12_000_000_001)
         assert not recovery.defer("A", message_count=17, now_ns=12_000_000_001)
+
+
+@pytest.mark.parametrize("event_key", ["event_type", "type"])
+def test_complementary_recovery_checks_only_touched_books(event_key):
+    touched = MarketBookState(asset_id="A", market="m")
+    touched.apply_book(
+        {
+            "bids": [{"price": "0.17", "size": "10"}],
+            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
+        }
+    )
+    lookups = []
+
+    class LookupOnlyStates(dict):
+        def items(self):
+            raise AssertionError("recovery must not scan unrelated instruments")
+
+        def __iter__(self):
+            raise AssertionError("recovery must not scan unrelated instruments")
+
+        def get(self, key, default=None):
+            lookups.append(key)
+            return super().get(key, default)
+
+    states = LookupOnlyStates(
+        A=touched, untouched=MarketBookState(asset_id="untouched")
+    )
+    recovery = ComplementaryDeltaRecovery()
+    message = {
+        event_key: "price_change",
+        "timestamp": "1789240000000",
+        "price_changes": [
+            {
+                "asset_id": "A",
+                "side": "BUY",
+                "price": "0.18",
+                "size": "20",
+                "best_bid": "0.18",
+                "best_ask": "0.19",
+                "hash": "paired",
+            }
+        ],
+    }
+    before = recovery.intact_changed_assets(message, states)
+    assert before == {"A"}
+    assert lookups == ["A"]
+    apply_market_message(states, message)
+    recovery.observe(message, states, before, message_count=1)
+    assert recovery.defer("A", message_count=1, now_ns=0)
+    lookups.clear()
+    assert (
+        recovery.intact_changed_assets({"event_type": "last_trade_price"}, states)
+        == set()
+    )
+    assert lookups == []
 
 
 class FakeWebSocket:
@@ -225,8 +299,12 @@ async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -
     async def connect_factory(_):
         return ws
 
-    client = AsyncMarketWebSocketClient(["a"], connect_factory=connect_factory,
-        heartbeat_interval=0.01, pong_timeout_seconds=1.0)
+    client = AsyncMarketWebSocketClient(
+        ["a"],
+        connect_factory=connect_factory,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=1.0,
+    )
     state = MarketBookState("a")
     async with client:
         task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
@@ -421,11 +499,15 @@ async def test_default_connector_disables_protocol_keepalive(monkeypatch) -> Non
 async def test_heartbeat_sends_text_ping() -> None:
     fake = FakeWebSocket()
     async with AsyncMarketWebSocketClient(
-        ["asset-a"], heartbeat_interval=0.01, connect_factory=lambda _: fake,
+        ["asset-a"],
+        heartbeat_interval=0.01,
+        connect_factory=lambda _: fake,
     ):
+
         async def wait_for_ping():
             while "PING" not in fake.sent:
                 await asyncio.sleep(0.001)
+
         await asyncio.wait_for(wait_for_ping(), timeout=2)
 
     assert "PING" in fake.sent
@@ -493,7 +575,9 @@ async def test_iter_messages_decodes_json_and_skips_heartbeats() -> None:
         ('{"event_type":"book"}', None),
     ],
 )
-def test_application_heartbeat_token_normalizes_control_frames(raw: Any, token: str | None) -> None:
+def test_application_heartbeat_token_normalizes_control_frames(
+    raw: Any, token: str | None
+) -> None:
     assert application_heartbeat_token(raw) == token
 
 
@@ -504,7 +588,9 @@ async def test_iter_messages_answers_venue_ping_immediately() -> None:
             "PING",
             " ping\n",
             b"PING",
-            json.dumps({"event_type": "book", "asset_id": "a1", "bids": [], "asks": []}),
+            json.dumps(
+                {"event_type": "book", "asset_id": "a1", "bids": [], "asks": []}
+            ),
         ]
     )
 
@@ -963,10 +1049,13 @@ async def test_silent_socket_expires_even_when_sends_succeed() -> None:
     class SilentSocket(FakeWebSocket):
         async def __anext__(self):
             await asyncio.Future()
+
     ws = SilentSocket()
     client = AsyncMarketWebSocketClient(
-        ["a"], connect_factory=lambda _: ws,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.1,
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.1,
     )
     async with client:
         with pytest.raises(asyncio.TimeoutError, match="heartbeat silence"):
@@ -979,13 +1068,17 @@ async def test_silent_socket_expires_even_when_sends_succeed() -> None:
 @pytest.mark.asyncio
 async def test_bounded_receiver_backpressure_is_not_remote_silence() -> None:
     from pmkt.exchanges.ws_transport import WebSocketTransportSettings
+
     class BusySocket(FakeWebSocket):
         async def __anext__(self):
             return '{"event_type":"last_trade_price","asset_id":"a"}'
+
     ws = BusySocket()
     client = AsyncMarketWebSocketClient(
-        ["a"], connect_factory=lambda _: ws,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.04,
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.04,
         transport_settings=WebSocketTransportSettings(max_queue_frames=2),
     )
     async with client:
@@ -1003,20 +1096,26 @@ async def test_bounded_receiver_backpressure_is_not_remote_silence() -> None:
 @pytest.mark.asyncio
 async def test_event_loop_stall_grants_receiver_time_to_drain_pong() -> None:
     import time
+
     class ReplySocket(FakeWebSocket):
         def __init__(self):
             super().__init__()
             self.responses = asyncio.Queue()
+
         async def send(self, payload):
             await super().send(payload)
             if payload == "PING":
                 self.responses.put_nowait("PONG")
+
         async def __anext__(self):
             return await self.responses.get()
+
     ws = ReplySocket()
     client = AsyncMarketWebSocketClient(
-        ["a"], connect_factory=lambda _: ws,
-        heartbeat_interval=0.01, pong_timeout_seconds=0.05,
+        ["a"],
+        connect_factory=lambda _: ws,
+        heartbeat_interval=0.01,
+        pong_timeout_seconds=0.05,
     )
     async with client:
         waiter = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
@@ -1033,12 +1132,16 @@ async def test_event_loop_stall_grants_receiver_time_to_drain_pong() -> None:
 @pytest.mark.asyncio
 async def test_heartbeat_send_preserves_concurrent_outer_cancellation():
     parent = None
+
     class CancellingSocket(FakeWebSocket):
         async def send(self, payload):
             if payload == "PING":
                 parent.cancel()
+
     client = AsyncMarketWebSocketClient(
-        ["a"], connect_factory=lambda _: CancellingSocket(), heartbeat_interval=None,
+        ["a"],
+        connect_factory=lambda _: CancellingSocket(),
+        heartbeat_interval=None,
     )
     async with client:
         parent = asyncio.create_task(client.ping())
@@ -1049,6 +1152,7 @@ async def test_heartbeat_send_preserves_concurrent_outer_cancellation():
 @pytest.mark.asyncio
 async def test_heartbeat_send_timeout_cancels_blocked_send():
     stopped = asyncio.Event()
+
     class BlockedSocket(FakeWebSocket):
         async def send(self, payload):
             if payload == "PING":
@@ -1056,8 +1160,11 @@ async def test_heartbeat_send_timeout_cancels_blocked_send():
                     await asyncio.Future()
                 finally:
                     stopped.set()
+
     client = AsyncMarketWebSocketClient(
-        ["a"], connect_factory=lambda _: BlockedSocket(), heartbeat_interval=None,
+        ["a"],
+        connect_factory=lambda _: BlockedSocket(),
+        heartbeat_interval=None,
         pong_timeout_seconds=0.03,
     )
     async with client:

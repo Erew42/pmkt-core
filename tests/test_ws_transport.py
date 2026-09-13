@@ -420,6 +420,7 @@ async def test_outer_cancellation_during_deadline_cleanup_is_not_suppressed():
 async def test_retry_diagnostic_precedes_invalidation_and_error_clear():
     from websockets.exceptions import ConnectionClosedError
     from websockets.frames import Close
+
     observed = []
     budget = WebSocketRetryBudget(
         backoff=0,
@@ -428,10 +429,12 @@ async def test_retry_diagnostic_precedes_invalidation_and_error_clear():
     )
     budget.last_error = ConnectionClosedError(Close(1011, "server restart"), None)
     budget.retry_context = {"origin": "transport", "reason": "receive_failure"}
+
     async def connected():
         assert observed[0]["received_close_code"] == 1011
         assert observed[0]["received_close_reason"] == "server restart"
         assert observed[1] == "invalidated"
+
     await budget.run(connected, retry_first=True)
     assert observed[0]["exception_type"] == "ConnectionClosedError"
     assert observed[0]["replacement_attempt"] == 1
@@ -452,5 +455,64 @@ async def test_client_retry_records_actual_cause(retry_client, failure):
         await iterator.aclose()
     assert len(records) == 1
     assert records[0]["origin"] == "transport"
-    assert records[0]["reason"] == ("receive_failure" if failure == "receive" else "clean_close")
+    assert records[0]["reason"] == (
+        "receive_failure" if failure == "receive" else "clean_close"
+    )
     assert records[0]["exception_type"] == ("OSError" if failure == "receive" else None)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_reconnect_diagnostic_write_failure_is_a_persistence_failure(
+    tmp_path, monkeypatch, venue
+):
+    import importlib
+    import json
+    from pathlib import Path
+
+    from pmkt.streaming.profiles import select_storage_profile
+
+    module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
+    capture = (
+        module.stream_order_book_data
+        if venue == "polymarket"
+        else module.stream_kalshi_order_book_data
+    )
+    original_open = Path.open
+    connections = 0
+
+    def fail_diagnostic_open(path, *args, **kwargs):
+        if path.name == "reconnect_diagnostics.jsonl":
+            raise OSError("diagnostic disk failure")
+        return original_open(path, *args, **kwargs)
+
+    async def connect(*args):
+        nonlocal connections
+        connections += 1
+        return RetrySocket("receive")
+
+    monkeypatch.setattr(Path, "open", fail_diagnostic_open)
+    kwargs = (
+        {"heartbeat_interval": None}
+        if venue == "polymarket"
+        else {"auth": FakeReadAuth()}
+    )
+    with pytest.raises(OSError, match="diagnostic disk failure"):
+        await capture(
+            ["A"],
+            output_root=tmp_path,
+            run_name="diagnostic-failure",
+            duration_s=10,
+            max_reconnects=1,
+            connect_factory=connect,
+            storage_profile=select_storage_profile("full", profile_version="3"),
+            **kwargs,
+        )
+    manifest = json.loads(
+        (tmp_path / "diagnostic-failure" / "manifest.json").read_text()
+    )
+    assert connections == 1
+    assert manifest["capture_completeness"]["terminal_reason"] == "persistence_error"
+    assert manifest["capture_completeness"]["capture_status"] == "failed"
+    assert manifest["reconnect_count"] == 0
+    assert manifest["reconnect_diagnostics"] == []

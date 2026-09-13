@@ -27,35 +27,60 @@ from pmkt.streaming.topbook_emission import TopbookEmissionTracker
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("yes,no,expected", [
-    ("0.5", "0.5", False), ("0.7", "0.6", False),
-    ("0.4", None, True), ("0.4", "0.4", True),
-])
+@pytest.mark.parametrize(
+    "yes,no,expected",
+    [
+        ("0.5", "0.5", False),
+        ("0.7", "0.6", False),
+        ("0.4", None, True),
+        ("0.4", "0.4", True),
+    ],
+)
 @pytest.mark.parametrize("version", ["2", "3"])
 @pytest.mark.parametrize("profile", ["full", "book-tape"])
-async def test_kalshi_profile_finalizes_projected_integrity(tmp_path, yes, no, expected, version, profile):
+async def test_kalshi_profile_finalizes_projected_integrity(
+    tmp_path, yes, no, expected, version, profile
+):
     from pmkt.data.validation import validate_frame
 
     clock = ManualMonotonicClock(start_ns=1_000_000_000)
-    payload = {"market_ticker": "A", "yes_dollars_fp": [[yes, "10"]],
-               "no_dollars_fp": [] if no is None else [[no, "10"]]}
+    payload = {
+        "market_ticker": "A",
+        "yes_dollars_fp": [[yes, "10"]],
+        "no_dollars_fp": [] if no is None else [[no, "10"]],
+    }
     # Repeat the same book after the checkpoint interval to exercise both sinks.
-    messages = [json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 1, "msg": payload}),
-                31.0,
-                json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 2, "msg": payload})]
+    messages = [
+        json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 1, "msg": payload}),
+        31.0,
+        json.dumps({"type": "orderbook_snapshot", "sid": 1, "seq": 2, "msg": payload}),
+    ]
     fake = ClockDrivenFakeWebSocket(messages, clock)
 
     async def connect_factory(*args, **kwargs):
         return fake
 
     manifest = await stream_kalshi_order_book_data(
-        ["A"], output_root=tmp_path, run_name="projected", duration_s=1,
-        max_messages=2, capture_intent="smoke", connect_factory=connect_factory,
-        auth=FakeReadAuth(), monotonic_ns=clock, use_yes_price=False,
-        storage_profile=select_storage_profile(profile, profile_version=version,
-            topbook_checkpoint_interval_seconds=1))
+        ["A"],
+        output_root=tmp_path,
+        run_name="projected",
+        duration_s=1,
+        max_messages=2,
+        capture_intent="smoke",
+        connect_factory=connect_factory,
+        auth=FakeReadAuth(),
+        monotonic_ns=clock,
+        use_yes_price=False,
+        storage_profile=select_storage_profile(
+            profile, profile_version=version, topbook_checkpoint_interval_seconds=1
+        ),
+    )
     assert manifest["socket_recovery_count"] == 0
-    roles = ["topbook_main", "depth_main"] if profile == "full" else ["topbook_main", "topbook_checkpoint"]
+    roles = (
+        ["topbook_main", "depth_main"]
+        if profile == "full"
+        else ["topbook_main", "topbook_checkpoint"]
+    )
     for role in roles:
         artifact = manifest["dataset_artifacts"][role]
         rows = pd.read_parquet(tmp_path / "projected" / artifact["path"])
@@ -881,14 +906,25 @@ async def test_kalshi_missing_initialization_does_not_reconnect(tmp_path):
         calls += 1
         return fake
 
-    supervisor = LiveFeedSupervisor([FeedShardHealth(
-        venue="kalshi", shard_id="silent", subscribed_instruments=("KXTEST",),
-    )])
+    supervisor = LiveFeedSupervisor(
+        [
+            FeedShardHealth(
+                venue="kalshi",
+                shard_id="silent",
+                subscribed_instruments=("KXTEST",),
+            )
+        ]
+    )
     supervisor.initialization_sla_ms = 1
     manifest = await stream_kalshi_order_book_data(
-        ["KXTEST"], output_root=tmp_path, run_name="silent",
-        duration_s=0.15, capture_intent="smoke", max_reconnects=0,
-        connect_factory=connect_factory, feed_supervisor=supervisor,
+        ["KXTEST"],
+        output_root=tmp_path,
+        run_name="silent",
+        duration_s=0.15,
+        capture_intent="smoke",
+        max_reconnects=0,
+        connect_factory=connect_factory,
+        feed_supervisor=supervisor,
         storage_profile=select_storage_profile("full", profile_version="3"),
         auth=FakeReadAuth(),
     )
@@ -2269,18 +2305,25 @@ async def test_invalid_kalshi_snapshot_is_diagnostic_not_coverage(tmp_path) -> N
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("peer", ["silent", "deltas", "empty", "late"])
-async def test_missing_peer_does_not_reset_initialized_kalshi_book(tmp_path, peer):
+@pytest.mark.parametrize("version", ["2", "3"])
+async def test_missing_peer_does_not_reset_initialized_kalshi_book(
+    tmp_path, peer, version
+):
     clock = ManualMonotonicClock(start_ns=1_000_000_000)
     sequence = count(1)
 
     def message(ticker, kind="orderbook_snapshot", empty=False):
         payload = {"market_ticker": ticker}
         if kind == "orderbook_snapshot":
-            payload.update(yes_dollars_fp=[] if empty else [["0.4", "10"]],
-                           no_dollars_fp=[] if empty else [["0.4", "10"]])
+            payload.update(
+                yes_dollars_fp=[] if empty else [["0.4", "10"]],
+                no_dollars_fp=[] if empty else [["0.4", "10"]],
+            )
         else:
             payload.update(side="yes", price_dollars="0.4", delta_fp="1")
-        return json.dumps({"type": kind, "sid": 1, "seq": next(sequence), "msg": payload})
+        return json.dumps(
+            {"type": kind, "sid": 1, "seq": next(sequence), "msg": payload}
+        )
 
     messages = [message("A"), 31.0]
     if peer == "deltas":
@@ -2295,14 +2338,27 @@ async def test_missing_peer_does_not_reset_initialized_kalshi_book(tmp_path, pee
     async def connect_factory(*args, **kwargs):
         return fake
 
-    supervisor = LiveFeedSupervisor([FeedShardHealth(
-        venue="kalshi", shard_id="shared", subscribed_instruments=("A", "B"))])
+    supervisor = LiveFeedSupervisor(
+        [
+            FeedShardHealth(
+                venue="kalshi", shard_id="shared", subscribed_instruments=("A", "B")
+            )
+        ]
+    )
     manifest = await stream_kalshi_order_book_data(
-        ["A", "B"], output_root=tmp_path, run_name=peer, duration_s=1,
-        max_messages=sum(isinstance(m, str) for m in messages), capture_intent="smoke",
-        max_reconnects=0, connect_factory=connect_factory, auth=FakeReadAuth(),
-        monotonic_ns=clock, feed_supervisor=supervisor,
-        storage_profile=select_storage_profile("full", profile_version="3"))
+        ["A", "B"],
+        output_root=tmp_path,
+        run_name=peer,
+        duration_s=1,
+        max_messages=sum(isinstance(m, str) for m in messages),
+        capture_intent="smoke",
+        max_reconnects=0,
+        connect_factory=connect_factory,
+        auth=FakeReadAuth(),
+        monotonic_ns=clock,
+        feed_supervisor=supervisor,
+        storage_profile=select_storage_profile("full", profile_version=version),
+    )
     assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
     assert manifest["kalshi_feed_recovery"]["targeted_snapshot_refresh_count"] == 0
     assert not any("get_snapshot" in payload for payload in fake.sent)
@@ -2318,10 +2374,15 @@ async def test_missing_peer_does_not_reset_initialized_kalshi_book(tmp_path, pee
         assert not shard.instrument_health["B"].initial_snapshot_received
         assert not shard.instrument_health["B"].book_integrity_valid
     assert manifest["capture_completeness"]["requested_instrument_count"] == 2
-    tape = pd.read_parquet(tmp_path / peer / manifest["dataset_artifacts"]["tape_event"]["path"])
+    tape = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_event"]["path"]
+    )
     peer_tape = tape[tape["venue_book_id"] == "B"]
     assert peer_tape.empty == (peer in {"silent", "deltas"})
     if peer == "late":
         assert peer_tape.iloc[0]["event_kind"] == "checkpoint"
-    controls = pd.read_parquet(tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"])
+    controls = pd.read_parquet(
+        tmp_path / peer / manifest["dataset_artifacts"]["tape_control"]["path"]
+    )
     assert "reconnect" not in set(controls["control_type"])
+    assert validate_run_manifest(tmp_path / peer / "manifest.json").ok

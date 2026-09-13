@@ -71,11 +71,16 @@ class _CaptureSessionBookkeeping:
             "local_sequence": self.sequence,
             "event_count": self.event_count,
             "feed_control_plane": self.feed_control_scheduler.manifest_metrics()
-            if self.feed_control_scheduler is not None else None,
+            if self.feed_control_scheduler is not None
+            else None,
         }
         # Persist before peer invalidation and before the next connection clears
         # last_error. This sidecar survives an interrupted or failed capture.
-        with (run_dir / "reconnect_diagnostics.jsonl").open("a", encoding="utf-8") as out:
+        # A failed write is a persistence failure: do not silently lose the
+        # recovery evidence and continue reporting a successful capture.
+        with (run_dir / "reconnect_diagnostics.jsonl").open(
+            "a", encoding="utf-8"
+        ) as out:
             out.write(json.dumps(record, sort_keys=True) + "\n")
             out.flush()
             os.fsync(out.fileno())

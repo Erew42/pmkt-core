@@ -522,7 +522,9 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
     level_count: int = 0
     topbook_count: int = 0
     depth_count: int = 0
-    complementary_recovery: ComplementaryDeltaRecovery = field(default_factory=ComplementaryDeltaRecovery)
+    complementary_recovery: ComplementaryDeltaRecovery = field(
+        default_factory=ComplementaryDeltaRecovery
+    )
     socket_recovery_count: int = 0
     sequence_gap_count: int = 0
     quality_counter: Counter[str] = field(default_factory=Counter)
@@ -1033,7 +1035,9 @@ async def stream_order_book_data(
     retry_budget = WebSocketRetryBudget(
         session.max_reconnects,
         on_reconnect=session.mark_reconnect,
-        on_retry=lambda event: session.record_reconnect_diagnostic(session.run_dir, event),
+        on_retry=lambda event: session.record_reconnect_diagnostic(
+            session.run_dir, event
+        ),
         deadline=deadline,
     )
 
@@ -1120,14 +1124,23 @@ async def stream_order_book_data(
                             )
                         # Only the identified intermediate lock may wait. Any
                         # other instrument/cause still requests recovery now.
-                        recovery_actions = [action for action in recovery_actions if not (
-                            set(action.reasons) == {"book_integrity"}
-                            and action.instruments
-                            and all(session.complementary_recovery.defer(
-                                asset, message_count=message_count,
-                                now_ns=session.monotonic_ns(),
-                            ) for asset in action.instruments)
-                        )]
+                        recovery_actions = [
+                            action
+                            for action in recovery_actions
+                            if not (
+                                action.action == "reconnect_socket"
+                                and set(action.reasons) == {"book_integrity"}
+                                and action.instruments
+                                and all(
+                                    session.complementary_recovery.defer(
+                                        asset,
+                                        message_count=message_count,
+                                        now_ns=session.monotonic_ns(),
+                                    )
+                                    for asset in action.instruments
+                                )
+                            )
+                        ]
                         if not recovery_actions:
                             return False
                         if session.reconnect_count >= session.max_reconnects:
@@ -1148,14 +1161,26 @@ async def stream_order_book_data(
                         retry_budget.last_error = None
                         retry_budget.retry_context = {
                             "origin": "supervisor",
-                            "reasons": sorted({reason for action in recovery_actions for reason in action.reasons}),
-                            "instruments": sorted({instrument for action in recovery_actions for instrument in action.instruments}),
+                            "reason": "recovery_action",
+                            "reasons": sorted(
+                                {
+                                    reason
+                                    for action in recovery_actions
+                                    for reason in action.reasons
+                                }
+                            ),
+                            "instruments": sorted(
+                                {
+                                    instrument
+                                    for action in recovery_actions
+                                    for instrument in action.instruments
+                                }
+                            ),
                             **ws.heartbeat_diagnostics(),
                         }
                         await retry_budget.run(
                             ws.reconnect, retry_first=True, immediate_first=True,
                         )
-                        session.complementary_recovery.clear()
                         session.socket_recovery_count += 1
                         connected_at = session.monotonic_ns()
                         for shard in session.health_shards:
@@ -1196,12 +1221,22 @@ async def stream_order_book_data(
                                 )
                             try:
                                 wait_started_ns = session.monotonic_ns()
+                                wait_timeout = session.message_wait_timeout(
+                                    remaining,
+                                    now_monotonic_ns=wait_started_ns,
+                                )
+                                recovery_deadline = (
+                                    session.complementary_recovery.next_deadline_ns
+                                )
+                                if recovery_deadline is not None:
+                                    wait_timeout = min(
+                                        wait_timeout,
+                                        max(0, recovery_deadline - wait_started_ns)
+                                        / 1_000_000_000,
+                                    )
                                 done, _ = await asyncio.wait(
                                     {next_message_task},
-                                    timeout=session.message_wait_timeout(
-                                        remaining,
-                                        now_monotonic_ns=wait_started_ns,
-                                    ),
+                                    timeout=wait_timeout,
                                 )
                                 if not done:
                                     raise asyncio.TimeoutError
@@ -1243,7 +1278,13 @@ async def stream_order_book_data(
                                     observed_at_utc=observed_at_utc,
                                     now_monotonic_ns=now_monotonic_ns,
                                 )
-                                if session.feed_control_scheduler is None:
+                                if (
+                                    session.feed_control_scheduler is None
+                                    or session.complementary_recovery.recovery_due(
+                                        message_count=message_count,
+                                        now_ns=session.monotonic_ns(),
+                                    )
+                                ):
                                     await maybe_recover_socket(now_monotonic_ns)
                                 continue
                             except StopAsyncIteration:
@@ -1253,6 +1294,14 @@ async def stream_order_book_data(
                                 break
 
                             message_count += 1
+                            # A late correction must not erase an expired failure.
+                            # Recovery replaces the socket, so discard this already
+                            # dequeued message from the previous connection too.
+                            if session.complementary_recovery.recovery_due(
+                                message_count=message_count,
+                                now_ns=session.monotonic_ns(),
+                            ) and await maybe_recover_socket(session.monotonic_ns()):
+                                continue
                             session.sequence += 1
                             received_at = time.time()
                             received_at_utc = (
@@ -1307,16 +1356,30 @@ async def stream_order_book_data(
                                 )
                                 if row.get("asset_id") in requested_assets
                             ]
-                            previously_intact = {asset for asset, state in session.states.items() if state.book_integrity_valid}
+                            previously_intact = (
+                                session.complementary_recovery.intact_changed_assets(
+                                    message,
+                                    session.states,
+                                )
+                            )
                             snapshots = apply_market_message(
                                 session.states,
                                 message,
                                 allowed_asset_ids=requested_assets,
                             )
-                            session.complementary_recovery.observe(
-                                message, session.states, previously_intact,
+                            revoked_delays = session.complementary_recovery.observe(
+                                message,
+                                session.states,
+                                previously_intact,
                                 message_count=message_count,
                             )
+                            # Eligibility for a recovery delay can change even
+                            # when the book's health flags remain identical.
+                            for asset in revoked_delays:
+                                shard = session.health_shard_for_instrument(asset)
+                                session.pending_health_shard_keys.add(
+                                    (shard.venue, shard.shard_id)
+                                )
                             if not snapshots:
                                 message_asset = str(message.get("asset_id") or "")
                                 message_shard = session.health_shard_for_instrument(

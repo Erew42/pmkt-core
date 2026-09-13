@@ -793,7 +793,9 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
                     "targeted_snapshot_response_count": self.targeted_snapshot_response_count,
                     "targeted_snapshot_response_success_count": self.targeted_snapshot_response_success_count,
                     "targeted_snapshot_response_timeout_count": self.targeted_snapshot_response_timeout_count,
-                    "pending_snapshot_request_count": len(self.pending_snapshot_requests),
+                    "pending_snapshot_request_count": len(
+                        self.pending_snapshot_requests
+                    ),
                 },
                 "subscription_plan": (
                     dict(self.subscription_plan_metadata)
@@ -1079,7 +1081,9 @@ async def stream_kalshi_order_book_data(
     retry_budget = WebSocketRetryBudget(
         session.max_reconnects,
         on_reconnect=session.mark_reconnect,
-        on_retry=lambda event: session.record_reconnect_diagnostic(session.run_dir, event),
+        on_retry=lambda event: session.record_reconnect_diagnostic(
+            session.run_dir, event
+        ),
         deadline=deadline,
     )
 
@@ -1217,15 +1221,25 @@ async def stream_kalshi_order_book_data(
                                             )
                                         if session.runtime_projection_recorder is not None:
                                             session.runtime_projection_recorder.record_recovery_actions(
-                                                actions=[FeedRecoveryAction(
-                                                    action="request_snapshot", venue="kalshi",
-                                                    shard_id=capture_shard_id,
-                                                    reasons=("book_integrity",),
-                                                    instruments=tuple(unique_tickers),
-                                                )],
+                                                actions=[
+                                                    FeedRecoveryAction(
+                                                        action="request_snapshot",
+                                                        venue="kalshi",
+                                                        shard_id=capture_shard_id,
+                                                        reasons=("book_integrity",),
+                                                        instruments=tuple(
+                                                            unique_tickers
+                                                        ),
+                                                    )
+                                                ],
                                                 observed_at_utc=_utc_now().isoformat(),
                                             )
-                                except (ConnectionClosed, OSError, RuntimeError, asyncio.TimeoutError) as exc:
+                                except (
+                                    ConnectionClosed,
+                                    OSError,
+                                    RuntimeError,
+                                    asyncio.TimeoutError,
+                                ) as exc:
                                     snapshot_request_error = exc
                                     session.targeted_snapshot_refresh_failure_count += 1
                                 else:
@@ -1256,9 +1270,26 @@ async def stream_kalshi_order_book_data(
                         retry_budget.last_error = snapshot_request_error
                         retry_budget.retry_context = {
                             "origin": "supervisor",
-                            "reason": "snapshot_request_failed" if snapshot_request_error is not None else "recovery_action",
-                            "reasons": ["snapshot_response_timeout"] if expired else sorted({reason for action in recovery_actions for reason in action.reasons}),
-                            "instruments": sorted(set(expired) | {instrument for action in recovery_actions for instrument in action.instruments}),
+                            "reason": "snapshot_request_failed"
+                            if snapshot_request_error is not None
+                            else "recovery_action",
+                            "reasons": ["snapshot_response_timeout"]
+                            if expired
+                            else sorted(
+                                {
+                                    reason
+                                    for action in recovery_actions
+                                    for reason in action.reasons
+                                }
+                            ),
+                            "instruments": sorted(
+                                set(expired)
+                                | {
+                                    instrument
+                                    for action in recovery_actions
+                                    for instrument in action.instruments
+                                }
+                            ),
                         }
                         await retry_budget.run(
                             ws.reconnect, retry_first=True, immediate_first=True,

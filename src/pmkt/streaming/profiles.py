@@ -622,10 +622,16 @@ def add_book_integrity(
     row: dict[str, Any], *, integrity: bool, selection: StorageProfileSelection | None,
 ) -> dict[str, Any]:
     if selection is not None and selection.definition.profile_version == "3":
-        return {**row, "schema_version": INTEGRITY_SCHEMA_VERSIONS[str(row["schema_version"])],
-                "book_integrity_valid": integrity and not bool(
-                    UNRESOLVED_BOOK_FAILURE_FLAGS.intersection(row.get("quality_flags") or ())
-                )}
+        return {
+            **row,
+            "schema_version": INTEGRITY_SCHEMA_VERSIONS[str(row["schema_version"])],
+            "book_integrity_valid": integrity
+            and not bool(
+                UNRESOLVED_BOOK_FAILURE_FLAGS.intersection(
+                    row.get("quality_flags") or ()
+                )
+            ),
+        }
     return row
 
 

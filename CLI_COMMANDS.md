@@ -73,12 +73,28 @@ inside each run directory and in the optional manifest `reconnect_diagnostics`
 list. Each replacement attempt records its origin and cause before book-state
 invalidation. Polymarket includes heartbeat activity and bounded receive-queue
 metrics; both venues include control-plane lag. No new CLI option is needed.
+Failure to persist this sidecar stops the capture as a persistence failure.
+These are replacement-attempt records; an exhausted-budget terminal error need
+not have a corresponding replacement record.
+
+Polymarket has separate transport and application receive buffers with the same
+configured capacity. The manifest's `websocket_transport.effective` describes
+transport limits, not the total connection memory budget. When the application
+queue is full, later heartbeat frames also wait for downstream processing.
 
 Polymarket manifests also record `complementary_delta_recovery`: bounded
 deferrals for an initialized book that becomes locked during a price update
 whose advertised top remains unlocked. The invalid row remains invalid; a
-follow-up has at most 250 ms from the first recovery decision or 16 messages
-before recovery is reconsidered. Missing initialization never enters this path.
+follow-up has at most 250 ms from the first recovery decision or 16 messages.
+Bounds are checked before applying a later message and also cap idle waits.
+A changed hash/timestamp that leaves the book invalid withdraws the delay even
+without a change in health flags. Synchronous work can delay when these checks
+run. `resolved` counts restoration by an actual update or authoritative snapshot.
+Missing initialization never enters this path.
+
+Both v2 and v3 tape profiles omit pre-snapshot deltas until a first baseline
+exists, as strict commit validation requires a checkpoint. Raw/parsed roles
+retain those observations when enabled; no initialization is inferred from them.
 
 Version-3 Parquet captures batch routine checkpoint publication using the
 existing durability coalescing window (one second by default). Pending rows

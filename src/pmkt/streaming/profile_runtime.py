@@ -137,9 +137,13 @@ def create_profile_runtime(
         commit_interval_seconds=durability_settings.effective_segment_seconds,
         durability_settings=durability_settings,
     )
-    if (selection.definition.profile_version == "3"
-            and storage_settings.backend is CaptureStorageBackend.PARQUET_SEGMENTS):
-        coordinator.checkpoint_coalesce_seconds = durability_settings.barrier_coalesce_seconds
+    if (
+        selection.definition.profile_version == "3"
+        and storage_settings.backend is CaptureStorageBackend.PARQUET_SEGMENTS
+    ):
+        coordinator.checkpoint_coalesce_seconds = (
+            durability_settings.barrier_coalesce_seconds
+        )
     sinks = {
         spec.file_key: CoordinatorSink(coordinator, role)
         for role, spec in specs_by_role.items()

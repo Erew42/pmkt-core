@@ -41,17 +41,17 @@ class TapeCaptureEmission:
             coordinator.add("tape_event", batch.event)
         for control in self.controls:
             coordinator.add("tape_control", control)
-        request_checkpoint = getattr(coordinator, "request_checkpoint_commit", None)
-        if self.barrier_cause in {
+        if self.barrier_cause is None:
+            if coordinator.barrier_due():
+                coordinator.commit()
+        elif self.barrier_cause in {
             CaptureCommitCause.CHECKPOINT_STARTUP,
             CaptureCommitCause.CHECKPOINT_RESYNC,
             CaptureCommitCause.CHECKPOINT_PERIODIC,
-        } and request_checkpoint is not None:
-            request_checkpoint(self.barrier_cause)
-        elif self.barrier_cause is not None:
+        }:
+            coordinator.request_checkpoint_commit(self.barrier_cause)
+        else:
             coordinator.commit(cause=self.barrier_cause, force=True)
-        elif coordinator.barrier_due():
-            coordinator.commit()
 
 
 class _EpochTracker:
@@ -315,8 +315,12 @@ class PolymarketTapeProducer:
                 continue
             if event_type != "price_change":
                 continue
-            # Skip first-baseline deltas; keep post-reconnect audit when an epoch already exists.
-            if not state.initial_snapshot_received and book_id not in self._epochs.generations:
+            # Both tape versions require a baseline for commit validation.
+            # Raw/parsed observations retain pre-snapshot delta evidence.
+            if (
+                not state.initial_snapshot_received
+                and book_id not in self._epochs.generations
+            ):
                 continue
             open_epoch = self._epochs.open_epochs.get(book_id)
             invalid_reason = _polymarket_invalidation_reason(state, integrity_evidence=self.integrity_evidence)
@@ -751,7 +755,10 @@ class KalshiTapeProducer:
             )
         if event_type != "orderbook_delta":
             return TapeCaptureEmission()
-        if not state.initial_snapshot_received and book_id not in self._epochs.generations:
+        if (
+            not state.initial_snapshot_received
+            and book_id not in self._epochs.generations
+        ):
             return TapeCaptureEmission()
         controls: list[Mapping[str, Any]] = []
         open_epoch = self._epochs.open_epochs.get(book_id)
