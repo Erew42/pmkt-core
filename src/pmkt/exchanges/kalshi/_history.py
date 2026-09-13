@@ -623,6 +623,8 @@ def _parse_routing_timestamp(value: object, label: str) -> datetime:
     match = _EXPLICIT_OFFSET_RE.fullmatch(text)
     if match is None:
         raise InvalidDataError(f"Kalshi {label} must have an explicit UTC offset")
+    # Truncation could turn a strict before-cutoff comparison into equality and
+    # route to the wrong dataset. Reject precision datetime cannot preserve.
     fraction = match.group("fraction")
     if fraction is not None and len(fraction) - 1 > 6:
         raise InvalidDataError(

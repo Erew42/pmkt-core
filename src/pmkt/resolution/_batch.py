@@ -73,6 +73,8 @@ async def resolve_ordered_batch(
         await cancel_and_drain(workers)
         raise
 
+    # The deadline covers delivery of the whole list, even if workers finished.
+    # Failure returns no partial list; it does not roll back worker cache writes.
     expiry.checkpoint()
     if any(result is _MISSING for result in results):
         raise RuntimeError("resolution batch completed with a missing result")

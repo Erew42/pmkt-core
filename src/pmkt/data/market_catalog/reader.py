@@ -522,6 +522,8 @@ def load_history_manifest(
                 f"history artifact {artifact_name} has invalid format: "
                 f"{recorded_format!r}"
             )
+        # Only a missing key is legacy; an explicit null is an invalid declaration.
+        # Infer from the known artifact role without rewriting hashed evidence.
         declared_schema = descriptor.get("schema")
         if "schema" not in descriptor:
             legacy_artifacts.append(artifact_name)
@@ -558,6 +560,7 @@ def load_history_manifest(
             ) from exc
         try:
             actual_rows = 0
+            # Both modes require canonical columns; only full mode validates values.
             expected_names = list(get_table_spec(expected_schema).columns)
             for parquet_path in files:
                 parquet = pq.ParquetFile(parquet_path)

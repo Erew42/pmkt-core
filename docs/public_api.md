@@ -85,12 +85,9 @@ close lifetime on one owned worker thread. Unsupported saved view-contract
 versions raise instead of being reinterpreted. Fixed catalog and parameter
 inputs also do not make unordered, random, or time-dependent SQL deterministic.
 
-The qualified dependency floor is DuckDB 1.5.5 with PyArrow 14.0.0. The
-catalog compatibility workflow exercises DuckDB 1.5.5 on Windows and Linux with
-Python 3.10 through 3.12, using both PyArrow 14.0.0 with NumPy 1.26.4 and
-PyArrow 25.0.1 with NumPy 2.2.6. It runs in CI for catalog and history changes;
-whether passing checks are required to merge is a separate repository-rules
-setting, not an API guarantee.
+Qualified catalog environments use DuckDB 1.5.5 on Windows and Linux with
+Python 3.10 through 3.12, and either PyArrow 14.0.0 with NumPy 1.26.4 or
+PyArrow 25.0.1 with NumPy 2.2.6.
 
 New publishers declare each artifact's canonical `schema`. Older descriptors
 with no `schema` key are accepted using the expected schema for that artifact
@@ -152,12 +149,9 @@ with CatalogSnapshot.open_latest_history(
 `discover-new --all` advances all discovery streams. The first current census
 must use `refresh-current --scope all` before promotion. Promotion advances an
 initialized history catalog; it does not bootstrap the first history release.
-The offline synthetic fixture and query above are bounded executable
-verification. The sequence runs from the same declared publisher `path_base`:
-discovery and refresh access live public APIs, `refresh-current --scope all`
-performs the full live census, and promotion is local. The CLI options were
-checked, but the live acquisition sequence was not run as part of the offline
-catalog qualification.
+Run the sequence from the declared publisher `path_base`. Discovery and refresh
+access live public APIs; promotion operates on local evidence. The synthetic
+fixture is an offline example and does not exercise live acquisition.
 
 ## Shared references and request runtime
 
@@ -710,8 +704,7 @@ separate `pmkt.catalog` facade.
 `MarketCatalogService` remains the mutable maintenance service and the CLI
 `query` command exposes an unmanaged DuckDB connection. Use `pmkt.catalog` for
 the pinned reader and bounded managed query result. WebSocket and capture
-helpers retain their existing recovery and evidence behavior until the
-separate capture qualification milestone.
+helpers retain their existing recovery and evidence behavior.
 
 ## Optional dependencies
 
