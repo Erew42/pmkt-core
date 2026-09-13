@@ -300,6 +300,15 @@ def _hash_tree(files: tuple[Path, ...], relative_files: tuple[str, ...]) -> str:
     return digest.hexdigest()
 
 
+def _validate_canonical_columns(
+    names: list[str], expected_names: list[str], *, artifact_name: str, path: Path
+) -> None:
+    if len(names) != len(set(names)) or set(names) != set(expected_names):
+        raise CatalogError(
+            f"history artifact {artifact_name} has incompatible columns: {path}"
+        )
+
+
 def _validate_canonical_batches(
     files: tuple[Path, ...], schema_version: str, *, artifact_name: str
 ) -> None:
@@ -316,12 +325,9 @@ def _validate_canonical_batches(
             raise CatalogError(
                 f"history artifact {artifact_name} has unreadable Parquet: {path}"
             ) from exc
-        if len(schema.names) != len(set(schema.names)) or set(schema.names) != set(
-            expected_names
-        ):
-            raise CatalogError(
-                f"history artifact {artifact_name} has incompatible columns: {path}"
-            )
+        _validate_canonical_columns(
+            schema.names, expected_names, artifact_name=artifact_name, path=path
+        )
         try:
             for batch in parquet.iter_batches(batch_size=65_536):
                 report = validate_frame(batch.to_pandas(), spec, strict=False)
@@ -477,6 +483,8 @@ def load_history_manifest(
     if not isinstance(manifest_artifacts, dict):
         raise CatalogError("history manifest has no artifacts")
     resolved_artifacts: list[ResolvedCatalogArtifact] = []
+    legacy_artifacts: list[str] = []
+    legacy_file_counts: list[str] = []
     total_rows = 0
     for artifact_name, (venue, expected_schema) in _ARTIFACTS.items():
         descriptor = manifest_artifacts.get(artifact_name)
@@ -504,21 +512,34 @@ def load_history_manifest(
         )
         recorded_format = descriptor.get("format")
         actual_format = "parquet" if path.is_file() else "partitioned_parquet"
-        if recorded_format != actual_format:
+        legacy_single_file = (
+            "schema" not in descriptor
+            and recorded_format == "parquet_file"
+            and path.is_file()
+        )
+        if recorded_format != actual_format and not legacy_single_file:
             raise CatalogError(
                 f"history artifact {artifact_name} has invalid format: "
                 f"{recorded_format!r}"
             )
         declared_schema = descriptor.get("schema")
-        if declared_schema != expected_schema:
+        if "schema" not in descriptor:
+            legacy_artifacts.append(artifact_name)
+        elif declared_schema != expected_schema:
             raise CatalogError(
                 f"history artifact {artifact_name} has unsupported schema: "
                 f"{descriptor.get('schema')!r}"
             )
         expected_rows = _count_field(descriptor, "rows", artifact_name=artifact_name)
-        expected_files = _count_field(
-            descriptor, "parquet_file_count", artifact_name=artifact_name
-        )
+        if legacy_single_file and "parquet_file_count" not in descriptor:
+            # The old single-file descriptor has an unambiguous count. Never
+            # infer the count of an undeclared partitioned dataset.
+            expected_files = 1
+            legacy_file_counts.append(artifact_name)
+        else:
+            expected_files = _count_field(
+                descriptor, "parquet_file_count", artifact_name=artifact_name
+            )
         expected_size = _count_field(
             descriptor, "size_bytes", artifact_name=artifact_name
         )
@@ -536,9 +557,19 @@ def load_history_manifest(
                 "catalog reading requires the 'data' extra: pip install 'pmkt[data]'"
             ) from exc
         try:
-            actual_rows = sum(
-                int(pq.ParquetFile(path).metadata.num_rows) for path in files
-            )
+            actual_rows = 0
+            expected_names = list(get_table_spec(expected_schema).columns)
+            for parquet_path in files:
+                parquet = pq.ParquetFile(parquet_path)
+                _validate_canonical_columns(
+                    parquet.schema_arrow.names,
+                    expected_names,
+                    artifact_name=artifact_name,
+                    path=parquet_path,
+                )
+                actual_rows += int(parquet.metadata.num_rows)
+        except CatalogError:
+            raise
         except (OSError, ValueError) as exc:
             raise CatalogError(
                 f"history artifact {artifact_name} has unreadable Parquet metadata"
@@ -611,9 +642,19 @@ def load_history_manifest(
         "artifact_file_count",
         "artifact_size",
         "artifact_row_count",
-        "artifact_schema_declarations",
+        "artifact_column_names",
     ]
     skipped: list[str] = []
+    if legacy_artifacts:
+        performed.append("artifact_schema_declarations_present")
+        for artifact_name in legacy_artifacts:
+            performed.append(f"legacy_schema_inferred_from_columns:{artifact_name}")
+            skipped.append(f"artifact_schema_declaration:{artifact_name}")
+    else:
+        performed.append("artifact_schema_declarations")
+    for artifact_name in legacy_file_counts:
+        performed.append(f"legacy_single_file_count_inferred:{artifact_name}")
+        skipped.append(f"artifact_file_count_declaration:{artifact_name}")
     if validation == "full":
         performed.extend(
             [

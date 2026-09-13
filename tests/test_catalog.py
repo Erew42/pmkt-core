@@ -1103,3 +1103,179 @@ def test_managed_query_rejects_unqualified_duckdb_runtime(
 
     with pytest.raises(OptionalDependencyError, match="duckdb>=1.5.5"):
         catalog.query("SELECT 1")
+
+
+@pytest.mark.parametrize("validation", ["full", "metadata"])
+def test_legacy_schemaless_catalog_is_validated_and_reopens(tmp_path, validation):
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    for descriptor in manifest["artifacts"].values():
+        del descriptor["schema"]
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    original = manifest_path.read_bytes()
+    with CatalogSnapshot.open_latest_history(
+        market_root, path_base=path_base, validation=validation
+    ) as catalog:
+        assert catalog.validation.row_count == 2
+        assert "artifact_column_names" in catalog.validation.performed_checks
+        for name in manifest["artifacts"]:
+            assert (
+                f"legacy_schema_inferred_from_columns:{name}"
+                in catalog.validation.performed_checks
+            )
+            assert (
+                f"artifact_schema_declaration:{name}"
+                in catalog.validation.skipped_checks
+            )
+        reference = catalog.reference
+        assert (
+            catalog.query("SELECT count(*) AS n FROM market_catalog")
+            .to_pandas()
+            .iloc[0]["n"]
+            == 2
+        )
+    with CatalogSnapshot.open(reference, validation=validation) as reopened:
+        assert reopened.reference == reference
+    assert (
+        manifest_path.read_bytes() == original
+    )  # inference never rewrites hashed evidence
+
+
+@pytest.mark.parametrize("validation", ["full", "metadata"])
+@pytest.mark.parametrize("schema", [None, "", "unknown.schema.v1"])
+def test_catalog_present_invalid_schema_is_not_legacy(tmp_path, validation, schema):
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["artifacts"]["polymarket_all_markets"]["schema"] = schema
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with pytest.raises(CatalogError, match="unsupported schema"):
+        CatalogSnapshot.open_latest_history(
+            market_root, path_base=path_base, validation=validation
+        )
+
+
+@pytest.mark.parametrize("validation", ["full", "metadata"])
+@pytest.mark.parametrize("mutation", ["missing", "extra", "duplicate"])
+def test_legacy_schema_requires_exact_columns(tmp_path, validation, mutation):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    name = "polymarket_all_markets"
+    path = path_base / manifest["artifacts"][name]["path"]
+    table = pq.read_table(path)
+    if mutation == "missing":
+        table = table.drop([table.column_names[-1]])
+    elif mutation == "extra":
+        table = table.append_column("undeclared", pa.array([1]))
+    else:
+        table = table.rename_columns([table.column_names[0], *table.column_names[:-1]])
+    pq.write_table(table, path)
+    descriptor = _artifact(
+        path,
+        repository_root=path_base,
+        rows=1,
+        schema=POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
+    )
+    descriptor.pop("schema", None)
+    manifest["artifacts"][name] = descriptor
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with pytest.raises(CatalogError, match="incompatible columns"):
+        CatalogSnapshot.open_latest_history(
+            market_root, path_base=path_base, validation=validation
+        )
+
+
+def test_legacy_schema_keeps_full_value_validation_and_metadata_limits(tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    name = "polymarket_all_markets"
+    path = path_base / manifest["artifacts"][name]["path"]
+    table = pq.read_table(path)
+    column = table.column_names.index("market_id")
+    table = table.set_column(column, "market_id", pa.array([None], type=pa.string()))
+    pq.write_table(table, path)
+    descriptor = _artifact(
+        path,
+        repository_root=path_base,
+        rows=1,
+        schema=POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
+    )
+    descriptor.pop("schema", None)
+    manifest["artifacts"][name] = descriptor
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with CatalogSnapshot.open_latest_history(
+        market_root, path_base=path_base, validation="metadata"
+    ) as catalog:
+        assert "artifact_canonical_schemas" in catalog.validation.skipped_checks
+    with pytest.raises(CatalogError, match="violates canonical schema"):
+        CatalogSnapshot.open_latest_history(market_root, path_base=path_base)
+
+
+def test_catalog_pandas_conversion_reports_optional_dependency(tmp_path, monkeypatch):
+    from pmkt.errors import OptionalDependencyError
+
+    path_base, market_root, _ = _catalog_fixture(tmp_path)
+    with CatalogSnapshot.open_latest_history(
+        market_root, path_base=path_base
+    ) as catalog:
+        result = catalog.query("SELECT 1 AS n")
+    original_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if name == "pandas" or name.startswith("pandas."):
+            raise ModuleNotFoundError("pandas unavailable")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    with pytest.raises(OptionalDependencyError, match="data.*extra"):
+        result.to_pandas()
+    assert result.to_arrow().num_rows == 1
+
+
+@pytest.mark.parametrize("validation", ["full", "metadata"])
+def test_legacy_single_file_descriptor_without_count(tmp_path, validation):
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    descriptor = manifest["artifacts"]["polymarket_all_markets"]
+    del descriptor["schema"]
+    del descriptor["parquet_file_count"]
+    descriptor["format"] = "parquet_file"
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with CatalogSnapshot.open_latest_history(
+        market_root, path_base=path_base, validation=validation
+    ) as catalog:
+        assert catalog.validation.parquet_file_count == 2
+        assert (
+            "legacy_single_file_count_inferred:polymarket_all_markets"
+            in catalog.validation.performed_checks
+        )
+        assert (
+            "artifact_file_count_declaration:polymarket_all_markets"
+            in catalog.validation.skipped_checks
+        )
+    descriptor["parquet_file_count"] = 2
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with pytest.raises(CatalogError, match="file count is invalid"):
+        CatalogSnapshot.open_latest_history(
+            market_root, path_base=path_base, validation=validation
+        )
+
+
+@pytest.mark.parametrize("format", ["parquet", "partitioned_parquet", "unknown"])
+def test_missing_file_count_is_not_inferred_for_other_formats(tmp_path, format):
+    path_base, market_root, manifest_path = _catalog_fixture(tmp_path)
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    descriptor = manifest["artifacts"]["polymarket_all_markets"]
+    del descriptor["schema"]
+    del descriptor["parquet_file_count"]
+    descriptor["format"] = format
+    _rewrite_manifest_and_pointer(market_root, manifest_path, manifest)
+    with pytest.raises(CatalogError):
+        CatalogSnapshot.open_latest_history(
+            market_root, path_base=path_base, validation="metadata"
+        )

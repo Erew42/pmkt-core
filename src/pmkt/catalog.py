@@ -27,6 +27,7 @@ from pmkt.data.market_catalog.views import CATALOG_VIEW_CONTRACT_VERSION
 from pmkt.errors import OptionalDependencyError, ResultLimitExceededError
 
 if TYPE_CHECKING:
+    import pandas as pd
     import pyarrow as pa
 
 
@@ -279,7 +280,14 @@ class CatalogQueryResult:
     def to_arrow(self) -> pa.Table:
         return self._table
 
-    def to_pandas(self) -> Any:
+    def to_pandas(self) -> pd.DataFrame:
+        try:
+            import pandas  # noqa: F401
+        except ImportError as exc:
+            raise OptionalDependencyError(
+                "catalog pandas conversion requires the 'data' extra: "
+                "pip install 'pmkt[data]'"
+            ) from exc
         return self._table.to_pandas()
 
 
