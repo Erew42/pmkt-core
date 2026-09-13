@@ -405,3 +405,19 @@ async def test_batch_prices_history_accepts_live_history_lists() -> None:
     assert set(history) == {"token-1", "token-2"}
     assert history["token-1"].history[0].p == 0.0
     assert history["token-2"].history[0].t == 1234567891
+
+
+@pytest.mark.parametrize(
+    "requested,returned", [("0xABCDEF", "0xabcdef"), ("0xabcdef", "0xABCDEF")]
+)
+async def test_get_book_condition_identity_is_case_insensitive(requested, returned):
+    instrument = PolymarketInstrumentRef(
+        "token", market=PolymarketMarketRef("gamma-id", condition_id=requested)
+    )
+    payload = {"asset_id": "token", "market": returned, "bids": [], "asks": []}
+    async with AsyncClobClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    ) as client:
+        book = await client.get_book(instrument)
+    assert book.instrument == instrument
+    assert f"condition_id={returned}" in book.observation.response_identities

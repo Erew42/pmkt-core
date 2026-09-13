@@ -642,3 +642,20 @@ async def test_price_history_lazy_table_conversions_and_empty_utc_schema() -> No
     assert empty_arrow.schema.field("timestamp_utc").type.tz == "UTC"
     assert str(empty_frame["timestamp_utc"].dtype) == "datetime64[ns, UTC]"
     assert str(empty_frame["price"].dtype) == "float64"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested,returned", [("0xABCDEF", "0xabcdef"), ("0xabcdef", "0xABCDEF")]
+)
+async def test_price_history_condition_identity_is_case_insensitive(
+    requested, returned
+):
+    instrument = PolymarketInstrumentRef(
+        "token", market=PolymarketMarketRef("gamma-id", condition_id=requested)
+    )
+    result = await _history(
+        {"history": [], "condition_id": returned}, instrument=instrument
+    )
+    assert result.instrument == instrument
+    assert f"condition_id={returned}" in result.observation.response_identities

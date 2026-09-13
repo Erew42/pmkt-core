@@ -223,7 +223,7 @@ def clob_book_identities(
     if (
         condition_id is not None
         and expected_condition is not None
-        and condition_id != expected_condition
+        and condition_id.casefold() != expected_condition.casefold()
     ):
         raise InvalidDataError(
             f"CLOB book condition mismatch: expected {expected_condition!r}, "
@@ -273,7 +273,7 @@ def clob_history_identities(
     if (
         condition_id is not None
         and expected_condition is not None
-        and condition_id != expected_condition
+        and condition_id.casefold() != expected_condition.casefold()
     ):
         raise InvalidDataError(
             f"CLOB history condition mismatch: expected {expected_condition!r}, "

@@ -242,7 +242,7 @@ class AsyncGammaClient:
         started = datetime.now(timezone.utc)
         requested_filters = _reported_filters(selected_filters)
         requested_ids = _deduplicate(selected_filters.condition_ids or ())
-        requested_id_set = frozenset(requested_ids)
+        requested_id_set = frozenset(value.casefold() for value in requested_ids)
         selection_strategy = (
             "targeted_condition_ids" if selected_filters.condition_ids is not None else "keyset_scan"
         )
@@ -731,7 +731,7 @@ def _market_matches(
         if market.ref.condition_id is None:
             _increment(unknown_counts, "condition_ids")
             matches = False
-        elif market.ref.condition_id not in requested_condition_ids:
+        elif market.ref.condition_id.casefold() not in requested_condition_ids:
             matches = False
     if filters.closed is not None:
         if market.closed is None:

@@ -690,3 +690,24 @@ async def test_contradictory_identity_and_token_aliases_fail_or_degrade() -> Non
         market = await client.get_market(market_id="1")
     assert market.mapping_status == "inconsistent"
     assert market.instruments == ()
+
+
+@pytest.mark.parametrize(
+    "requested,returned", [("0xABCDEF", "0xabcdef"), ("0xabcdef", "0xABCDEF")]
+)
+async def test_discovery_condition_ids_match_without_case_changes_to_evidence(
+    requested, returned
+):
+    def handler(request):
+        assert request.url.params.get_list("condition_ids") == [requested]
+        return httpx.Response(
+            200, json={"markets": [market_row(condition_id=returned)]}
+        )
+
+    async with AsyncGammaClient(transport=httpx.MockTransport(handler)) as client:
+        result = await client.discover_markets(
+            filters=PolymarketFilter(condition_ids=(requested,), closed=False)
+        )
+    assert len(result.items) == 1
+    assert result.items[0].ref.condition_id == returned
+    assert f"condition_id={returned}" in result.items[0].observation.response_identities
