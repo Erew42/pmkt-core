@@ -2253,7 +2253,8 @@ async def test_missing_peer_does_not_reset_initialized_polymarket_book(
         ["A", "B"],
         output_root=tmp_path,
         run_name=peer,
-        duration_s=1,
+        # Message count defines this scenario; wall time is only a test backstop.
+        duration_s=30,
         max_messages=sum(isinstance(m, str) for m in messages),
         capture_intent="smoke",
         heartbeat_interval=None,
@@ -2264,6 +2265,7 @@ async def test_missing_peer_does_not_reset_initialized_polymarket_book(
         storage_profile=select_storage_profile("full", profile_version=version),
     )
     assert manifest["socket_recovery_count"] == manifest["reconnect_count"] == 0
+    assert manifest["capture_completeness"]["terminal_reason"] == "max_messages_reached"
     shard = supervisor.shard("polymarket", "shared")
     assert shard.instrument_health["A"].book_integrity_valid
     assert "reconnect" not in shard.instrument_health["A"].quality_flags
