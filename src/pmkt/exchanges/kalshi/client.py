@@ -5,16 +5,26 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import math
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Iterable, Literal, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Callable,
+    Iterable,
+    Literal,
+    Sequence,
+)
 from urllib.parse import quote, urlparse
 from uuid import uuid4
 
 import httpx
+from pmkt.exchanges._requests import VenueRequests
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient, RequestPolicy
-from pmkt._operation import OperationExpiry
-from pmkt.config import PmktConfig, get_config
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient
+from pmkt.runtime import OperationExpiry
+from pmkt.config import PmktConfig
 from pmkt.data.canonical import KALSHI_MARKET_SNAPSHOT_COLUMNS
 from pmkt.data.normalize_kalshi import (
     kalshi_market_matches_query_status,
@@ -76,7 +86,15 @@ if TYPE_CHECKING:
 KALSHI_DISCOVERY_TICKER_CHUNK_SIZE = 20
 _MARKETS_ENDPOINT = "/markets"
 _MARKETS_PARAMETER_ALLOWLIST = frozenset(
-    {"limit", "cursor", "status", "event_ticker", "series_ticker", "tickers", "mve_filter"}
+    {
+        "limit",
+        "cursor",
+        "status",
+        "event_ticker",
+        "series_ticker",
+        "tickers",
+        "mve_filter",
+    }
 )
 _CANDLE_PARAMETER_ALLOWLIST = frozenset(
     {"start_ts", "end_ts", "period_interval", "include_latest_before_start"}
@@ -116,7 +134,11 @@ def _signed_path(base_url: str, endpoint_path: str) -> str:
 def kalshi_markets_dataframe(markets: list[dict[str, Any]]) -> pd.DataFrame:
     import pandas as pd
 
-    rows = [normalize_kalshi_market(market) for market in markets if isinstance(market, dict)]
+    rows = [
+        normalize_kalshi_market(market)
+        for market in markets
+        if isinstance(market, dict)
+    ]
     df = pd.DataFrame(rows, columns=KALSHI_MARKET_SNAPSHOT_COLUMNS)
     if not df.empty and "market_key" in df.columns:
         df = df.sort_values("market_key").reset_index(drop=True)
@@ -152,7 +174,9 @@ def normalize_kalshi_event(event: dict[str, Any]) -> dict[str, Any]:
 def kalshi_events_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
     import pandas as pd
 
-    rows = [normalize_kalshi_event(event) for event in events if isinstance(event, dict)]
+    rows = [
+        normalize_kalshi_event(event) for event in events if isinstance(event, dict)
+    ]
     df = pd.DataFrame(rows)
     if not df.empty and "event_ticker" in df.columns:
         df = df.sort_values("event_ticker").reset_index(drop=True)
@@ -167,7 +191,7 @@ class KalshiHttpClient(HttpClient):
         auth: ReadAuthHeaderProvider | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         timeout_s: float = 10.0,
-        max_retries: int = 3,
+        max_attempts: int = 3,
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
     ) -> None:
@@ -175,11 +199,9 @@ class KalshiHttpClient(HttpClient):
             base_url=base_url,
             transport=transport,
             timeout_s=timeout_s,
-            max_retries=max_retries,
+            max_attempts=max_attempts,
             limiter=limiter,
             request_policy=request_policy,
-            source_venue="kalshi",
-            source_service="kalshi",
         )
         self.header_provider = auth
 
@@ -251,7 +273,7 @@ class AsyncKalshiClient:
             if base_url is not None
             else config.resolved_kalshi_api_url
             if config is not None
-            else get_config().resolved_kalshi_api_url
+            else PmktConfig().resolved_kalshi_api_url
         )
         self.header_provider = auth
         self.transport = transport
@@ -265,6 +287,7 @@ class AsyncKalshiClient:
             request_policy=request_policy,
             timeout_s=timeout_s,
         )
+        self._requests = VenueRequests(self._http, venue="kalshi", service="kalshi")
 
     async def close(self) -> None:
         await self._http.close()
@@ -282,25 +305,27 @@ class AsyncKalshiClient:
     async def get_market(
         self,
         *,
-        ticker: str,
+        market: KalshiMarketRef,
         source: Literal["live", "historical"] = "live",
         deadline_s: float = 30.0,
     ) -> KalshiMarket:
         """Fetch one normalized market from exactly the selected Kalshi dataset."""
 
-        _require_nonempty_string(ticker, "ticker")
+        if not isinstance(market, KalshiMarketRef):
+            raise TypeError("market must be a KalshiMarketRef")
+        ticker = market.ticker
         if source not in ("live", "historical"):
             raise ValueError("source must be 'live' or 'historical'")
         expiry = OperationExpiry.bounded(deadline_s)
         observations: list[RequestObservation] = []
-        market = await self._get_market_with_expiry(
+        result = await self._get_market_with_expiry(
             ticker=ticker,
             source=source,
             expiry=expiry,
             observations=observations,
         )
         expiry.checkpoint()
-        return market
+        return result
 
     async def _get_market_with_expiry(
         self,
@@ -323,12 +348,11 @@ class AsyncKalshiClient:
             template = "/historical/markets/{ticker}"
             lookup_scope = "Kalshi historical market detail"
         try:
-            payload, observation = await self._http.request_json_observed(
+            payload, observation = await self._requests.request_json_observed(
                 "GET",
                 path,
                 request_id=f"kalshi-detail-{uuid4().hex}",
                 endpoint_template=template,
-                parameter_allowlist=(),
                 effective_parameters=None,
                 params=None,
                 expiry=expiry,
@@ -387,7 +411,7 @@ class AsyncKalshiClient:
                     unique_markets_seen=0,
                     duplicates_seen=0,
                     unknown_counts={},
-                    data_scope=self._http.source.data_scope,
+                    data_scope=self._requests.source.data_scope,
                     observations=(),
                     issues=(),
                     selection_strategy=selection_strategy,
@@ -443,12 +467,11 @@ class AsyncKalshiClient:
             effective_parameters = {
                 key: value for key, value in params.items() if value is not None
             }
-            payload, observation = await self._http.request_json_observed(
+            payload, observation = await self._requests.request_json_observed(
                 "GET",
                 _MARKETS_ENDPOINT,
                 request_id=f"kalshi-discovery-{operation_id}-{pages_fetched + 1}",
                 endpoint_template=_MARKETS_ENDPOINT,
-                parameter_allowlist=_MARKETS_PARAMETER_ALLOWLIST,
                 effective_parameters=effective_parameters,
                 params=params,
                 expiry=expiry,
@@ -511,7 +534,9 @@ class AsyncKalshiClient:
             unique_markets_seen=len(seen_tickers),
             duplicates_seen=duplicates_seen,
             unknown_counts=unknown_counts,
-            data_scope=_combined_data_scope(observations, self._http.source.data_scope),
+            data_scope=_combined_data_scope(
+                observations, self._requests.source.data_scope
+            ),
             observations=tuple(observations),
             issues=_aggregate_issues(issues),
             selection_strategy=selection_strategy,
@@ -562,12 +587,11 @@ class AsyncKalshiClient:
         expiry.checkpoint()
         encoded_ticker = quote(instrument.market.ticker, safe="")
         try:
-            payload, _ = await self._http.request_json_observed(
+            payload, _ = await self._requests.request_json_observed(
                 "GET",
                 f"/markets/{encoded_ticker}/orderbook",
                 request_id=f"kalshi-book-{uuid4().hex}",
                 endpoint_template="/markets/{ticker}/orderbook",
-                parameter_allowlist=(),
                 effective_parameters=None,
                 params=None,
                 expiry=expiry,
@@ -743,16 +767,18 @@ class AsyncKalshiClient:
                     observations=observations,
                 )
                 routing_market = live_market
-            alternate_payloads, alternate_windows, alternate_missing = (
-                await self._fetch_candle_dataset(
-                    market=market,
-                    dataset=alternate,
-                    series_ticker=live_series if alternate == "live" else None,
-                    query_windows=windows,
-                    period_minutes=period_minutes,
-                    expiry=expiry,
-                    observations=observations,
-                )
+            (
+                alternate_payloads,
+                alternate_windows,
+                alternate_missing,
+            ) = await self._fetch_candle_dataset(
+                market=market,
+                dataset=alternate,
+                series_ticker=live_series if alternate == "live" else None,
+                query_windows=windows,
+                period_minutes=period_minutes,
+                expiry=expiry,
+                observations=observations,
             )
             queried_windows.extend(alternate_windows)
             if alternate_missing:
@@ -818,12 +844,11 @@ class AsyncKalshiClient:
                 "Kalshi live candle routing requires verified event or series evidence"
             )
         encoded_event = quote(event_ticker, safe="")
-        payload, _ = await self._http.request_json_observed(
+        payload, _ = await self._requests.request_json_observed(
             "GET",
             f"/events/{encoded_event}",
             request_id=f"kalshi-candle-event-{uuid4().hex}",
             endpoint_template="/events/{event_ticker}",
-            parameter_allowlist=(),
             effective_parameters=None,
             params=None,
             expiry=expiry,
@@ -871,7 +896,9 @@ class AsyncKalshiClient:
             try:
                 if dataset == "live":
                     if series_ticker is None:
-                        raise RuntimeError("live candle fetch requires a verified series")
+                        raise RuntimeError(
+                            "live candle fetch requires a verified series"
+                        )
                     response_market = KalshiMarketRef(
                         market.ticker, series_ticker=series_ticker
                     )
@@ -887,16 +914,17 @@ class AsyncKalshiClient:
                         observations=observations,
                     )
                 else:
-                    payload, observation = (
-                        await self._historical_market_candlesticks_payload(
-                            ticker=market.ticker,
-                            start_ts=start_ts,
-                            end_ts=end_ts,
-                            period_interval=period_minutes,
-                            market=market,
-                            expiry=expiry,
-                            observations=observations,
-                        )
+                    (
+                        payload,
+                        observation,
+                    ) = await self._historical_market_candlesticks_payload(
+                        ticker=market.ticker,
+                        start_ts=start_ts,
+                        end_ts=end_ts,
+                        period_interval=period_minutes,
+                        market=market,
+                        expiry=expiry,
+                        observations=observations,
                     )
             except httpx.HTTPStatusError as exc:
                 if exc.response.status_code == 404:
@@ -931,6 +959,7 @@ class AsyncKalshiClient:
         max_updated_ts: int | None = None,
         min_settled_ts: int | None = None,
         max_settled_ts: int | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         self._validate_limit(limit)
         params = {
@@ -950,36 +979,20 @@ class AsyncKalshiClient:
             "min_settled_ts": min_settled_ts,
             "max_settled_ts": max_settled_ts,
         }
-        data = await self._http.request_json("GET", "/markets", params=params)
+        data = await self._http.request_json(
+            "GET", "/markets", params=params, expiry=expiry
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
-    async def _resolution_market_payload(
-        self,
-        ticker: str,
-        *,
-        source: Literal["live", "historical"],
-        expiry: OperationExpiry | None,
-    ) -> Any:
-        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
-        path = (
-            f"/markets/{encoded_ticker}"
-            if source == "live"
-            else f"/historical/markets/{encoded_ticker}"
-        )
-        return await self._http.request_json(
+    async def market(
+        self, ticker: str, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
+        data = await self._http.request_json(
             "GET",
-            path,
-            params=None,
+            f"/markets/{quote(ticker, safe='')}",
             expiry=expiry,
-        )
-
-    async def market(self, ticker: str) -> dict[str, Any]:
-        data = await self._resolution_market_payload(
-            ticker,
-            source="live",
-            expiry=None,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -988,11 +1001,13 @@ class AsyncKalshiClient:
             return market
         return data
 
-    async def historical_market(self, ticker: str) -> dict[str, Any]:
-        data = await self._resolution_market_payload(
-            ticker,
-            source="historical",
-            expiry=None,
+    async def historical_market(
+        self, ticker: str, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
+        data = await self._http.request_json(
+            "GET",
+            f"/historical/markets/{quote(ticker, safe='')}",
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1007,6 +1022,7 @@ class AsyncKalshiClient:
         limit: int = 100,
         status: str | None = "open",
         max_pages: int | None = None,
+        expiry: OperationExpiry | None = None,
         **params: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         cursor = params.pop("cursor", None)
@@ -1016,10 +1032,7 @@ class AsyncKalshiClient:
             if max_pages is not None and pages >= max_pages:
                 break
             page = await self.markets_page(
-                limit=limit,
-                cursor=cursor,
-                status=status,
-                **params,
+                limit=limit, cursor=cursor, status=status, **params, expiry=expiry
             )
             pages += 1
             markets = page.get("markets")
@@ -1044,6 +1057,7 @@ class AsyncKalshiClient:
         status: str | None = None,
         series_ticker: str | None = None,
         with_nested_markets: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         self._validate_limit(limit)
         data = await self._http.request_json(
@@ -1056,6 +1070,7 @@ class AsyncKalshiClient:
                 "series_ticker": series_ticker,
                 "with_nested_markets": with_nested_markets,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1067,6 +1082,7 @@ class AsyncKalshiClient:
         limit: int = 100,
         status: str | None = None,
         max_pages: int | None = None,
+        expiry: OperationExpiry | None = None,
         **params: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         cursor = params.pop("cursor", None)
@@ -1075,10 +1091,7 @@ class AsyncKalshiClient:
             if max_pages is not None and pages >= max_pages:
                 break
             page = await self.events_page(
-                limit=limit,
-                cursor=cursor,
-                status=status,
-                **params,
+                limit=limit, cursor=cursor, status=status, **params, expiry=expiry
             )
             pages += 1
             events = page.get("events")
@@ -1091,12 +1104,16 @@ class AsyncKalshiClient:
             if not cursor:
                 break
 
-    async def orderbook(self, ticker: str, *, depth: int | None = None) -> dict[str, Any]:
+    async def orderbook(
+        self,
+        ticker: str,
+        *,
+        depth: int | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> dict[str, Any]:
         params = {"depth": depth}
         data = await self._http.request_json(
-            "GET",
-            f"/markets/{ticker}/orderbook",
-            params=params,
+            "GET", f"/markets/{ticker}/orderbook", params=params, expiry=expiry
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1107,8 +1124,9 @@ class AsyncKalshiClient:
         ticker: str,
         *,
         depth: int | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
-        data = await self.orderbook(ticker, depth=depth)
+        data = await self.orderbook(ticker, depth=depth, expiry=expiry)
         return normalize_kalshi_orderbook(data, market_ticker=ticker)
 
     async def market_candlesticks(
@@ -1120,6 +1138,7 @@ class AsyncKalshiClient:
         end_ts: int,
         period_interval: int,
         include_latest_before_start: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         data, _ = await self._market_candlesticks_payload(
             series_ticker=series_ticker,
@@ -1128,6 +1147,7 @@ class AsyncKalshiClient:
             end_ts=end_ts,
             period_interval=period_interval,
             include_latest_before_start=include_latest_before_start,
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1146,7 +1166,9 @@ class AsyncKalshiClient:
         expiry: OperationExpiry | None = None,
         observations: list[RequestObservation] | None = None,
     ) -> tuple[object, RequestObservation | None]:
-        encoded_series = quote(series_ticker, safe="") if expiry is not None else series_ticker
+        encoded_series = (
+            quote(series_ticker, safe="") if expiry is not None else series_ticker
+        )
         encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
         path = f"/series/{encoded_series}/markets/{encoded_ticker}/candlesticks"
         params = {
@@ -1162,12 +1184,11 @@ class AsyncKalshiClient:
         effective_parameters = {
             key: value for key, value in params.items() if value is not None
         }
-        data, observation = await self._http.request_json_observed(
+        data, observation = await self._requests.request_json_observed(
             "GET",
             path,
             request_id=f"kalshi-candles-live-{uuid4().hex}",
             endpoint_template="/series/{series_ticker}/markets/{ticker}/candlesticks",
-            parameter_allowlist=_CANDLE_PARAMETER_ALLOWLIST,
             effective_parameters=effective_parameters,
             params=params,
             expiry=expiry,
@@ -1186,6 +1207,7 @@ class AsyncKalshiClient:
         end_ts: int,
         period_interval: int,
         include_latest_before_start: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         tickers = _normalize_tickers(market_tickers)
         if not tickers:
@@ -1200,6 +1222,7 @@ class AsyncKalshiClient:
                 "period_interval": period_interval,
                 "include_latest_before_start": include_latest_before_start,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1212,12 +1235,14 @@ class AsyncKalshiClient:
         start_ts: int,
         end_ts: int,
         period_interval: int,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         data, _ = await self._historical_market_candlesticks_payload(
             ticker=ticker,
             start_ts=start_ts,
             end_ts=end_ts,
             period_interval=period_interval,
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1245,12 +1270,11 @@ class AsyncKalshiClient:
             return await self._http.request_json("GET", path, params=params), None
         if market is None or observations is None:
             raise RuntimeError("observed candle fetch requires workflow context")
-        data, observation = await self._http.request_json_observed(
+        data, observation = await self._requests.request_json_observed(
             "GET",
             path,
             request_id=f"kalshi-candles-historical-{uuid4().hex}",
             endpoint_template="/historical/markets/{ticker}/candlesticks",
-            parameter_allowlist=_CANDLE_PARAMETER_ALLOWLIST,
             effective_parameters=params,
             params=params,
             expiry=expiry,
@@ -1261,8 +1285,10 @@ class AsyncKalshiClient:
         )
         return data, observation
 
-    async def historical_cutoff(self) -> dict[str, Any]:
-        data, _ = await self._historical_cutoff_payload()
+    async def historical_cutoff(
+        self, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
+        data, _ = await self._historical_cutoff_payload(expiry=expiry)
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
@@ -1277,12 +1303,11 @@ class AsyncKalshiClient:
             return await self._http.request_json("GET", "/historical/cutoff"), None
         if observations is None:
             raise RuntimeError("observed cutoff fetch requires workflow context")
-        data, observation = await self._http.request_json_observed(
+        data, observation = await self._requests.request_json_observed(
             "GET",
             "/historical/cutoff",
             request_id=f"kalshi-candle-cutoff-{uuid4().hex}",
             endpoint_template="/historical/cutoff",
-            parameter_allowlist=(),
             effective_parameters=None,
             params=None,
             expiry=expiry,
@@ -1296,11 +1321,13 @@ class AsyncKalshiClient:
         series_ticker: str,
         *,
         include_volume: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         data = await self._http.request_json(
             "GET",
             f"/series/{series_ticker}",
             params={"include_volume": include_volume},
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1314,6 +1341,7 @@ class AsyncKalshiClient:
         include_product_metadata: bool | None = None,
         include_volume: bool | None = None,
         min_updated_ts: int | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         data = await self._http.request_json(
             "GET",
@@ -1325,6 +1353,7 @@ class AsyncKalshiClient:
                 "include_volume": include_volume,
                 "min_updated_ts": min_updated_ts,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1338,6 +1367,7 @@ class AsyncKalshiClient:
         ticker: str | None = None,
         min_ts: int | None = None,
         max_ts: int | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         self._validate_limit(limit)
         data = await self._http.request_json(
@@ -1350,6 +1380,7 @@ class AsyncKalshiClient:
                 "min_ts": min_ts,
                 "max_ts": max_ts,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1364,6 +1395,7 @@ class AsyncKalshiClient:
         min_ts: int | None = None,
         max_ts: int | None = None,
         is_block_trade: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         self._validate_limit(limit)
         data = await self._http.request_json(
@@ -1377,6 +1409,7 @@ class AsyncKalshiClient:
                 "max_ts": max_ts,
                 "is_block_trade": is_block_trade,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -1633,12 +1666,9 @@ def _kalshi_discovery_report(
     )
 
 
-KalshiClient = AsyncKalshiClient
-
-
 __all__ = [
     "AsyncKalshiClient",
-    "KalshiClient",
+    "AsyncKalshiClient",
     "kalshi_events_dataframe",
     "kalshi_markets_dataframe",
     "normalize_kalshi_event",

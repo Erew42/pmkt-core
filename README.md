@@ -109,3 +109,8 @@ The caller owns any relocation policy. Exact artifact paths must still be
 canonical and contained within the authoritative manifest directory; hashes,
 schemas, counts, and journal bindings are always validated after resolution.
 With no callback, existing path behavior is unchanged.
+
+## Python API 0.2
+
+See [the 0.2 migration guide](docs/migration_0_2.md) for deterministic configuration,
+typed workflow inputs, shared request deadlines, and consolidated result provenance.

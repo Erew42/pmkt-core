@@ -1,9 +1,10 @@
+from pmkt.records import PolymarketMarketRef
 import httpx
 import pytest
 
 import pmkt.exchanges.polymarket.gamma as gamma_module
-from pmkt._http import RequestPolicy
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import RequestPolicy
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import InvalidDataError, MarketNotFoundError, OperationTimeoutError
 from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.records import PolymarketFilter
@@ -41,7 +42,7 @@ async def test_get_market_strict_mapping_prices_and_defensive_native_copy() -> N
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
 
     async with AsyncGammaClient(transport=transport) as client:
-        market = await client.get_market(market_id="1")
+        market = await client.get_market(market=PolymarketMarketRef("1"))
 
     assert market.mapping_status == "mapped"
     assert market.outcome_prices is None
@@ -81,7 +82,7 @@ async def test_get_market_mapping_states(
     payload = market_row(outcomes=outcomes, tokens=tokens)
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
     async with AsyncGammaClient(transport=transport) as client:
-        market = await client.get_market(market_id="1")
+        market = await client.get_market(market=PolymarketMarketRef("1"))
     assert market.mapping_status == expected
     if expected != "mapped":
         assert market.instruments == ()
@@ -94,7 +95,7 @@ async def test_mapping_aliases_are_semantic_and_duplicate_labels_are_ambiguous()
     payload["outcome_prices"] = ["0.2", "0.8"]
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
     async with AsyncGammaClient(transport=transport) as client:
-        market = await client.get_market(market_id="1")
+        market = await client.get_market(market=PolymarketMarketRef("1"))
     assert market.mapping_status == "mapped"
     assert market.outcome_prices == (0.2, 0.8)
     with pytest.raises(ValueError, match="ambiguous"):
@@ -113,7 +114,7 @@ async def test_bad_book_capability_evidence_is_not_promoted(
         payload["enable_order_book"] = capability[1]
     transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
     async with AsyncGammaClient(transport=transport) as client:
-        market = await client.get_market(market_id="1")
+        market = await client.get_market(market=PolymarketMarketRef("1"))
     assert market.mapping_status == "mapped"
     assert not market.book_supported
     assert {issue.code for issue in market.issues} == {"invalid_book_capability"}
@@ -130,9 +131,9 @@ async def test_get_market_encodes_id_and_scopes_identity_and_404_failures() -> N
 
     async with AsyncGammaClient(transport=httpx.MockTransport(handler)) as client:
         with pytest.raises(InvalidDataError, match="identity mismatch"):
-            await client.get_market(market_id="wanted/segment?x=1")
+            await client.get_market(market=PolymarketMarketRef("wanted/segment?x=1"))
         with pytest.raises(MarketNotFoundError) as caught:
-            await client.get_market(market_id="missing")
+            await client.get_market(market=PolymarketMarketRef("missing"))
     assert seen[0] == "/markets/wanted%2Fsegment%3Fx%3D1"
     assert caught.value.lookup_scope == "Gamma current market detail"
 
@@ -324,7 +325,7 @@ async def test_client_reuse_and_close() -> None:
 
 
 async def test_gamma_client_accepts_catalog_request_policy() -> None:
-    policy = RequestPolicy(max_retries=20, backoff_base_s=5.0, backoff_max_s=60.0)
+    policy = RequestPolicy(max_attempts=20, backoff_base_s=5.0, backoff_max_s=60.0)
     client = AsyncGammaClient(
         transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])),
         request_policy=policy,
@@ -535,7 +536,7 @@ async def test_new_gamma_workflows_require_bounded_deadlines_before_io(
             filters=PolymarketFilter(condition_ids=()), deadline_s=deadline
         )
     with pytest.raises(expected):
-        await client.get_market(market_id="1", deadline_s=deadline)  # type: ignore[arg-type]
+        await client.get_market(market=PolymarketMarketRef("1"), deadline_s=deadline)  # type: ignore[arg-type]
     assert requests == 0
     await client.close()
 
@@ -686,8 +687,8 @@ async def test_contradictory_identity_and_token_aliases_fail_or_degrade() -> Non
         )
     ) as client:
         with pytest.raises(InvalidDataError, match="conflicting market ID"):
-            await client.get_market(market_id="1")
-        market = await client.get_market(market_id="1")
+            await client.get_market(market=PolymarketMarketRef("1"))
+        market = await client.get_market(market=PolymarketMarketRef("1"))
     assert market.mapping_status == "inconsistent"
     assert market.instruments == ()
 

@@ -9,9 +9,10 @@ import math
 from typing import Any, Literal, Sequence
 
 from pmkt import __version__
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import InvalidDataError, ResultLimitExceededError
 from pmkt.records import (
+    ResultProvenance, RawResponseEvidence,
     BookLevel,
     BookSnapshot,
     DataIssue,
@@ -461,28 +462,22 @@ def normalize_clob_price_history(
         conflicting_rows=conflicting_rows,
         outside_window_rows=outside_window_rows,
     )
-    native_payload = deepcopy(payload)
     expiry.checkpoint()
     return PriceHistoryResult(
+        provenance=ResultProvenance(
+            observations=(observation,),
+            interpretation_id=POLYMARKET_CLOB_HISTORY_INTERPRETATION_ID,
+            package_version=__version__,
+            raw_responses=(RawResponseEvidence(observation.request_id, payload),),
+        ),
         instrument=instrument,
         points=tuple(points),
-        requested_start_utc=requested_start_utc,
-        requested_end_utc=requested_end_utc,
-        queried_start_utc=queried_start_utc,
-        queried_end_utc=queried_end_utc,
         sampling_minutes=sampling_minutes,
-        observed_start_utc=observed_start,
-        observed_end_utc=observed_end,
         source="polymarket_clob",
         dataset=POLYMARKET_CLOB_HISTORY_DATASET,
         price_basis="venue_defined",
-        observation=observation,
-        observations=(observation,),
         issues=tuple(issues),
-        interpretation_id=POLYMARKET_CLOB_HISTORY_INTERPRETATION_ID,
-        package_version=__version__,
         coverage=coverage,
-        native_payloads=(native_payload,),
     )
 
 
@@ -521,6 +516,12 @@ def normalize_clob_book(
 
     exchange_timestamp = _clob_timestamp(payload.get("timestamp", _MISSING))
     return BookSnapshot(
+        provenance=ResultProvenance(
+            observations=(observation,),
+            interpretation_id=POLYMARKET_CLOB_BOOK_INTERPRETATION_ID,
+            package_version=__version__,
+            raw_responses=(RawResponseEvidence(observation.request_id, payload),),
+        ),
         instrument=instrument,
         bids=returned_bids,
         asks=returned_asks,
@@ -529,10 +530,6 @@ def normalize_clob_book(
         endpoint="/book",
         source_scope="clob_current_book",
         data_scope=observation.data_scope,
-        observation=observation,
-        observations=(observation,),
-        interpretation_id=POLYMARKET_CLOB_BOOK_INTERPRETATION_ID,
-        package_version=__version__,
         quote_normalization_policy=None,
         valid_state=not flags,
         quality_flags=tuple(sorted(flags)),
@@ -544,7 +541,6 @@ def normalize_clob_book(
         pre_trim_ask_count=len(pre_trim_asks),
         returned_bid_count=len(returned_bids),
         returned_ask_count=len(returned_asks),
-        native_payload=deepcopy(payload),
     )
 
 

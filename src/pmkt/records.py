@@ -485,9 +485,50 @@ class BookLevel:
 
 
 @dataclass(frozen=True)
+class RawResponseEvidence:
+    """One retained decoded response; nested data is caller-owned and mutable."""
+
+    request_id: str
+    payload: dict[str, object] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        from copy import deepcopy
+
+        _require_identifier(self.request_id, "request_id")
+        if not isinstance(self.payload, dict):
+            raise TypeError("payload must be a dict")
+        object.__setattr__(self, "payload", deepcopy(self.payload))
+
+
+@dataclass(frozen=True)
+class ResultProvenance:
+    """Request facts and raw evidence with one owner per result."""
+
+    observations: tuple[RequestObservation, ...]
+    interpretation_id: str
+    package_version: str
+    raw_responses: tuple[RawResponseEvidence, ...] = field(repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        if not self.observations:
+            raise ValueError("observations must contain at least one request observation")
+        _require_identifier(self.interpretation_id, "interpretation_id")
+        _require_identifier(self.package_version, "package_version")
+        request_ids = {observation.request_id for observation in self.observations}
+        if len(request_ids) != len(self.observations):
+            raise ValueError("observation request IDs must be unique")
+        evidence_ids = [response.request_id for response in self.raw_responses]
+        if len(set(evidence_ids)) != len(evidence_ids):
+            raise ValueError("raw responses must be retained once per request")
+        if not set(evidence_ids) <= request_ids:
+            raise ValueError("raw evidence must reference an observed request")
+
+
+@dataclass(frozen=True)
 class BookSnapshot:
     """One normalized REST book for one outcome instrument."""
 
+    provenance: ResultProvenance
     instrument: InstrumentRef
     bids: tuple[BookLevel, ...]
     asks: tuple[BookLevel, ...]
@@ -496,10 +537,6 @@ class BookSnapshot:
     endpoint: str
     source_scope: str
     data_scope: DataScope
-    observation: RequestObservation
-    observations: tuple[RequestObservation, ...]
-    interpretation_id: str
-    package_version: str
     quote_normalization_policy: str | None
     valid_state: bool
     quality_flags: tuple[str, ...]
@@ -511,9 +548,10 @@ class BookSnapshot:
     pre_trim_ask_count: int
     returned_bid_count: int
     returned_ask_count: int
-    native_payload: dict[str, object] = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provenance, ResultProvenance):
+            raise TypeError("provenance must be ResultProvenance")
         if not isinstance(
             self.instrument, (PolymarketInstrumentRef, KalshiInstrumentRef)
         ):
@@ -524,15 +562,9 @@ class BookSnapshot:
             _require_utc(self.exchange_timestamp_utc, "exchange_timestamp_utc")
         _require_identifier(self.endpoint, "endpoint")
         _require_identifier(self.source_scope, "source_scope")
-        _require_identifier(self.interpretation_id, "interpretation_id")
-        _require_identifier(self.package_version, "package_version")
         _require_optional_identifier(
             self.quote_normalization_policy, "quote_normalization_policy"
         )
-        if not self.observations:
-            raise ValueError("observations must contain at least one request observation")
-        if self.observations[-1] != self.observation:
-            raise ValueError("observation must be the final request observation")
         if not isinstance(self.valid_state, bool):
             raise TypeError("valid_state must be a bool")
         for name in (
@@ -548,8 +580,6 @@ class BookSnapshot:
                 raise TypeError(f"{name} must be an int")
             if value < 0:
                 raise ValueError(f"{name} must be nonnegative")
-        if not isinstance(self.native_payload, dict):
-            raise TypeError("native_payload must be a dict")
 
 
 @dataclass(frozen=True)
@@ -665,63 +695,33 @@ class HistoryCoverage:
 class PriceHistoryResult:
     """Normalized sampled CLOB history with retained provenance and coverage."""
 
+    provenance: ResultProvenance
     instrument: PolymarketInstrumentRef
     points: tuple[SampledPricePoint, ...]
-    requested_start_utc: datetime
-    requested_end_utc: datetime
-    queried_start_utc: datetime
-    queried_end_utc: datetime
     sampling_minutes: int
-    observed_start_utc: datetime | None
-    observed_end_utc: datetime | None
     source: str
     dataset: str
     price_basis: PriceBasis
-    observation: RequestObservation
-    observations: tuple[RequestObservation, ...]
     issues: tuple[DataIssue, ...]
-    interpretation_id: str
-    package_version: str
     coverage: HistoryCoverage
-    native_payloads: tuple[dict[str, object], ...] = field(
-        repr=False, compare=False
-    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provenance, ResultProvenance):
+            raise TypeError("provenance must be ResultProvenance")
         if not isinstance(self.instrument, PolymarketInstrumentRef):
             raise TypeError("instrument must be a PolymarketInstrumentRef")
-        _require_utc(self.requested_start_utc, "requested_start_utc")
-        _require_utc(self.requested_end_utc, "requested_end_utc")
-        _require_utc(self.queried_start_utc, "queried_start_utc")
-        _require_utc(self.queried_end_utc, "queried_end_utc")
-        if self.requested_end_utc <= self.requested_start_utc:
-            raise ValueError("requested history end must follow its start")
-        if self.queried_end_utc <= self.queried_start_utc:
-            raise ValueError("queried history end must follow its start")
         if isinstance(self.sampling_minutes, bool) or not isinstance(
             self.sampling_minutes, int
         ):
             raise TypeError("sampling_minutes must be an int")
         if self.sampling_minutes <= 0:
             raise ValueError("sampling_minutes must be positive")
-        if (self.observed_start_utc is None) != (self.observed_end_utc is None):
-            raise ValueError("observed history bounds must both be present or absent")
-        if self.observed_start_utc is not None:
-            _require_utc(self.observed_start_utc, "observed_start_utc")
-            assert self.observed_end_utc is not None
-            _require_utc(self.observed_end_utc, "observed_end_utc")
         _require_identifier(self.source, "source")
         _require_identifier(self.dataset, "dataset")
         if self.price_basis != "venue_defined":
             raise ValueError("unsupported price_basis")
-        if not self.observations or self.observations[-1] != self.observation:
-            raise ValueError("observation must be the final request observation")
-        _require_identifier(self.interpretation_id, "interpretation_id")
-        _require_identifier(self.package_version, "package_version")
         if self.coverage.accepted_rows != len(self.points):
             raise ValueError("coverage accepted_rows must equal returned point count")
-        if any(not isinstance(payload, dict) for payload in self.native_payloads):
-            raise TypeError("native_payloads must contain dictionaries")
 
     def to_arrow(self) -> pa.Table:
         """Materialize points as an Arrow table, loading the data extra lazily."""
@@ -774,7 +774,6 @@ class KalshiCandle:
     volume_contracts: float | None
     open_interest_contracts: float | None
     quality_flags: tuple[str, ...]
-    native_payload: dict[str, object] = field(repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.market, KalshiMarketRef):
@@ -817,44 +816,32 @@ class KalshiCandle:
                 raise ValueError(f"{name} must be nonnegative")
         for flag in self.quality_flags:
             _require_identifier(flag, "quality flag")
-        if not isinstance(self.native_payload, dict):
-            raise TypeError("native_payload must be a dict")
 
 
 @dataclass(frozen=True)
 class CandleHistoryResult:
     """Normalized Kalshi candle history with routing and coverage evidence."""
 
+    provenance: ResultProvenance
     market: KalshiMarketRef
     candles: tuple[KalshiCandle, ...]
-    requested_start_utc: datetime
-    requested_end_utc: datetime
     period_minutes: Literal[1, 60, 1440]
     source: Literal["auto", "live", "historical"]
     completed_through_utc: datetime
     historical_cutoff_utc: datetime | None
-    observation: RequestObservation
-    observations: tuple[RequestObservation, ...]
     issues: tuple[DataIssue, ...]
-    interpretation_id: str
-    package_version: str
     coverage: HistoryCoverage
     quality_flags: tuple[str, ...]
     routing_market: KalshiMarket | None
-    native_payloads: tuple[dict[str, object], ...] = field(
-        repr=False, compare=False
-    )
 
     def __post_init__(self) -> None:
+        if not isinstance(self.provenance, ResultProvenance):
+            raise TypeError("provenance must be ResultProvenance")
         if not isinstance(self.market, KalshiMarketRef):
             raise TypeError("market must be a KalshiMarketRef")
-        _require_utc(self.requested_start_utc, "requested_start_utc")
-        _require_utc(self.requested_end_utc, "requested_end_utc")
         _require_utc(self.completed_through_utc, "completed_through_utc")
         if self.historical_cutoff_utc is not None:
             _require_utc(self.historical_cutoff_utc, "historical_cutoff_utc")
-        if self.requested_end_utc <= self.requested_start_utc:
-            raise ValueError("requested history end must follow its start")
         if isinstance(self.period_minutes, bool) or not isinstance(
             self.period_minutes, int
         ):
@@ -869,16 +856,10 @@ class CandleHistoryResult:
             self.routing_market, KalshiMarket
         ):
             raise TypeError("routing_market must be a KalshiMarket or None")
-        if not self.observations or self.observations[-1] != self.observation:
-            raise ValueError("observation must be the final request observation")
-        _require_identifier(self.interpretation_id, "interpretation_id")
-        _require_identifier(self.package_version, "package_version")
         if self.coverage.accepted_rows != len(self.candles):
             raise ValueError("coverage accepted_rows must equal returned candle count")
         for flag in self.quality_flags:
             _require_identifier(flag, "quality flag")
-        if any(not isinstance(payload, dict) for payload in self.native_payloads):
-            raise TypeError("native_payloads must contain dictionaries")
 
     def to_arrow(self) -> pa.Table:
         """Materialize candles as an Arrow table, loading the data extra lazily."""
@@ -898,8 +879,8 @@ def _price_history_metadata(result: PriceHistoryResult) -> dict[str, str]:
         "dataset": result.dataset,
         "price_basis": result.price_basis,
         "sampling_minutes": str(result.sampling_minutes),
-        "interpretation_id": result.interpretation_id,
-        "package_version": result.package_version,
+        "interpretation_id": result.provenance.interpretation_id,
+        "package_version": result.provenance.package_version,
     }
 
 
@@ -976,8 +957,8 @@ def _candle_history_metadata(result: CandleHistoryResult) -> dict[str, str]:
         "source": result.source,
         "datasets": ",".join(result.coverage.datasets),
         "period_minutes": str(result.period_minutes),
-        "interpretation_id": result.interpretation_id,
-        "package_version": result.package_version,
+        "interpretation_id": result.provenance.interpretation_id,
+        "package_version": result.provenance.package_version,
     }
 
 
@@ -1173,6 +1154,8 @@ __all__ = [
     "BookQuantityUnit",
     "BookSideProvenance",
     "BookSnapshot",
+    "ResultProvenance",
+    "RawResponseEvidence",
     "CandleHistoryResult",
     "CandleOHLC",
     "DataScope",

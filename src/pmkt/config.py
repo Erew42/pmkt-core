@@ -2,14 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-from pmkt._http import RequestPolicy
-
-
-_ConfigT = TypeVar("_ConfigT", bound="PmktConfig")
 
 
 KALSHI_ENDPOINTS = {
@@ -40,15 +36,10 @@ def resolve_default_env_files(*, cwd: str | Path | None = None) -> tuple[Path, .
     return _env_files_for_dir(_find_source_root(current) or current)
 
 
-class PmktConfig(BaseSettings):
+class PmktConfig(BaseModel):
     """Endpoint configuration for public, read-only market-data clients."""
 
-    model_config = SettingsConfigDict(
-        env_file=(".env", ".env.local"),
-        env_file_encoding="utf-8",
-        env_prefix="PMKT_",
-        extra="ignore",
-    )
+    model_config = ConfigDict(extra="forbid")
 
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"
@@ -61,26 +52,11 @@ class PmktConfig(BaseSettings):
     kalshi_api_url: str | None = None
     kalshi_ws_url: str | None = None
 
-    def __init__(self, **values: Any) -> None:
-        if "_env_file" not in values:
-            values["_env_file"] = resolve_default_env_files()
-        super().__init__(**values)
-
-    @classmethod
-    def from_values(cls: type[_ConfigT], **values: Any) -> _ConfigT:
-        """Build independent settings from arguments and declared defaults only.
-
-        The result is an instance of ``cls`` (including subclasses), so
-        subclass fields are validated instead of being silently ignored.
-        """
-
-        return _init_only_variant(cls)(**values)
-
     @classmethod
     def from_env(cls, **values: Any) -> "PmktConfig":
-        """Build settings through the legacy OS environment and dotenv sources."""
-
-        return cls(**values)
+        """Load process environment and dotenv explicitly; arguments win."""
+        values.setdefault("_env_file", resolve_default_env_files())
+        return cls(**_EnvironmentSettings(**values).model_dump())
 
     @property
     def resolved_kalshi_api_url(self) -> str:
@@ -91,72 +67,13 @@ class PmktConfig(BaseSettings):
         return self.kalshi_ws_url or KALSHI_ENDPOINTS[self.kalshi_env]["ws"]
 
 
-_INIT_ONLY_VARIANTS: dict[type[PmktConfig], type[PmktConfig]] = {}
-
-
-def _init_only_variant(cls: type[_ConfigT]) -> type[_ConfigT]:
-    """Return a cached subclass of ``cls`` whose only settings source is init."""
-
-    cached = _INIT_ONLY_VARIANTS.get(cls)
-    if cached is not None:
-        return cast("type[_ConfigT]", cached)
-
-    def __init__(self: PmktConfig, **values: Any) -> None:
-        # Run the full constructor chain of ``cls`` with dotenv discovery
-        # disabled; ``settings_customise_sources`` below drops the OS
-        # environment and dotenv sources regardless of ``_env_file``.
-        values["_env_file"] = None
-        cls.__init__(self, **values)
-
-    def settings_customise_sources(
-        klass: type[BaseSettings],
-        settings_cls: type[BaseSettings],
-        init_settings: Any,
-        env_settings: Any,
-        dotenv_settings: Any,
-        file_secret_settings: Any,
-    ) -> tuple[Any, ...]:
-        del klass, settings_cls, env_settings, dotenv_settings, file_secret_settings
-        return (init_settings,)
-
-    def __reduce__(self: PmktConfig) -> tuple[Any, ...]:
-        # The variant class is created at runtime and cannot be found by name
-        # when unpickling, so rebuild it from the public class instead. The
-        # restore path sets pydantic state directly and never reads settings.
-        return (_restore_init_only, (cls, self.__getstate__()))
-
-    variant = type(
-        f"_InitOnly{cls.__name__}",
-        (cls,),
-        {
-            "__init__": __init__,
-            "__module__": cls.__module__,
-            "__qualname__": f"_InitOnly{cls.__qualname__}",
-            "settings_customise_sources": classmethod(settings_customise_sources),
-            "__reduce__": __reduce__,
-        },
+class _EnvironmentSettings(PmktConfig, BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.local"),
+        env_file_encoding="utf-8",
+        env_prefix="PMKT_",
+        extra="ignore",
     )
-    _INIT_ONLY_VARIANTS[cls] = variant
-    return cast("type[_ConfigT]", variant)
-
-
-def _restore_init_only(cls: type[_ConfigT], state: dict[Any, Any]) -> _ConfigT:
-    """Unpickle an init-only config without consulting any settings source."""
-
-    variant = _init_only_variant(cls)
-    instance = variant.__new__(variant)
-    instance.__setstate__(state)
-    return instance
-
-
-_config: PmktConfig | None = None
-
-
-def get_config(*, refresh: bool = False) -> PmktConfig:
-    global _config
-    if refresh or _config is None:
-        _config = PmktConfig()
-    return _config
 
 
 def _clean_env_path(name: str) -> Path | None:
@@ -181,7 +98,5 @@ def _find_source_root(cwd: Path) -> Path | None:
 __all__ = [
     "KALSHI_ENDPOINTS",
     "PmktConfig",
-    "RequestPolicy",
-    "get_config",
     "resolve_default_env_files",
 ]

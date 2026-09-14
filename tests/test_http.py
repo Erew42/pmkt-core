@@ -4,7 +4,8 @@ import httpx
 import pytest
 
 import pmkt._http as http_module
-from pmkt._http import HttpClient, RequestPolicy, format_url, request_with_retry
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient, format_url, request_with_retry
 
 
 pytestmark = pytest.mark.asyncio
@@ -57,7 +58,7 @@ async def test_retryable_response_is_closed_before_error() -> None:
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=1,
+        max_attempts=1,
     )
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -88,7 +89,7 @@ async def test_retryable_response_is_closed_before_success(monkeypatch) -> None:
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=2,
+        max_attempts=2,
     )
 
     assert await client.request_json("GET", "/markets") == {"attempt": 2}
@@ -120,7 +121,7 @@ async def test_async_request_honors_retry_after(monkeypatch) -> None:
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=2,
+        max_attempts=2,
     )
 
     assert await client.request_json("GET", "/markets") == {"attempt": 2}
@@ -143,7 +144,7 @@ async def test_request_policy_caps_large_retry_after() -> None:
 
 
 async def test_request_policy_retries_get_but_not_plain_post_by_default() -> None:
-    policy = RequestPolicy(max_retries=3)
+    policy = RequestPolicy(max_attempts=3)
 
     assert policy.attempts_for("GET") == 3
     assert policy.attempts_for("POST") == 1
@@ -164,7 +165,7 @@ async def test_async_request_does_not_retry_501(monkeypatch) -> None:
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=3,
+        max_attempts=3,
     )
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -185,7 +186,7 @@ async def test_async_request_does_not_retry_plain_post_by_default(monkeypatch) -
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=3,
+        max_attempts=3,
     )
 
     with pytest.raises(httpx.HTTPStatusError):
@@ -210,7 +211,7 @@ async def test_async_request_retries_post_with_idempotency_header(monkeypatch) -
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=3,
+        max_attempts=3,
     )
 
     assert await client.request_json(
@@ -240,7 +241,7 @@ async def test_async_request_retries_timeout(monkeypatch) -> None:
     client = HttpClient(
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
-        max_retries=2,
+        max_attempts=2,
     )
 
     assert await client.request_json("GET", "/markets") == {"ok": True}
@@ -267,7 +268,7 @@ async def test_catalog_sized_policy_waits_and_retries_same_page(monkeypatch) -> 
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
         request_policy=RequestPolicy(
-            max_retries=20,
+            max_attempts=20,
             backoff_base_s=5.0,
             backoff_max_s=60.0,
         ),
@@ -348,7 +349,7 @@ async def test_sync_request_with_retry_retries_retryable_status(monkeypatch) -> 
             "GET",
             "/markets",
             params={"closed": False, "cursor": None},
-            max_retries=2,
+            max_attempts=2,
         )
 
     assert response.status_code == 200
@@ -378,7 +379,7 @@ async def test_sync_request_with_retry_honors_retry_after(monkeypatch) -> None:
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
     ) as client:
-        response = request_with_retry(client, "GET", "/markets", max_retries=2)
+        response = request_with_retry(client, "GET", "/markets", max_attempts=2)
 
     assert response.status_code == 200
     assert sleeps == [0.25]
@@ -400,7 +401,7 @@ async def test_sync_request_with_retry_does_not_retry_501(monkeypatch) -> None:
         base_url="https://example.com",
         transport=httpx.MockTransport(handler),
     ) as client:
-        response = request_with_retry(client, "GET", "/markets", max_retries=3)
+        response = request_with_retry(client, "GET", "/markets", max_attempts=3)
 
     assert response.status_code == 501
     assert len(seen) == 1
@@ -420,7 +421,7 @@ async def test_sync_request_with_retry_closes_intermediate_retryable_response(
     )
     client = _FakeSyncClient([retryable, success])
 
-    response = request_with_retry(client, "GET", "/markets", max_retries=2)  # type: ignore[arg-type]
+    response = request_with_retry(client, "GET", "/markets", max_attempts=2)  # type: ignore[arg-type]
 
     assert response is success
     assert retryable.is_closed is True
@@ -435,7 +436,7 @@ async def test_sync_request_with_retry_returns_final_retryable_response_open(mon
     )
     client = _FakeSyncClient([retryable])
 
-    response = request_with_retry(client, "GET", "/markets", max_retries=1)  # type: ignore[arg-type]
+    response = request_with_retry(client, "GET", "/markets", max_attempts=1)  # type: ignore[arg-type]
 
     assert response is retryable
     assert response.status_code == 500

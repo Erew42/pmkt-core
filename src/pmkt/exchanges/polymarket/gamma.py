@@ -8,11 +8,13 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
+from pmkt.exchanges._requests import VenueRequests
 from aiolimiter import AsyncLimiter
 from pydantic import TypeAdapter
 
-from pmkt._http import HttpClient, RequestPolicy
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient
+from pmkt.runtime import OperationExpiry
 from pmkt import __version__
 from pmkt.errors import InvalidDataError, MarketNotFoundError
 from pmkt.models import Event, Market
@@ -25,6 +27,7 @@ from pmkt.records import (
     DiscoveryStopReason,
     PolymarketFilter,
     PolymarketMarket,
+    PolymarketMarketRef,
     RequestObservation,
 )
 
@@ -38,7 +41,7 @@ from pmkt.exchanges.polymarket._workflow import (
 )
 
 
-from pmkt.config import PmktConfig, get_config
+from pmkt.config import PmktConfig
 
 
 POLYMARKET_DISCOVERY_CONDITION_CHUNK_SIZE = 20
@@ -79,7 +82,7 @@ class AsyncGammaClient:
             if base_url is not None
             else config.gamma_api_url
             if config is not None
-            else get_config().gamma_api_url
+            else PmktConfig().gamma_api_url
         )
         self.transport = transport
         # Default to 10 requests per second if not provided
@@ -90,9 +93,8 @@ class AsyncGammaClient:
             limiter=self.limiter,
             request_policy=request_policy,
             timeout_s=timeout_s,
-            source_venue="polymarket",
-            source_service="gamma",
         )
+        self._requests = VenueRequests(self._http, venue="polymarket", service="gamma")
 
     async def close(self) -> None:
         await self._http.close()
@@ -124,30 +126,20 @@ class AsyncGammaClient:
         if limit < 1 or limit > 100:
             raise ValueError("keyset limit must be between 1 and 100")
 
-    async def _resolution_market_payload(
-        self,
-        market_id: str | int,
-        *,
-        expiry: OperationExpiry | None,
-    ) -> Any:
-        encoded_market_id = (
-            quote(str(market_id), safe="") if expiry is not None else market_id
-        )
-        return await self._http.request_json(
-            "GET",
-            f"/markets/{encoded_market_id}",
-            params=None,
-            expiry=expiry,
-        )
-
-    async def market(self, market_id: str | int) -> dict[str, Any]:
+    async def market(
+        self, market_id: str | int, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
         """Fetch one Gamma market by id, preserving raw fields for resolution joins."""
-        data = await self._resolution_market_payload(market_id, expiry=None)
+        data = await self._http.request_json(
+            "GET", f"/markets/{quote(str(market_id), safe='')}", expiry=expiry
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
-    async def market_with_events(self, market_id: str | int) -> dict[str, Any]:
+    async def market_with_events(
+        self, market_id: str | int, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
         """Fetch one market and attach its Gamma event metadata.
 
         Gamma's single-market endpoint omits ``events``. The filtered list
@@ -157,11 +149,12 @@ class AsyncGammaClient:
         """
 
         key = str(market_id)
-        payload = await self.market(market_id)
+        payload = await self.market(market_id, expiry=expiry)
         rows = await self._http.request_json(
             "GET",
             "/markets",
             params={"id": key, "closed": bool(payload.get("closed"))},
+            expiry=expiry,
         )
         if (
             not isinstance(rows, list)
@@ -181,21 +174,22 @@ class AsyncGammaClient:
         return result
 
     async def get_market(
-        self, *, market_id: str, deadline_s: float = 30.0
+        self, *, market: PolymarketMarketRef, deadline_s: float = 30.0
     ) -> PolymarketMarket:
         """Fetch and strictly normalize one Gamma market by its native ID."""
 
-        _require_nonempty_string(market_id, "market_id")
+        if not isinstance(market, PolymarketMarketRef):
+            raise TypeError("market must be a PolymarketMarketRef")
+        market_id = market.market_id
         expiry = OperationExpiry.bounded(deadline_s)
         observations: list[RequestObservation] = []
         request_id = f"gamma-detail-{uuid4().hex}"
         try:
-            payload, observation = await self._http.request_json_observed(
+            payload, observation = await self._requests.request_json_observed(
                 "GET",
                 f"/markets/{quote(market_id, safe='')}",
                 request_id=request_id,
                 endpoint_template="/markets/{market_id}",
-                parameter_allowlist=(),
                 effective_parameters=None,
                 params=None,
                 expiry=expiry,
@@ -216,12 +210,12 @@ class AsyncGammaClient:
         if observation.received_at_utc is None:
             raise InvalidDataError("Gamma detail observation has no receive time")
         assert isinstance(payload, dict)
-        market = normalize_gamma_market(
+        result = normalize_gamma_market(
             payload,
             observation=observation,
         )
         expiry.checkpoint()
-        return market
+        return result
 
     async def discover_markets(
         self,
@@ -244,7 +238,9 @@ class AsyncGammaClient:
         requested_ids = _deduplicate(selected_filters.condition_ids or ())
         requested_id_set = frozenset(value.casefold() for value in requested_ids)
         selection_strategy = (
-            "targeted_condition_ids" if selected_filters.condition_ids is not None else "keyset_scan"
+            "targeted_condition_ids"
+            if selected_filters.condition_ids is not None
+            else "keyset_scan"
         )
         if selected_filters.condition_ids == ():
             expiry.checkpoint()
@@ -260,7 +256,7 @@ class AsyncGammaClient:
                 local_filters=_local_filter_names(selected_filters),
                 unknown_counts={},
                 source_scope=_source_scope(selected_filters),
-                data_scope=self._http.source.data_scope,
+                data_scope=self._requests.source.data_scope,
                 observations=(),
                 issues=(),
                 selection_strategy=selection_strategy,
@@ -281,7 +277,9 @@ class AsyncGammaClient:
         else:
             chunks = (None,)
         lifecycle = (
-            (False, True) if selected_filters.closed is None else (selected_filters.closed,)
+            (False, True)
+            if selected_filters.closed is None
+            else (selected_filters.closed,)
         )
         partitions = deque(
             _DiscoveryPartition(index, chunk, closed)
@@ -322,12 +320,11 @@ class AsyncGammaClient:
                 key: value for key, value in params.items() if value is not None
             }
             request_id = f"gamma-discovery-{operation_id}-{pages_fetched + 1}"
-            payload, observation = await self._http.request_json_observed(
+            payload, observation = await self._requests.request_json_observed(
                 "GET",
                 _KEYSET_ENDPOINT,
                 request_id=request_id,
                 endpoint_template=_KEYSET_ENDPOINT,
-                parameter_allowlist=_KEYSET_PARAMETER_ALLOWLIST,
                 effective_parameters=effective_parameters,
                 params=params,
                 expiry=expiry,
@@ -396,7 +393,9 @@ class AsyncGammaClient:
             local_filters=_local_filter_names(selected_filters),
             unknown_counts=unknown_counts,
             source_scope=_source_scope(selected_filters),
-            data_scope=_combined_data_scope(observations, self._http.source.data_scope),
+            data_scope=_combined_data_scope(
+                observations, self._requests.source.data_scope
+            ),
             observations=tuple(observations),
             issues=_aggregate_issues(issues),
             selection_strategy=selection_strategy,
@@ -416,6 +415,7 @@ class AsyncGammaClient:
         tag_id: str | None = None,
         related_tags: bool | None = None,
         exclude_tag_id: str | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> list[Market]:
         """Fetch one page from /markets using limit/offset pagination."""
         self._validate_pagination(limit, offset)
@@ -426,6 +426,7 @@ class AsyncGammaClient:
             tag_id=tag_id,
             related_tags=related_tags,
             exclude_tag_id=exclude_tag_id,
+            expiry=expiry,
         )
         return TypeAdapter(list[Market]).validate_python(data)
 
@@ -438,6 +439,7 @@ class AsyncGammaClient:
         tag_id: str | None = None,
         related_tags: bool | None = None,
         exclude_tag_id: str | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch one page while preserving decoded venue payload fields."""
         self._validate_pagination(limit, offset)
@@ -452,6 +454,7 @@ class AsyncGammaClient:
                 "related_tags": related_tags,
                 "exclude_tag_id": exclude_tag_id,
             },
+            expiry=expiry,
         )
         if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
             raise TypeError(f"Expected list[dict], got {type(data)}")
@@ -469,6 +472,7 @@ class AsyncGammaClient:
         condition_ids: Sequence[str] | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         """Fetch one page from /markets/keyset using cursor pagination."""
         self._validate_keyset_limit(limit)
@@ -482,6 +486,7 @@ class AsyncGammaClient:
             condition_ids=condition_ids,
             order=order,
             ascending=ascending,
+            expiry=expiry,
         )
         return {
             **data,
@@ -500,6 +505,7 @@ class AsyncGammaClient:
         condition_ids: Sequence[str] | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         """Fetch a keyset page while preserving decoded venue payload fields."""
         self._validate_keyset_limit(limit)
@@ -517,6 +523,7 @@ class AsyncGammaClient:
                 "order": order,
                 "ascending": ascending,
             },
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -538,6 +545,7 @@ class AsyncGammaClient:
         exclude_tag_id: str | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> list[Event]:
         """Fetch one page from /events using limit/offset pagination."""
         self._validate_pagination(limit, offset)
@@ -551,7 +559,9 @@ class AsyncGammaClient:
             "order": order,
             "ascending": ascending,
         }
-        data = await self._http.request_json("GET", "/events", params=params)
+        data = await self._http.request_json(
+            "GET", "/events", params=params, expiry=expiry
+        )
         if not isinstance(data, list):
             raise TypeError(f"Expected list, got {type(data)}")
         return TypeAdapter(list[Event]).validate_python(data)
@@ -565,6 +575,7 @@ class AsyncGammaClient:
         tag_id: str | None = None,
         related_tags: bool | None = None,
         exclude_tag_id: str | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> AsyncIterator[Market]:
         """Iterate over /markets until pagination exhausts."""
         current_offset = offset
@@ -576,6 +587,7 @@ class AsyncGammaClient:
                 tag_id=tag_id,
                 related_tags=related_tags,
                 exclude_tag_id=exclude_tag_id,
+                expiry=expiry,
             )
             if not page:
                 break
@@ -597,6 +609,7 @@ class AsyncGammaClient:
         condition_ids: Sequence[str] | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> AsyncIterator[Market]:
         """Iterate over /markets/keyset until cursor exhaustion."""
         cursor = after_cursor
@@ -611,6 +624,7 @@ class AsyncGammaClient:
                 condition_ids=condition_ids,
                 order=order,
                 ascending=ascending,
+                expiry=expiry,
             )
             markets = page["markets"]
             if not markets:
@@ -633,6 +647,7 @@ class AsyncGammaClient:
         exclude_tag_id: str | None = None,
         order: str | None = None,
         ascending: bool | None = None,
+        expiry: OperationExpiry | None = None,
     ) -> AsyncIterator[Event]:
         """Iterate over /events until pagination exhausts."""
         current_offset = offset
@@ -646,6 +661,7 @@ class AsyncGammaClient:
                 exclude_tag_id=exclude_tag_id,
                 order=order,
                 ascending=ascending,
+                expiry=expiry,
             )
             if not page:
                 break
@@ -858,5 +874,3 @@ def _discovery_report(
         queried_chunks=queried_chunks,
         traversal_complete=traversal_complete,
     )
-
-GammaClient = AsyncGammaClient

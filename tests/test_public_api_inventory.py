@@ -8,7 +8,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 INVENTORY_PATH = ROOT / "tests" / "fixtures" / "public_api_inventory.json"
-TIERS = {"supported", "retained_native", "inherited"}
+TIERS = {"supported", "native", "advanced"}
 
 
 def _inventory() -> dict[str, Any]:
@@ -22,7 +22,7 @@ def _resolve(path: str) -> object:
 
 
 def test_facade_export_inventory_has_no_unclassified_drift() -> None:
-    """Force facade changes through an explicit compatibility-tier decision."""
+    """Force facade changes through an explicit supported-interface decision."""
 
     inventory = _inventory()
     assert set(inventory["tier_meanings"]) == TIERS

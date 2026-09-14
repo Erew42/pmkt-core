@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.records import PolymarketMarketRef, KalshiMarketRef
+
 import asyncio
 import json
 from collections import Counter
@@ -566,7 +568,7 @@ async def resolve_market_resolution_cache(
             if platform == "polymarket":
                 key = str(row["market_id"])
                 try:
-                    record = await polymarket_resolver.resolve(key, snapshot=row)
+                    record = await polymarket_resolver.resolve(PolymarketMarketRef(key), snapshot=row)
                 except Exception as exc:
                     record = error_record(
                         platform="polymarket",
@@ -577,7 +579,7 @@ async def resolve_market_resolution_cache(
                 return record.to_row()
             key = str(row["market_key"])
             try:
-                record = await kalshi_resolver.resolve(key, snapshot=row)
+                record = await kalshi_resolver.resolve(KalshiMarketRef(key), snapshot=row)
             except Exception as exc:
                 record = error_record(
                     platform="kalshi",

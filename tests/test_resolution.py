@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.records import KalshiMarketRef, PolymarketMarketRef
+
 import asyncio
 import json
 
@@ -7,8 +9,8 @@ import httpx
 import pandas as pd
 import pytest
 
-from pmkt._http import RequestPolicy
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import RequestPolicy
+from pmkt.runtime import OperationExpiry
 from pmkt.data.canonical import (
     kalshi_market_snapshot_v2_row,
     market_resolution_row,
@@ -21,7 +23,6 @@ from pmkt.exchanges.kalshi import AsyncKalshiClient
 from pmkt.exchanges.kalshi.client import normalize_kalshi_market
 from pmkt.exchanges.polymarket import AsyncGammaClient
 from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
-from pmkt.records import KalshiMarketRef, PolymarketMarketRef
 from pmkt.resolution import (
     EvmRpcError as ExportedEvmRpcError,
     KalshiResolutionResolver as ExportedKalshiResolutionResolver,
@@ -36,6 +37,23 @@ from pmkt.resolution.kalshi import (
 )
 from pmkt.resolution.models import RESOLVER_VERSION, error_record
 from pmkt.resolution.polymarket import PolymarketResolutionResolver, _clob_tokens
+
+
+@pytest.mark.asyncio
+async def test_rpc_request_timeout_is_capped_by_operation_expiry() -> None:
+    timeouts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        timeouts.append(request.extensions["timeout"])
+        return httpx.Response(200, json={"result": "0x89"})
+
+    async with PolygonCtfClient(
+        "https://rpc.test", timeout_s=20, transport=httpx.MockTransport(handler)
+    ) as client:
+        await client.ensure_polygon(expiry=OperationExpiry.after(2, clock=lambda: 100))
+        await client.ensure_polygon()
+    assert all(value == 2 for value in timeouts[0].values())
+    assert all(value == 20 for value in timeouts[1].values())
 
 
 def test_polymarket_normalizer_keeps_legacy_snapshot_v1_resolution_fields() -> None:
@@ -256,7 +274,7 @@ def test_kalshi_resolution_maps_nonfinal_statuses(status: str) -> None:
 @pytest.mark.asyncio
 async def test_kalshi_resolver_prefers_live_rest_over_disagreeing_snapshot() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -264,7 +282,7 @@ async def test_kalshi_resolver_prefers_live_rest_over_disagreeing_snapshot() -> 
                 "settlement_value_dollars": "0",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             request = httpx.Request(
                 "GET", f"https://kalshi.test/historical/markets/{ticker}"
             )
@@ -272,7 +290,7 @@ async def test_kalshi_resolver_prefers_live_rest_over_disagreeing_snapshot() -> 
             raise httpx.HTTPStatusError("not found", request=request, response=response)
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -294,12 +312,12 @@ async def test_kalshi_resolver_prefers_live_rest_over_disagreeing_snapshot() -> 
 @pytest.mark.asyncio
 async def test_kalshi_resolver_uses_historical_fallback_after_404() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             request = httpx.Request("GET", f"https://kalshi.test/markets/{ticker}")
             response = httpx.Response(404, request=request)
             raise httpx.HTTPStatusError("not found", request=request, response=response)
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -307,7 +325,7 @@ async def test_kalshi_resolver_uses_historical_fallback_after_404() -> None:
                 "settlement_value_dollars": "1",
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXRAIN"))
 
     assert record.resolution_state == "final"
     assert record.confidence == "canonical"
@@ -318,19 +336,19 @@ async def test_kalshi_resolver_uses_historical_fallback_after_404() -> None:
 @pytest.mark.asyncio
 async def test_kalshi_resolver_accepts_official_historical_settlement_shape() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             request = httpx.Request("GET", f"https://kalshi.test/markets/{ticker}")
             response = httpx.Response(404, request=request)
             raise httpx.HTTPStatusError("not found", request=request, response=response)
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "settlement_value_dollars": "0.5",
                 "settlement_ts": "2026-01-01T00:00:00Z",
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXSCALAR")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXSCALAR"))
 
     assert record.resolution_state == "final"
     assert record.confidence == "canonical"
@@ -346,14 +364,14 @@ async def test_kalshi_resolver_preserves_snapshot_metadata_when_rest_unavailable
     None
 ):
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -377,18 +395,18 @@ async def test_kalshi_resolver_preserves_snapshot_metadata_when_rest_unavailable
 @pytest.mark.asyncio
 async def test_kalshi_resolver_preserves_live_error_over_snapshot_metadata() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             request = httpx.Request("GET", f"https://kalshi.test/markets/{ticker}")
             response = httpx.Response(500, request=request)
             raise httpx.HTTPStatusError(
                 "server error", request=request, response=response
             )
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -418,17 +436,17 @@ async def test_kalshi_resolver_preserves_live_error_over_snapshot_metadata() -> 
 @pytest.mark.asyncio
 async def test_kalshi_resolver_live_nonfinal_blocks_snapshot_finality() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "open",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -454,19 +472,19 @@ async def test_kalshi_resolver_historical_nonfinal_blocks_snapshot_finality_afte
     None
 ):
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             request = httpx.Request("GET", f"https://kalshi.test/markets/{ticker}")
             response = httpx.Response(404, request=request)
             raise httpx.HTTPStatusError("not found", request=request, response=response)
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "open",
             }
 
     record = await KalshiResolutionResolver(FakeKalshi()).resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -492,13 +510,13 @@ async def test_kalshi_resolver_live_nonfinal_blocks_historical_final(
     status: str,
 ) -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": status,
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -506,7 +524,7 @@ async def test_kalshi_resolver_live_nonfinal_blocks_historical_final(
                 "settlement_value_dollars": "1",
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXRAIN"))
 
     assert record.resolution_state == "open"
     assert record.confidence == "unavailable"
@@ -522,7 +540,7 @@ async def test_kalshi_resolver_live_nonfinal_blocks_historical_final(
 @pytest.mark.asyncio
 async def test_kalshi_resolver_marks_live_historical_conflict_inconsistent() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -530,7 +548,7 @@ async def test_kalshi_resolver_marks_live_historical_conflict_inconsistent() -> 
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -538,7 +556,7 @@ async def test_kalshi_resolver_marks_live_historical_conflict_inconsistent() -> 
                 "settlement_value_dollars": "0",
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXRAIN"))
 
     assert record.resolution_state == "inconsistent"
     assert record.confidence == "inconsistent"
@@ -563,21 +581,21 @@ async def test_kalshi_resolver_marks_exact_scalar_conflicts_inconsistent(
     historical_settlement: str,
 ) -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": live_settlement,
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": historical_settlement,
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXSCALAR")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXSCALAR"))
 
     assert record.resolution_state == "inconsistent"
     assert record.confidence == "inconsistent"
@@ -592,21 +610,21 @@ async def test_kalshi_resolver_marks_exact_scalar_conflicts_inconsistent(
 @pytest.mark.asyncio
 async def test_kalshi_resolver_keeps_equivalent_scalar_formats_consistent() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": "0.420",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": "0.42",
             }
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXSCALAR")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXSCALAR"))
 
     assert record.resolution_state == "final"
     assert record.confidence == "canonical"
@@ -621,7 +639,7 @@ async def test_kalshi_resolver_live_final_preserves_historical_error_observation
     None
 ):
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -629,7 +647,7 @@ async def test_kalshi_resolver_live_final_preserves_historical_error_observation
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             request = httpx.Request(
                 "GET", f"https://kalshi.test/historical/markets/{ticker}"
             )
@@ -638,7 +656,7 @@ async def test_kalshi_resolver_live_final_preserves_historical_error_observation
                 "server error", request=request, response=response
             )
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXRAIN"))
 
     assert record.resolution_state == "final"
     assert record.confidence == "canonical"
@@ -656,14 +674,14 @@ async def test_kalshi_resolver_live_final_preserves_historical_error_observation
 @pytest.mark.asyncio
 async def test_kalshi_resolver_records_historical_transport_error_observation() -> None:
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             raise httpx.ConnectError(
                 "historical transport failed",
                 request=httpx.Request(
@@ -671,7 +689,7 @@ async def test_kalshi_resolver_records_historical_transport_error_observation() 
                 ),
             )
 
-    record = await KalshiResolutionResolver(FakeKalshi()).resolve("KXRAIN")
+    record = await KalshiResolutionResolver(FakeKalshi()).resolve(KalshiMarketRef("KXRAIN"))
 
     assert record.resolution_state == "final"
     assert record.confidence == "canonical"
@@ -691,7 +709,7 @@ async def test_kalshi_resolver_records_historical_transport_error_observation() 
 @pytest.mark.asyncio
 async def test_kalshi_resolver_snapshot_alone_is_noncanonical_fallback() -> None:
     record = await KalshiResolutionResolver().resolve(
-        "KXRAIN",
+        KalshiMarketRef("KXRAIN"),
         snapshot={
             "ticker": "KXRAIN",
             "status": "finalized",
@@ -710,17 +728,17 @@ async def test_kalshi_resolver_snapshot_alone_is_noncanonical_fallback() -> None
 @pytest.mark.asyncio
 async def test_polymarket_resolver_ctf_final_vector_is_canonical() -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return 1, [1, 0]
 
     resolver = PolymarketResolutionResolver(ctf_client=FakeCtf())
     record = await resolver.resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -737,16 +755,16 @@ async def test_polymarket_resolver_ctf_final_vector_is_canonical() -> None:
 @pytest.mark.asyncio
 async def test_polymarket_resolver_ctf_final_retains_snapshot_label_mapping() -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return 1, [1, 0]
 
     record = await PolymarketResolutionResolver(ctf_client=FakeCtf()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -772,7 +790,7 @@ async def test_polymarket_resolver_ctf_final_retains_snapshot_label_mapping() ->
 @pytest.mark.asyncio
 async def test_polymarket_resolver_ctf_final_retains_gamma_label_mapping() -> None:
     class FakeGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             assert market_key == "pm-1"
             return {
                 "id": "pm-1",
@@ -781,10 +799,10 @@ async def test_polymarket_resolver_ctf_final_retains_gamma_label_mapping() -> No
             }
 
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return 1, [0, 1]
@@ -792,7 +810,7 @@ async def test_polymarket_resolver_ctf_final_retains_gamma_label_mapping() -> No
     record = await PolymarketResolutionResolver(
         gamma_client=FakeGamma(),
         ctf_client=FakeCtf(),
-    ).resolve("pm-1", snapshot={})
+    ).resolve(PolymarketMarketRef("pm-1"), snapshot={})
 
     assert record.resolution_state == "final"
     assert record.winner == "under"
@@ -836,16 +854,16 @@ async def test_polymarket_resolver_ctf_final_vectors_have_exact_payouts(
     expected_payouts: list[str],
 ) -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return denominator, numerators
 
     record = await PolymarketResolutionResolver(ctf_client=FakeCtf()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -877,16 +895,16 @@ async def test_polymarket_resolver_rejects_invalid_ctf_payout_vectors(
     expected_error: str,
 ) -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return denominator, numerators
 
     record = await PolymarketResolutionResolver(ctf_client=FakeCtf()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -906,7 +924,7 @@ async def test_polymarket_resolver_rejects_invalid_ctf_payout_vectors(
 @pytest.mark.asyncio
 async def test_polymarket_resolver_official_clob_tokens_are_non_authoritative() -> None:
     class FakeClob:
-        async def clob_market_info(self, condition_id: str):
+        async def clob_market_info(self, condition_id: str, *, expiry=None):
             return {
                 "condition_id": condition_id,
                 "question_id": "q-1",
@@ -924,7 +942,7 @@ async def test_polymarket_resolver_official_clob_tokens_are_non_authoritative() 
 
     resolver = PolymarketResolutionResolver(clob_client=FakeClob())
     record = await resolver.resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -981,14 +999,14 @@ def test_polymarket_clob_tokens_parse_official_compressed_entries() -> None:
 @pytest.mark.asyncio
 async def test_polymarket_resolver_retains_gamma_failure_observation() -> None:
     class FakeGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             raise httpx.ConnectError(
                 "gamma unavailable",
                 request=httpx.Request("GET", f"https://gamma.test/{market_key}"),
             )
 
     record = await PolymarketResolutionResolver(gamma_client=FakeGamma()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={"market_id": "pm-1"},
     )
 
@@ -1005,14 +1023,14 @@ async def test_polymarket_resolver_retains_gamma_failure_observation() -> None:
 @pytest.mark.asyncio
 async def test_polymarket_resolver_retains_clob_failure_observation() -> None:
     class FakeClob:
-        async def clob_market_info(self, condition_id: str):
+        async def clob_market_info(self, condition_id: str, *, expiry=None):
             raise httpx.ConnectError(
                 "clob unavailable",
                 request=httpx.Request("GET", f"https://clob.test/{condition_id}"),
             )
 
     record = await PolymarketResolutionResolver(clob_client=FakeClob()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1043,7 +1061,7 @@ async def test_polymarket_resolver_status_substrings_do_not_imply_finality(
     status: str,
 ) -> None:
     record = await PolymarketResolutionResolver().resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1078,7 +1096,7 @@ async def test_polymarket_resolver_non_authoritative_metadata_alone_is_not_final
     }
     snapshot.update(snapshot_update)
 
-    record = await PolymarketResolutionResolver().resolve("pm-1", snapshot=snapshot)
+    record = await PolymarketResolutionResolver().resolve(PolymarketMarketRef("pm-1"), snapshot=snapshot)
 
     assert record.resolution_state == "open"
     assert record.confidence == "unavailable"
@@ -1090,7 +1108,7 @@ async def test_polymarket_resolver_non_authoritative_metadata_alone_is_not_final
 @pytest.mark.asyncio
 async def test_polymarket_resolver_near_certain_prices_are_non_authoritative() -> None:
     record = await PolymarketResolutionResolver().resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1110,7 +1128,7 @@ async def test_polymarket_resolver_near_certain_prices_are_non_authoritative() -
 @pytest.mark.asyncio
 async def test_polymarket_oversized_sourced_price_is_ignored_as_invalid_evidence() -> None:
     record = await PolymarketResolutionResolver().resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1129,7 +1147,7 @@ async def test_polymarket_resolver_official_gamma_fields_are_non_authoritative()
     None
 ):
     class FakeGamma:
-        async def market(self, market_id: str):
+        async def market(self, market_id: str, *, expiry=None):
             return {
                 "id": market_id,
                 "question": "Will it rain?",
@@ -1147,7 +1165,7 @@ async def test_polymarket_resolver_official_gamma_fields_are_non_authoritative()
             }
 
     record = await PolymarketResolutionResolver(gamma_client=FakeGamma()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={"market_id": "pm-1"},
     )
 
@@ -1170,7 +1188,7 @@ async def test_polymarket_resolver_winner_hint_keeps_snapshot_status_observation
     None
 ):
     record = await PolymarketResolutionResolver().resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1197,7 +1215,7 @@ async def test_polymarket_resolver_metadata_status_is_diagnostic_not_canonical()
     None
 ):
     record = await PolymarketResolutionResolver().resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1219,15 +1237,15 @@ async def test_polymarket_resolver_metadata_status_is_diagnostic_not_canonical()
 @pytest.mark.asyncio
 async def test_polymarket_resolver_ctf_denominator_zero_is_nonfinal() -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             return 0, [0, 0]
 
     resolver = PolymarketResolutionResolver(ctf_client=FakeCtf())
     record = await resolver.resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1252,14 +1270,14 @@ async def test_polymarket_resolver_ctf_denominator_zero_ignores_lifecycle_status
     status: str,
 ) -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             return 0, [0, 0]
 
     record = await PolymarketResolutionResolver(ctf_client=FakeCtf()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot={
             "market_id": "pm-1",
             "condition_id": "0xabc",
@@ -1291,10 +1309,10 @@ async def test_polymarket_resolver_ctf_denominator_zero_status_is_diagnostic(
     status_update: dict[str, str],
 ) -> None:
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             return 0, [0, 0]
 
     snapshot = {
@@ -1305,7 +1323,7 @@ async def test_polymarket_resolver_ctf_denominator_zero_status_is_diagnostic(
     snapshot.update(status_update)
 
     record = await PolymarketResolutionResolver(ctf_client=FakeCtf()).resolve(
-        "pm-1",
+        PolymarketMarketRef("pm-1"),
         snapshot=snapshot,
     )
 
@@ -1377,7 +1395,7 @@ def test_resolution_facade_exports_supported_single_resolution_types() -> None:
 
 
 @pytest.mark.asyncio
-async def test_single_resolvers_accept_typed_refs_and_legacy_keyword_calls() -> None:
+async def test_single_resolvers_accept_typed_keyword_refs() -> None:
     polymarket = await PolymarketResolutionResolver().resolve(
         market_key=PolymarketMarketRef("pm-1", condition_id="0xabc"),
         snapshot={
@@ -1397,7 +1415,7 @@ async def test_single_resolvers_accept_typed_refs_and_legacy_keyword_calls() -> 
         },
     )
     legacy = await KalshiResolutionResolver().resolve(
-        market_key="KXLEGACY",
+        market_key=KalshiMarketRef("KXLEGACY"),
         snapshot={"ticker": "KXLEGACY", "status": "open"},
     )
 
@@ -1413,7 +1431,7 @@ async def test_typed_ref_validation_happens_before_io() -> None:
     calls = 0
 
     class FakeGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             nonlocal calls
             calls += 1
             return {"id": market_key}
@@ -1441,10 +1459,10 @@ async def test_typed_ref_validation_happens_before_io() -> None:
             snapshot={"market_id": 1},
         )
     class FakeCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             raise AssertionError("invalid condition must fail before CTF I/O")
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             raise AssertionError("invalid condition must fail before CTF I/O")
 
     with pytest.raises(ValueError, match="condition_id is not hex"):
@@ -1473,7 +1491,7 @@ async def test_typed_ref_validation_happens_before_io() -> None:
 @pytest.mark.asyncio
 async def test_returned_typed_identity_conflicts_are_source_evidence() -> None:
     class FakeGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             return {
                 "id": market_key,
                 "market_id": "pm-other",
@@ -1481,14 +1499,14 @@ async def test_returned_typed_identity_conflicts_are_source_evidence() -> None:
             }
 
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker, "market_key": "OTHER"}
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker, "series_ticker": "OTHER-SERIES"}
 
     class ContradictoryGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             return {
                 "id": market_key,
                 "condition_id": "0xabc",
@@ -1521,30 +1539,30 @@ async def test_returned_typed_identity_conflicts_are_source_evidence() -> None:
 @pytest.mark.asyncio
 async def test_programmer_errors_escape_single_resolvers() -> None:
     class BrokenGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             raise RuntimeError("injected gamma bug")
 
     class BrokenKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             raise AttributeError("injected kalshi bug")
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
     class BrokenCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             raise AssertionError("injected CTF bug")
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             return 1, [1, 0]
 
     with pytest.raises(RuntimeError, match="injected gamma bug"):
-        await PolymarketResolutionResolver(gamma_client=BrokenGamma()).resolve("pm-1")
+        await PolymarketResolutionResolver(gamma_client=BrokenGamma()).resolve(PolymarketMarketRef("pm-1"))
     with pytest.raises(AttributeError, match="injected kalshi bug"):
-        await KalshiResolutionResolver(BrokenKalshi()).resolve("KXRAIN")
+        await KalshiResolutionResolver(BrokenKalshi()).resolve(KalshiMarketRef("KXRAIN"))
     with pytest.raises(AssertionError, match="injected CTF bug"):
         await PolymarketResolutionResolver(ctf_client=BrokenCtf()).resolve(
-            "pm-1",
+            PolymarketMarketRef("pm-1"),
             snapshot={
                 "market_id": "pm-1",
                 "condition_id": "0xabc",
@@ -1569,7 +1587,7 @@ async def test_kalshi_read_auth_signal_escapes_but_http_403_is_evidence() -> Non
     )
     try:
         with pytest.raises(ReadAuthenticationRequiredError):
-            await KalshiResolutionResolver(auth_client).resolve("KXRAIN")
+            await KalshiResolutionResolver(auth_client).resolve(KalshiMarketRef("KXRAIN"))
     finally:
         await auth_client.close()
 
@@ -1582,7 +1600,7 @@ async def test_kalshi_read_auth_signal_escapes_but_http_403_is_evidence() -> Non
         request_policy=RequestPolicy(max_attempts=1),
     )
     try:
-        record = await KalshiResolutionResolver(http_client).resolve("KXRAIN")
+        record = await KalshiResolutionResolver(http_client).resolve(KalshiMarketRef("KXRAIN"))
     finally:
         await http_client.close()
 
@@ -1611,7 +1629,7 @@ async def test_invalid_json_and_malformed_gamma_condition_are_source_evidence() 
         await client.close()
 
     class MalformedGamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             return {
                 "id": market_key,
                 "conditionId": "not-hex",
@@ -1619,10 +1637,10 @@ async def test_invalid_json_and_malformed_gamma_condition_are_source_evidence() 
             }
 
     class UnusedCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             raise AssertionError("malformed Gamma condition must block CTF I/O")
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             raise AssertionError("malformed Gamma condition must block CTF I/O")
 
     malformed = await PolymarketResolutionResolver(
@@ -1675,7 +1693,7 @@ async def test_persisted_rpc_error_does_not_include_rpc_url_or_remote_body() -> 
     )
     try:
         record = await PolymarketResolutionResolver(ctf_client=client).resolve(
-            "pm-1",
+            PolymarketMarketRef("pm-1"),
             snapshot={
                 "market_id": "pm-1",
                 "condition_id": "0xabc",
@@ -1735,7 +1753,7 @@ async def test_persisted_rpc_decode_errors_are_sanitized(
     client._client.headers["Authorization"] = "RPC-AUTH-HEADER-MARKER"
     try:
         record = await PolymarketResolutionResolver(ctf_client=client).resolve(
-            "pm-1",
+            PolymarketMarketRef("pm-1"),
             snapshot={
                 "market_id": "pm-1",
                 "condition_id": "0xabc",
@@ -1795,10 +1813,10 @@ async def test_single_deadline_expires_while_waiting_for_limiter_without_request
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("pm-1", deadline_s=1.0)  # warm the HTTP client
+        await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)  # warm the HTTP client
         block = True
         with pytest.raises(OperationTimeoutError):
-            await resolver.resolve("pm-1", deadline_s=0.05)
+            await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=0.05)
         assert entered.is_set()
         assert drained.is_set()
         assert request_count == 1
@@ -1825,14 +1843,14 @@ async def test_single_deadline_expires_in_retry_backoff_without_second_attempt()
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("pm-1", deadline_s=1.0)
+        await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)
         fail = True
         with pytest.raises(OperationTimeoutError):
-            await resolver.resolve("pm-1", deadline_s=0.05)
+            await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=0.05)
         await asyncio.sleep(0)
         assert request_count == 2
         fail = False
-        record = await resolver.resolve("pm-1", deadline_s=1.0)
+        record = await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)
     finally:
         await client.close()
 
@@ -1866,11 +1884,11 @@ async def test_transport_cleanup_completes_before_failure_and_client_reuses(
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("pm-1", deadline_s=1.0)
+        await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)
         block = True
         task = asyncio.create_task(
             resolver.resolve(
-                "pm-1",
+                PolymarketMarketRef("pm-1"),
                 deadline_s=0.05 if failure == "timeout" else None,
             )
         )
@@ -1884,7 +1902,7 @@ async def test_transport_cleanup_completes_before_failure_and_client_reuses(
                 await task
         assert drained.is_set()
         block = False
-        record = await resolver.resolve("pm-1", deadline_s=1.0)
+        record = await resolver.resolve(PolymarketMarketRef("pm-1"), deadline_s=1.0)
     finally:
         await client.close()
 
@@ -1945,7 +1963,7 @@ async def test_rpc_failure_drains_owned_await_and_client_is_reusable(
     try:
         task = asyncio.create_task(
             resolver.resolve(
-                "pm-1",
+                PolymarketMarketRef("pm-1"),
                 snapshot=snapshot,
                 deadline_s=0.05 if failure == "timeout" else None,
             )
@@ -1961,7 +1979,7 @@ async def test_rpc_failure_drains_owned_await_and_client_is_reusable(
         assert drained.is_set()
         assert resolver._ctf_chain_checked is (stage == "payout")
         block = False
-        record = await resolver.resolve("pm-1", snapshot=snapshot, deadline_s=1.0)
+        record = await resolver.resolve(PolymarketMarketRef("pm-1"), snapshot=snapshot, deadline_s=1.0)
     finally:
         await client.close()
 
@@ -1974,11 +1992,11 @@ async def test_ctf_chain_success_is_cached_only_after_expiry_checkpoint() -> Non
     now = 0.0
 
     class Ctf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             nonlocal now
             now = 2.0
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             raise AssertionError("expired chain validation must stop payout reads")
 
     resolver = PolymarketResolutionResolver(ctf_client=Ctf())
@@ -1986,7 +2004,7 @@ async def test_ctf_chain_success_is_cached_only_after_expiry_checkpoint() -> Non
 
     with pytest.raises(OperationTimeoutError):
         await resolver._resolve_with_expiry(
-            "pm-1",
+            PolymarketMarketRef("pm-1"),
             snapshot={
                 "market_id": "pm-1",
                 "condition_id": "0xabc",
@@ -2009,7 +2027,7 @@ async def test_late_normalization_checkpoint_uses_original_expiry() -> None:
             return 0.5
 
     class Gamma:
-        async def market(self, market_key: str):
+        async def market(self, market_key: str, *, expiry=None):
             return {
                 "id": market_key,
                 "outcomes": ["Yes", "No"],
@@ -2021,19 +2039,19 @@ async def test_late_normalization_checkpoint_uses_original_expiry() -> None:
 
     with pytest.raises(OperationTimeoutError):
         await resolver._resolve_with_expiry(
-            "pm-1",
+            PolymarketMarketRef("pm-1"),
             snapshot=None,
             expiry=expiry,
         )
 
 
 @pytest.mark.asyncio
-async def test_native_client_subclass_overrides_remain_in_resolution_call_path() -> None:
+async def test_provider_methods_receive_the_shared_resolution_expiry() -> None:
     gamma_called = False
     ctf_calls: list[str] = []
 
     class Gamma(AsyncGammaClient):
-        async def market(self, market_id: str | int) -> dict[str, object]:
+        async def market(self, market_id: str | int, *, expiry=None) -> dict[str, object]:
             nonlocal gamma_called
             gamma_called = True
             return {
@@ -2043,11 +2061,11 @@ async def test_native_client_subclass_overrides_remain_in_resolution_call_path()
             }
 
     class Ctf(PolygonCtfClient):
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             ctf_calls.append("chain")
 
         async def payout_vector(
-            self, condition_id: str, outcome_count: int
+            self, condition_id: str, outcome_count: int, *, expiry=None
         ) -> tuple[int, list[int]]:
             ctf_calls.append("payout")
             return 1, [1, 0]
@@ -2117,7 +2135,7 @@ async def test_resolution_cache_writes_parquet_and_summary(tmp_path) -> None:
     ).to_parquet(kalshi_path, index=False)
 
     class FakeClob:
-        async def clob_market_info(self, condition_id: str):
+        async def clob_market_info(self, condition_id: str, *, expiry=None):
             return {
                 "tokens": [
                     {"t": "token-yes", "o": "Yes"},
@@ -2126,11 +2144,11 @@ async def test_resolution_cache_writes_parquet_and_summary(tmp_path) -> None:
             }
 
     class FakeGamma:
-        async def market(self, market_id: str):
+        async def market(self, market_id: str, *, expiry=None):
             return {}
 
     class FakeKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -2138,7 +2156,7 @@ async def test_resolution_cache_writes_parquet_and_summary(tmp_path) -> None:
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {}
 
     summary = await resolve_market_resolution_cache(
@@ -2199,10 +2217,10 @@ async def test_resolution_cache_refresh_keeps_existing_canonical_on_weak_refresh
     ).to_parquet(output_dir / "market_resolutions.parquet", index=False)
 
     class WeakKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker, "status": "active"}
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {"ticker": ticker}
 
     await resolve_market_resolution_cache(
@@ -2264,14 +2282,14 @@ async def test_resolution_cache_refresh_records_fresh_authority_conflict(
     ).to_parquet(output_dir / "market_resolutions.parquet", index=False)
 
     class ConflictingKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
@@ -2334,16 +2352,16 @@ async def test_resolution_cache_refresh_records_invalid_ctf_vector(tmp_path) -> 
     ).to_parquet(output_dir / "market_resolutions.parquet", index=False)
 
     class InvalidCtf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             return None
 
-        async def payout_vector(self, condition_id: str, outcome_count: int):
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
             assert condition_id == "0xabc"
             assert outcome_count == 2
             return 1, [1, 1]
 
     class EmptyClob:
-        async def clob_market_info(self, condition_id: str):
+        async def clob_market_info(self, condition_id: str, *, expiry=None):
             return {}
 
     await resolve_market_resolution_cache(
@@ -2430,14 +2448,14 @@ async def test_resolution_cache_retained_finals_are_universe_and_version_aware(
     ).to_parquet(output_dir / "market_resolutions.parquet", index=False)
 
     class FreshKalshi:
-        async def market(self, ticker: str):
+        async def market(self, ticker: str, *, expiry=None):
             return {
                 "ticker": ticker,
                 "status": "finalized",
                 "settlement_value_dollars": "1",
             }
 
-        async def historical_market(self, ticker: str):
+        async def historical_market(self, ticker: str, *, expiry=None):
             return {}
 
     await resolve_market_resolution_cache(
@@ -2454,3 +2472,11 @@ async def test_resolution_cache_retained_finals_are_universe_and_version_aware(
     assert row["resolver_version"] == RESOLVER_VERSION
     assert row["resolution_state"] == "final"
     assert row["winner"] == "yes"
+
+
+@pytest.mark.asyncio
+async def test_resolution_rejects_untyped_identifiers() -> None:
+    with pytest.raises(TypeError, match="PolymarketMarketRef"):
+        await PolymarketResolutionResolver().resolve("pm-1")
+    with pytest.raises(TypeError, match="KalshiMarketRef"):
+        await KalshiResolutionResolver().resolve("KX-ONE")

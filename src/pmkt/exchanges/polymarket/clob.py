@@ -7,11 +7,13 @@ from urllib.parse import quote
 from uuid import uuid4
 
 import httpx
+from pmkt.exchanges._requests import VenueRequests
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient, RequestPolicy
-from pmkt._operation import OperationExpiry
-from pmkt.config import PmktConfig, get_config
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient
+from pmkt.runtime import OperationExpiry
+from pmkt.config import PmktConfig
 from pmkt.errors import MarketNotFoundError
 from pmkt.exchanges.polymarket._workflow import (
     clob_book_identities,
@@ -47,7 +49,7 @@ class AsyncClobClient:
             if base_url is not None
             else config.clob_api_url
             if config is not None
-            else get_config().clob_api_url
+            else PmktConfig().clob_api_url
         )
         self.transport = transport
         self.limiter = limiter or AsyncLimiter(10, 1)
@@ -58,9 +60,8 @@ class AsyncClobClient:
             timeout_s=timeout_s,
             request_policy=request_policy,
             retryable_post_paths={"/books", "/batch-prices-history"},
-            source_venue="polymarket",
-            source_service="clob",
         )
+        self._requests = VenueRequests(self._http, venue="polymarket", service="clob")
 
     async def close(self) -> None:
         await self._http.close()
@@ -75,8 +76,12 @@ class AsyncClobClient:
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    async def book(self, token_id: str) -> OrderBook:
-        data = await self._http.request_json("GET", "/book", params={"token_id": token_id})
+    async def book(
+        self, token_id: str, *, expiry: OperationExpiry | None = None
+    ) -> OrderBook:
+        data = await self._http.request_json(
+            "GET", "/book", params={"token_id": token_id}, expiry=expiry
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return OrderBook(**data)
@@ -100,12 +105,11 @@ class AsyncClobClient:
         expiry = OperationExpiry.bounded(deadline_s)
         observations: list[RequestObservation] = []
         try:
-            payload, observation = await self._http.request_json_observed(
+            payload, observation = await self._requests.request_json_observed(
                 "GET",
                 "/book",
                 request_id=f"clob-book-{uuid4().hex}",
                 endpoint_template="/book",
-                parameter_allowlist={"token_id"},
                 effective_parameters={"token_id": instrument.token_id},
                 params={"token_id": instrument.token_id},
                 expiry=expiry,
@@ -133,56 +137,56 @@ class AsyncClobClient:
         expiry.checkpoint()
         return result
 
-    async def books(self, token_ids: Sequence[str]) -> list[OrderBook]:
+    async def books(
+        self, token_ids: Sequence[str], *, expiry: OperationExpiry | None = None
+    ) -> list[OrderBook]:
         payload = [{"token_id": str(token_id)} for token_id in token_ids]
-        data = await self._http.request_json("POST", "/books", json=payload)
+        data = await self._http.request_json(
+            "POST", "/books", json=payload, expiry=expiry
+        )
         if not isinstance(data, list):
             raise TypeError(f"Expected list, got {type(data)}")
         return [OrderBook(**item) for item in data if isinstance(item, dict)]
 
-    async def _resolution_market_payload(
+    async def clob_market_info(
+        self, condition_id: str, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
+        data = await self._http.request_json(
+            "GET", f"/markets/{quote(condition_id, safe='')}", expiry=expiry
+        )
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict, got {type(data)}")
+        return data
+
+    async def price(
         self,
-        condition_id: str,
+        token_id: str,
+        side: Literal["BUY", "SELL"],
         *,
-        expiry: OperationExpiry | None,
-    ) -> Any:
-        encoded_condition_id = (
-            quote(condition_id, safe="") if expiry is not None else condition_id
-        )
-        return await self._http.request_json(
-            "GET",
-            f"/clob-markets/{encoded_condition_id}",
-            params=None,
-            expiry=expiry,
-        )
-
-    async def clob_market_info(self, condition_id: str) -> dict[str, Any]:
-        data = await self._resolution_market_payload(condition_id, expiry=None)
-        if not isinstance(data, dict):
-            raise TypeError(f"Expected dict, got {type(data)}")
-        return data
-
-    async def price(self, token_id: str, side: Literal["BUY", "SELL"]) -> dict[str, Any]:
+        expiry: OperationExpiry | None = None,
+    ) -> dict[str, Any]:
         data = await self._http.request_json(
-            "GET",
-            "/price",
-            params={"token_id": token_id, "side": side},
+            "GET", "/price", params={"token_id": token_id, "side": side}, expiry=expiry
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
-    async def midpoint(self, token_id: str) -> dict[str, Any]:
-        data = await self._http.request_json("GET", "/midpoint", params={"token_id": token_id})
+    async def midpoint(
+        self, token_id: str, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
+        data = await self._http.request_json(
+            "GET", "/midpoint", params={"token_id": token_id}, expiry=expiry
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         return data
 
-    async def fee_rate(self, token_id: str) -> dict[str, Any]:
+    async def fee_rate(
+        self, token_id: str, *, expiry: OperationExpiry | None = None
+    ) -> dict[str, Any]:
         data = await self._http.request_json(
-            "GET",
-            f"/fee-rate/{token_id}",
-            params=None,
+            "GET", f"/fee-rate/{token_id}", params=None, expiry=expiry
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -197,6 +201,8 @@ class AsyncClobClient:
         fidelity: int | None = None,
         start_ts: int | None = None,
         end_ts: int | None = None,
+        *,
+        expiry: OperationExpiry | None = None,
     ) -> PriceHistory:
         data, _observation = await self._prices_history_payload(
             market=market,
@@ -204,6 +210,7 @@ class AsyncClobClient:
             fidelity=fidelity,
             start_ts=start_ts,
             end_ts=end_ts,
+            expiry=expiry,
         )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
@@ -230,9 +237,7 @@ class AsyncClobClient:
         if invalid_rows not in ("raise", "report"):
             raise ValueError("invalid_rows must be 'raise' or 'report'")
         expiry = OperationExpiry.bounded(deadline_s)
-        query_start_ts, query_end_ts = _clob_history_query_bounds(
-            start_utc, end_utc
-        )
+        query_start_ts, query_end_ts = _clob_history_query_bounds(start_utc, end_utc)
         queried_start_utc = datetime.fromtimestamp(query_start_ts, tz=timezone.utc)
         queried_end_utc = datetime.fromtimestamp(query_end_ts, tz=timezone.utc)
         observations: list[RequestObservation] = []
@@ -291,12 +296,11 @@ class AsyncClobClient:
             return data, None
         if instrument is None or observations is None:
             raise RuntimeError("observed history fetch requires workflow context")
-        data, observation = await self._http.request_json_observed(
+        data, observation = await self._requests.request_json_observed(
             "GET",
             "/prices-history",
             request_id=f"clob-history-{uuid4().hex}",
             endpoint_template="/prices-history",
-            parameter_allowlist={"market", "fidelity", "startTs", "endTs"},
             effective_parameters={
                 "market": market,
                 "fidelity": fidelity,
@@ -319,12 +323,16 @@ class AsyncClobClient:
         fidelity: int | None = None,
         start_ts: int | None = None,
         end_ts: int | None = None,
+        *,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, PriceHistory]:
         market_ids = [str(market).strip() for market in markets if str(market).strip()]
         if not market_ids:
             raise ValueError("markets must contain at least one market id")
         if len(market_ids) > 20:
-            raise ValueError("batch-prices-history supports at most 20 markets per request")
+            raise ValueError(
+                "batch-prices-history supports at most 20 markets per request"
+            )
         payload: dict[str, Any] = {
             "markets": market_ids,
             "fidelity": fidelity,
@@ -334,7 +342,9 @@ class AsyncClobClient:
         if start_ts is None and end_ts is None:
             payload["interval"] = interval
         payload = {key: value for key, value in payload.items() if value is not None}
-        data = await self._http.request_json("POST", "/batch-prices-history", json=payload)
+        data = await self._http.request_json(
+            "POST", "/batch-prices-history", json=payload, expiry=expiry
+        )
         if not isinstance(data, dict):
             raise TypeError(f"Expected dict, got {type(data)}")
         raw_history = data.get("history", data)
@@ -354,6 +364,8 @@ class AsyncClobClient:
         interval: str,
         fidelity: int | None = None,
         skip_missing: bool = True,
+        *,
+        expiry: OperationExpiry | None = None,
     ) -> dict[str, PriceHistory]:
         token_ids = extract_token_ids(event_payload)
         if not token_ids:
@@ -361,7 +373,9 @@ class AsyncClobClient:
         history: dict[str, PriceHistory] = {}
         for token_id in token_ids:
             params = {"market": token_id, "interval": interval, "fidelity": fidelity}
-            response = await self._http._request("GET", "/prices-history", params=params)
+            response = await self._http._request(
+                "GET", "/prices-history", params=params
+            )
             if response.status_code == 404:
                 if skip_missing:
                     await response.aclose()
@@ -385,8 +399,6 @@ class AsyncClobClient:
             history[token_id] = PriceHistory(**data)
         return history
 
-ClobClient = AsyncClobClient
-
 
 def _utc_history_bounds(start: datetime, end: datetime) -> tuple[datetime, datetime]:
     normalized: list[datetime] = []
@@ -409,7 +421,9 @@ def _require_positive_int(value: object, name: str) -> None:
         raise ValueError(f"{name} must be positive")
 
 
-def _clob_history_query_bounds(start_utc: datetime, end_utc: datetime) -> tuple[int, int]:
+def _clob_history_query_bounds(
+    start_utc: datetime, end_utc: datetime
+) -> tuple[int, int]:
     start_floor = math.floor(start_utc.timestamp())
     query_start = start_floor - 1 if start_utc.microsecond == 0 else start_floor
     end_floor = math.floor(end_utc.timestamp())

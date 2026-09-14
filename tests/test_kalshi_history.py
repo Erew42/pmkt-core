@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import pytest
 
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import (
     InvalidDataError,
     MarketNotFoundError,
@@ -36,6 +36,45 @@ NOW = BASE + timedelta(days=500)
 TICKER = "KX TEST/ONE"
 EVENT = "KX EVENT/ONE"
 SERIES = "KX SERIES/ONE"
+
+
+def test_retained_evidence_is_independent_and_includes_rejected_rows() -> None:
+    row = _historical_row(BASE + timedelta(hours=1))
+    invalid_row = _historical_row(BASE + timedelta(hours=1))
+    invalid_row["end_period_ts"] = "invalid"
+    payload = {"candlesticks": [row, invalid_row]}
+    observation = _observation()
+    end = BASE + timedelta(hours=2)
+    result = normalize_kalshi_candle_history(
+        [CandlePayload(payload, "historical", observation)],
+        market=KalshiMarketRef(TICKER),
+        requested_start_utc=BASE,
+        requested_end_utc=end,
+        period_minutes=60,
+        requested_source="historical",
+        completed_through_utc=NOW,
+        historical_cutoff_utc=None,
+        queried_windows=[
+            HistoryQueryWindow(
+                BASE, end, "historical", "/historical/markets/{ticker}/candlesticks"
+            )
+        ],
+        observations=[observation],
+        max_candles=10,
+        invalid_rows="report",
+        routing_flags=(),
+        routing_market=None,
+        expiry=OperationExpiry.after(5),
+    )
+    assert result.coverage.accepted_rows == 1
+    assert result.coverage.rejected_rows == 1
+    [evidence] = result.provenance.raw_responses
+    assert evidence.request_id == observation.request_id
+    assert len(evidence.payload["candlesticks"]) == 2
+    row["price"]["close"] = "0.99"
+    assert evidence.payload["candlesticks"][0]["price"]["close"] == "0.4000"
+    evidence.payload["candlesticks"][0]["price"]["close"] = "0.01"
+    assert result.candles[0].traded_price.close == 0.4
 
 
 def _historical_row(end: datetime, *, close: str | None = "0.4000") -> dict[str, Any]:
@@ -141,9 +180,7 @@ def _observation(request_id: str = "candle-test") -> RequestObservation:
 def test_routing_timestamp_fraction_precision_is_python_version_independent(
     digits: str,
 ) -> None:
-    parsed = parse_kalshi_settlement_timestamp(
-        f"2026-01-01T00:00:00.{digits}Z"
-    )
+    parsed = parse_kalshi_settlement_timestamp(f"2026-01-01T00:00:00.{digits}Z")
     assert parsed is not None
     assert parsed.microsecond == int(digits.ljust(6, "0"))
 
@@ -247,12 +284,16 @@ async def test_explicit_historical_decodes_units_without_series_or_fallback() ->
     assert candle.traded_price_previous == 0.35
     assert candle.volume_contracts == 2.25
     assert candle.open_interest_contracts == 12.5
-    assert result.native_payloads[0]["unknown_native"] == {"kept": True}
+    assert result.provenance.raw_responses[0].payload["unknown_native"] == {
+        "kept": True
+    }
     assert result.coverage.datasets == ("historical",)
 
 
 @pytest.mark.asyncio
-async def test_explicit_live_resolves_verified_event_series_and_disables_projection() -> None:
+async def test_explicit_live_resolves_verified_event_series_and_disables_projection() -> (
+    None
+):
     paths: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -377,7 +418,9 @@ async def test_live_rejects_event_alias_and_candle_series_contradictions() -> No
 
 
 @pytest.mark.asyncio
-async def test_auto_routes_on_market_settlement_cutoff_not_requested_or_trade_cutoff() -> None:
+async def test_auto_routes_on_market_settlement_cutoff_not_requested_or_trade_cutoff() -> (
+    None
+):
     paths: list[str] = []
     settlement = (BASE + timedelta(days=4)).isoformat()
 
@@ -425,14 +468,14 @@ async def test_auto_cutoff_boundary_is_strictly_before(
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/historical/cutoff":
-            return httpx.Response(
-                200, json={"market_settled_ts": cutoff.isoformat()}
-            )
+            return httpx.Response(200, json={"market_settled_ts": cutoff.isoformat()})
         if request.url.path.startswith("/markets/"):
             return httpx.Response(
                 200,
                 json=_market(
-                    settlement=(cutoff + timedelta(seconds=settlement_delta)).isoformat()
+                    settlement=(
+                        cutoff + timedelta(seconds=settlement_delta)
+                    ).isoformat()
                 ),
             )
         if request.url.path.startswith("/events/"):
@@ -640,7 +683,9 @@ async def test_migration_overlap_conflict_issues_name_each_originating_request(
     assert result.coverage.conflicting_rows == 3
     assert len(result.issues) == 3
     assert sum(issue.occurrence_count for issue in result.issues) == 3
-    observation_ids = {observation.request_id for observation in result.observations}
+    observation_ids = {
+        observation.request_id for observation in result.provenance.observations
+    }
     assert {issue.request_id for issue in result.issues} <= observation_ids
 
 
@@ -869,7 +914,9 @@ async def test_reconciliation_precedes_containment_and_cap() -> None:
 
 
 @pytest.mark.asyncio
-async def test_quote_only_candle_is_legitimate_and_boundaries_are_fully_contained() -> None:
+async def test_quote_only_candle_is_legitimate_and_boundaries_are_fully_contained() -> (
+    None
+):
     rows = [
         _historical_row(BASE + timedelta(hours=1), close=None),
         _historical_row(BASE + timedelta(hours=2), close=None),
@@ -898,7 +945,7 @@ async def test_empty_conversions_keep_typed_utc_columns_and_metadata() -> None:
     assert table.schema.metadata[b"market_ticker"] == TICKER.encode()
     assert str(frame.dtypes["period_start_utc"]) == "datetime64[ns, UTC]"
     assert str(frame.dtypes["period_end_utc"]) == "datetime64[ns, UTC]"
-    assert frame.attrs["interpretation_id"] == result.interpretation_id
+    assert frame.attrs["interpretation_id"] == result.provenance.interpretation_id
 
 
 def test_candle_record_period_rejects_bool_and_float() -> None:
@@ -971,7 +1018,7 @@ async def test_utc_first_fold_ordering_and_subsecond_containment() -> None:
         start=earlier_utc_later_wall,
         end=later_utc_earlier_wall,
     )
-    assert empty.requested_start_utc < empty.requested_end_utc
+    assert empty.coverage.requested_start_utc < empty.coverage.requested_end_utc
     with pytest.raises(ValueError, match="UTC normalization"):
         await _explicit_history(
             {"ticker": TICKER, "candlesticks": []},
@@ -1012,7 +1059,9 @@ async def test_daily_fixed_elapsed_intervals_validate_both_dst_transitions() -> 
         for start in local_starts
     ]
     start = min(item.astimezone(timezone.utc) for item in local_starts)
-    end = max(item.astimezone(timezone.utc) + timedelta(days=1) for item in local_starts)
+    end = max(
+        item.astimezone(timezone.utc) + timedelta(days=1) for item in local_starts
+    )
     result = await _explicit_history(
         {"ticker": TICKER, "candlesticks": rows},
         start=start,
@@ -1077,9 +1126,7 @@ async def test_varied_internal_chunk_sizes_return_same_candles(
             start_ts = int(request.url.params["start_ts"])
             end_ts = int(request.url.params["end_ts"])
             selected = [
-                row
-                for row in rows
-                if start_ts <= int(row["end_period_ts"]) <= end_ts
+                row for row in rows if start_ts <= int(row["end_period_ts"]) <= end_ts
             ]
             return httpx.Response(
                 200, json={"ticker": TICKER, "candlesticks": selected}
@@ -1279,9 +1326,7 @@ def test_normalization_and_window_planning_checkpoint_expiry() -> None:
                 CandlePayload(
                     {
                         "ticker": TICKER,
-                        "candlesticks": [
-                            _historical_row(BASE + timedelta(hours=1))
-                        ]
+                        "candlesticks": [_historical_row(BASE + timedelta(hours=1))]
                         * 1000,
                     },
                     "historical",
@@ -1434,7 +1479,9 @@ async def test_live_sparse_trade_prices_preserve_quotes_and_missing_evidence(
     assert candle.yes_bid.close == 0.35
     assert candle.yes_ask.close == 0.45
     assert candle.volume_contracts == 0
-    assert candle.native_payload["price"] == price
+    assert (
+        result.provenance.raw_responses[0].payload["candlesticks"][0]["price"] == price
+    )
     assert result.coverage.rejected_rows == 0
 
 

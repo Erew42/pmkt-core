@@ -5,10 +5,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 import httpx
+from pmkt.runtime import OperationExpiry
 from aiolimiter import AsyncLimiter
 
-from pmkt._http import HttpClient, RequestPolicy
-from pmkt.config import PmktConfig, get_config
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient
+from pmkt.config import PmktConfig
 
 
 MAX_OPEN_INTEREST_MARKETS = 25
@@ -112,7 +114,7 @@ class AsyncPolymarketDataClient:
             if base_url is not None
             else config.polymarket_data_api_url
             if config is not None
-            else get_config().polymarket_data_api_url
+            else PmktConfig().polymarket_data_api_url
         )
         self.limiter = limiter or AsyncLimiter(
             DEFAULT_DATA_API_MAX_RATE,
@@ -124,8 +126,6 @@ class AsyncPolymarketDataClient:
             limiter=self.limiter,
             timeout_s=timeout_s,
             request_policy=request_policy,
-            source_venue="polymarket",
-            source_service="data_api",
         )
 
     async def __aenter__(self) -> "AsyncPolymarketDataClient":
@@ -139,13 +139,11 @@ class AsyncPolymarketDataClient:
         await self._http.close()
 
     async def open_interest_page(
-        self, condition_ids: Sequence[object]
+        self, condition_ids: Sequence[object], *, expiry: OperationExpiry | None = None
     ) -> list[dict[str, Any]]:
         requested = normalize_condition_ids(condition_ids)
         payload = await self._http.request_json(
-            "GET",
-            "/oi",
-            params={"market": ",".join(requested)},
+            "GET", "/oi", params={"market": ",".join(requested)}, expiry=expiry
         )
         if not isinstance(payload, list) or any(
             not isinstance(row, dict) for row in payload

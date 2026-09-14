@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.records import PolymarketMarketRef
+
 import asyncio
 from typing import Any
 
@@ -7,11 +9,11 @@ import httpx
 import pytest
 
 import pmkt.resolution._batch as batch_module
-from pmkt._http import RequestPolicy
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import RequestPolicy
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import OperationTimeoutError, ReadAuthenticationRequiredError
 from pmkt.exchanges.polymarket import AsyncGammaClient
-from pmkt.records import KalshiMarketRef, PolymarketMarketRef
+from pmkt.records import KalshiMarketRef
 from pmkt.resolution import KalshiResolutionResolver, PolymarketResolutionResolver
 from pmkt.resolution.models import ResolutionRecord, SourceObservation
 
@@ -38,7 +40,7 @@ async def test_batch_validates_options_and_all_inputs_before_io() -> None:
     calls = 0
 
     class Gamma:
-        async def market(self, market_id: str) -> dict[str, Any]:
+        async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
             nonlocal calls
             calls += 1
             return {"id": market_id}
@@ -84,13 +86,13 @@ async def test_batch_late_malformed_ctf_enrichment_fails_before_io() -> None:
     calls = 0
 
     class Gamma:
-        async def market(self, market_id: str) -> dict[str, Any]:
+        async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
             nonlocal calls
             calls += 1
             return {"id": market_id}
 
     class Ctf:
-        async def ensure_polygon(self) -> None:
+        async def ensure_polygon(self, *, expiry=None) -> None:
             raise AssertionError("CTF I/O must not start")
 
         async def payout_vector(
@@ -209,7 +211,7 @@ async def test_batch_drains_workers_when_later_worker_allocation_fails(
 @pytest.mark.asyncio
 async def test_batch_expected_source_failures_keep_order_and_cardinality() -> None:
     class Gamma:
-        async def market(self, market_id: str) -> dict[str, Any]:
+        async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
             request = httpx.Request("GET", f"https://gamma.test/{market_id}")
             if market_id == "transport":
                 raise httpx.ConnectError("offline", request=request)
@@ -252,7 +254,7 @@ async def test_batch_global_or_programmer_failure_drains_sibling_and_client_reus
     failing = True
 
     class Client:
-        async def market(self, ticker: str) -> dict[str, Any]:
+        async def market(self, ticker: str, *, expiry=None) -> dict[str, Any]:
             if not failing:
                 return {"ticker": ticker, "status": "finalized", "result": "yes"}
             if ticker == "slow":
@@ -266,7 +268,7 @@ async def test_batch_global_or_programmer_failure_drains_sibling_and_client_reus
             await slow_entered.wait()
             raise failure
 
-        async def historical_market(self, ticker: str) -> dict[str, Any]:
+        async def historical_market(self, ticker: str, *, expiry=None) -> dict[str, Any]:
             return {"ticker": ticker, "status": "finalized", "result": "yes"}
 
     resolver = KalshiResolutionResolver(Client())
@@ -401,7 +403,7 @@ async def test_batch_timeout_while_limiter_blocked_drains_without_request() -> N
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("warm", deadline_s=1.0)
+        await resolver.resolve(PolymarketMarketRef("warm"), deadline_s=1.0)
         blocked = True
         task = asyncio.create_task(
             resolver.resolve_many(
@@ -455,7 +457,7 @@ async def test_batch_transport_failure_drains_before_raise_and_client_reuses(
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("warm", deadline_s=1.0)
+        await resolver.resolve(PolymarketMarketRef("warm"), deadline_s=1.0)
         blocked = True
         task = asyncio.create_task(
             resolver.resolve_many(
@@ -499,7 +501,7 @@ async def test_batch_timeout_in_retry_backoff_starts_no_late_retry() -> None:
     )
     resolver = PolymarketResolutionResolver(gamma_client=client)
     try:
-        await resolver.resolve("warm", deadline_s=1.0)
+        await resolver.resolve(PolymarketMarketRef("warm"), deadline_s=1.0)
         failing = True
         with pytest.raises(OperationTimeoutError):
             await resolver.resolve_many(

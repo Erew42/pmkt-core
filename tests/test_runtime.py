@@ -7,34 +7,26 @@ import httpx
 import pytest
 
 import pmkt.config as config_module
-import pmkt.exchanges.kalshi.client as kalshi_module
-import pmkt.exchanges.polymarket.clob as clob_module
-import pmkt.exchanges.polymarket.data_api as data_api_module
-import pmkt.exchanges.polymarket.gamma as gamma_module
-import pmkt.exchanges.polymarket.subgraph as subgraph_module
-from pmkt._http import HttpClient, RequestPolicy
+from pmkt.runtime import RequestPolicy
+from pmkt._http import HttpClient
+from pmkt.exchanges._requests import VenueRequests
 from pmkt._observations import (
     classify_request_source,
     sanitize_effective_parameters,
     sanitize_endpoint_template,
     source_after_response,
 )
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.config import PmktConfig
-from pmkt.config import RequestPolicy as ConfigRequestPolicy
 from pmkt.errors import (
     InvalidDataError,
     MarketNotFoundError,
     OperationTimeoutError,
-    ReadAuthenticationRequiredError,
 )
 from pmkt.exchanges.kalshi import AsyncKalshiClient
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient
 from pmkt.exchanges.polymarket.data_api import AsyncPolymarketDataClient
 from pmkt.exchanges.polymarket.subgraph import AsyncSubgraphClient
-from pmkt.exchanges.read_auth import (
-    ReadAuthenticationRequiredError as CanonicalReadAuthenticationRequiredError,
-)
 
 
 def test_market_not_found_error_survives_pickle_and_copy() -> None:
@@ -54,61 +46,48 @@ def test_market_not_found_error_survives_pickle_and_copy() -> None:
         assert restored.__dict__ == error.__dict__
 
 
-def test_from_values_bypasses_os_dotenv_discovery_and_cache(
+def test_constructor_bypasses_os_and_dotenv_discovery(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     env_file = tmp_path / ".env"
     env_file.write_text("PMKT_GAMMA_API_URL=https://dotenv.invalid\n", encoding="utf-8")
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PMKT_GAMMA_API_URL", "https://environment.invalid")
-    cached = PmktConfig.from_values(gamma_api_url="https://cached.test")
-    monkeypatch.setattr(config_module, "_config", cached)
 
     def fail_discovery(*args: object, **kwargs: object) -> tuple[Path, ...]:
-        raise AssertionError("from_values discovered environment files")
+        raise AssertionError("constructor discovered environment files")
 
     monkeypatch.setattr(config_module, "resolve_default_env_files", fail_discovery)
-    defaulted = PmktConfig.from_values()
-    explicit = PmktConfig.from_values(gamma_api_url="https://explicit.test")
+    defaulted = PmktConfig()
+    explicit = PmktConfig(gamma_api_url="https://explicit.test")
 
     assert defaulted.gamma_api_url == "https://gamma-api.polymarket.com"
     assert explicit.gamma_api_url == "https://explicit.test"
-    assert config_module._config is cached
 
 
-def test_from_env_and_legacy_constructor_preserve_environment_behavior(
+def test_only_explicit_loader_reads_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("PMKT_GAMMA_API_URL", "https://environment.test")
 
     assert PmktConfig.from_env(_env_file=None).gamma_api_url == "https://environment.test"
-    assert PmktConfig(_env_file=None).gamma_api_url == "https://environment.test"
+    assert PmktConfig().gamma_api_url == "https://gamma-api.polymarket.com"
 
 
 @pytest.mark.asyncio
-async def test_supplied_config_clients_do_not_call_global_config(
+async def test_supplied_config_clients_ignore_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fail_global() -> PmktConfig:
-        raise AssertionError("supplied config called get_config")
+    monkeypatch.setenv("PMKT_GAMMA_API_URL", "https://environment.test")
 
-    for module in (
-        gamma_module,
-        clob_module,
-        data_api_module,
-        subgraph_module,
-        kalshi_module,
-    ):
-        monkeypatch.setattr(module, "get_config", fail_global)
-
-    config = PmktConfig.from_values(
+    config = PmktConfig(
         gamma_api_url="https://gamma.test",
         clob_api_url="https://clob.test",
         polymarket_data_api_url="https://data.test",
         subgraph_api_url="https://subgraph.test",
         kalshi_api_url="https://kalshi.test/trade-api/v2",
     )
-    second_config = PmktConfig.from_values(gamma_api_url="https://gamma-two.test")
+    second_config = PmktConfig(gamma_api_url="https://gamma-two.test")
     clients = (
         AsyncGammaClient(config=config),
         AsyncGammaClient(config=second_config),
@@ -132,7 +111,7 @@ async def test_supplied_config_clients_do_not_call_global_config(
 
 @pytest.mark.asyncio
 async def test_explicit_endpoint_precedes_supplied_config_and_positionals_remain_valid() -> None:
-    config = PmktConfig.from_values(gamma_api_url="https://configured.test")
+    config = PmktConfig(gamma_api_url="https://configured.test")
     transport = httpx.MockTransport(
         lambda request: httpx.Response(200, request=request, json={})
     )
@@ -155,17 +134,6 @@ async def test_explicit_endpoint_precedes_supplied_config_and_positionals_remain
         )
 
 
-def test_request_policy_attempt_alias_preserves_total_attempt_semantics() -> None:
-    legacy = RequestPolicy(2)
-    renamed = RequestPolicy(max_attempts=2)
-
-    assert legacy.max_retries == legacy.max_attempts == 2
-    assert renamed.max_retries == renamed.max_attempts == 2
-    assert legacy.attempts_for("GET") == renamed.attempts_for("GET") == 2
-    with pytest.raises(ValueError, match="cannot both"):
-        RequestPolicy(max_retries=2, max_attempts=2)
-    assert ConfigRequestPolicy is RequestPolicy
-    assert ReadAuthenticationRequiredError is CanonicalReadAuthenticationRequiredError
 
 
 @pytest.mark.parametrize(
@@ -188,7 +156,7 @@ def test_rest_client_timeout_must_be_finite_positive_numeric(
     error = TypeError if isinstance(timeout_s, (bool, str)) else ValueError
     with pytest.raises(error, match="timeout_s"):
         client_type(
-            config=PmktConfig.from_values(),
+            config=PmktConfig(),
             timeout_s=timeout_s,  # type: ignore[arg-type]
         )
 
@@ -270,18 +238,17 @@ async def test_limiter_expiry_drains_with_zero_dispatched_attempts() -> None:
     client = HttpClient(
         "https://clob.polymarket.com",
         limiter=limiter,  # type: ignore[arg-type]
-        source_venue="polymarket",
-        source_service="clob",
+
+
     )
     client._get_client()
     expiry = OperationExpiry.after(0.05)
     task = asyncio.create_task(
-        client.request_json_observed(
+        VenueRequests(client, venue="polymarket", service="clob").request_json_observed(
             "GET",
             "/book",
             request_id="limited",
             endpoint_template="/book",
-            parameter_allowlist={"token_id"},
             effective_parameters={"token_id": "token"},
             params={"token_id": "token"},
             expiry=expiry,
@@ -430,12 +397,11 @@ async def test_expiry_checkpoint_prevents_late_success(expiry_point: str) -> Non
     client._get_client()
     try:
         with pytest.raises(OperationTimeoutError):
-            await client.request_json_observed(
+            await VenueRequests(client, venue="polymarket", service="clob").request_json_observed(
                 "GET",
                 "/market",
                 request_id="late-result",
                 endpoint_template="/market",
-                parameter_allowlist=(),
                 expiry=OperationExpiry(deadline_monotonic=1.0, _clock=clock),
                 response_identities=identities,
             )
@@ -455,16 +421,15 @@ async def test_observed_request_is_sanitized_and_injected_transport_is_unknown()
         "https://user:password@clob.polymarket.com",
         transport=httpx.MockTransport(handler),
         timeout_s=10,
-        source_venue="polymarket",
-        source_service="clob",
+
+
     )
     try:
-        data, observation = await client.request_json_observed(
+        data, observation = await VenueRequests(client, venue="polymarket", service="clob").request_json_observed(
             "GET",
             "/book?token_id=secret-in-url",
             request_id="request-1",
             endpoint_template="/book",
-            parameter_allowlist={"token_id"},
             effective_parameters={"token_id": "public-token"},
             headers={"Authorization": "secret"},
             expiry=OperationExpiry.after(1),
@@ -501,12 +466,11 @@ async def test_unexpected_observation_error_propagates_without_remote_reclassifi
 
     try:
         with pytest.raises(RuntimeError, match="workflow mapper"):
-            await client.request_json_observed(
+            await VenueRequests(client, venue="polymarket", service="clob").request_json_observed(
                 "GET",
                 "/markets",
                 request_id="bug",
                 endpoint_template="/markets",
-                parameter_allowlist=(),
                 response_identities=programmer_bug,
                 record_observation=observations.append,
             )
@@ -532,12 +496,11 @@ async def test_invalid_data_from_identity_extractor_is_classified_as_invalid_res
 
     try:
         with pytest.raises(InvalidDataError, match="identity mismatch"):
-            await client.request_json_observed(
+            await VenueRequests(client, venue="polymarket", service="clob").request_json_observed(
                 "GET",
                 "/markets/expected",
                 request_id="invalid-data",
                 endpoint_template="/markets/{market_id}",
-                parameter_allowlist=(),
                 response_identities=invalid_identity,
                 record_observation=observations.append,
             )
@@ -659,110 +622,15 @@ class _FirstRequestBlocksTransport(httpx.AsyncBaseTransport):
         return httpx.Response(200, request=request, json={"ok": True})
 
 
-@pytest.mark.asyncio
-async def test_legacy_signature_request_override_still_serves_request_json() -> None:
-    """Consumers override ``_request`` with the pre-workflow signature."""
-
-    seen: list[tuple[str, str, dict[str, str] | None]] = []
-
-    class LegacyHttpClient(HttpClient):
-        async def _request(  # type: ignore[override]
-            self,
-            method: str,
-            path: str,
-            params: dict[str, object] | None,
-            json: object | None = None,
-            headers: dict[str, str] | None = None,
-        ) -> httpx.Response:
-            seen.append((method, path, headers))
-            return await super()._request(
-                method,
-                path,
-                params=params,
-                json=json,
-                headers={**(headers or {}), "X-Legacy": "1"},
-            )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        assert request.headers["X-Legacy"] == "1"
-        return httpx.Response(200, request=request, json={"ok": True})
-
-    client = LegacyHttpClient(
-        "https://example.test", transport=httpx.MockTransport(handler)
-    )
-    try:
-        assert await client.request_json("GET", "/markets") == {"ok": True}
-        assert await client.request_json(
-            "POST", "/orders", None, {"size": 1}, {"X-Caller": "yes"}
-        ) == {"ok": True}
-    finally:
-        await client.close()
-    assert [(method, path) for method, path, _ in seen] == [
-        ("GET", "/markets"),
-        ("POST", "/orders"),
-    ]
-    assert seen[1][2] == {"X-Caller": "yes"}
 
 
-def test_from_values_builds_subclass_instances_with_subclass_fields(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Consumers subclass ``PmktConfig``; ``from_values`` must honor ``cls``."""
-
-    class _ResearchConfig(PmktConfig):
-        research_mode: str = "offline"
-
-    monkeypatch.setenv("PMKT_RESEARCH_MODE", "poisoned")
-    monkeypatch.setenv("PMKT_GAMMA_API_URL", "https://poisoned.test")
-
-    config = _ResearchConfig.from_values(research_mode="live")
-    assert isinstance(config, _ResearchConfig)
-    assert config.research_mode == "live"
-    assert config.gamma_api_url == "https://gamma-api.polymarket.com"
-    assert _ResearchConfig.from_values().research_mode == "offline"
-    assert type(_ResearchConfig.from_values()) is type(config)
-    assert not isinstance(PmktConfig.from_values(), _ResearchConfig)
 
 
-class _PicklableResearchConfig(PmktConfig):
-    research_mode: str = "offline"
 
 
-def test_from_values_instances_pickle_without_rereading_settings() -> None:
-    """Runtime variants must stay picklable, including into a fresh process."""
 
-    import os
-    import pickle
-    import subprocess
-    import sys
 
-    base = PmktConfig.from_values(gamma_api_url="https://explicit.test")
-    restored = pickle.loads(pickle.dumps(base))
-    assert type(restored) is type(base)
-    assert restored.model_dump() == base.model_dump()
-
-    sub = _PicklableResearchConfig.from_values(research_mode="live")
-    restored_sub = pickle.loads(pickle.dumps(sub))
-    assert type(restored_sub) is type(sub)
-    assert isinstance(restored_sub, _PicklableResearchConfig)
-    assert restored_sub.research_mode == "live"
-
-    env = {**os.environ, "PMKT_GAMMA_API_URL": "https://poisoned.test"}
-    code = (
-        "import pickle, sys; from pmkt.config import PmktConfig; "
-        "c = pickle.loads(sys.stdin.buffer.read()); "
-        "print(type(c).__name__, isinstance(c, PmktConfig), c.gamma_api_url)"
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", code],
-        input=pickle.dumps(base),
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
-    assert completed.stdout.decode().split() == [
-        "_InitOnlyPmktConfig",
-        "True",
-        "https://explicit.test",
-    ]
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "3"])
+def test_invalid_attempt_budgets_are_rejected(value) -> None:
+    with pytest.raises((TypeError, ValueError), match="max_attempts"):
+        RequestPolicy(max_attempts=value)

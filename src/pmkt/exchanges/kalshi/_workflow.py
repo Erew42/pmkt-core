@@ -6,13 +6,15 @@ from copy import deepcopy
 from typing import Any, Literal, Sequence
 
 from pmkt import __version__
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.data.kalshi_quotes import KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT
 from pmkt.data.normalize_kalshi import normalize_kalshi_market_status
 from pmkt.data.prices import complement_probability
 from pmkt.data.types import parse_float
 from pmkt.errors import InvalidDataError
 from pmkt.records import (
+    ResultProvenance,
+    RawResponseEvidence,
     BookLevel,
     BookSnapshot,
     DataIssue,
@@ -42,7 +44,9 @@ def _levels_to_map(
             expiry.checkpoint()
         if isinstance(level, dict):
             price = parse_float(level.get("price") or level.get("price_dollars"))
-            size = parse_float(level.get("size") or level.get("count") or level.get("count_fp"))
+            size = parse_float(
+                level.get("size") or level.get("count") or level.get("count_fp")
+            )
         elif isinstance(level, (list, tuple)) and len(level) >= 2:
             price = parse_float(level[0])
             size = parse_float(level[1])
@@ -66,17 +70,11 @@ def normalize_kalshi_orderbook(
     raw_book = payload.get("orderbook_fp")
     book = raw_book if isinstance(raw_book, dict) else payload
     yes_levels = _levels_to_map(
-        book.get("yes_dollars_fp")
-        or book.get("yes_dollars")
-        or book.get("yes")
-        or [],
+        book.get("yes_dollars_fp") or book.get("yes_dollars") or book.get("yes") or [],
         expiry=_expiry,
     )
     no_levels = _levels_to_map(
-        book.get("no_dollars_fp")
-        or book.get("no_dollars")
-        or book.get("no")
-        or [],
+        book.get("no_dollars_fp") or book.get("no_dollars") or book.get("no") or [],
         expiry=_expiry,
     )
     if _expiry is not None:
@@ -87,7 +85,11 @@ def normalize_kalshi_orderbook(
     no_ask = complement_probability(yes_bid)
     yes_bid_size = yes_levels.get(yes_bid) if yes_bid is not None else None
     no_bid_size = no_levels.get(no_bid) if no_bid is not None else None
-    mid = (yes_bid + yes_ask) / 2.0 if yes_bid is not None and yes_ask is not None else None
+    mid = (
+        (yes_bid + yes_ask) / 2.0
+        if yes_bid is not None and yes_ask is not None
+        else None
+    )
     spread = yes_ask - yes_bid if yes_bid is not None and yes_ask is not None else None
     return {
         "exchange": "kalshi",
@@ -124,8 +126,12 @@ def normalize_kalshi_orderbook(
 def kalshi_market_identity(payload: object) -> tuple[str, str | None]:
     if not isinstance(payload, dict):
         raise InvalidDataError("Kalshi market must be an object")
-    ticker = _required_alias_identifier(payload, "ticker", "market_ticker", label="ticker")
-    series_ticker = _optional_identifier(payload.get("series_ticker", _MISSING), "series ticker")
+    ticker = _required_alias_identifier(
+        payload, "ticker", "market_ticker", label="ticker"
+    )
+    series_ticker = _optional_identifier(
+        payload.get("series_ticker", _MISSING), "series ticker"
+    )
     return ticker, series_ticker
 
 
@@ -184,8 +190,12 @@ def decode_kalshi_markets_envelope(
     if not isinstance(payload, dict):
         raise InvalidDataError("Kalshi markets response must be an object")
     markets = payload.get("markets")
-    if not isinstance(markets, list) or any(not isinstance(row, dict) for row in markets):
-        raise InvalidDataError("Kalshi markets field 'markets' must be an array of objects")
+    if not isinstance(markets, list) or any(
+        not isinstance(row, dict) for row in markets
+    ):
+        raise InvalidDataError(
+            "Kalshi markets field 'markets' must be an array of objects"
+        )
     if "cursor" not in payload:
         raise InvalidDataError("Kalshi markets response is missing cursor")
     cursor_value = payload["cursor"]
@@ -284,7 +294,9 @@ def normalize_kalshi_workflow_market(
         book_supported=mapping_status == "mapped",
         market_type=type_value,
         status=normalize_kalshi_market_status(payload.get("status")),
-        event_ticker=_optional_identifier(payload.get("event_ticker", _MISSING), "event ticker"),
+        event_ticker=_optional_identifier(
+            payload.get("event_ticker", _MISSING), "event ticker"
+        ),
         open_time=_optional_text(payload.get("open_time", _MISSING)),
         close_time=_optional_text(payload.get("close_time", _MISSING)),
         expected_expiration_time=_optional_text(
@@ -304,8 +316,12 @@ def kalshi_book_identities(
 ) -> tuple[str, ...]:
     if not isinstance(payload, dict):
         raise InvalidDataError("Kalshi order book response must be an object")
-    ticker = _optional_alias_identifier(payload, "ticker", "market_ticker", label="ticker")
-    series_ticker = _optional_identifier(payload.get("series_ticker", _MISSING), "series ticker")
+    ticker = _optional_alias_identifier(
+        payload, "ticker", "market_ticker", label="ticker"
+    )
+    series_ticker = _optional_identifier(
+        payload.get("series_ticker", _MISSING), "series ticker"
+    )
     if ticker is not None and ticker != instrument.market.ticker:
         raise InvalidDataError(
             f"Kalshi book ticker mismatch: requested {instrument.market.ticker!r}, received {ticker!r}"
@@ -354,18 +370,13 @@ def normalize_kalshi_workflow_book(
     raw_no = _strict_dollar_ladder(raw_book, "no_dollars", expiry=expiry)
     expiry.checkpoint()
 
-    # Run the already-public permissive normalizer after strict unit/layout validation.
-    canonical_payload = {
-        "orderbook_fp": {"yes_dollars": raw_yes, "no_dollars": raw_no}
-    }
-    normalized = normalize_kalshi_orderbook(
-        canonical_payload,
-        market_ticker=instrument.market.ticker,
-        _expiry=expiry,
+    # Validated ladders use the native last-positive-price-wins policy.
+    yes_bids = tuple(
+        {level.price: level for level in raw_yes if level.quantity > 0}.values()
     )
-    expiry.checkpoint()
-    yes_bids = _normalized_levels(normalized["yes_levels"])
-    no_bids = _normalized_levels(normalized["no_levels"])
+    no_bids = tuple(
+        {level.price: level for level in raw_no if level.quantity > 0}.values()
+    )
     yes_asks = tuple(
         BookLevel(price=_required_complement(level.price), quantity=level.quantity)
         for level in no_bids
@@ -403,6 +414,12 @@ def normalize_kalshi_workflow_book(
             flags.add("crossed_book")
     book_observation = observations[-1]
     return BookSnapshot(
+        provenance=ResultProvenance(
+            observations=tuple(observations),
+            interpretation_id=KALSHI_BOOK_INTERPRETATION_ID,
+            package_version=__version__,
+            raw_responses=(RawResponseEvidence(book_observation.request_id, payload),),
+        ),
         instrument=instrument,
         bids=returned_bids,
         asks=returned_asks,
@@ -411,10 +428,6 @@ def normalize_kalshi_workflow_book(
         endpoint="/markets/{ticker}/orderbook",
         source_scope="kalshi_current_orderbook_fp",
         data_scope=_combined_scope(observations),
-        observation=book_observation,
-        observations=tuple(observations),
-        interpretation_id=KALSHI_BOOK_INTERPRETATION_ID,
-        package_version=__version__,
         quote_normalization_policy=KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT,
         valid_state=not flags,
         quality_flags=tuple(sorted(flags)),
@@ -426,14 +439,15 @@ def normalize_kalshi_workflow_book(
         pre_trim_ask_count=len(pre_trim_asks),
         returned_bid_count=len(returned_bids),
         returned_ask_count=len(returned_asks),
-        native_payload=deepcopy(payload),
     )
 
 
 def _normalized_market_type(
     payload: dict[str, Any],
 ) -> tuple[Literal["binary", "missing", "unsupported", "malformed"], str | None]:
-    present = [(name, payload[name]) for name in ("market_type", "type") if name in payload]
+    present = [
+        (name, payload[name]) for name in ("market_type", "type") if name in payload
+    ]
     if not present or all(value is None for _, value in present):
         return "missing", None
     normalized: list[str] = []
@@ -444,38 +458,41 @@ def _normalized_market_type(
     if len(set(normalized)) != 1:
         return "malformed", None
     market_type = normalized[0]
-    return ("binary", market_type) if market_type == "binary" else ("unsupported", market_type)
+    return (
+        ("binary", market_type)
+        if market_type == "binary"
+        else ("unsupported", market_type)
+    )
 
 
 def _strict_dollar_ladder(
     book: dict[str, Any], name: str, *, expiry: OperationExpiry
-) -> list[object]:
+) -> list[BookLevel]:
     if name not in book:
         return []
     values = book[name]
     if not isinstance(values, list):
         raise InvalidDataError(f"Kalshi book field {name!r} must be an array")
+    levels: list[BookLevel] = []
     for index, value in enumerate(values):
         if index % 256 == 0:
             expiry.checkpoint()
         if not isinstance(value, (list, tuple)) or len(value) != 2:
-            raise InvalidDataError(f"Kalshi {name} level {index} must be [price, quantity]")
+            raise InvalidDataError(
+                f"Kalshi {name} level {index} must be [price, quantity]"
+            )
         price = _finite_number(value[0], f"Kalshi {name} level {index} price")
         quantity = _finite_number(value[1], f"Kalshi {name} level {index} quantity")
         if not 0 <= price <= 1:
-            raise InvalidDataError(f"Kalshi {name} level {index} price must be in [0, 1]")
+            raise InvalidDataError(
+                f"Kalshi {name} level {index} price must be in [0, 1]"
+            )
         if quantity < 0:
-            raise InvalidDataError(f"Kalshi {name} level {index} quantity must be nonnegative")
-    return values
-
-
-def _normalized_levels(values: object) -> tuple[BookLevel, ...]:
-    assert isinstance(values, list)
-    return tuple(
-        BookLevel(price=float(value["price"]), quantity=float(value["size"]))
-        for value in values
-        if isinstance(value, dict)
-    )
+            raise InvalidDataError(
+                f"Kalshi {name} level {index} quantity must be nonnegative"
+            )
+        levels.append(BookLevel(price, quantity))
+    return levels
 
 
 def _finite_number(value: object, label: str) -> float:

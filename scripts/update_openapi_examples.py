@@ -23,7 +23,7 @@ DEFAULT_MANIFEST_NAME = "manifest.json"
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
-DEFAULT_MAX_RETRIES = 4
+DEFAULT_MAX_ATTEMPTS = 4
 USER_AGENT = "pmkt-openapi-examples/0.1"
 
 
@@ -36,7 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--token-id", default=None, help="Override token id for CLOB calls.")
     parser.add_argument(
         "--output-dir",
@@ -73,14 +73,14 @@ def save_example(path: str, payload: Any, stamp: str, examples_root: Path) -> Pa
 def find_clob_token(
     gamma_client: httpx.Client,
     clob_client: httpx.Client,
-    max_retries: int,
+    max_attempts: int,
 ) -> str:
     response = request_with_retry(
         gamma_client,
         "GET",
         "/markets",
         params={"limit": 50, "offset": 0, "closed": "false"},
-        max_retries=max_retries,
+        max_attempts=max_attempts,
     )
     if response.status_code != 200:
         raise UpdateError(f"Gamma /markets returned {response.status_code}")
@@ -97,7 +97,7 @@ def find_clob_token(
             "GET",
             "/book",
             params={"token_id": token},
-            max_retries=max_retries,
+            max_attempts=max_attempts,
         )
         if r.status_code == 200:
             return token
@@ -108,9 +108,9 @@ def fetch_json(
     client: httpx.Client,
     path: str,
     params: dict[str, Any] | None,
-    max_retries: int,
+    max_attempts: int,
 ) -> Any:
-    response = request_with_retry(client, "GET", path, params=params, max_retries=max_retries)
+    response = request_with_retry(client, "GET", path, params=params, max_attempts=max_attempts)
     response.raise_for_status()
     try:
         return response.json()
@@ -156,7 +156,7 @@ def run() -> int:
     ) as clob_client:
         token_id = args.token_id
         if not token_id:
-            token_id = find_clob_token(gamma_client, clob_client, args.max_retries)
+            token_id = find_clob_token(gamma_client, clob_client, args.max_attempts)
 
         examples: dict[str, dict[str, Any]] = {}
 
@@ -175,7 +175,7 @@ def run() -> int:
             gamma_client,
             "/markets",
             params=markets_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example("/markets", markets, markets_params)
 
@@ -184,7 +184,7 @@ def run() -> int:
             gamma_client,
             "/events",
             params=events_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example("/events", events, events_params)
 
@@ -193,7 +193,7 @@ def run() -> int:
             clob_client,
             "/book",
             params=book_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example("/book", book, book_params)
 
@@ -202,7 +202,7 @@ def run() -> int:
             clob_client,
             "/price",
             params=price_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example("/price", price, price_params)
 
@@ -211,7 +211,7 @@ def run() -> int:
             clob_client,
             "/midpoint",
             params=midpoint_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example("/midpoint", midpoint, midpoint_params)
 
@@ -220,7 +220,7 @@ def run() -> int:
             clob_client,
             "/prices-history",
             params=prices_history_params,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
         record_example(
             "/prices-history",

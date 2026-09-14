@@ -6,6 +6,8 @@ from typing import Any
 import pandas as pd
 import pytest
 
+from pmkt.records import KalshiMarketRef, PolymarketMarketRef
+
 import pmkt.resolution.cache as cache_module
 from pmkt.data.canonical import market_resolution_row
 from pmkt.data.registry import MARKET_RESOLUTION_COLUMNS
@@ -30,12 +32,12 @@ from pmkt.resolution.models import (
 
 
 class FakeGamma:
-    async def market(self, market_id: str) -> dict[str, Any]:
+    async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
         return {}
 
 
 class FakeClob:
-    async def clob_market_info(self, condition_id: str) -> dict[str, Any]:
+    async def clob_market_info(self, condition_id: str, *, expiry=None) -> dict[str, Any]:
         return {}
 
 
@@ -43,10 +45,10 @@ class FakeKalshiClient:
     def __init__(self, payloads: dict[str, dict[str, Any]] | None = None) -> None:
         self.payloads = payloads or {}
 
-    async def market(self, ticker: str) -> dict[str, Any]:
+    async def market(self, ticker: str, *, expiry=None) -> dict[str, Any]:
         return self.payloads.get(ticker, {"ticker": ticker})
 
-    async def historical_market(self, ticker: str) -> dict[str, Any]:
+    async def historical_market(self, ticker: str, *, expiry=None) -> dict[str, Any]:
         return {"ticker": ticker}
 
 
@@ -211,7 +213,8 @@ async def test_cache_reuse_is_universe_and_resolver_version_aware(
         def __init__(self, **_: Any) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: PolymarketMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.market_id
             calls.append(market_key)
             return _final_record("polymarket", market_key, "no")
 
@@ -273,7 +276,8 @@ async def test_cache_migrates_unsafe_v1_polymarket_final_to_corrected_metadata_o
         def __init__(self, **_: Any) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: PolymarketMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.market_id
             calls.append(market_key)
             return _metadata_record("polymarket", market_key)
 
@@ -333,7 +337,8 @@ async def test_cache_refresh_migrates_unsafe_v1_kalshi_final_to_unavailable(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return _unavailable_record("kalshi", market_key)
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -392,7 +397,8 @@ async def test_cache_migrates_unsafe_v1_conflicting_canonical_to_inconsistent(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return _final_record("kalshi", market_key, "no")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -659,7 +665,8 @@ async def test_cache_refresh_carries_current_final_over_weak_downgrade(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return ResolutionRecord(
                 platform="kalshi",
                 market_key=market_key,
@@ -718,7 +725,8 @@ async def test_cache_refresh_carries_canonical_final_over_platform_confirmed_fin
         def __init__(self, **_: Any) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: PolymarketMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.market_id
             return ResolutionRecord(
                 platform="polymarket",
                 market_key=market_key,
@@ -786,7 +794,8 @@ async def test_cache_refresh_marks_conflicting_canonical_finals_inconsistent(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return _final_record("kalshi", market_key, "no")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -838,7 +847,8 @@ async def test_cache_refresh_accepts_matching_canonical_terminal_forms(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return _final_record("kalshi", market_key, "yes")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -891,7 +901,8 @@ async def test_cache_refresh_accepts_equivalent_zero_scalar_terminals(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return ResolutionRecord(
                 platform="kalshi",
                 market_key=market_key,
@@ -966,7 +977,8 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return _final_record("kalshi", market_key, "no")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
@@ -1019,7 +1031,8 @@ async def test_cache_resolver_failure_isolated_to_market(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             if market_key == "KXFAIL":
                 raise RuntimeError("SECRET-CACHE-FAILURE-MARKER")
             return _final_record("kalshi", market_key, "yes")
@@ -1070,7 +1083,8 @@ async def test_cache_inconsistent_record_is_not_collapsed_into_existing_final(
         def __init__(self, client: Any | None = None) -> None:
             pass
 
-        async def resolve(self, market_key: str, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+        async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
+            market_key = market.ticker
             return ResolutionRecord(
                 platform="kalshi",
                 market_key=market_key,

@@ -1,29 +1,27 @@
 {
   "format_version": 1,
   "tier_meanings": {
-    "supported": "Delivered high-level workflow with an explicit public contract.",
-    "retained_native": "Native client method, model, or schema/storage contract retained under its existing lifecycle.",
-    "inherited": "Import preserved for compatibility without promotion into the new workflow guarantee."
+    "supported": "Normalized workflows with explicit result and error contracts.",
+    "native": "Venue endpoint interfaces and canonical data contracts.",
+    "advanced": "Supported low-level utilities with their documented domain-specific contracts."
   },
   "facades": {
     "pmkt": {
-      "default_tier": "retained_native",
+      "default_tier": "native",
       "exports": [
         "__version__"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.config": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "KALSHI_ENDPOINTS",
         "PmktConfig",
-        "RequestPolicy",
-        "get_config",
         "resolve_default_env_files"
       ],
       "tier_overrides": {
-        "PmktConfig": "supported",
-        "RequestPolicy": "supported"
+        "PmktConfig": "supported"
       }
     },
     "pmkt.catalog": {
@@ -33,10 +31,11 @@
         "CatalogReference",
         "CatalogSnapshot",
         "CatalogValidationReport"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.data": {
-      "default_tier": "retained_native",
+      "default_tier": "native",
       "exports": [
         "ARBITRAGE_CANDIDATE_COLUMNS",
         "ARBITRAGE_CANDIDATE_SCHEMA_VERSION",
@@ -183,18 +182,18 @@
         "validate_run_manifest"
       ],
       "tier_overrides": {
-        "DEFAULT_BOOK_BATCH_SIZE": "inherited",
-        "DEFAULT_EVENT_SLUG": "inherited",
-        "batched": "inherited",
-        "collect_order_book_summaries_parquet": "inherited",
-        "compute_features": "inherited",
-        "fetch_trade_history": "inherited",
-        "find_event_by_slug": "inherited",
-        "iter_order_book_metrics": "inherited",
-        "join_market_metadata": "inherited",
-        "logit": "inherited",
-        "order_book_summary_dataframe": "inherited",
-        "trade_history_dataframe": "inherited"
+        "DEFAULT_BOOK_BATCH_SIZE": "advanced",
+        "DEFAULT_EVENT_SLUG": "advanced",
+        "batched": "advanced",
+        "collect_order_book_summaries_parquet": "advanced",
+        "compute_features": "advanced",
+        "fetch_trade_history": "advanced",
+        "find_event_by_slug": "advanced",
+        "iter_order_book_metrics": "advanced",
+        "join_market_metadata": "advanced",
+        "logit": "advanced",
+        "order_book_summary_dataframe": "advanced",
+        "trade_history_dataframe": "advanced"
       }
     },
     "pmkt.errors": {
@@ -208,7 +207,8 @@
         "ReadAuthenticationRequiredError",
         "ResultLimitExceededError",
         "UnsupportedCapabilityError"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.records": {
       "default_tier": "supported",
@@ -242,15 +242,18 @@
         "PolymarketMarketRef",
         "PriceBasis",
         "PriceHistoryResult",
+        "RawResponseEvidence",
         "RequestObservation",
         "RequestOutcome",
+        "ResultProvenance",
         "SampledPricePoint",
         "SourceCompleteness",
         "TransportOrigin"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.data.market_catalog": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "CURRENT_MANIFEST_SCHEMA",
         "CatalogError",
@@ -282,25 +285,28 @@
         "tree_sha256",
         "utc_now",
         "verify_kalshi_filter_agreement"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.data.storage": {
-      "default_tier": "retained_native",
+      "default_tier": "native",
       "exports": [
         "read_parquet",
         "write_parquet"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.exchanges": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "VenueAdapter",
         "kalshi",
         "polymarket"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.exchanges.polymarket": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "AsyncClobClient",
         "AsyncGammaClient",
@@ -308,18 +314,15 @@
         "AsyncPolymarketDataClient",
         "AsyncSubgraphClient",
         "AsyncWebSocketClient",
-        "ClobClient",
         "DEFAULT_DATA_API_MAX_RATE",
         "DEFAULT_DATA_API_PERIOD_SECONDS",
         "DEFAULT_ORDER_BOOK_STREAM_ROOT",
-        "GammaClient",
         "MarketBookState",
         "MarketStreamSnapshot",
         "PolymarketFilter",
         "PolymarketInstrumentRef",
         "PolymarketMarket",
         "PolymarketMarketRef",
-        "SubgraphClient",
         "WebSocketProtocolError",
         "apply_market_message",
         "collect_market_snapshots",
@@ -330,9 +333,7 @@
       ],
       "tier_overrides": {
         "AsyncClobClient": "supported",
-        "ClobClient": "retained_native",
         "AsyncGammaClient": "supported",
-        "GammaClient": "retained_native",
         "PolymarketFilter": "supported",
         "PolymarketInstrumentRef": "supported",
         "PolymarketMarket": "supported",
@@ -340,13 +341,12 @@
       }
     },
     "pmkt.exchanges.kalshi": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "AsyncKalshiClient",
         "AsyncKalshiWebSocketClient",
         "DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT",
         "KalshiBookSnapshot",
-        "KalshiClient",
         "KalshiConnectFactory",
         "KalshiFilter",
         "KalshiInstrumentRef",
@@ -374,7 +374,6 @@
       ],
       "tier_overrides": {
         "AsyncKalshiClient": "supported",
-        "KalshiClient": "retained_native",
         "KalshiFilter": "supported",
         "KalshiInstrumentRef": "supported",
         "KalshiMarket": "supported",
@@ -382,7 +381,7 @@
       }
     },
     "pmkt.market_structure": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "Interval",
         "build_market_groups",
@@ -397,10 +396,11 @@
         "parse_interval",
         "structures_to_group_records",
         "sum_prob_sanity"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.resolution": {
-      "default_tier": "retained_native",
+      "default_tier": "native",
       "exports": [
         "CONFIDENCE_CANONICAL",
         "CONFIDENCE_INCONSISTENT",
@@ -439,7 +439,7 @@
       }
     },
     "pmkt.streaming": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "CliImportTimingResult",
         "CliImportTimingSpec",
@@ -460,13 +460,22 @@
         "pr15_fake_websocket_replay_config",
         "run_fake_websocket_load_replay",
         "validate_parquet_rotation_config"
-      ]
+      ],
+      "tier_overrides": {}
     },
     "pmkt.text": {
-      "default_tier": "inherited",
+      "default_tier": "advanced",
       "exports": [
         "normalize_text",
         "token_set"
+      ],
+      "tier_overrides": {}
+    },
+    "pmkt.runtime": {
+      "default_tier": "supported",
+      "exports": [
+        "OperationExpiry",
+        "RequestPolicy"
       ]
     }
   },
@@ -476,7 +485,7 @@
       "tier": "supported"
     },
     {
-      "path": "pmkt.config.RequestPolicy",
+      "path": "pmkt.runtime.RequestPolicy",
       "tier": "supported"
     },
     {
@@ -601,43 +610,43 @@
     },
     {
       "path": "pmkt.models.Event",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.models.Market",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.models.Order",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.models.OrderBook",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.models.PriceHistory",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.models.PriceHistoryPoint",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.exchanges.read_auth.ReadAuthHeaderProvider",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.exchanges.read_auth.ReadAuthenticationRequiredError",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.exchanges.read_auth.ReadOnlyRequestError",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.exchanges.read_auth.headers_for_read",
-      "tier": "retained_native"
+      "tier": "native"
     },
     {
       "path": "pmkt.resolution.polymarket.PolymarketResolutionResolver",
@@ -662,6 +671,38 @@
     {
       "path": "pmkt.resolution.evm.EvmRpcError",
       "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.ResultProvenance",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.records.RawResponseEvidence",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.runtime.OperationExpiry",
+      "tier": "supported"
+    },
+    {
+      "path": "pmkt.resolution.providers.GammaResolutionProvider",
+      "tier": "advanced",
+      "methods": ["market"]
+    },
+    {
+      "path": "pmkt.resolution.providers.ClobResolutionProvider",
+      "tier": "advanced",
+      "methods": ["clob_market_info"]
+    },
+    {
+      "path": "pmkt.resolution.providers.KalshiResolutionProvider",
+      "tier": "advanced",
+      "methods": ["market", "historical_market"]
+    },
+    {
+      "path": "pmkt.resolution.providers.CtfResolutionProvider",
+      "tier": "advanced",
+      "methods": ["ensure_polygon", "payout_vector"]
     }
   ]
 }

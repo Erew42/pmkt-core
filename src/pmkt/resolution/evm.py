@@ -4,7 +4,7 @@ from typing import Any
 
 import httpx
 
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 
 POLYGON_CHAIN_ID = "0x89"
 CTF_CONTRACT_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
@@ -83,7 +83,9 @@ class PolygonCtfClient:
         request_id = self._request_id
 
         async def send() -> httpx.Response:
-            timeout = expiry.capped_timeout(self.timeout_s) if expiry is not None else None
+            timeout = (
+                expiry.capped_timeout(self.timeout_s) if expiry is not None else None
+            )
             kwargs: dict[str, Any] = {
                 "json": {
                     "jsonrpc": "2.0",
@@ -112,34 +114,21 @@ class PolygonCtfClient:
             raise EvmRpcError(str(payload["error"]))
         return payload.get("result")
 
-    async def _chain_id_with_expiry(self, expiry: OperationExpiry | None) -> str:
+    async def chain_id(self, *, expiry: OperationExpiry | None = None) -> str:
         result = await self._rpc("eth_chainId", [], expiry=expiry)
         if not isinstance(result, str):
             raise EvmRpcError(f"unexpected chain id: {result!r}")
         return result.lower()
 
-    async def chain_id(self) -> str:
-        result = await self._rpc("eth_chainId", [])
-        if not isinstance(result, str):
-            raise EvmRpcError(f"unexpected chain id: {result!r}")
-        return result.lower()
-
-    async def _ensure_polygon_with_expiry(
-        self, expiry: OperationExpiry | None
-    ) -> None:
-        chain_id = await self._chain_id_with_expiry(expiry)
-        if expiry is not None:
-            expiry.checkpoint()
+    async def ensure_polygon(self, *, expiry: OperationExpiry | None = None) -> None:
+        chain_id = await self.chain_id(expiry=expiry)
         if chain_id != POLYGON_CHAIN_ID:
-            raise EvmRpcError(f"expected Polygon chain {POLYGON_CHAIN_ID}, got {chain_id}")
+            raise EvmRpcError(
+                f"expected Polygon chain {POLYGON_CHAIN_ID}, got {chain_id}"
+            )
 
-    async def ensure_polygon(self) -> None:
-        chain_id = await self.chain_id()
-        if chain_id != POLYGON_CHAIN_ID:
-            raise EvmRpcError(f"expected Polygon chain {POLYGON_CHAIN_ID}, got {chain_id}")
-
-    async def _eth_call_with_expiry(
-        self, data: str, expiry: OperationExpiry | None
+    async def eth_call(
+        self, data: str, *, expiry: OperationExpiry | None = None
     ) -> str:
         result = await self._rpc(
             "eth_call",
@@ -150,30 +139,18 @@ class PolygonCtfClient:
             raise EvmRpcError(f"eth_call returned non-string result: {result!r}")
         return result
 
-    async def eth_call(self, data: str) -> str:
-        result = await self._rpc(
-            "eth_call",
-            [{"to": self.contract_address, "data": data}, "latest"],
-        )
-        if not isinstance(result, str):
-            raise EvmRpcError(f"eth_call returned non-string result: {result!r}")
-        return result
-
-    async def _payout_denominator_with_expiry(
-        self, condition_id: str, expiry: OperationExpiry | None
+    async def payout_denominator(
+        self, condition_id: str, *, expiry: OperationExpiry | None = None
     ) -> int:
         data = "0x" + PAYOUT_DENOMINATOR_SELECTOR + _normalize_hex32(condition_id)
-        return _parse_uint256(await self._eth_call_with_expiry(data, expiry))
+        return _parse_uint256(await self.eth_call(data, expiry=expiry))
 
-    async def payout_denominator(self, condition_id: str) -> int:
-        data = "0x" + PAYOUT_DENOMINATOR_SELECTOR + _normalize_hex32(condition_id)
-        return _parse_uint256(await self.eth_call(data))
-
-    async def _payout_numerator_with_expiry(
+    async def payout_numerator(
         self,
         condition_id: str,
         outcome_index: int,
-        expiry: OperationExpiry | None,
+        *,
+        expiry: OperationExpiry | None = None,
     ) -> int:
         data = (
             "0x"
@@ -181,39 +158,18 @@ class PolygonCtfClient:
             + _normalize_hex32(condition_id)
             + _uint256(outcome_index)
         )
-        return _parse_uint256(await self._eth_call_with_expiry(data, expiry))
+        return _parse_uint256(await self.eth_call(data, expiry=expiry))
 
-    async def payout_numerator(self, condition_id: str, outcome_index: int) -> int:
-        data = (
-            "0x"
-            + PAYOUT_NUMERATORS_SELECTOR
-            + _normalize_hex32(condition_id)
-            + _uint256(outcome_index)
-        )
-        return _parse_uint256(await self.eth_call(data))
-
-    async def _payout_vector_with_expiry(
+    async def payout_vector(
         self,
         condition_id: str,
         outcome_count: int,
-        expiry: OperationExpiry | None,
+        *,
+        expiry: OperationExpiry | None = None,
     ) -> tuple[int, list[int]]:
-        denominator = await self._payout_denominator_with_expiry(condition_id, expiry)
-        numerators: list[int] = []
-        for outcome_index in range(outcome_count):
-            if expiry is not None:
-                expiry.checkpoint()
-            numerators.append(
-                await self._payout_numerator_with_expiry(
-                    condition_id, outcome_index, expiry
-                )
-            )
-        return denominator, numerators
-
-    async def payout_vector(self, condition_id: str, outcome_count: int) -> tuple[int, list[int]]:
-        denominator = await self.payout_denominator(condition_id)
+        denominator = await self.payout_denominator(condition_id, expiry=expiry)
         numerators = [
-            await self.payout_numerator(condition_id, outcome_index)
+            await self.payout_numerator(condition_id, outcome_index, expiry=expiry)
             for outcome_index in range(outcome_count)
         ]
         return denominator, numerators

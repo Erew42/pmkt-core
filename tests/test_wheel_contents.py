@@ -71,7 +71,7 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
     assert "pmkt/py.typed" in names
     assert "pmkt/text/taxonomy_data/token_aliases.json" in names
     assert metadata["Name"] == "pmkt"
-    assert metadata["Version"] == "0.1.1"
+    assert metadata["Version"] == "0.2.0"
     assert "cryptography" not in requirements.lower()
     assert "py-clob-client" not in requirements.lower()
     assert "py-builder-relayer-client" not in requirements.lower()
@@ -308,7 +308,7 @@ async def main():
             result.items[0].instruments[0], depth=1, deadline_s=5.0
         )
     assert book.asks[0].quantity == 2.0
-    assert len(book.observations) == 2
+    assert len(book.provenance.observations) == 2
 
 
 asyncio.run(main())
@@ -447,7 +447,8 @@ assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sy
 from datetime import datetime, timezone
 from pathlib import Path
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
-from pmkt.config import PmktConfig, RequestPolicy
+from pmkt.runtime import RequestPolicy
+from pmkt.config import PmktConfig
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrumentRef, KalshiMarket, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
 from pmkt.records import BookSnapshot, CandleHistoryResult, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
@@ -458,7 +459,7 @@ result: CatalogQueryResult = snapshot.query(
     "SELECT ? AS n", parameters=(1,), max_result_rows=1, max_result_bytes=1024
 )
 table = result.to_arrow()
-config = PmktConfig.from_values()
+config = PmktConfig()
 policy = RequestPolicy(max_attempts=2)
 gamma = AsyncGammaClient(config=config, timeout_s=5.0, request_policy=policy)
 clob = AsyncClobClient(config=config, timeout_s=5.0, request_policy=policy)
@@ -490,7 +491,7 @@ async def polymarket_workflow() -> None:
         deadline_s=5.0,
     )
     detail: PolymarketMarket = await gamma.get_market(
-        market_id="market", deadline_s=5.0
+        market=PolymarketMarketRef("market"), deadline_s=5.0
     )
     selected = detail.instrument_for_label("Yes")
     book: BookSnapshot = await clob.get_book(selected, depth=5, deadline_s=5.0)
@@ -522,7 +523,7 @@ async def kalshi_workflow() -> None:
         deadline_s=5.0,
     )
     detail: KalshiMarket = await kalshi.get_market(
-        ticker="ticker", source="historical", deadline_s=5.0
+        market=KalshiMarketRef("ticker"), source="historical", deadline_s=5.0
     )
     book: BookSnapshot = await kalshi.get_book(
         discovery.items[0].instruments[0], depth=5, deadline_s=5.0
@@ -556,7 +557,7 @@ from pmkt.resolution import KalshiResolutionResolver, PolymarketResolutionResolv
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 snapshot.query("SELECT 1", params=())
 snapshot.query("SELECT ?", parameters=(object(),))
-config = PmktConfig.from_values()
+config = PmktConfig()
 PolymarketMarketRef(ticker="wrong")
 KalshiInstrumentRef(KalshiMarketRef("ticker"), "buy")
 AsyncGammaClient(config=config, unsupported=True)
@@ -595,7 +596,7 @@ async def invalid_kalshi_calls() -> None:
     await kalshi.discover_markets()
     await kalshi.discover_markets(filters="bad")
     await kalshi.get_market("ticker")
-    await kalshi.get_market(ticker="ticker", source="archive")
+    await kalshi.get_market(market=KalshiMarketRef("ticker"), source="archive")
     await kalshi.get_book(PolymarketInstrumentRef("token"))
     await kalshi.get_book(KalshiInstrumentRef(KalshiMarketRef("ticker"), "yes"), depth="one")
     await kalshi.get_candles(
@@ -691,23 +692,22 @@ async def invalid_resolution_calls() -> None:
     assert 'Argument "source" to "get_candles"' in rejected.stdout
     assert 'Argument "deadline_s" to "get_candles"' in rejected.stdout
     assert (
-        'No overload variant of "resolve" of "PolymarketResolutionResolver" '
-        'matches argument type "KalshiMarketRef"'
+        'Argument 1 to "resolve" of "PolymarketResolutionResolver" '
+        'has incompatible type "KalshiMarketRef"'
         in rejected.stdout
     )
     assert (
-        'No overload variant of "resolve" of "KalshiResolutionResolver" '
-        'matches argument type "PolymarketMarketRef"'
+        'Argument 1 to "resolve" of "KalshiResolutionResolver" '
+        'has incompatible type "PolymarketMarketRef"'
         in rejected.stdout
     )
     assert (
-        'No overload variant of "resolve" of "PolymarketResolutionResolver" '
-        'matches argument types "PolymarketMarketRef", "str"'
+        'Argument "deadline_s" to "resolve" of "PolymarketResolutionResolver" '
+        'has incompatible type "str"'
         in rejected.stdout
     )
     assert (
-        'No overload variant of "resolve" of "KalshiResolutionResolver" '
-        'matches argument types "KalshiMarketRef", "float"'
+        'Too many positional arguments for "resolve" of "KalshiResolutionResolver"'
         in rejected.stdout
     )
     assert (

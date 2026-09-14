@@ -30,7 +30,7 @@ def test_loaded_source_identity_is_independent_of_caller(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     after = provenance.implementation_identity(pmkt.__file__, "pmkt")
     assert before == after
-    assert after.commit and after.version == "0.1.1"
+    assert after.commit and after.version == "0.2.0"
     assert isinstance(after.dirty, bool)
     assert "source-git" in after.evidence_source
 

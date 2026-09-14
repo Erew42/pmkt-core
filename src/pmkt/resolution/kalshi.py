@@ -4,12 +4,12 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
 from json import JSONDecodeError
-from typing import Any, NoReturn, Literal, overload
+from typing import Any, NoReturn, Literal
 
 import httpx
 
-from pmkt._operation import OperationExpiry
-from pmkt.exchanges.kalshi.client import AsyncKalshiClient
+from pmkt.runtime import OperationExpiry
+from pmkt.resolution.providers import KalshiResolutionProvider
 from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
 from pmkt.records import KalshiMarketRef
 from pmkt.resolution._batch import resolve_ordered_batch
@@ -54,7 +54,7 @@ _EXPECTED_SOURCE_ERRORS = (
 @dataclass(frozen=True)
 class _PreparedKalshiResolution:
     market_key: str
-    typed_ref: KalshiMarketRef | None
+    typed_ref: KalshiMarketRef
     snapshot: dict[str, Any]
     has_snapshot: bool
 
@@ -92,16 +92,10 @@ def _evidence_mapping(payload: object, *, source: str) -> dict[str, Any]:
     return dict(nested) if isinstance(nested, Mapping) else mapped
 
 
-def _require_market_input(
-    market: str | KalshiMarketRef,
-) -> tuple[str, KalshiMarketRef | None]:
-    if isinstance(market, KalshiMarketRef):
-        return market.ticker, market
-    if not isinstance(market, str):
-        raise TypeError("market must be a string or KalshiMarketRef")
-    if not market.strip():
-        raise ValueError("market must not be empty")
-    return market, None
+def _require_market_input(value: KalshiMarketRef) -> tuple[str, KalshiMarketRef]:
+    if not isinstance(value, KalshiMarketRef):
+        raise TypeError("market must be a KalshiMarketRef")
+    return value.ticker, value
 
 
 def _raise_identity_mismatch(message: str, *, caller_input: bool) -> NoReturn:
@@ -534,24 +528,23 @@ def _endpoint_error_record(
 
 
 class KalshiResolutionResolver:
-    def __init__(self, client: AsyncKalshiClient | None = None) -> None:
+    def __init__(self, client: KalshiResolutionProvider | None = None) -> None:
         self.client = client
 
     def _prepare_resolution_input(
         self,
-        market_key: str | KalshiMarketRef,
+        market_key: KalshiMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None,
     ) -> _PreparedKalshiResolution:
         key, typed_ref = _require_market_input(market_key)
         snapshot_map = _snapshot_mapping(snapshot)
-        if typed_ref is not None:
-            _validate_typed_identity(
-                snapshot_map,
-                market=typed_ref,
-                source="snapshot",
-                caller_input=True,
-            )
+        _validate_typed_identity(
+            snapshot_map,
+            market=typed_ref,
+            source="snapshot",
+            caller_input=True,
+        )
         return _PreparedKalshiResolution(
             market_key=key,
             typed_ref=typed_ref,
@@ -575,42 +568,20 @@ class KalshiResolutionResolver:
     ) -> dict[str, Any]:
         client = self.client
         assert client is not None
-        if type(client) is AsyncKalshiClient:
-            payload = await client._resolution_market_payload(
-                ticker,
-                source=source,
-                expiry=expiry,
-            )
-        elif source == "live":
-            payload = await expiry.run(lambda: client.market(ticker))
+        if source == "live":
+            payload = await expiry.run(lambda: client.market(ticker, expiry=expiry))
         else:
-            payload = await expiry.run(lambda: client.historical_market(ticker))
+            payload = await expiry.run(lambda: client.historical_market(ticker, expiry=expiry))
         expiry.checkpoint()
         result = _evidence_mapping(payload, source=f"kalshi_{source}_rest")
         expiry.checkpoint()
         return result
 
-    @overload
+
+
     async def resolve(
         self,
         market_key: KalshiMarketRef,
-        *,
-        snapshot: Mapping[str, Any] | Any | None = None,
-        deadline_s: float | None = None,
-    ) -> ResolutionRecord: ...
-
-    @overload
-    async def resolve(
-        self,
-        market_key: str,
-        *,
-        snapshot: Mapping[str, Any] | Any | None = None,
-        deadline_s: float | None = None,
-    ) -> ResolutionRecord: ...
-
-    async def resolve(
-        self,
-        market_key: str | KalshiMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None = None,
         deadline_s: float | None = None,
@@ -640,7 +611,7 @@ class KalshiResolutionResolver:
 
     async def _resolve_with_expiry(
         self,
-        market_key: str | KalshiMarketRef,
+        market_key: KalshiMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None,
         expiry: OperationExpiry,
@@ -693,13 +664,12 @@ class KalshiResolutionResolver:
                 source="live",
                 expiry=expiry,
             )
-            if typed_ref is not None:
-                _validate_typed_identity(
-                    live,
-                    market=typed_ref,
-                    source="kalshi_rest",
-                    caller_input=False,
-                )
+            _validate_typed_identity(
+                live,
+                market=typed_ref,
+                source="kalshi_rest",
+                caller_input=False,
+            )
             live_record = kalshi_resolution_from_payload(
                 live,
                 input_identifier=market_key,
@@ -737,13 +707,12 @@ class KalshiResolutionResolver:
                 source="historical",
                 expiry=expiry,
             )
-            if typed_ref is not None:
-                _validate_typed_identity(
-                    historical,
-                    market=typed_ref,
-                    source="kalshi_historical_rest",
-                    caller_input=False,
-                )
+            _validate_typed_identity(
+                historical,
+                market=typed_ref,
+                source="kalshi_historical_rest",
+                caller_input=False,
+            )
             historical_record = kalshi_resolution_from_payload(
                 historical,
                 input_identifier=market_key,

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from typing import TypeVar, cast
 
-from pmkt._operation import OperationExpiry, cancel_and_drain
+from pmkt.runtime import OperationExpiry, cancel_and_drain
 
 
 _InputT = TypeVar("_InputT")

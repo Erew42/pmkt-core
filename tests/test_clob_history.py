@@ -10,7 +10,7 @@ import httpx
 from pydantic import ValidationError
 import pytest
 
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import InvalidDataError, OperationTimeoutError, ResultLimitExceededError
 from pmkt.exchanges.polymarket import AsyncClobClient
 from pmkt.exchanges.polymarket._workflow import normalize_clob_price_history
@@ -74,9 +74,9 @@ async def test_price_history_accepts_zero_and_one_and_retains_provenance() -> No
     assert result.coverage.accepted_rows == 2
     assert result.coverage.source_completeness == "unknown"
     assert result.coverage.requests_complete is True
-    assert result.observation.endpoint_template == "/prices-history"
-    assert result.observation.response_identities == ()
-    assert result.native_payloads[0]["history"] == [
+    assert result.provenance.observations[-1].endpoint_template == "/prices-history"
+    assert result.provenance.observations[-1].response_identities == ()
+    assert result.provenance.raw_responses[0].payload["history"] == [
         {"t": first + 1, "p": 0},
         {"t": first + 2, "p": 1},
     ]
@@ -126,8 +126,8 @@ async def test_price_history_explicit_query_widens_only_integer_strict_bounds() 
         BASE + timedelta(seconds=3),
     ]
     assert result.coverage.outside_window_rows == 2
-    assert result.queried_start_utc == BASE
-    assert result.queried_end_utc == BASE + timedelta(seconds=4)
+    assert result.coverage.queried_windows[0].start_utc == BASE
+    assert result.coverage.queried_windows[-1].end_utc == BASE + timedelta(seconds=4)
 
 
 @pytest.mark.asyncio
@@ -144,8 +144,8 @@ async def test_price_history_exact_bounds_are_start_inclusive_end_exclusive() ->
     )
 
     assert [point.price for point in result.points] == [0.2]
-    assert result.queried_start_utc == BASE - timedelta(seconds=1)
-    assert result.queried_end_utc == BASE + timedelta(seconds=10)
+    assert result.coverage.queried_windows[0].start_utc == BASE - timedelta(seconds=1)
+    assert result.coverage.queried_windows[-1].end_utc == BASE + timedelta(seconds=10)
     assert result.coverage.outside_window_rows == 2
 
 
@@ -185,7 +185,7 @@ async def test_price_history_normalizes_utc_before_fold_ordering() -> None:
         start=earlier_utc_later_wall,
         end=later_utc_earlier_wall,
     )
-    assert result.requested_start_utc < result.requested_end_utc
+    assert result.coverage.requested_start_utc < result.coverage.requested_end_utc
 
     with pytest.raises(ValueError, match="UTC normalization"):
         await _history(
@@ -355,7 +355,7 @@ async def test_price_history_matching_identity_hints_are_retained() -> None:
         },
         instrument=instrument,
     )
-    assert result.observation.response_identities == (
+    assert result.provenance.observations[-1].response_identities == (
         "token_id=token",
         "condition_id=condition",
         "parent_market_id=parent",
@@ -563,7 +563,7 @@ async def test_price_history_explicit_endpoint_ignores_poisoned_global_config(
     def poisoned_config() -> None:
         raise AssertionError("global config must not be read")
 
-    monkeypatch.setattr("pmkt.exchanges.polymarket.clob.get_config", poisoned_config)
+    monkeypatch.setattr("pmkt.config.PmktConfig.from_env", poisoned_config)
     result = await _history({"history": []})
     assert result.points == ()
 
@@ -658,4 +658,4 @@ async def test_price_history_condition_identity_is_case_insensitive(
         {"history": [], "condition_id": returned}, instrument=instrument
     )
     assert result.instrument == instrument
-    assert f"condition_id={returned}" in result.observation.response_identities
+    assert f"condition_id={returned}" in result.provenance.observations[-1].response_identities

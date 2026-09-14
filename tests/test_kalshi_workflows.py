@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 import asyncio
 import math
 
@@ -8,7 +9,7 @@ import pytest
 
 import pmkt.exchanges.kalshi._workflow as workflow_module
 import pmkt.exchanges.kalshi.client as client_module
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import (
     InvalidDataError,
     MarketNotFoundError,
@@ -290,7 +291,7 @@ async def test_detail_source_is_explicit_encoded_and_has_no_fallback() -> None:
 
     client = AsyncKalshiClient(transport=httpx.MockTransport(handler))
     with pytest.raises(MarketNotFoundError) as live_error:
-        await client.get_market(ticker="A/B?x=1", source="live")
+        await client.get_market(market=KalshiMarketRef("A/B?x=1"), source="live")
     assert live_error.value.venue == "kalshi"
     assert live_error.value.identifier == "A/B?x=1"
     assert "historical archive was not checked" in live_error.value.lookup_scope
@@ -298,7 +299,7 @@ async def test_detail_source_is_explicit_encoded_and_has_no_fallback() -> None:
     assert urls[0].endswith("/markets/A%2FB%3Fx%3D1")
     urls.clear()
     with pytest.raises(MarketNotFoundError) as historical_error:
-        await client.get_market(ticker="OLD", source="historical")
+        await client.get_market(market=KalshiMarketRef("OLD"), source="historical")
     assert "historical market detail" in historical_error.value.lookup_scope
     assert len(urls) == 1
     assert urls[0].endswith("/historical/markets/OLD")
@@ -325,7 +326,7 @@ async def test_market_capability_mapping_states(
             lambda request: httpx.Response(200, json={"market": row})
         )
     ) as client:
-        market = await client.get_market(ticker="KXTEST")
+        market = await client.get_market(market=KalshiMarketRef("KXTEST"))
     assert market.mapping_status == mapping
     assert market.book_supported is supported
     assert tuple(item.side for item in market.instruments) == (
@@ -379,8 +380,7 @@ async def test_book_projects_both_outcomes_with_opposite_quantities_then_trims()
     assert yes.quantity_unit == "contracts"
     assert yes.bid_provenance == "direct"
     assert yes.ask_provenance == "complement_derived"
-    assert len(yes.observations) == 2
-    assert yes.observation == yes.observations[-1]
+    assert len(yes.provenance.observations) == 2
     assert all(query == "" for path, query in calls if path.endswith("/orderbook"))
 
 
@@ -601,7 +601,7 @@ async def test_workflow_deadlines_validate_before_io(deadline: object) -> None:
             filters=KalshiFilter(), deadline_s=deadline  # type: ignore[arg-type]
         )
     with pytest.raises(expected):
-        await client.get_market(ticker="KXTEST", deadline_s=deadline)  # type: ignore[arg-type]
+        await client.get_market(market=KalshiMarketRef("KXTEST"), deadline_s=deadline)  # type: ignore[arg-type]
     with pytest.raises(expected):
         await client.get_book(
             KalshiInstrumentRef(KalshiMarketRef("KXTEST"), "yes"),

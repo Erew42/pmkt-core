@@ -23,7 +23,7 @@ from pmkt.tokens import extract_token_ids  # noqa: E402
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
-DEFAULT_MAX_RETRIES = 4
+DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_MAX_PAGES = 3
 USER_AGENT = "pmkt-contract-check/0.1"
 
@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
     parser.add_argument("--json", action="store_true", dest="json_output")
     return parser.parse_args()
@@ -67,14 +67,14 @@ def summarize_body(response: httpx.Response, limit: int = 200) -> str:
 def fetch_gamma_markets(
     client: httpx.Client,
     offset: int,
-    max_retries: int,
+    max_attempts: int,
 ) -> list[Any]:
     response = request_with_retry(
         client,
         "GET",
         "/markets",
         params={"limit": 50, "offset": offset},
-        max_retries=max_retries,
+        max_attempts=max_attempts,
     )
     if response.status_code != 200:
         raise CheckError(
@@ -89,7 +89,7 @@ def fetch_gamma_markets(
 def select_token_with_orderbook(
     client: httpx.Client,
     tokens: list[str],
-    max_retries: int,
+    max_attempts: int,
 ) -> tuple[str | None, CheckResult | None]:
     for token in tokens:
         response = request_with_retry(
@@ -97,7 +97,7 @@ def select_token_with_orderbook(
             "GET",
             "/book",
             params={"token_id": token},
-            max_retries=max_retries,
+            max_attempts=max_attempts,
         )
         if response.status_code == 404:
             continue
@@ -153,7 +153,7 @@ def run_check(
     params: dict[str, Any],
     expected_type: type,
     required_keys: tuple[str, ...],
-    max_retries: int,
+    max_attempts: int,
     skip_on_status: set[int] | None = None,
 ) -> CheckResult:
     url = format_url(client.base_url, path)
@@ -163,7 +163,7 @@ def run_check(
             "GET",
             path,
             params=params,
-            max_retries=max_retries,
+            max_attempts=max_attempts,
         )
     except httpx.RequestError as exc:
         return CheckResult(name=name, url=url, status_code=None, ok=False, error=str(exc))
@@ -237,7 +237,7 @@ def run() -> int:
     ) as clob_client:
         results: list[CheckResult] = []
         try:
-            markets = fetch_gamma_markets(gamma_client, offset=0, max_retries=args.max_retries)
+            markets = fetch_gamma_markets(gamma_client, offset=0, max_attempts=args.max_attempts)
         except CheckError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -253,7 +253,7 @@ def run() -> int:
         token_id, book_result = select_token_with_orderbook(
             clob_client,
             tokens,
-            max_retries=args.max_retries,
+            max_attempts=args.max_attempts,
         )
 
         pages_checked = 1
@@ -263,7 +263,7 @@ def run() -> int:
                 markets = fetch_gamma_markets(
                     gamma_client,
                     offset=offset,
-                    max_retries=args.max_retries,
+                    max_attempts=args.max_attempts,
                 )
             except CheckError:
                 break
@@ -272,7 +272,7 @@ def run() -> int:
                 token_id, book_result = select_token_with_orderbook(
                     clob_client,
                     tokens,
-                    max_retries=args.max_retries,
+                    max_attempts=args.max_attempts,
                 )
             pages_checked += 1
 
@@ -297,7 +297,7 @@ def run() -> int:
                 params={"token_id": token_id, "side": "BUY"},
                 expected_type=dict,
                 required_keys=("price",),
-                max_retries=args.max_retries,
+                max_attempts=args.max_attempts,
             )
         )
         results.append(
@@ -308,7 +308,7 @@ def run() -> int:
                 params={"token_id": token_id},
                 expected_type=dict,
                 required_keys=("mid",),
-                max_retries=args.max_retries,
+                max_attempts=args.max_attempts,
             )
         )
         results.append(
@@ -319,7 +319,7 @@ def run() -> int:
                 params={"market": token_id, "interval": "1d"},
                 expected_type=dict,
                 required_keys=("history",),
-                max_retries=args.max_retries,
+                max_attempts=args.max_attempts,
                 skip_on_status={404},
             )
         )

@@ -1,25 +1,21 @@
 # Public Python API
 
-This inventory records the import surface shipped by `pmkt` 0.1.x. It is a
-compatibility baseline, not a preview: names appear here only when they are
+This inventory records the import surface shipped by `pmkt` 0.2.x. It is a
+supported surface, not a preview: names appear here only when they are
 importable from the current package. The machine-readable facade inventory is
 [`tests/fixtures/public_api_inventory.json`](../tests/fixtures/public_api_inventory.json),
 and CI checks every listed lazy and eager export.
 
-## Compatibility tiers
+## Interface tiers
 
-- **Supported workflow** means a delivered high-level workflow with explicit
-  result types and error semantics. The pinned history catalog, the Polymarket
-  and Kalshi discovery-to-book paths, the sampled CLOB and Kalshi candle
-  history workflows, and the typed single and batch resolution workflows
-  described below are in this tier.
-- **Retained native** means an existing venue method, model, or canonical
-  schema/storage contract kept under its current lifecycle. These APIs remain
-  compatible, but do not acquire the guarantees of a future high-level
-  workflow merely by being importable.
-- **Inherited** means an existing convenience or advanced surface preserved
-  pending deliberate migration. Its presence in `__all__` is not a promise of
-  the supported-workflow tier.
+- **Supported workflow** provides normalized results with explicit identity,
+  coverage, provenance, and error semantics.
+- **Native** provides venue endpoint access and canonical data contracts under
+  their documented semantics.
+- **Advanced** provides supported low-level utilities with domain-specific
+  contracts; importability does not imply normalized-workflow guarantees.
+
+See [Migrating to 0.2](migration_0_2.md) for the deliberate breaking changes.
 
 The package root deliberately exports only `pmkt.__version__`. Import clients,
 records, and utilities from their owning modules.
@@ -163,24 +159,18 @@ wrong parent-reference classes, non-YES/NO Kalshi sides, booleans and negative
 outcome indexes before any venue request. The venue facades reexport their own
 reference classes.
 
-`PmktConfig.from_values(...)` creates independent endpoint settings from only
-its arguments and declared defaults. It does not read OS variables, dotenv
-files, or the process-wide legacy cache. `PmktConfig.from_env(...)` and direct
-`PmktConfig(...)` construction retain environment-aware behavior. REST client
-endpoint precedence is an explicit `base_url`, then a supplied `config`, then
-the legacy cached configuration. Pickling `from_values` settings restores the
-stored values without rereading settings sources, including for importable
-module-level subclasses. REST clients accept keyword-only
-`config`, `timeout_s`, and `request_policy` arguments while retaining existing
-positional meanings. `timeout_s` must be a finite positive number; `None`, zero,
-booleans and `httpx.Timeout` objects are not accepted. Native callers that
-previously relied on httpx accepting those values must update their configuration.
+`PmktConfig(...)` constructs validated endpoint values using explicit arguments
+and defaults only. `PmktConfig.from_env(...)` explicitly loads the process
+environment and dotenv sources. REST endpoint precedence is explicit `base_url`,
+then supplied `config`, then deterministic defaults. Clients never load settings
+implicitly. Applications and CLI entrypoints load configuration and pass it down.
 
-`RequestPolicy(max_attempts=N)` is the preferred spelling for the existing
-total-attempt count. `max_retries=N` remains compatible and still means `N`
-total attempts. Supplying both names is an error. CLOB retries read-only POSTs
-only for `/books` and `/batch-prices-history`; arbitrary POST behavior and the
-Kalshi pre-authentication GET-only boundary remain unchanged.
+Import `RequestPolicy` and `OperationExpiry` from `pmkt.runtime`.
+`RequestPolicy(max_attempts=N)` means N total attempts, including the first;
+positive integers are required. The old retry-name alias is removed. CLOB retries
+read-only POSTs only for `/books` and `/batch-prices-history`; the Kalshi
+pre-authentication GET-only boundary remains unchanged. REST `timeout_s` must
+be finite and positive.
 
 The private HTTP runtime accepts one monotonic expiry passed explicitly through
 each nested call. It covers limiter acquisition, retry waits, transport, and
@@ -189,8 +179,8 @@ remaining operation budget. The state is per call, so future workflow methods
 can safely borrow one client with different concurrent expiries. Timeout and
 caller cancellation drain owned work before returning, and the borrowed client
 remains reusable. `OperationTimeoutError` reports expiry without converting
-unrelated worker errors. Retained native methods remain unbounded when they do
-not supply an expiry.
+unrelated worker errors. Native request methods accept optional keyword-only `expiry`; omission retains
+per-request timeouts without an operation-wide deadline.
 
 `RequestObservation` stores sanitized operation-local request provenance.
 Only explicit endpoint templates and adapter-allowlisted effective parameters
@@ -261,7 +251,7 @@ and history identity checks. Requests, references and response evidence retain
 their original spelling; market IDs and token IDs remain exact identifiers.
 
 Fetch a known market by Gamma market ID with
-`await gamma.get_market(market_id=..., deadline_s=...)`. The ID is encoded as
+`await gamma.get_market(market=PolymarketMarketRef(...), deadline_s=...)`. The ID is encoded as
 one URL path segment. A Gamma 404 raises `MarketNotFoundError` scoped to current
 Gamma detail. Discovery and detail records retain a defensive copy of the
 native payload and the actual `RequestObservation` used to produce them.
@@ -339,7 +329,7 @@ occurrences of that key are rejected; every occurrence of a nonconflicting key
 outside the requested window is counted as outside-window. This distinguishes
 a source-empty response from an all-rejected response. Coverage retains the
 requested bounds, transmitted query markers, dataset, and observed returned
-extent; the owning result separately retains its request observation(s). A
+extent; the owning result retains request observations under `provenance`. A
 successful request sets `requests_complete=True`, while
 `source_completeness` remains `"unknown"`: one HTTP response does not prove the
 venue supplied every possible sample.
@@ -399,7 +389,7 @@ title. A `series_ticker` filter remains request evidence when rows omit their
 series; it does not fabricate `market.ref.series_ticker`. An actual returned
 series contradiction is excluded and diagnosed.
 
-`await kalshi.get_market(ticker=..., source="historical")` reads only the
+`await kalshi.get_market(market=KalshiMarketRef(...), source="historical")` reads only the
 selected dataset and never falls back; `source="live"` is the default. IDs are encoded as single URL path
 segments. A 404 reports its exact lookup scope; live absence explicitly says the
 historical archive was not checked. Returned binary markets map to YES then NO
@@ -424,8 +414,9 @@ finite probabilities, quantities are finite nonnegative contracts, and the
 existing `kalshi_quote_normalization.v2` complement and provenance policy is
 retained. Duplicate prices retain the last positive quantity under the existing
 native normalizer behavior. Empty or unusable sides remain an inspectable snapshot with missing
-provenance and quality flags. `BookSnapshot.observations` retains both the
-capability and book requests; `observation` remains the final book request.
+provenance and quality flags. `BookSnapshot.provenance.observations` retains both the
+capability and book requests. Request-linked raw responses live alongside them
+in `provenance.raw_responses`; no duplicate singular observation is stored.
 
 [`scripts/kalshi_book_example.py`](../scripts/kalshi_book_example.py) is a
 runnable offline discovery-to-book example using injected synthetic HTTP
@@ -513,8 +504,8 @@ candle response.
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
 `pmkt.exchanges.polymarket.AsyncClobClient`, and
-`pmkt.exchanges.kalshi.AsyncKalshiClient`. `GammaClient`, `ClobClient`, and
-`KalshiClient` are compatibility aliases for those async classes. Use
+`pmkt.exchanges.kalshi.AsyncKalshiClient`. The former aliases `GammaClient`,
+`ClobClient`, and `KalshiClient` have been removed. Use
 `async with`; calling a synchronous context manager raises `RuntimeError`.
 
 `AsyncGammaClient` retains these native methods:
@@ -581,10 +572,10 @@ they are not canonical persisted records.
 `KalshiResolutionResolver`, `PolygonCtfClient`, `EvmRpcError`,
 `ResolutionRecord`, `Payout`, `SourceObservation`, and their state, result-type,
 confidence, and resolver-version constants. The resolvers accept their matching
-`PolymarketMarketRef` or `KalshiMarketRef`; retained string calls, including the
-`market_key=` keyword and optional snapshot, remain available. A keyword-only
+`PolymarketMarketRef` or `KalshiMarketRef`, including through the
+`market_key=` keyword, with an optional snapshot. Strings are rejected. A keyword-only
 `deadline_s` bounds the complete single-market operation. Its default `None`
-preserves the unbounded legacy operation while each underlying client keeps its
+leaves the operation unbounded while each underlying client keeps its
 own request timeout.
 
 Resolvers borrow every supplied client and never create or close one. The

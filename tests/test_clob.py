@@ -5,7 +5,7 @@ import pytest
 
 import pmkt.exchanges.polymarket.clob as clob_module
 import pmkt.exchanges.polymarket._workflow as workflow_module
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import InvalidDataError, MarketNotFoundError, OperationTimeoutError
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.records import KalshiMarketRef, PolymarketInstrumentRef, PolymarketMarketRef
@@ -43,12 +43,12 @@ async def test_get_book_sorts_trims_and_preserves_identity_and_native_copy() -> 
     assert book.native_bid_count == 3
     assert book.pre_trim_bid_count == 3
     assert book.returned_bid_count == 2
-    assert book.observation.response_identities == (
+    assert book.provenance.observations[-1].response_identities == (
         "token_id=token",
         "condition_id=condition",
     )
     payload["bids"] = []
-    book.native_payload["asset_id"] = "changed"
+    book.provenance.raw_responses[0].payload["asset_id"] = "changed"
     assert book.bids[0].quantity == 4.0
     assert book.instrument.token_id == "token"
 
@@ -420,4 +420,4 @@ async def test_get_book_condition_identity_is_case_insensitive(requested, return
     ) as client:
         book = await client.get_book(instrument)
     assert book.instrument == instrument
-    assert f"condition_id={returned}" in book.observation.response_identities
+    assert f"condition_id={returned}" in book.provenance.observations[-1].response_identities

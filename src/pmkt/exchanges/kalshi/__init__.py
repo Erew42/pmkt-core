@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from pmkt.exchanges.kalshi.client import (
         AsyncKalshiClient as AsyncKalshiClient,
-        KalshiClient as KalshiClient,
+
     )
     from pmkt.records import (
         KalshiFilter as KalshiFilter,
@@ -32,7 +32,6 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT",
     ),
     "KalshiBookSnapshot": ("pmkt.exchanges.kalshi.ws", "KalshiBookSnapshot"),
-    "KalshiClient": ("pmkt.exchanges.kalshi.client", "KalshiClient"),
     "KalshiFilter": ("pmkt.records", "KalshiFilter"),
     "KalshiConnectFactory": ("pmkt.exchanges.kalshi.ws", "KalshiConnectFactory"),
     "KalshiInstrumentRef": ("pmkt.records", "KalshiInstrumentRef"),

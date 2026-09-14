@@ -31,7 +31,7 @@ def test_contract_check_selects_later_token_with_orderbook_offline() -> None:
         token, result = contract_check.select_token_with_orderbook(
             client,
             ["token-without-book", "token-with-book"],
-            max_retries=0,
+            max_attempts=1,
         )
 
     assert token == "token-with-book"
@@ -68,7 +68,7 @@ def test_update_openapi_examples_finds_later_clob_token_offline() -> None:
         token = update_openapi_examples.find_clob_token(
             gamma_client,
             clob_client,
-            max_retries=0,
+            max_attempts=1,
         )
 
     assert token == "token-with-book"

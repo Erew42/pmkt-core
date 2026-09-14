@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -11,9 +10,10 @@ from typing import Literal, Sequence
 from zoneinfo import ZoneInfo
 
 from pmkt import __version__
-from pmkt._operation import OperationExpiry
+from pmkt.runtime import OperationExpiry
 from pmkt.errors import InvalidDataError, ResultLimitExceededError
 from pmkt.records import (
+    ResultProvenance, RawResponseEvidence,
     CandleHistoryResult,
     CandleOHLC,
     DataIssue,
@@ -207,13 +207,12 @@ def normalize_kalshi_candle_history(
     candidates: dict[tuple[int, int], _Candidate] = {}
     invalid_groups: dict[str, tuple[int, list[str]]] = {}
     raw_rows = 0
-    native_payloads: list[dict[str, object]] = []
+    native_payloads: list[RawResponseEvidence] = []
 
     for payload_index, source_payload in enumerate(candle_payloads):
         rows, _, _ = decode_kalshi_candle_envelope(source_payload.payload)
-        native_payload = deepcopy(source_payload.payload)
-        assert isinstance(native_payload, dict)
-        native_payloads.append(native_payload)
+        assert isinstance(source_payload.payload, dict)
+        native_payloads.append(RawResponseEvidence(source_payload.observation.request_id, source_payload.payload))
         for row_index, row in enumerate(rows):
             if raw_rows % 256 == 0:
                 expiry.checkpoint()
@@ -372,23 +371,22 @@ def normalize_kalshi_candle_history(
     )
     expiry.checkpoint()
     return CandleHistoryResult(
+        provenance=ResultProvenance(
+            observations=tuple(observations),
+            interpretation_id=KALSHI_CANDLE_INTERPRETATION_ID,
+            package_version=__version__,
+            raw_responses=tuple(native_payloads),
+        ),
         market=market,
         candles=tuple(candles),
-        requested_start_utc=requested_start_utc,
-        requested_end_utc=requested_end_utc,
         period_minutes=period_minutes,
         source=requested_source,
         completed_through_utc=completed_through_utc,
         historical_cutoff_utc=historical_cutoff_utc,
-        observation=observations[-1],
-        observations=tuple(observations),
         issues=tuple(issues),
-        interpretation_id=KALSHI_CANDLE_INTERPRETATION_ID,
-        package_version=__version__,
         coverage=coverage,
         quality_flags=tuple(sorted(quality_flags)),
         routing_market=routing_market,
-        native_payloads=tuple(native_payloads),
     )
 
 
@@ -437,8 +435,6 @@ def _parse_candle(
         flags.add("no_traded_price_ohlc")
     elif any(value is None for value in traded_values):
         flags.add("partial_traded_price_ohlc")
-    native = deepcopy(row)
-    assert isinstance(native, dict)
     return KalshiCandle(
         market=market,
         period_start_utc=period_start,
@@ -454,7 +450,6 @@ def _parse_candle(
         volume_contracts=volume,
         open_interest_contracts=open_interest,
         quality_flags=tuple(sorted(flags)),
-        native_payload=native,
     )
 
 

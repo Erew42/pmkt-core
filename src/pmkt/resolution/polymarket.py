@@ -6,16 +6,15 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from fractions import Fraction
 from json import JSONDecodeError
-from typing import Any, NoReturn, overload
+from typing import Any, NoReturn
 
 import httpx
 
-from pmkt._operation import OperationExpiry
-from pmkt.exchanges.polymarket.clob import AsyncClobClient
-from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
+from pmkt.runtime import OperationExpiry
+from pmkt.resolution.providers import ClobResolutionProvider, GammaResolutionProvider, CtfResolutionProvider
 from pmkt.records import PolymarketMarketRef
 from pmkt.resolution._batch import resolve_ordered_batch
-from pmkt.resolution.evm import EvmRpcError, PolygonCtfClient, _normalize_hex32
+from pmkt.resolution.evm import EvmRpcError, _normalize_hex32
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
@@ -52,7 +51,7 @@ _EXPECTED_SOURCE_ERRORS = (
 @dataclass(frozen=True)
 class _PreparedPolymarketResolution:
     input_identifier: str
-    typed_ref: PolymarketMarketRef | None
+    typed_ref: PolymarketMarketRef
     snapshot: dict[str, Any]
     market_key: str
     condition_id: str | None
@@ -89,16 +88,10 @@ def _evidence_mapping(payload: object, *, source: str) -> dict[str, Any]:
     return dict(payload)
 
 
-def _require_market_input(
-    market: str | PolymarketMarketRef,
-) -> tuple[str, PolymarketMarketRef | None]:
-    if isinstance(market, PolymarketMarketRef):
-        return market.market_id, market
-    if not isinstance(market, str):
-        raise TypeError("market must be a string or PolymarketMarketRef")
-    if not market.strip():
-        raise ValueError("market must not be empty")
-    return market, None
+def _require_market_input(value: PolymarketMarketRef) -> tuple[str, PolymarketMarketRef]:
+    if not isinstance(value, PolymarketMarketRef):
+        raise TypeError("market must be a PolymarketMarketRef")
+    return value.market_id, value
 
 
 def _same_condition_id(left: str, right: str) -> bool:
@@ -610,9 +603,9 @@ class PolymarketResolutionResolver:
     def __init__(
         self,
         *,
-        gamma_client: AsyncGammaClient | None = None,
-        clob_client: AsyncClobClient | None = None,
-        ctf_client: PolygonCtfClient | None = None,
+        gamma_client: GammaResolutionProvider | None = None,
+        clob_client: ClobResolutionProvider | None = None,
+        ctf_client: CtfResolutionProvider | None = None,
     ) -> None:
         self.gamma_client = gamma_client
         self.clob_client = clob_client
@@ -621,26 +614,21 @@ class PolymarketResolutionResolver:
 
     def _prepare_resolution_input(
         self,
-        market_key: str | PolymarketMarketRef,
+        market_key: PolymarketMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None,
     ) -> _PreparedPolymarketResolution:
         input_identifier, typed_ref = _require_market_input(market_key)
         snapshot_map = _snapshot_mapping(snapshot)
-        if typed_ref is not None:
-            _validate_typed_identity(
-                snapshot_map,
-                market=typed_ref,
-                source="snapshot",
-                caller_input=True,
-            )
-        key = (
-            typed_ref.market_id
-            if typed_ref is not None
-            else _market_key(snapshot_map, fallback=input_identifier)
+        _validate_typed_identity(
+            snapshot_map,
+            market=typed_ref,
+            source="snapshot",
+            caller_input=True,
         )
+        key = typed_ref.market_id
         condition_id = _condition_id(snapshot_map) or (
-            typed_ref.condition_id if typed_ref is not None else None
+            typed_ref.condition_id
         )
         if condition_id is not None and self.ctf_client is not None:
             condition_id = _validate_condition_id(
@@ -668,12 +656,7 @@ class PolymarketResolutionResolver:
     ) -> dict[str, Any]:
         client = self.gamma_client
         assert client is not None
-        if type(client) is AsyncGammaClient:
-            payload = await client._resolution_market_payload(
-                market_key, expiry=expiry
-            )
-        else:
-            payload = await expiry.run(lambda: client.market(market_key))
+        payload = await expiry.run(lambda: client.market(market_key, expiry=expiry))
         expiry.checkpoint()
         result = _evidence_mapping(payload, source="polymarket_gamma")
         expiry.checkpoint()
@@ -684,14 +667,7 @@ class PolymarketResolutionResolver:
     ) -> dict[str, Any]:
         client = self.clob_client
         assert client is not None
-        if type(client) is AsyncClobClient:
-            payload = await client._resolution_market_payload(
-                condition_id, expiry=expiry
-            )
-        else:
-            payload = await expiry.run(
-                lambda: client.clob_market_info(condition_id)
-            )
+        payload = await expiry.run(lambda: client.clob_market_info(condition_id, expiry=expiry))
         expiry.checkpoint()
         result = _evidence_mapping(payload, source="polymarket_clob")
         expiry.checkpoint()
@@ -703,10 +679,7 @@ class PolymarketResolutionResolver:
             return
         client = self.ctf_client
         assert client is not None
-        if type(client) is PolygonCtfClient:
-            await client._ensure_polygon_with_expiry(expiry)
-        else:
-            await expiry.run(client.ensure_polygon)
+        await expiry.run(lambda: client.ensure_polygon(expiry=expiry))
         expiry.checkpoint()
         self._ctf_chain_checked = True
 
@@ -719,14 +692,7 @@ class PolymarketResolutionResolver:
     ) -> tuple[int, list[int]]:
         client = self.ctf_client
         assert client is not None
-        if type(client) is PolygonCtfClient:
-            payload = await client._payout_vector_with_expiry(
-                condition_id, outcome_count, expiry
-            )
-        else:
-            payload = await expiry.run(
-                lambda: client.payout_vector(condition_id, outcome_count)
-            )
+        payload = await expiry.run(lambda: client.payout_vector(condition_id, outcome_count, expiry=expiry))
         expiry.checkpoint()
         if (
             not isinstance(payload, tuple)
@@ -743,27 +709,11 @@ class PolymarketResolutionResolver:
         expiry.checkpoint()
         return result
 
-    @overload
+
+
     async def resolve(
         self,
         market_key: PolymarketMarketRef,
-        *,
-        snapshot: Mapping[str, Any] | Any | None = None,
-        deadline_s: float | None = None,
-    ) -> ResolutionRecord: ...
-
-    @overload
-    async def resolve(
-        self,
-        market_key: str,
-        *,
-        snapshot: Mapping[str, Any] | Any | None = None,
-        deadline_s: float | None = None,
-    ) -> ResolutionRecord: ...
-
-    async def resolve(
-        self,
-        market_key: str | PolymarketMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None = None,
         deadline_s: float | None = None,
@@ -793,7 +743,7 @@ class PolymarketResolutionResolver:
 
     async def _resolve_with_expiry(
         self,
-        market_key: str | PolymarketMarketRef,
+        market_key: PolymarketMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None,
         expiry: OperationExpiry,
@@ -823,16 +773,15 @@ class PolymarketResolutionResolver:
         ):
             try:
                 gamma_payload = await self._gamma_market(key, expiry=expiry)
-                if typed_ref is not None:
-                    _validate_typed_identity(
-                        gamma_payload,
-                        market=typed_ref,
-                        source="polymarket_gamma",
-                        expected_condition_id=condition_id,
-                        caller_input=False,
-                    )
+                _validate_typed_identity(
+                    gamma_payload,
+                    market=typed_ref,
+                    source="polymarket_gamma",
+                    expected_condition_id=condition_id,
+                    caller_input=False,
+                )
                 candidate_condition_id = _condition_id(snapshot_map, gamma_payload) or (
-                    typed_ref.condition_id if typed_ref is not None else None
+                    typed_ref.condition_id
                 )
                 if candidate_condition_id is not None and self.ctf_client is not None:
                     candidate_condition_id = _validate_condition_id(
@@ -882,14 +831,13 @@ class PolymarketResolutionResolver:
         if condition_id and self.clob_client is not None:
             try:
                 clob_payload = await self._clob_market(condition_id, expiry=expiry)
-                if typed_ref is not None:
-                    _validate_typed_identity(
-                        clob_payload,
-                        market=typed_ref,
-                        source="polymarket_clob",
-                        expected_condition_id=condition_id,
-                        caller_input=False,
-                    )
+                _validate_typed_identity(
+                    clob_payload,
+                    market=typed_ref,
+                    source="polymarket_clob",
+                    expected_condition_id=condition_id,
+                    caller_input=False,
+                )
                 prices = prices or _prices(clob_payload)
                 expiry.checkpoint()
                 endpoint_observations.append(
