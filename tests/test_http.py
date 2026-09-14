@@ -5,46 +5,25 @@ import pytest
 
 import pmkt._http as http_module
 from pmkt.runtime import RequestPolicy
-from pmkt._http import HttpClient, format_url, request_with_retry
+from pmkt._http import HttpClient, format_url
 
 
 pytestmark = pytest.mark.asyncio
 
 
-class _TrackingStream(httpx.SyncByteStream):
-    def __init__(self, payload: bytes) -> None:
-        self.payload = payload
-        self.closed = False
-
-    def __iter__(self):
-        yield self.payload
-
-    def close(self) -> None:
-        self.closed = True
-
-
-class _FakeSyncClient:
-    def __init__(self, responses: list[httpx.Response]) -> None:
-        self.responses = list(responses)
-        self.requests: list[dict[str, object]] = []
-
-    def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params: dict[str, object] | None = None,
-        headers: dict[str, str] | None = None,
-    ) -> httpx.Response:
-        self.requests.append(
-            {
-                "method": method,
-                "path": path,
-                "params": params,
-                "headers": headers,
-            }
-        )
-        return self.responses.pop(0)
+@pytest.mark.parametrize("status", [200, 500])
+async def test_diagnostic_response_is_readable_after_transport_cleanup(status) -> None:
+    async with HttpClient(
+        "https://example.test",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(status, json={"ok": True})
+        ),
+        request_policy=RequestPolicy(max_attempts=1),
+    ) as client:
+        response = await client.request_response("GET", "/markets")
+        assert response.is_closed
+        assert response.status_code == status
+        assert response.json() == {"ok": True}
 
 
 async def test_retryable_response_is_closed_before_error() -> None:
@@ -190,7 +169,9 @@ async def test_async_request_does_not_retry_plain_post_by_default(monkeypatch) -
     )
 
     with pytest.raises(httpx.HTTPStatusError):
-        await client.request_json("POST", "/orders", json={"client_order_id": "order-1"})
+        await client.request_json(
+            "POST", "/orders", json={"client_order_id": "order-1"}
+        )
 
     assert seen == ["POST"]
     await client.close()
@@ -278,9 +259,13 @@ async def test_catalog_sized_policy_waits_and_retries_same_page(monkeypatch) -> 
         "GET", "/markets", params={"cursor": "same-page"}
     ) == {"cursor": "next"}
     assert sleeps == [5.0, 10.0, 20.0, 40.0]
-    assert seen_urls == [
-        "https://example.com/markets?cursor=same-page",
-    ] * 5
+    assert (
+        seen_urls
+        == [
+            "https://example.com/markets?cursor=same-page",
+        ]
+        * 5
+    )
     await client.close()
 
 
@@ -325,124 +310,6 @@ async def test_response_is_closed_when_json_decode_fails() -> None:
     assert len(responses) == 1
     assert responses[0].is_closed
     await client.close()
-
-
-async def test_sync_request_with_retry_retries_retryable_status(monkeypatch) -> None:
-    monkeypatch.setattr(http_module.time, "sleep", lambda _: None)
-    seen: list[str] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(str(request.url))
-        status_code = 500 if len(seen) == 1 else 200
-        return httpx.Response(
-            status_code,
-            request=request,
-            json={"attempt": len(seen)},
-        )
-
-    with httpx.Client(
-        base_url="https://example.com",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        response = request_with_retry(
-            client,
-            "GET",
-            "/markets",
-            params={"closed": False, "cursor": None},
-            max_attempts=2,
-        )
-
-    assert response.status_code == 200
-    assert response.json() == {"attempt": 2}
-    assert seen == [
-        "https://example.com/markets?closed=false",
-        "https://example.com/markets?closed=false",
-    ]
-
-
-async def test_sync_request_with_retry_honors_retry_after(monkeypatch) -> None:
-    sleeps: list[float] = []
-    monkeypatch.setattr(http_module.time, "sleep", sleeps.append)
-    responses = iter(
-        [
-            httpx.Response(429, headers={"Retry-After": "0.25"}),
-            httpx.Response(200, json={"ok": True}),
-        ]
-    )
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        response = next(responses)
-        response.request = request
-        return response
-
-    with httpx.Client(
-        base_url="https://example.com",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        response = request_with_retry(client, "GET", "/markets", max_attempts=2)
-
-    assert response.status_code == 200
-    assert sleeps == [0.25]
-
-
-async def test_sync_request_with_retry_does_not_retry_501(monkeypatch) -> None:
-    monkeypatch.setattr(http_module.time, "sleep", lambda _: None)
-    seen: list[int] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        seen.append(1)
-        return httpx.Response(
-            501,
-            request=request,
-            json={"error": "not implemented"},
-        )
-
-    with httpx.Client(
-        base_url="https://example.com",
-        transport=httpx.MockTransport(handler),
-    ) as client:
-        response = request_with_retry(client, "GET", "/markets", max_attempts=3)
-
-    assert response.status_code == 501
-    assert len(seen) == 1
-
-
-async def test_sync_request_with_retry_closes_intermediate_retryable_response(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(http_module.time, "sleep", lambda _: None)
-    retryable = httpx.Response(
-        500,
-        stream=_TrackingStream(b'{"attempt":1}'),
-    )
-    success = httpx.Response(
-        200,
-        stream=_TrackingStream(b'{"attempt":2}'),
-    )
-    client = _FakeSyncClient([retryable, success])
-
-    response = request_with_retry(client, "GET", "/markets", max_attempts=2)  # type: ignore[arg-type]
-
-    assert response is success
-    assert retryable.is_closed is True
-    assert success.is_closed is False
-
-
-async def test_sync_request_with_retry_returns_final_retryable_response_open(monkeypatch) -> None:
-    monkeypatch.setattr(http_module.time, "sleep", lambda _: None)
-    retryable = httpx.Response(
-        500,
-        stream=_TrackingStream(b'{"error":"temporary"}'),
-    )
-    client = _FakeSyncClient([retryable])
-
-    response = request_with_retry(client, "GET", "/markets", max_attempts=1)  # type: ignore[arg-type]
-
-    assert response is retryable
-    assert response.status_code == 500
-    assert retryable.is_closed is False
-    assert response.read() == b'{"error":"temporary"}'
-    assert retryable.is_closed is True
 
 
 async def test_format_url_preserves_absolute_and_joins_relative() -> None:

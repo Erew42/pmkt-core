@@ -4,59 +4,12 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
-import time
 from typing import Any, Collection, Mapping
 
 import httpx
 from aiolimiter import AsyncLimiter
 
 from pmkt.runtime import OperationExpiry, RequestPolicy
-
-
-def request_with_retry(
-    client: httpx.Client,
-    method: str,
-    path: str,
-    params: dict[str, Any] | None = None,
-    headers: dict[str, str] | None = None,
-    request_policy: RequestPolicy | None = None,
-    *,
-    max_attempts: int = 3,
-) -> httpx.Response:
-
-    policy = request_policy or RequestPolicy(
-        max_attempts=max_attempts,
-    )
-    attempts = policy.attempts_for(method, headers)
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            response = client.request(
-                method,
-                path,
-                params=_normalize_params(params),
-                headers=headers,
-            )
-        except httpx.RequestError as exc:
-            last_error = exc
-            if attempt == attempts or not policy.should_retry_exception(exc):
-                raise
-            time.sleep(policy.delay_for(attempt=attempt))
-            continue
-
-        if policy.should_retry_response(response):
-            if attempt == attempts:
-                return response
-            backoff = policy.delay_for(attempt=attempt, response=response)
-            response.close()
-            time.sleep(backoff)
-            continue
-
-        return response
-
-    if last_error:
-        raise last_error
-    raise RuntimeError("request failed unexpectedly")
 
 
 def format_url(base_url: httpx.URL, path: str) -> str:
@@ -111,6 +64,7 @@ class HttpClient:
         *,
         max_attempts: int = 3,
         retryable_post_paths: Collection[str] = (),
+        follow_redirects: bool = False,
     ) -> None:
 
         self.base_url = base_url
@@ -123,6 +77,7 @@ class HttpClient:
         self.retryable_post_paths = frozenset(
             "/" + path.lstrip("/") for path in retryable_post_paths
         )
+        self._follow_redirects = follow_redirects
         self._transport = transport
         self._client: httpx.AsyncClient | None = None
 
@@ -133,6 +88,7 @@ class HttpClient:
                 timeout=httpx.Timeout(self.timeout_s),
                 headers=self._headers,
                 transport=self._transport,
+                follow_redirects=self._follow_redirects,
             )
         return self._client
 
@@ -270,6 +226,25 @@ class HttpClient:
         if expiry is not None:
             return await expiry.run(acquire_and_send)
         return await acquire_and_send()
+
+    async def request_response(
+        self,
+        method: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        expiry: OperationExpiry | None = None,
+    ) -> httpx.Response:
+        """Return a fully read, closed response for internal API diagnostics."""
+        response = await self._request(method, path, params=params, expiry=expiry)
+        try:
+            if expiry is None:
+                await response.aread()
+            else:
+                await expiry.run(response.aread)
+            return response
+        finally:
+            await response.aclose()
 
     async def request_json(
         self,
