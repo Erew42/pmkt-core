@@ -446,8 +446,12 @@ contained in the original window and complete against one UTC clock value
 frozen at operation start. Thus 10:30–12:00 includes the 11:00–12:00 hourly
 bar only. Inclusive native end-label requests may overlap at internal adapter
 boundaries; all valid keys are reconciled before original-window containment,
-completion filtering, and the output cap. Chunk size is a bounded adapter
-choice, not a claimed upstream maximum.
+completion filtering, and the output cap. Chunk size is 5,000 elapsed periods
+(`end_ts - start_ts`), not candle count: a max-sized chunk may include 5,001
+inclusive end-labels. Kalshi publishes a 10,000-candlestick / 100-ticker cap
+only on the batch endpoint; the single-market live and historical endpoints do
+not document a numeric cap. The adapter bound is a conservative client choice,
+not a claimed upstream maximum.
 
 Live and historical payloads have separate contracts. Live fields use
 `*_dollars`, `volume_fp`, and `open_interest_fp`, and explicitly send

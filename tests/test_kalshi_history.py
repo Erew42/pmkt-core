@@ -635,7 +635,7 @@ async def test_migration_overlap_conflict_issues_name_each_originating_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "pmkt.exchanges.kalshi.client.KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST", 1
+        "pmkt.exchanges.kalshi.client.KALSHI_CANDLE_QUERY_ELAPSED_PERIODS_PER_REQUEST", 1
     )
     live_calls = 0
 
@@ -1118,7 +1118,7 @@ async def test_varied_internal_chunk_sizes_return_same_candles(
 
     async def run(chunk_size: int) -> tuple[tuple[int, float | None], ...]:
         monkeypatch.setattr(
-            "pmkt.exchanges.kalshi.client.KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST",
+            "pmkt.exchanges.kalshi.client.KALSHI_CANDLE_QUERY_ELAPSED_PERIODS_PER_REQUEST",
             chunk_size,
         )
 
@@ -1363,7 +1363,7 @@ def test_normalization_and_window_planning_checkpoint_expiry() -> None:
             BASE,
             BASE + timedelta(days=100),
             period_minutes=1,
-            periods_per_request=1,
+            elapsed_periods_per_request=1,
             expiry=expiry,
         )
 
@@ -1540,7 +1540,10 @@ async def test_single_market_history_span_limit_and_overlap(periods, expected_re
     def handler(request):
         start = int(request.url.params["start_ts"])
         end = int(request.url.params["end_ts"])
-        assert end - start <= 5000 * 60
+        elapsed_seconds = end - start
+        assert elapsed_seconds <= 5000 * 60
+        # Inclusive end-labels: N elapsed minute periods can yield N+1 candles.
+        assert elapsed_seconds // 60 + 1 <= 5001
         requests.append((start, end))
         return httpx.Response(200, json={"ticker": TICKER, "candlesticks": [
             _historical_row(datetime.fromtimestamp(t, timezone.utc))

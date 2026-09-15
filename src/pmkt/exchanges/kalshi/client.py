@@ -99,8 +99,13 @@ _MARKETS_PARAMETER_ALLOWLIST = frozenset(
 _CANDLE_PARAMETER_ALLOWLIST = frozenset(
     {"start_ts", "end_ts", "period_interval", "include_latest_before_start"}
 )
-# Both single-market endpoints bound elapsed periods, with inclusive labels.
-KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST = 5_000
+# Adapter chunk size in elapsed periods (`end_ts - start_ts`), not candle count.
+# Kalshi's single-market live and historical candlestick endpoints use inclusive
+# `start_ts`/`end_ts` labels (candles ending on or after start, on or before end)
+# and do not publish a numeric cap. The batch endpoint caps 10,000 candles across
+# at most 100 tickers. A window of N elapsed periods can include N+1 inclusive
+# end-labels, so 5,000 elapsed periods stays well under that published batch cap.
+KALSHI_CANDLE_QUERY_ELAPSED_PERIODS_PER_REQUEST = 5_000
 
 
 @dataclass
@@ -1446,19 +1451,24 @@ def _kalshi_candle_query_windows(
     end_utc: datetime,
     *,
     period_minutes: int,
-    periods_per_request: int | None = None,
+    elapsed_periods_per_request: int | None = None,
     expiry: OperationExpiry | None = None,
 ) -> tuple[tuple[int, int], ...]:
-    """Build bounded inclusive-label requests with one-marker overlap."""
+    """Build inclusive-label requests of at most N elapsed periods.
 
-    if periods_per_request is None:
-        periods_per_request = KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST
-    _require_positive_int(periods_per_request, "periods_per_request")
+    Adjacent chunks overlap at one end-label (`chunk_end` becomes the next
+    `start_ts`), so a max-sized window of N elapsed periods may contain N+1
+    inclusive candle labels.
+    """
+
+    if elapsed_periods_per_request is None:
+        elapsed_periods_per_request = KALSHI_CANDLE_QUERY_ELAPSED_PERIODS_PER_REQUEST
+    _require_positive_int(elapsed_periods_per_request, "elapsed_periods_per_request")
     query_start = math.floor(start_utc.timestamp())
     query_end = math.ceil(end_utc.timestamp())
     if query_end <= query_start:
         query_end = query_start + 1
-    span = period_minutes * 60 * periods_per_request
+    span = period_minutes * 60 * elapsed_periods_per_request
     windows: list[tuple[int, int]] = []
     cursor = query_start
     while cursor < query_end:

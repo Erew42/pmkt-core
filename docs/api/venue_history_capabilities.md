@@ -19,9 +19,9 @@ candle-history workflows on 2026-09-11.
 
 ## Kalshi
 
-- `/series/{series_ticker}/markets/{ticker}/candlesticks` provides live-dataset market candlesticks with price, yes-bid, yes-ask, volume, and open-interest context. Source: <https://docs.kalshi.com/api-reference/market/get-market-candlesticks>
+- `/series/{series_ticker}/markets/{ticker}/candlesticks` provides live-dataset market candlesticks with price, yes-bid, yes-ask, volume, and open-interest context. `start_ts`/`end_ts` are inclusive end-labels. Source: <https://docs.kalshi.com/api-reference/market/get-market-candlesticks>
 - `/markets/candlesticks` provides batched live-dataset candlesticks for up to 100 market tickers and up to 10,000 candles total. Source: <https://docs.kalshi.com/api-reference/market/batch-get-market-candlesticks>
-- `/historical/markets/{ticker}/candlesticks` provides archived market candlesticks after Kalshi's historical cutoff. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-market-candlesticks>
+- `/historical/markets/{ticker}/candlesticks` provides archived market candlesticks after Kalshi's historical cutoff, with the same inclusive `start_ts`/`end_ts` labels. The single-market live and historical endpoints do not publish a numeric cap. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-market-candlesticks>
 - `/historical/trades` provides historical trade context. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-trades>
 - There is no documented historical topbook or historical depth endpoint. `/markets/{ticker}/orderbook` is a current order-book snapshot endpoint, so CR-10.1 recording is required for forward-looking executable topbook evidence.
 - `AsyncKalshiClient.get_candles(...)` is the supported single-market,
@@ -33,6 +33,10 @@ candle-history workflows on 2026-09-11.
   records separate traded price from YES bid and ask OHLC and retain native
   evidence. Fully contained, completed periods are selected after global
   reconciliation. HTTP traversal does not establish source completeness.
+  The adapter chunks single-market requests at 5,000 elapsed periods
+  (`end_ts - start_ts`), not candle count, so a max-sized chunk may include
+  5,001 inclusive end-labels. That bound is a conservative client choice
+  relative to the published batch 10,000-candle cap.
 - For the versioned initial 1440-minute interpretation, the native end minus
   86,400 seconds must be `America/New_York` midnight. Saved primary API checks
   across both 2025 fall and 2026 spring DST transitions support this bounded
