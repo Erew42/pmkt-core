@@ -1,20 +1,20 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import httpx
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from pmkt._http import request_with_retry  # noqa: E402
+from pmkt._http import HttpClient  # noqa: E402
+from pmkt.runtime import RequestPolicy  # noqa: E402
 from pmkt.tokens import extract_token_ids  # noqa: E402
 
 DEFAULT_EXAMPLES_ROOT = ROOT / "generated" / "openapi" / "examples"
@@ -23,7 +23,7 @@ DEFAULT_MANIFEST_NAME = "manifest.json"
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
-DEFAULT_MAX_RETRIES = 4
+DEFAULT_MAX_ATTEMPTS = 4
 USER_AGENT = "pmkt-openapi-examples/0.1"
 
 
@@ -36,8 +36,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
-    parser.add_argument("--token-id", default=None, help="Override token id for CLOB calls.")
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
+    parser.add_argument(
+        "--token-id", default=None, help="Override token id for CLOB calls."
+    )
     parser.add_argument(
         "--output-dir",
         default=str(DEFAULT_EXAMPLES_ROOT),
@@ -51,7 +53,9 @@ def utc_stamp() -> str:
 
 
 def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return (
+        datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    )
 
 
 def resolve_output_dir(output_dir: str) -> Path:
@@ -66,21 +70,20 @@ def save_example(path: str, payload: Any, stamp: str, examples_root: Path) -> Pa
     dest_dir = examples_root / name
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest_path = dest_dir / f"{stamp}.json"
-    dest_path.write_text(json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8")
+    dest_path.write_text(
+        json.dumps(payload, ensure_ascii=True, indent=2), encoding="utf-8"
+    )
     return dest_path
 
 
-def find_clob_token(
-    gamma_client: httpx.Client,
-    clob_client: httpx.Client,
-    max_retries: int,
+async def find_clob_token(
+    gamma_client: HttpClient,
+    clob_client: HttpClient,
 ) -> str:
-    response = request_with_retry(
-        gamma_client,
+    response = await gamma_client.request_response(
         "GET",
         "/markets",
         params={"limit": 50, "offset": 0, "closed": "false"},
-        max_retries=max_retries,
     )
     if response.status_code != 200:
         raise UpdateError(f"Gamma /markets returned {response.status_code}")
@@ -92,25 +95,22 @@ def find_clob_token(
         raise UpdateError("No token_id values found in Gamma /markets response.")
 
     for token in tokens:
-        r = request_with_retry(
-            clob_client,
+        r = await clob_client.request_response(
             "GET",
             "/book",
             params={"token_id": token},
-            max_retries=max_retries,
         )
         if r.status_code == 200:
             return token
     raise UpdateError("No token_id with an orderbook found using closed=false markets.")
 
 
-def fetch_json(
-    client: httpx.Client,
+async def fetch_json(
+    client: HttpClient,
     path: str,
     params: dict[str, Any] | None,
-    max_retries: int,
 ) -> Any:
-    response = request_with_retry(client, "GET", path, params=params, max_retries=max_retries)
+    response = await client.request_response("GET", path, params=params)
     response.raise_for_status()
     try:
         return response.json()
@@ -133,30 +133,34 @@ def write_manifest(manifest_path: Path, manifest: dict[str, Any]) -> None:
         handle.write("\n")
 
 
-def run() -> int:
+async def run() -> int:
     args = parse_args()
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    timeout = httpx.Timeout(args.timeout)
     stamp = utc_stamp()
     examples_root = resolve_output_dir(args.output_dir)
     examples_root.mkdir(parents=True, exist_ok=True)
     manifest_path = examples_root / DEFAULT_MANIFEST_NAME
     generated_at = utc_iso()
 
-    with httpx.Client(
-        base_url=args.gamma_base_url.rstrip("/"),
-        timeout=timeout,
-        headers=headers,
-        follow_redirects=True,
-    ) as gamma_client, httpx.Client(
-        base_url=args.clob_base_url.rstrip("/"),
-        timeout=timeout,
-        headers=headers,
-        follow_redirects=True,
-    ) as clob_client:
+    async with (
+        HttpClient(
+            base_url=args.gamma_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as gamma_client,
+        HttpClient(
+            base_url=args.clob_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as clob_client,
+    ):
         token_id = args.token_id
         if not token_id:
-            token_id = find_clob_token(gamma_client, clob_client, args.max_retries)
+            token_id = await find_clob_token(gamma_client, clob_client)
 
         examples: dict[str, dict[str, Any]] = {}
 
@@ -171,56 +175,50 @@ def run() -> int:
             }
 
         markets_params = {"limit": 50, "offset": 0, "closed": "false"}
-        markets = fetch_json(
+        markets = await fetch_json(
             gamma_client,
             "/markets",
             params=markets_params,
-            max_retries=args.max_retries,
         )
         record_example("/markets", markets, markets_params)
 
         events_params = {"limit": 50, "offset": 0, "closed": "false"}
-        events = fetch_json(
+        events = await fetch_json(
             gamma_client,
             "/events",
             params=events_params,
-            max_retries=args.max_retries,
         )
         record_example("/events", events, events_params)
 
         book_params = {"token_id": token_id}
-        book = fetch_json(
+        book = await fetch_json(
             clob_client,
             "/book",
             params=book_params,
-            max_retries=args.max_retries,
         )
         record_example("/book", book, book_params)
 
         price_params = {"token_id": token_id, "side": "BUY"}
-        price = fetch_json(
+        price = await fetch_json(
             clob_client,
             "/price",
             params=price_params,
-            max_retries=args.max_retries,
         )
         record_example("/price", price, price_params)
 
         midpoint_params = {"token_id": token_id}
-        midpoint = fetch_json(
+        midpoint = await fetch_json(
             clob_client,
             "/midpoint",
             params=midpoint_params,
-            max_retries=args.max_retries,
         )
         record_example("/midpoint", midpoint, midpoint_params)
 
         prices_history_params = {"market": token_id, "interval": "1d"}
-        prices_history = fetch_json(
+        prices_history = await fetch_json(
             clob_client,
             "/prices-history",
             params=prices_history_params,
-            max_retries=args.max_retries,
         )
         record_example(
             "/prices-history",
@@ -264,4 +262,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(asyncio.run(run()))

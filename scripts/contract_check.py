@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import json
 import sys
 from dataclasses import dataclass
@@ -17,15 +18,17 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from sync_upstream_docs import format_timestamp, utc_now  # noqa: E402
-from pmkt._http import format_url, request_with_retry  # noqa: E402
+from pmkt._http import HttpClient, format_url  # noqa: E402
+from pmkt.runtime import RequestPolicy  # noqa: E402
 from pmkt.tokens import extract_token_ids  # noqa: E402
 
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
-DEFAULT_MAX_RETRIES = 4
+DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_MAX_PAGES = 3
 USER_AGENT = "pmkt-contract-check/0.1"
+
 
 class CheckError(Exception):
     pass
@@ -46,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
-    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
+    parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
     parser.add_argument("--json", action="store_true", dest="json_output")
     return parser.parse_args()
@@ -64,17 +67,14 @@ def summarize_body(response: httpx.Response, limit: int = 200) -> str:
     return text if len(text) <= limit else f"{text[:limit]}..."
 
 
-def fetch_gamma_markets(
-    client: httpx.Client,
+async def fetch_gamma_markets(
+    client: HttpClient,
     offset: int,
-    max_retries: int,
 ) -> list[Any]:
-    response = request_with_retry(
-        client,
+    response = await client.request_response(
         "GET",
         "/markets",
         params={"limit": 50, "offset": offset},
-        max_retries=max_retries,
     )
     if response.status_code != 200:
         raise CheckError(
@@ -86,18 +86,15 @@ def fetch_gamma_markets(
     return markets
 
 
-def select_token_with_orderbook(
-    client: httpx.Client,
+async def select_token_with_orderbook(
+    client: HttpClient,
     tokens: list[str],
-    max_retries: int,
 ) -> tuple[str | None, CheckResult | None]:
     for token in tokens:
-        response = request_with_retry(
-            client,
+        response = await client.request_response(
             "GET",
             "/book",
             params={"token_id": token},
-            max_retries=max_retries,
         )
         if response.status_code == 404:
             continue
@@ -105,7 +102,7 @@ def select_token_with_orderbook(
             error = summarize_body(response)
             return None, CheckResult(
                 name="book",
-                url=format_url(client.base_url, "/book"),
+                url=format_url(httpx.URL(client.base_url), "/book"),
                 status_code=response.status_code,
                 ok=False,
                 error=f"Unexpected status {response.status_code}: {error}",
@@ -115,7 +112,7 @@ def select_token_with_orderbook(
         except CheckError as exc:
             return None, CheckResult(
                 name="book",
-                url=format_url(client.base_url, "/book"),
+                url=format_url(httpx.URL(client.base_url), "/book"),
                 status_code=response.status_code,
                 ok=False,
                 error=str(exc),
@@ -123,7 +120,7 @@ def select_token_with_orderbook(
         if not isinstance(data, dict):
             return None, CheckResult(
                 name="book",
-                url=format_url(client.base_url, "/book"),
+                url=format_url(httpx.URL(client.base_url), "/book"),
                 status_code=response.status_code,
                 ok=False,
                 error="Expected JSON object",
@@ -132,41 +129,40 @@ def select_token_with_orderbook(
             if key not in data:
                 return None, CheckResult(
                     name="book",
-                    url=format_url(client.base_url, "/book"),
+                    url=format_url(httpx.URL(client.base_url), "/book"),
                     status_code=response.status_code,
                     ok=False,
                     error=f"Missing key: {key}",
                 )
         return token, CheckResult(
             name="book",
-            url=format_url(client.base_url, "/book"),
+            url=format_url(httpx.URL(client.base_url), "/book"),
             status_code=response.status_code,
             ok=True,
         )
     return None, None
 
 
-def run_check(
-    client: httpx.Client,
+async def run_check(
+    client: HttpClient,
     name: str,
     path: str,
     params: dict[str, Any],
     expected_type: type,
     required_keys: tuple[str, ...],
-    max_retries: int,
     skip_on_status: set[int] | None = None,
 ) -> CheckResult:
-    url = format_url(client.base_url, path)
+    url = format_url(httpx.URL(client.base_url), path)
     try:
-        response = request_with_retry(
-            client,
+        response = await client.request_response(
             "GET",
             path,
             params=params,
-            max_retries=max_retries,
         )
     except httpx.RequestError as exc:
-        return CheckResult(name=name, url=url, status_code=None, ok=False, error=str(exc))
+        return CheckResult(
+            name=name, url=url, status_code=None, ok=False, error=str(exc)
+        )
 
     if skip_on_status and response.status_code in skip_on_status:
         return CheckResult(
@@ -218,26 +214,30 @@ def run_check(
     return CheckResult(name=name, url=url, status_code=response.status_code, ok=True)
 
 
-def run() -> int:
+async def run() -> int:
     args = parse_args()
     timestamp = format_timestamp(utc_now())
     headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
-    timeout = httpx.Timeout(args.timeout)
 
-    with httpx.Client(
-        base_url=args.gamma_base_url.rstrip("/"),
-        timeout=timeout,
-        headers=headers,
-        follow_redirects=True,
-    ) as gamma_client, httpx.Client(
-        base_url=args.clob_base_url.rstrip("/"),
-        timeout=timeout,
-        headers=headers,
-        follow_redirects=True,
-    ) as clob_client:
+    async with (
+        HttpClient(
+            base_url=args.gamma_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as gamma_client,
+        HttpClient(
+            base_url=args.clob_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as clob_client,
+    ):
         results: list[CheckResult] = []
         try:
-            markets = fetch_gamma_markets(gamma_client, offset=0, max_retries=args.max_retries)
+            markets = await fetch_gamma_markets(gamma_client, offset=0)
         except CheckError as exc:
             print(str(exc), file=sys.stderr)
             return 1
@@ -250,29 +250,26 @@ def run() -> int:
             )
             return 1
 
-        token_id, book_result = select_token_with_orderbook(
+        token_id, book_result = await select_token_with_orderbook(
             clob_client,
             tokens,
-            max_retries=args.max_retries,
         )
 
         pages_checked = 1
         while token_id is None and pages_checked < max(args.max_pages, 1):
             offset = pages_checked * 50
             try:
-                markets = fetch_gamma_markets(
+                markets = await fetch_gamma_markets(
                     gamma_client,
                     offset=offset,
-                    max_retries=args.max_retries,
                 )
             except CheckError:
                 break
             tokens = extract_token_ids(markets)
             if tokens:
-                token_id, book_result = select_token_with_orderbook(
+                token_id, book_result = await select_token_with_orderbook(
                     clob_client,
                     tokens,
-                    max_retries=args.max_retries,
                 )
             pages_checked += 1
 
@@ -290,36 +287,33 @@ def run() -> int:
         results.append(book_result)
 
         results.append(
-            run_check(
+            await run_check(
                 clob_client,
                 name="price",
                 path="/price",
                 params={"token_id": token_id, "side": "BUY"},
                 expected_type=dict,
                 required_keys=("price",),
-                max_retries=args.max_retries,
             )
         )
         results.append(
-            run_check(
+            await run_check(
                 clob_client,
                 name="midpoint",
                 path="/midpoint",
                 params={"token_id": token_id},
                 expected_type=dict,
                 required_keys=("mid",),
-                max_retries=args.max_retries,
             )
         )
         results.append(
-            run_check(
+            await run_check(
                 clob_client,
                 name="prices-history",
                 path="/prices-history",
                 params={"market": token_id, "interval": "1d"},
                 expected_type=dict,
                 required_keys=("history",),
-                max_retries=args.max_retries,
                 skip_on_status={404},
             )
         )
@@ -362,4 +356,4 @@ def run() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(run())
+    raise SystemExit(asyncio.run(run()))

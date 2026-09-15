@@ -46,8 +46,11 @@ jobs:
               tests/test_imports.py
               tests/test_models.py
               tests/test_public_boundary.py
+              tests/test_public_api_inventory.py
               tests/test_provenance.py
+              tests/test_records.py
               tests/test_repo_hygiene.py
+              tests/test_runtime.py
               tests/test_source_archive_builder.py
               tests/test_time.py
               tests/test_wheel_contents.py
@@ -56,6 +59,7 @@ jobs:
               tests/test_book_schemas.py
               tests/test_canonical_schemas.py
               tests/test_clob.py
+              tests/test_clob_history.py
               tests/test_contract_evidence.py
               tests/test_contract_evidence_integration.py
               tests/test_derive_market_snapshots_from_raw_json.py
@@ -67,6 +71,9 @@ jobs:
               tests/test_historical_books.py
               tests/test_io.py
               tests/test_kalshi.py
+              tests/test_kalshi_history.py
+              tests/test_kalshi_workflows.py
+              tests/test_catalog.py
               tests/test_market_catalog.py
               tests/test_market_data.py
               tests/test_normalize.py
@@ -74,6 +81,7 @@ jobs:
               tests/test_polymarket_data_api.py
               tests/test_recorder.py
               tests/test_resolution.py
+              tests/test_resolution_batch.py
               tests/test_resolution_cache.py
               tests/test_resolution_terminal_labels.py
               tests/test_run_manifests.py
@@ -132,6 +140,35 @@ jobs:
             exit 1
           fi
 
+  catalog-compatibility:
+    name: catalog (${{ matrix.os }}, py${{ matrix.python-version }}, ${{ matrix.stack.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+        stack:
+          - name: arrow14-min
+            pyarrow: "pyarrow==14.0.0"
+            numpy: "numpy==1.26.4"
+          - name: arrow25-current
+            pyarrow: "pyarrow==25.0.1"
+            numpy: "numpy==2.2.6"
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install qualified catalog stack
+        run: >-
+          python -m pip install -e . pytest pytest-asyncio "pandas>=2.1,<3"
+          duckdb==1.5.5 ${{ matrix.stack.pyarrow }} ${{ matrix.stack.numpy }}
+      - run: >-
+          python -m pytest -q tests/test_catalog.py tests/test_clob_history.py
+          tests/test_kalshi_history.py
+
   packaging-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -142,7 +179,7 @@ jobs:
           python-version: "3.11"
       - name: Build wheel and source distribution
         run: |
-          python -m pip install --upgrade pip build "setuptools>=68" wheel pytest
+          python -m pip install --upgrade pip build "setuptools>=68" wheel pytest "mypy>=1.8"
           python -m build
       - name: Install wheel away from the checkout
         run: |

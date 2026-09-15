@@ -1,12 +1,18 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
-from dataclasses import replace
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from json import JSONDecodeError
+from typing import Any, NoReturn, Literal
 
 import httpx
 
+from pmkt.runtime import OperationExpiry
+from pmkt.resolution.providers import KalshiResolutionProvider
+from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
+from pmkt.records import KalshiMarketRef
+from pmkt.resolution._batch import resolve_ordered_batch
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
@@ -27,9 +33,30 @@ from pmkt.resolution.models import (
     STATE_PROVISIONAL,
     STATE_UNAVAILABLE,
     SourceObservation,
+    _sanitized_error_message,
     error_record,
     utc_now_iso,
 )
+
+
+class InvalidResolutionEvidenceError(ValueError):
+    """A venue response cannot safely be used as resolution evidence."""
+
+
+_EXPECTED_SOURCE_ERRORS = (
+    httpx.RequestError,
+    JSONDecodeError,
+    UnicodeDecodeError,
+    InvalidResolutionEvidenceError,
+)
+
+
+@dataclass(frozen=True)
+class _PreparedKalshiResolution:
+    market_key: str
+    typed_ref: KalshiMarketRef
+    snapshot: dict[str, Any]
+    has_snapshot: bool
 
 
 def _mapping(payload: Mapping[str, Any] | Any | None) -> dict[str, Any]:
@@ -41,6 +68,104 @@ def _mapping(payload: Mapping[str, Any] | Any | None) -> dict[str, Any]:
         result = payload.to_dict()
         return result if isinstance(result, dict) else {}
     return {}
+
+
+def _snapshot_mapping(snapshot: Mapping[str, Any] | Any | None) -> dict[str, Any]:
+    if snapshot is None:
+        return {}
+    if isinstance(snapshot, Mapping):
+        return dict(snapshot)
+    to_dict = getattr(snapshot, "to_dict", None)
+    if not callable(to_dict):
+        raise TypeError("snapshot must be a mapping or expose to_dict()")
+    result = to_dict()
+    if not isinstance(result, Mapping):
+        raise TypeError("snapshot.to_dict() must return a mapping")
+    return dict(result)
+
+
+def _evidence_mapping(payload: object, *, source: str) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise InvalidResolutionEvidenceError(f"{source} returned a non-object payload")
+    mapped = dict(payload)
+    nested = mapped.get("market")
+    return dict(nested) if isinstance(nested, Mapping) else mapped
+
+
+def _require_market_input(value: KalshiMarketRef) -> tuple[str, KalshiMarketRef]:
+    if not isinstance(value, KalshiMarketRef):
+        raise TypeError("market must be a KalshiMarketRef")
+    return value.ticker, value
+
+
+def _raise_identity_mismatch(message: str, *, caller_input: bool) -> NoReturn:
+    if caller_input:
+        raise ValueError(message)
+    raise InvalidResolutionEvidenceError(message)
+
+
+def _identity_values(
+    payload: Mapping[str, Any],
+    fields: tuple[str, ...],
+    *,
+    source: str,
+    caller_input: bool,
+) -> list[tuple[str, str]]:
+    values: list[tuple[str, str]] = []
+    for field in fields:
+        if field not in payload or payload[field] is None:
+            continue
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip():
+            _raise_identity_mismatch(
+                f"{source} {field} identity must be a non-empty string",
+                caller_input=caller_input,
+            )
+        values.append((field, value))
+    return values
+
+
+def _validate_typed_identity(
+    payload: Mapping[str, Any],
+    *,
+    market: KalshiMarketRef,
+    source: str,
+    caller_input: bool,
+) -> None:
+    for field, observed_market in _identity_values(
+        payload,
+        ("market_key", "ticker", "market_ticker", "instrument_key"),
+        source=source,
+        caller_input=caller_input,
+    ):
+        if (
+            observed_market is not None
+            and observed_market.split(":")[0] != market.ticker
+        ):
+            _raise_identity_mismatch(
+                f"{source} {field} identity {observed_market!r} does not match "
+                f"KalshiMarketRef {market.ticker!r}",
+                caller_input=caller_input,
+            )
+    series_values = _identity_values(
+        payload,
+        ("series_ticker", "seriesTicker"),
+        source=source,
+        caller_input=caller_input,
+    )
+    if len({value for _, value in series_values}) > 1:
+        _raise_identity_mismatch(
+            f"{source} contains contradictory series identities",
+            caller_input=caller_input,
+        )
+    if market.series_ticker is not None:
+        for field, observed_series in series_values:
+            if observed_series is not None and observed_series != market.series_ticker:
+                _raise_identity_mismatch(
+                    f"{source} {field} identity {observed_series!r} does not match "
+                    f"KalshiMarketRef enrichment {market.series_ticker!r}",
+                    caller_input=caller_input,
+                )
 
 
 def _first(payload: Mapping[str, Any], *keys: str) -> Any:
@@ -391,40 +516,135 @@ def _endpoint_error_record(
         error=error,
         observed_at_utc=observed_at_utc,
     )
+    message = _sanitized_error_message(error, source=source)
     return replace(
         record,
+        error_message=message,
         source_observations=[
-            replace(observation, source=source)
+            replace(observation, source=source, error_message=message)
             for observation in record.source_observations
         ],
     )
 
 
 class KalshiResolutionResolver:
-    def __init__(self, client: Any | None = None) -> None:
+    def __init__(self, client: KalshiResolutionProvider | None = None) -> None:
         self.client = client
+
+    def _prepare_resolution_input(
+        self,
+        market_key: KalshiMarketRef,
+        *,
+        snapshot: Mapping[str, Any] | Any | None,
+    ) -> _PreparedKalshiResolution:
+        key, typed_ref = _require_market_input(market_key)
+        snapshot_map = _snapshot_mapping(snapshot)
+        _validate_typed_identity(
+            snapshot_map,
+            market=typed_ref,
+            source="snapshot",
+            caller_input=True,
+        )
+        return _PreparedKalshiResolution(
+            market_key=key,
+            typed_ref=typed_ref,
+            snapshot=snapshot_map,
+            has_snapshot=snapshot is not None,
+        )
+
+    def _prepare_batch_input(
+        self, market: KalshiMarketRef
+    ) -> _PreparedKalshiResolution:
+        if not isinstance(market, KalshiMarketRef):
+            raise TypeError("markets must contain only KalshiMarketRef values")
+        return self._prepare_resolution_input(market, snapshot=None)
+
+    async def _market_payload(
+        self,
+        ticker: str,
+        *,
+        source: Literal["live", "historical"],
+        expiry: OperationExpiry,
+    ) -> dict[str, Any]:
+        client = self.client
+        assert client is not None
+        if source == "live":
+            payload = await expiry.run(lambda: client.market(ticker, expiry=expiry))
+        else:
+            payload = await expiry.run(lambda: client.historical_market(ticker, expiry=expiry))
+        expiry.checkpoint()
+        result = _evidence_mapping(payload, source=f"kalshi_{source}_rest")
+        expiry.checkpoint()
+        return result
+
+
 
     async def resolve(
         self,
-        market_key: str,
+        market_key: KalshiMarketRef,
         *,
         snapshot: Mapping[str, Any] | Any | None = None,
+        deadline_s: float | None = None,
     ) -> ResolutionRecord:
+        return await self._resolve_with_expiry(
+            market_key,
+            snapshot=snapshot,
+            expiry=OperationExpiry.after(deadline_s),
+        )
+
+    async def resolve_many(
+        self,
+        markets: Sequence[KalshiMarketRef],
+        *,
+        concurrency: int = 8,
+        deadline_s: float = 120.0,
+    ) -> list[ResolutionRecord]:
+        return await resolve_ordered_batch(
+            markets,
+            concurrency=concurrency,
+            deadline_s=deadline_s,
+            prepare=self._prepare_batch_input,
+            resolve_one=lambda prepared, expiry: self._resolve_prepared_with_expiry(
+                prepared, expiry=expiry
+            ),
+        )
+
+    async def _resolve_with_expiry(
+        self,
+        market_key: KalshiMarketRef,
+        *,
+        snapshot: Mapping[str, Any] | Any | None,
+        expiry: OperationExpiry,
+    ) -> ResolutionRecord:
+        prepared = self._prepare_resolution_input(market_key, snapshot=snapshot)
+        expiry.checkpoint()
+        return await self._resolve_prepared_with_expiry(prepared, expiry=expiry)
+
+    async def _resolve_prepared_with_expiry(
+        self,
+        prepared: _PreparedKalshiResolution,
+        *,
+        expiry: OperationExpiry,
+    ) -> ResolutionRecord:
+        market_key = prepared.market_key
+        typed_ref = prepared.typed_ref
+        snapshot_map = prepared.snapshot
         observed = utc_now_iso()
         observations: list[SourceObservation] = []
         snapshot_fallback: ResolutionRecord | None = None
-        if snapshot is not None:
+        if prepared.has_snapshot:
             snapshot_record = kalshi_resolution_from_payload(
-                snapshot,
+                snapshot_map,
                 input_identifier=market_key,
                 source="kalshi_snapshot",
                 observed_at_utc=observed,
             )
             snapshot_fallback = _snapshot_fallback(snapshot_record)
             observations.extend(snapshot_fallback.source_observations)
+            expiry.checkpoint()
 
         if self.client is None:
-            return snapshot_fallback or ResolutionRecord(
+            record = snapshot_fallback or ResolutionRecord(
                 platform="kalshi",
                 market_key=market_key,
                 input_identifier=market_key,
@@ -432,12 +652,24 @@ class KalshiResolutionResolver:
                 confidence=CONFIDENCE_UNAVAILABLE,
                 observed_at_utc=observed,
             )
+            expiry.checkpoint()
+            return record
 
         live_record: ResolutionRecord | None = None
         historical_record: ResolutionRecord | None = None
         best: ResolutionRecord | None = None
         try:
-            live = await self.client.market(market_key)
+            live = await self._market_payload(
+                market_key,
+                source="live",
+                expiry=expiry,
+            )
+            _validate_typed_identity(
+                live,
+                market=typed_ref,
+                source="kalshi_rest",
+                caller_input=False,
+            )
             live_record = kalshi_resolution_from_payload(
                 live,
                 input_identifier=market_key,
@@ -446,6 +678,9 @@ class KalshiResolutionResolver:
             )
             observations.extend(live_record.source_observations)
             best = live_record
+            expiry.checkpoint()
+        except ReadAuthenticationRequiredError:
+            raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 best = _endpoint_error_record(
@@ -456,7 +691,7 @@ class KalshiResolutionResolver:
                     observed_at_utc=observed,
                 )
                 observations.extend(best.source_observations)
-        except Exception as exc:  # pragma: no cover - defensive live API guard
+        except _EXPECTED_SOURCE_ERRORS as exc:
             best = _endpoint_error_record(
                 source="kalshi_rest",
                 market_key=market_key,
@@ -467,7 +702,17 @@ class KalshiResolutionResolver:
             observations.extend(best.source_observations)
 
         try:
-            historical = await self.client.historical_market(market_key)
+            historical = await self._market_payload(
+                market_key,
+                source="historical",
+                expiry=expiry,
+            )
+            _validate_typed_identity(
+                historical,
+                market=typed_ref,
+                source="kalshi_historical_rest",
+                caller_input=False,
+            )
             historical_record = kalshi_resolution_from_payload(
                 historical,
                 input_identifier=market_key,
@@ -475,6 +720,9 @@ class KalshiResolutionResolver:
                 observed_at_utc=observed,
             )
             observations.extend(historical_record.source_observations)
+            expiry.checkpoint()
+        except ReadAuthenticationRequiredError:
+            raise
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 best = _endpoint_error_record(
@@ -485,7 +733,7 @@ class KalshiResolutionResolver:
                     observed_at_utc=observed,
                 )
                 observations.extend(best.source_observations)
-        except Exception as exc:  # pragma: no cover - defensive historical API guard
+        except _EXPECTED_SOURCE_ERRORS as exc:
             best = _endpoint_error_record(
                 source="kalshi_historical_rest",
                 market_key=market_key,
@@ -497,7 +745,7 @@ class KalshiResolutionResolver:
 
         if live_record is not None and historical_record is not None:
             if _final_records_conflict(live_record, historical_record):
-                return _inconsistent_authority_record(
+                record = _inconsistent_authority_record(
                     market_key=live_record.market_key,
                     input_identifier=market_key,
                     observed_at_utc=observed,
@@ -505,41 +753,63 @@ class KalshiResolutionResolver:
                     right=historical_record,
                     observations=observations,
                 )
+                expiry.checkpoint()
+                return record
             if live_record.resolution_state == STATE_FINAL:
-                return _with_observations(live_record, observations)
+                record = _with_observations(live_record, observations)
+                expiry.checkpoint()
+                return record
             if live_record.resolution_state != STATE_UNAVAILABLE:
-                return _with_observations(live_record, observations)
+                record = _with_observations(live_record, observations)
+                expiry.checkpoint()
+                return record
             if historical_record.resolution_state == STATE_FINAL:
-                return _with_observations(historical_record, observations)
+                record = _with_observations(historical_record, observations)
+                expiry.checkpoint()
+                return record
 
         if live_record is not None and live_record.resolution_state == STATE_FINAL:
-            return _with_observations(live_record, observations)
+            record = _with_observations(live_record, observations)
+            expiry.checkpoint()
+            return record
         if (
             live_record is not None
             and live_record.resolution_state != STATE_UNAVAILABLE
         ):
-            return _with_observations(live_record, observations)
+            record = _with_observations(live_record, observations)
+            expiry.checkpoint()
+            return record
         if (
             historical_record is not None
             and historical_record.resolution_state == STATE_FINAL
         ):
-            return _with_observations(historical_record, observations)
+            record = _with_observations(historical_record, observations)
+            expiry.checkpoint()
+            return record
         if (
             historical_record is not None
             and historical_record.resolution_state != STATE_UNAVAILABLE
             and (best is None or best.resolution_state == STATE_UNAVAILABLE)
         ):
-            return _with_observations(historical_record, observations)
+            record = _with_observations(historical_record, observations)
+            expiry.checkpoint()
+            return record
         if best is not None and best.error_type:
-            return _with_observations(best, observations)
+            record = _with_observations(best, observations)
+            expiry.checkpoint()
+            return record
         if snapshot_fallback is not None:
-            return _with_observations(snapshot_fallback, observations)
+            record = _with_observations(snapshot_fallback, observations)
+            expiry.checkpoint()
+            return record
         if historical_record is not None and (
             best is None or best.resolution_state == STATE_UNAVAILABLE
         ):
-            return _with_observations(historical_record, observations)
+            record = _with_observations(historical_record, observations)
+            expiry.checkpoint()
+            return record
 
-        return best or ResolutionRecord(
+        record = best or ResolutionRecord(
             platform="kalshi",
             market_key=market_key,
             input_identifier=market_key,
@@ -547,6 +817,8 @@ class KalshiResolutionResolver:
             confidence=CONFIDENCE_UNAVAILABLE,
             observed_at_utc=observed,
         )
+        expiry.checkpoint()
+        return record
 
 
 __all__ = [

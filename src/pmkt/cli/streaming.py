@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.config import PmktConfig
+
 import asyncio
 import importlib
 import sys
@@ -13,7 +15,7 @@ import pandas as pd
 import typer
 
 from pmkt.tokens import flatten_token_ids
-from pmkt.exchanges.polymarket.clob import ClobClient
+from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
     ReadAuthenticationRequiredError,
@@ -89,6 +91,7 @@ async def _lazy_stream_order_book_data(*args: Any, **kwargs: Any) -> dict[str, A
     collector = _load_stream_collector(
         "pmkt.exchanges.polymarket.order_book_stream", "stream_order_book_data"
     )
+    kwargs.setdefault("ws_url", PmktConfig.from_env().clob_ws_url)
     return await collector(*args, **kwargs)
 
 
@@ -98,6 +101,7 @@ async def _lazy_stream_kalshi_order_book_data(
     collector = _load_stream_collector(
         "pmkt.exchanges.kalshi.order_book_stream", "stream_kalshi_order_book_data"
     )
+    kwargs.setdefault("ws_url", PmktConfig.from_env().resolved_kalshi_ws_url)
     return await collector(*args, **kwargs)
 
 
@@ -510,7 +514,7 @@ async def _collect_books_async(
             )
         resolved_run_id = run_id or _default_one_shot_run_id("polymarket")
         started_at_utc = _utc_now_iso()
-        async with ClobClient() as clob:
+        async with AsyncClobClient( config=PmktConfig.from_env()) as clob:
             path = await collect_order_book_topbooks_parquet(
                 clob,
                 token_ids,
@@ -540,7 +544,7 @@ async def _collect_books_async(
     if manifest_out is not None:
         error_exit("--manifest-out requires --output-format topbook")
 
-    async with ClobClient() as clob:
+    async with AsyncClobClient( config=PmktConfig.from_env()) as clob:
         path = await collect_order_book_summaries_parquet(
             clob,
             token_ids,
@@ -699,7 +703,7 @@ async def _collect_kalshi_books_async(
             )
         resolved_run_id = run_id or _default_one_shot_run_id("kalshi")
         started_at_utc = _utc_now_iso()
-        async with AsyncKalshiClient() as kalshi:
+        async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
             batches = await asyncio.gather(
                 *(
                     fetch_topbooks(
@@ -738,7 +742,7 @@ async def _collect_kalshi_books_async(
     if manifest_out is not None:
         error_exit("--manifest-out requires --output-format topbook")
 
-    async with AsyncKalshiClient() as kalshi:
+    async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
         rows = await asyncio.gather(
             *(fetch_summary(kalshi, ticker) for ticker in tickers)
         )

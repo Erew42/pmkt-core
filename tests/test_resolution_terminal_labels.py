@@ -70,6 +70,16 @@ def test_polymarket_canonical_binary_labels_are_training_eligible() -> None:
     assert no_label.exclusion_reason is None
 
 
+def test_default_training_policy_accepts_retained_v2_canonical_rows() -> None:
+    retained = _record(resolver_version="market_resolution_resolver.v2")
+
+    label = resolution_training_label(retained)
+
+    assert is_authoritative_final_resolution(retained)
+    assert label.terminal_label == "yes"
+    assert label.resolver_version == "market_resolution_resolver.v2"
+
+
 def test_polymarket_refund_and_fractional_payouts_are_nonbinary() -> None:
     refund = _record(
         payouts_json=json.dumps(

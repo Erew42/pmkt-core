@@ -2,11 +2,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from json import JSONDecodeError
 from typing import Any
+
+import httpx
 
 from pmkt.data.canonical import market_resolution_row
 
-RESOLVER_VERSION = "market_resolution_resolver.v2"
+RESOLVER_VERSION = "market_resolution_resolver.v3"
+COMPATIBLE_RESOLVER_VERSIONS = (
+    "market_resolution_resolver.v2",
+    RESOLVER_VERSION,
+)
 
 STATE_FINAL = "final"
 STATE_OPEN = "open"
@@ -58,6 +65,18 @@ def compact_dict(values: dict[str, Any]) -> dict[str, Any]:
         for key, value in values.items()
         if value is not None and value != ""
     }
+
+
+def _sanitized_error_message(error: BaseException, *, source: str) -> str:
+    """Describe a failed source without persisting remote or endpoint secrets."""
+
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"{source} returned HTTP {error.response.status_code}"
+    if isinstance(error, httpx.RequestError):
+        return f"{source} request failed ({type(error).__name__})"
+    if isinstance(error, (JSONDecodeError, UnicodeDecodeError)):
+        return f"{source} returned invalid JSON"
+    return f"{source} failed ({type(error).__name__})"
 
 
 @dataclass(frozen=True)
@@ -163,6 +182,7 @@ def error_record(
     observed_at_utc: str | None = None,
 ) -> ResolutionRecord:
     observed = observed_at_utc or utc_now_iso()
+    message = _sanitized_error_message(error, source=platform)
     return ResolutionRecord(
         platform=platform,
         market_key=market_key,
@@ -171,14 +191,14 @@ def error_record(
         confidence=CONFIDENCE_UNAVAILABLE,
         observed_at_utc=observed,
         error_type=type(error).__name__,
-        error_message=str(error),
+        error_message=message,
         source_observations=[
             SourceObservation(
                 source=platform,
                 confidence=CONFIDENCE_UNAVAILABLE,
                 observed_at_utc=observed,
                 error_type=type(error).__name__,
-                error_message=str(error),
+                error_message=message,
             )
         ],
     )

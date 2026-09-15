@@ -102,3 +102,11 @@ are not crash-durable until journal publication. Invalidations, termination,
 and explicit forced commits still publish synchronously. See the
 [capture runbook](docs/storage_profile_capture_runbook.md) for the exact boundary
 and the additive `capture_durability.metrics.checkpoint_publication` diagnostics.
+
+## Runtime configuration in 0.2
+
+Application entrypoints explicitly load `PmktConfig.from_env()` and pass the
+result to core clients. Python client construction alone uses deterministic
+defaults. Repository API-check/example scripts now use `--max-attempts` for the
+total request budget; `--max-retries` is removed. Existing `pmkt` command names
+and stored-data formats are unchanged.

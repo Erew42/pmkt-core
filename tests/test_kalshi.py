@@ -6,7 +6,7 @@ import httpx
 import pandas as pd
 import pytest
 
-from pmkt._http import RequestPolicy
+from pmkt.runtime import RequestPolicy
 from pmkt.data.canonical import KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION
 from pmkt.data.normalize_kalshi import (
     kalshi_market_matches_query_status,
@@ -91,7 +91,7 @@ async def test_kalshi_markets_page_serializes_params() -> None:
 
 @pytest.mark.asyncio
 async def test_kalshi_client_accepts_catalog_request_policy() -> None:
-    policy = RequestPolicy(max_retries=20, backoff_base_s=5.0, backoff_max_s=60.0)
+    policy = RequestPolicy(max_attempts=20, backoff_base_s=5.0, backoff_max_s=60.0)
     client = AsyncKalshiClient(
         base_url="https://example.com/trade-api/v2",
         transport=httpx.MockTransport(

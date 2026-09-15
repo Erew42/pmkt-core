@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import BaseModel, ConfigDict
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -35,15 +36,10 @@ def resolve_default_env_files(*, cwd: str | Path | None = None) -> tuple[Path, .
     return _env_files_for_dir(_find_source_root(current) or current)
 
 
-class PmktConfig(BaseSettings):
+class PmktConfig(BaseModel):
     """Endpoint configuration for public, read-only market-data clients."""
 
-    model_config = SettingsConfigDict(
-        env_file=(".env", ".env.local"),
-        env_file_encoding="utf-8",
-        env_prefix="PMKT_",
-        extra="ignore",
-    )
+    model_config = ConfigDict(extra="forbid")
 
     gamma_api_url: str = "https://gamma-api.polymarket.com"
     clob_api_url: str = "https://clob.polymarket.com"
@@ -56,10 +52,11 @@ class PmktConfig(BaseSettings):
     kalshi_api_url: str | None = None
     kalshi_ws_url: str | None = None
 
-    def __init__(self, **values: Any) -> None:
-        if "_env_file" not in values:
-            values["_env_file"] = resolve_default_env_files()
-        super().__init__(**values)
+    @classmethod
+    def from_env(cls, **values: Any) -> "PmktConfig":
+        """Load process environment and dotenv explicitly; arguments win."""
+        values.setdefault("_env_file", resolve_default_env_files())
+        return cls(**_EnvironmentSettings(**values).model_dump())
 
     @property
     def resolved_kalshi_api_url(self) -> str:
@@ -70,14 +67,13 @@ class PmktConfig(BaseSettings):
         return self.kalshi_ws_url or KALSHI_ENDPOINTS[self.kalshi_env]["ws"]
 
 
-_config: PmktConfig | None = None
-
-
-def get_config(*, refresh: bool = False) -> PmktConfig:
-    global _config
-    if refresh or _config is None:
-        _config = PmktConfig()
-    return _config
+class _EnvironmentSettings(PmktConfig, BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=(".env", ".env.local"),
+        env_file_encoding="utf-8",
+        env_prefix="PMKT_",
+        extra="ignore",
+    )
 
 
 def _clean_env_path(name: str) -> Path | None:
@@ -102,6 +98,5 @@ def _find_source_root(cwd: Path) -> Path | None:
 __all__ = [
     "KALSHI_ENDPOINTS",
     "PmktConfig",
-    "get_config",
     "resolve_default_env_files",
 ]

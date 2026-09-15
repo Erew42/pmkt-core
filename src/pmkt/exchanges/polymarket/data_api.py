@@ -5,10 +5,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Mapping, Sequence
 
 import httpx
+from pmkt.runtime import OperationExpiry
 from aiolimiter import AsyncLimiter
 
+from pmkt.runtime import RequestPolicy
 from pmkt._http import HttpClient
-from pmkt.config import get_config
+from pmkt.config import PmktConfig
 
 
 MAX_OPEN_INTEREST_MARKETS = 25
@@ -102,8 +104,18 @@ class AsyncPolymarketDataClient:
         base_url: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         limiter: AsyncLimiter | None = None,
+        *,
+        config: PmktConfig | None = None,
+        timeout_s: float = 30.0,
+        request_policy: RequestPolicy | None = None,
     ) -> None:
-        self.base_url = base_url or get_config().polymarket_data_api_url
+        self.base_url = (
+            base_url
+            if base_url is not None
+            else config.polymarket_data_api_url
+            if config is not None
+            else PmktConfig().polymarket_data_api_url
+        )
         self.limiter = limiter or AsyncLimiter(
             DEFAULT_DATA_API_MAX_RATE,
             DEFAULT_DATA_API_PERIOD_SECONDS,
@@ -112,7 +124,8 @@ class AsyncPolymarketDataClient:
             base_url=self.base_url,
             transport=transport,
             limiter=self.limiter,
-            timeout_s=30.0,
+            timeout_s=timeout_s,
+            request_policy=request_policy,
         )
 
     async def __aenter__(self) -> "AsyncPolymarketDataClient":
@@ -126,13 +139,11 @@ class AsyncPolymarketDataClient:
         await self._http.close()
 
     async def open_interest_page(
-        self, condition_ids: Sequence[object]
+        self, condition_ids: Sequence[object], *, expiry: OperationExpiry | None = None
     ) -> list[dict[str, Any]]:
         requested = normalize_condition_ids(condition_ids)
         payload = await self._http.request_json(
-            "GET",
-            "/oi",
-            params={"market": ",".join(requested)},
+            "GET", "/oi", params={"market": ",".join(requested)}, expiry=expiry
         )
         if not isinstance(payload, list) or any(
             not isinstance(row, dict) for row in payload

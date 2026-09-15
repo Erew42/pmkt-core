@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.resolution.evm import EvmRpcError, PolygonCtfClient
+from pmkt.resolution.kalshi import KalshiResolutionResolver
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
@@ -26,6 +28,7 @@ from pmkt.resolution.models import (
     STATE_PROVISIONAL,
     STATE_UNAVAILABLE,
 )
+from pmkt.resolution.polymarket import PolymarketResolutionResolver
 
 __all__ = [
     "CONFIDENCE_CANONICAL",
@@ -34,7 +37,11 @@ __all__ = [
     "CONFIDENCE_PLATFORM_CONFIRMED",
     "CONFIDENCE_PROVISIONAL",
     "CONFIDENCE_UNAVAILABLE",
+    "EvmRpcError",
+    "KalshiResolutionResolver",
     "Payout",
+    "PolygonCtfClient",
+    "PolymarketResolutionResolver",
     "RESOLVER_VERSION",
     "RESULT_TYPE_BINARY",
     "RESULT_TYPE_FRACTIONAL",

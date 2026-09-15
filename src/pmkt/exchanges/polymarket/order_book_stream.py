@@ -794,6 +794,7 @@ class _PolymarketCaptureSession(_CaptureSessionBookkeeping):
 async def stream_order_book_data(
     asset_ids: Sequence[str],
     *,
+    ws_url: str | None = None,
     output_root: str | Path = DEFAULT_ORDER_BOOK_STREAM_ROOT,
     run_name: str | None = None,
     duration_s: float = 300.0,
@@ -1061,6 +1062,7 @@ async def stream_order_book_data(
             health_sink = sink_for(DatasetRole.HEALTH)
             async with AsyncMarketWebSocketClient(
                 session.instrument_ids,
+                ws_url=ws_url,
                 custom_feature_enabled=session.custom_feature_enabled,
                 heartbeat_interval=heartbeat_interval,
                 connect_factory=connect_factory,

@@ -1,7 +1,23 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pmkt.exchanges.polymarket.clob import (
+        AsyncClobClient as AsyncClobClient,
+
+    )
+    from pmkt.exchanges.polymarket.gamma import (
+        AsyncGammaClient as AsyncGammaClient,
+
+    )
+    from pmkt.records import (
+        PolymarketFilter as PolymarketFilter,
+        PolymarketInstrumentRef as PolymarketInstrumentRef,
+        PolymarketMarket as PolymarketMarket,
+        PolymarketMarketRef as PolymarketMarketRef,
+    )
 
 _LAZY_MODULES: dict[str, str] = {
     "clob": "pmkt.exchanges.polymarket.clob",
@@ -33,15 +49,16 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     ),
     "AsyncSubgraphClient": ("pmkt.exchanges.polymarket.subgraph", "AsyncSubgraphClient"),
     "AsyncWebSocketClient": ("pmkt.exchanges.polymarket.ws", "AsyncWebSocketClient"),
-    "ClobClient": ("pmkt.exchanges.polymarket.clob", "ClobClient"),
     "DEFAULT_ORDER_BOOK_STREAM_ROOT": (
         "pmkt.exchanges.polymarket.order_book_stream",
         "DEFAULT_ORDER_BOOK_STREAM_ROOT",
     ),
-    "GammaClient": ("pmkt.exchanges.polymarket.gamma", "GammaClient"),
     "MarketBookState": ("pmkt.exchanges.polymarket.ws", "MarketBookState"),
     "MarketStreamSnapshot": ("pmkt.exchanges.polymarket.ws", "MarketStreamSnapshot"),
-    "SubgraphClient": ("pmkt.exchanges.polymarket.subgraph", "SubgraphClient"),
+    "PolymarketFilter": ("pmkt.records", "PolymarketFilter"),
+    "PolymarketInstrumentRef": ("pmkt.records", "PolymarketInstrumentRef"),
+    "PolymarketMarket": ("pmkt.records", "PolymarketMarket"),
+    "PolymarketMarketRef": ("pmkt.records", "PolymarketMarketRef"),
     "WebSocketProtocolError": ("pmkt.exchanges.polymarket.ws", "WebSocketProtocolError"),
     "apply_market_message": ("pmkt.exchanges.polymarket.ws", "apply_market_message"),
     "collect_market_snapshots": ("pmkt.exchanges.polymarket.ws", "collect_market_snapshots"),

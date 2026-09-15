@@ -276,49 +276,96 @@ async def test_queued_pong_survives_reader_stall_past_deadline() -> None:
 @pytest.mark.asyncio
 async def test_pong_keeps_quiet_connection_alive_without_book_initialization() -> None:
     class ResponsiveSocket(FakeWebSocket):
-        def __init__(self):
+        def __init__(self) -> None:
             super().__init__()
-            self.responses = asyncio.Queue()
-            self.delivered = 0
-            self.three_pongs = asyncio.Event()
+            self.deliveries: asyncio.Queue[str] = asyncio.Queue()
+            self.first_receive_waiting = asyncio.Event()
+            self.second_receive_waiting = asyncio.Event()
+            self.first_ping_sent = asyncio.Event()
+            self.second_ping_sent = asyncio.Event()
+            self.receive_cancelled = asyncio.Event()
+            self.receive_calls = 0
+            self.ping_count = 0
 
-        async def send(self, payload):
+        async def send(self, payload: str) -> None:
             await super().send(payload)
-            if payload == "PING":
-                self.responses.put_nowait("PONG")
+            if payload != "PING":
+                return
+            self.ping_count += 1
+            if self.ping_count == 1:
+                self.first_ping_sent.set()
+            elif self.ping_count == 2:
+                self.second_ping_sent.set()
 
         async def __anext__(self):
-            response = await self.responses.get()
-            self.delivered += 1
-            if self.delivered == 3:
-                self.three_pongs.set()
-            return response
+            self.receive_calls += 1
+            if self.receive_calls == 1:
+                self.first_receive_waiting.set()
+            elif self.receive_calls == 2:
+                self.second_receive_waiting.set()
+            try:
+                return await self.deliveries.get()
+            except asyncio.CancelledError:
+                self.receive_cancelled.set()
+                raise
 
     ws = ResponsiveSocket()
+    now = [100.0]
+    heartbeat_waits: asyncio.Queue[tuple[float, asyncio.Event]] = asyncio.Queue()
 
     async def connect_factory(_):
         return ws
 
+    async def controlled_heartbeat_sleep(delay: float) -> None:
+        released = asyncio.Event()
+        await heartbeat_waits.put((delay, released))
+        await released.wait()
+
     client = AsyncMarketWebSocketClient(
         ["a"],
         connect_factory=connect_factory,
-        heartbeat_interval=0.01,
-        pong_timeout_seconds=1.0,
+        heartbeat_interval=10.0,
+        pong_timeout_seconds=20.0,
+        heartbeat_clock=lambda: now[0],
+        sleep=controlled_heartbeat_sleep,
     )
     state = MarketBookState("a")
     async with client:
         task = asyncio.create_task(client.iter_messages(reconnect=False).__anext__())
-        # Deadline expiry is tested separately with an advancing clock. Here,
-        # synchronize on actual replies rather than Windows timer granularity.
-        await asyncio.wait_for(ws.three_pongs.wait(), timeout=2)
+
+        first_delay, release_first_heartbeat = await asyncio.wait_for(
+            heartbeat_waits.get(), timeout=1
+        )
+        await asyncio.wait_for(ws.first_receive_waiting.wait(), timeout=1)
+        assert first_delay == 10.0
+
+        now[0] = 110.0
+        release_first_heartbeat.set()
+        await asyncio.wait_for(ws.first_ping_sent.wait(), timeout=1)
+        second_delay, release_second_heartbeat = await asyncio.wait_for(
+            heartbeat_waits.get(), timeout=1
+        )
+        assert second_delay == 10.0
+        assert client._pending_ping_since == 110.0
+
+        await ws.deliveries.put("PONG")
+        await asyncio.wait_for(ws.second_receive_waiting.wait(), timeout=1)
+        assert client._pending_ping_since is None
+        assert client.last_frame_sequence == 0
+
+        now[0] = 135.0
+        release_second_heartbeat.set()
+        await asyncio.wait_for(ws.second_ping_sent.wait(), timeout=1)
         assert not task.done()
         assert client._heartbeat_error is None
-        assert client._pending_ping_since is None
         assert not state.initial_snapshot_received
         assert not state.book_integrity_valid
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+        assert not ws.receive_cancelled.is_set()
+    assert ws.receive_cancelled.is_set()
+    assert ws.closed
     assert client._heartbeat_task is None
 
 

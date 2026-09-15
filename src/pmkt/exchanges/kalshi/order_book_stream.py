@@ -836,6 +836,7 @@ class _KalshiCaptureSession(_CaptureSessionBookkeeping):
 async def stream_kalshi_order_book_data(
     market_tickers: Sequence[str],
     *,
+    ws_url: str | None = None,
     output_root: str | Path = DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
     run_name: str | None = None,
     duration_s: float = 300.0,
@@ -1107,6 +1108,7 @@ async def stream_kalshi_order_book_data(
             health_sink = sink_for(DatasetRole.HEALTH)
             async with AsyncKalshiWebSocketClient(
                 session.instrument_ids,
+                ws_url=ws_url,
                 connect_factory=connect_factory,
                 auth=auth,
                 transport_settings=session.transport_settings,
