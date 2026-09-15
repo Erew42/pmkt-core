@@ -289,12 +289,12 @@ class AsyncClobClient:
         }
         if start_ts is None and end_ts is None:
             params["interval"] = interval
-        if expiry is None:
+        if observations is None:
             data = await self._http.request_json(
-                "GET", "/prices-history", params=params
+                "GET", "/prices-history", params=params, expiry=expiry
             )
             return data, None
-        if instrument is None or observations is None:
+        if instrument is None:
             raise RuntimeError("observed history fetch requires workflow context")
         data, observation = await self._requests.request_json_observed(
             "GET",
@@ -374,7 +374,7 @@ class AsyncClobClient:
         for token_id in token_ids:
             params = {"market": token_id, "interval": interval, "fidelity": fidelity}
             response = await self._http._request(
-                "GET", "/prices-history", params=params
+                "GET", "/prices-history", params=params, expiry=expiry
             )
             if response.status_code == 404:
                 if skip_missing:
@@ -392,11 +392,19 @@ class AsyncClobClient:
                 finally:
                     await response.aclose()
                 continue
-            data = response.json()
-            await response.aclose()
+            try:
+                if expiry is not None:
+                    expiry.checkpoint()
+                data = response.json()
+                if expiry is not None:
+                    expiry.checkpoint()
+            finally:
+                await response.aclose()
             if not isinstance(data, dict):
                 raise TypeError(f"Expected dict, got {type(data)}")
             history[token_id] = PriceHistory(**data)
+        if expiry is not None:
+            expiry.checkpoint()
         return history
 
 

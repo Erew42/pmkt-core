@@ -99,7 +99,8 @@ _MARKETS_PARAMETER_ALLOWLIST = frozenset(
 _CANDLE_PARAMETER_ALLOWLIST = frozenset(
     {"start_ts", "end_ts", "period_interval", "include_latest_before_start"}
 )
-KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST = 10_000
+# Both single-market endpoints bound elapsed periods, with inclusive labels.
+KALSHI_CANDLE_QUERY_PERIODS_PER_REQUEST = 5_000
 
 
 @dataclass
@@ -1166,10 +1167,8 @@ class AsyncKalshiClient:
         expiry: OperationExpiry | None = None,
         observations: list[RequestObservation] | None = None,
     ) -> tuple[object, RequestObservation | None]:
-        encoded_series = (
-            quote(series_ticker, safe="") if expiry is not None else series_ticker
-        )
-        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
+        encoded_series = quote(series_ticker, safe="")
+        encoded_ticker = quote(ticker, safe="")
         path = f"/series/{encoded_series}/markets/{encoded_ticker}/candlesticks"
         params = {
             "start_ts": start_ts,
@@ -1177,9 +1176,9 @@ class AsyncKalshiClient:
             "period_interval": period_interval,
             "include_latest_before_start": include_latest_before_start,
         }
-        if expiry is None:
-            return await self._http.request_json("GET", path, params=params), None
-        if market is None or observations is None:
+        if observations is None:
+            return await self._http.request_json("GET", path, params=params, expiry=expiry), None
+        if market is None:
             raise RuntimeError("observed candle fetch requires workflow context")
         effective_parameters = {
             key: value for key, value in params.items() if value is not None
@@ -1259,16 +1258,16 @@ class AsyncKalshiClient:
         expiry: OperationExpiry | None = None,
         observations: list[RequestObservation] | None = None,
     ) -> tuple[object, RequestObservation | None]:
-        encoded_ticker = quote(ticker, safe="") if expiry is not None else ticker
+        encoded_ticker = quote(ticker, safe="")
         path = f"/historical/markets/{encoded_ticker}/candlesticks"
         params = {
             "start_ts": start_ts,
             "end_ts": end_ts,
             "period_interval": period_interval,
         }
-        if expiry is None:
-            return await self._http.request_json("GET", path, params=params), None
-        if market is None or observations is None:
+        if observations is None:
+            return await self._http.request_json("GET", path, params=params, expiry=expiry), None
+        if market is None:
             raise RuntimeError("observed candle fetch requires workflow context")
         data, observation = await self._requests.request_json_observed(
             "GET",
@@ -1299,10 +1298,8 @@ class AsyncKalshiClient:
         expiry: OperationExpiry | None = None,
         observations: list[RequestObservation] | None = None,
     ) -> tuple[object, RequestObservation | None]:
-        if expiry is None:
-            return await self._http.request_json("GET", "/historical/cutoff"), None
         if observations is None:
-            raise RuntimeError("observed cutoff fetch requires workflow context")
+            return await self._http.request_json("GET", "/historical/cutoff", expiry=expiry), None
         data, observation = await self._requests.request_json_observed(
             "GET",
             "/historical/cutoff",

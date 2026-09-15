@@ -1508,3 +1508,48 @@ async def test_sparse_price_invalid_value_still_obeys_row_policy():
     result = await _explicit_live(payload, invalid_rows="report")
     assert len(result.candles) == 1
     assert result.coverage.rejected_rows == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["market_candlesticks", "historical_market_candlesticks", "historical_cutoff"])
+async def test_native_history_deadlines_preserve_encoded_request(method):
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={})
+    async with AsyncKalshiClient(base_url="https://offline.invalid", transport=httpx.MockTransport(handler)) as client:
+        args = (SERIES, TICKER) if method == "market_candlesticks" else (TICKER,)
+        kwargs = dict(start_ts=1, end_ts=61, period_interval=1)
+        if method == "historical_cutoff":
+            args, kwargs = (), {}
+        call = getattr(client, method)
+        assert await call(*args, **kwargs) == {}
+        assert await call(*args, **kwargs, expiry=OperationExpiry.after(5)) == {}
+        assert requests[0].url == requests[1].url
+        if args:
+            assert b"%2F" in requests[0].url.raw_path
+        with pytest.raises(OperationTimeoutError):
+            await call(*args, **kwargs, expiry=OperationExpiry(0, lambda: 1))
+        assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("periods,expected_requests", [(4999, 1), (5000, 1), (5001, 2), (5760, 2)])
+async def test_single_market_history_span_limit_and_overlap(periods, expected_requests):
+    requests = []
+    def handler(request):
+        start = int(request.url.params["start_ts"])
+        end = int(request.url.params["end_ts"])
+        assert end - start <= 5000 * 60
+        requests.append((start, end))
+        return httpx.Response(200, json={"ticker": TICKER, "candlesticks": [
+            _historical_row(datetime.fromtimestamp(t, timezone.utc))
+            for t in range(start, end + 1, 60)
+        ]})
+    async with AsyncKalshiClient(base_url="https://offline.invalid", transport=httpx.MockTransport(handler), _utc_now=lambda: NOW) as client:
+        result = await client.get_candles(KalshiMarketRef(TICKER), start=BASE,
+            end=BASE+timedelta(minutes=periods), period_minutes=1, source="historical")
+    assert len(requests) == expected_requests
+    assert all(a[1] == b[0] for a, b in zip(requests, requests[1:]))
+    assert len(result.candles) == periods
+    assert result.coverage.duplicate_rows == expected_requests - 1

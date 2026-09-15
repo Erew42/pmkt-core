@@ -659,3 +659,63 @@ async def test_price_history_condition_identity_is_case_insensitive(
     )
     assert result.instrument == instrument
     assert f"condition_id={returned}" in result.provenance.observations[-1].response_identities
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event", [False, True])
+async def test_native_price_history_deadline(event):
+    requests = []
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(200, json={"history": []})
+    async with AsyncClobClient(base_url="https://offline.invalid", transport=httpx.MockTransport(handler)) as client:
+        async def call(expiry):
+            if event:
+                return await client.event_prices_history({"markets": [{"clobTokenIds": '["a", "b"]'}]}, "1d", expiry=expiry)
+            return await client.prices_history("a", interval="1d", expiry=expiry)
+        await call(None)
+        count = len(requests)
+        await call(OperationExpiry.after(5))
+        assert [r.url for r in requests[:count]] == [r.url for r in requests[count:]]
+        with pytest.raises(OperationTimeoutError):
+            await call(OperationExpiry(0, lambda: 1))
+        assert len(requests) == 2 * count
+
+
+@pytest.mark.asyncio
+async def test_event_history_tokens_share_one_deadline():
+    clock = [0.0]
+    requests = []
+    def handler(request):
+        requests.append(request)
+        clock[0] = 2.0
+        return httpx.Response(200, json={"history": []})
+    async with AsyncClobClient(base_url="https://offline.invalid", transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(OperationTimeoutError):
+            await client.event_prices_history({"markets": [{"clobTokenIds": '["a", "b"]'}]}, "1d", expiry=OperationExpiry(1, lambda: clock[0]))
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_observation_collection_does_not_require_a_deadline():
+    observations = []
+    async with AsyncClobClient(base_url="https://offline.invalid",
+            transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"history": []}))) as client:
+        payload, observation = await client._prices_history_payload(
+            market="a", interval="1d", fidelity=None, start_ts=None, end_ts=None,
+            instrument=PolymarketInstrumentRef("a"), observations=observations)
+    assert payload == {"history": []}
+    assert observations == [observation]
+    assert observation.outcome == "success"
+
+
+@pytest.mark.asyncio
+async def test_event_history_checks_deadline_after_skipped_missing_token():
+    clock = [0.0]
+    def handler(request):
+        clock[0] = 2.0
+        return httpx.Response(404)
+    async with AsyncClobClient(base_url="https://offline.invalid", transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(OperationTimeoutError):
+            await client.event_prices_history({"markets": [{"clobTokenIds": '["a"]'}]}, "1d",
+                expiry=OperationExpiry(1, lambda: clock[0]))
