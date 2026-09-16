@@ -6,12 +6,12 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Iterable, Mapping
 
-from pmkt.streaming.profiles import (
+from pmkt.streaming.legacy.profiles import (
     TOPBOOK_CHANGE_TRIGGER_VERSION,
     TOPBOOK_EXCLUDED_QUALITY_FLAGS,
     DatasetRole,
 )
-from pmkt.streaming.tape import canonical_decimal, semantic_hash
+from pmkt.streaming.legacy.tape import canonical_decimal, semantic_hash
 
 EXCLUDED_NON_STATE_QUALITY_FLAGS = TOPBOOK_EXCLUDED_QUALITY_FLAGS
 TOPBOOK_CHECKPOINT_REASONS = frozenset(

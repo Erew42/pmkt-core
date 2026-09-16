@@ -173,6 +173,21 @@
       ],
       "contract_owner": "pmkt-core",
       "consumer_policy_owner": "per-schema repository_ownership"
+    },
+    {
+      "id": "stream_recording",
+      "owner": "pmkt-core",
+      "status": "active_core",
+      "summary": "Changed topbooks, selected full snapshots, public trades and recording events in SQLite and Parquet.",
+      "schemas": [
+        "recording_topbook.v1",
+        "recording_book_snapshots.v1",
+        "recording_book_levels.v1",
+        "recording_trades.v1",
+        "recording_events.v1"
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "pmkt-core"
     }
   ],
   "evidence_overrides": {
@@ -594,6 +609,31 @@
       "contract_owner": "pmkt-core",
       "classification": "core_owned",
       "consumer_policy_owner": null
+    },
+    "recording_topbook.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_book_snapshots.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_book_levels.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_trades.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_events.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
     }
   },
   "source_inventory_summary": {

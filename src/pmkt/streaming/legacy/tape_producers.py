@@ -10,17 +10,17 @@ from pmkt.data.kalshi_quotes import (
 )
 from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.exchanges.polymarket.ws import MarketBookState
-from pmkt.streaming.capture import TapeBatchIntent
-from pmkt.streaming.storage_backends import CaptureCoordinator
-from pmkt.streaming.recovery_contracts import CaptureCommitCause
-from pmkt.streaming.tape import (
+from pmkt.streaming.legacy.tape import TapeBatchIntent
+from pmkt.streaming.legacy.storage_backends import CaptureCoordinator
+from pmkt.streaming.legacy.recovery_contracts import CaptureCommitCause
+from pmkt.streaming.legacy.tape import (
     CaptureCoordinate,
     build_control_row,
     build_tape_batch,
     epoch_id,
     semantic_hash,
 )
-from pmkt.streaming.venue_tape import (
+from pmkt.streaming.legacy.venue_tape import (
     kalshi_book_levels,
     kalshi_delta_levels,
     polymarket_book_levels,

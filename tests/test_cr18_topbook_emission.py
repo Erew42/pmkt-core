@@ -6,13 +6,13 @@ from decimal import Decimal
 import pytest
 
 from pmkt.data.schemas import topbook_row
-from pmkt.streaming.profiles import (
+from pmkt.streaming.legacy.profiles import (
     TOPBOOK_CHANGE_TRIGGER_VERSION,
     TOPBOOK_EXCLUDED_QUALITY_FLAGS,
     DatasetRole,
     select_storage_profile,
 )
-from pmkt.streaming.topbook_emission import (
+from pmkt.streaming.legacy.topbook_emission import (
     EXCLUDED_NON_STATE_QUALITY_FLAGS,
     TOPBOOK_BOUNDARY_REASONS,
     TopbookEmissionTracker,

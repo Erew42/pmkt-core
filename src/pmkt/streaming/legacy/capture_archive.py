@@ -10,12 +10,12 @@ from pathlib import Path
 from typing import Any
 
 from pmkt.data.manifests import validate_run_manifest
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     RUN_STATE_NAME,
     file_sha256,
     write_json_atomic_fsync,
 )
-from pmkt.streaming.recovery_contracts import RunStateV1
+from pmkt.streaming.legacy.recovery_contracts import RunStateV1
 
 
 @dataclass(frozen=True)

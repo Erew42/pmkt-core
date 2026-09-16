@@ -16,7 +16,7 @@ from pmkt.data.registry import (
     get_table_spec,
 )
 from pmkt.streaming.collector import StreamDatasetSpec
-from pmkt.streaming.profiles import DatasetRole
+from pmkt.streaming.legacy.profiles import DatasetRole
 
 
 def _registered_spec(

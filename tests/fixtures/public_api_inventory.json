@@ -449,6 +449,7 @@
         "FeedRecoveryAction",
         "FeedShardHealth",
         "LiveFeedSupervisor",
+        "RecordingOptions",
         "RuntimeFeedProjectionRecorder",
         "StreamDatasetSpec",
         "StreamRunOutputs",
@@ -456,6 +457,7 @@
         "SubscriptionPlanValidation",
         "SubscriptionPlanValidator",
         "default_cli_import_timing_specs",
+        "export_recording",
         "measure_cli_import_timing",
         "pr15_fake_websocket_replay_config",
         "run_fake_websocket_load_replay",
@@ -687,22 +689,32 @@
     {
       "path": "pmkt.resolution.providers.GammaResolutionProvider",
       "tier": "advanced",
-      "methods": ["market"]
+      "methods": [
+        "market"
+      ]
     },
     {
       "path": "pmkt.resolution.providers.ClobResolutionProvider",
       "tier": "advanced",
-      "methods": ["clob_market_info"]
+      "methods": [
+        "clob_market_info"
+      ]
     },
     {
       "path": "pmkt.resolution.providers.KalshiResolutionProvider",
       "tier": "advanced",
-      "methods": ["market", "historical_market"]
+      "methods": [
+        "market",
+        "historical_market"
+      ]
     },
     {
       "path": "pmkt.resolution.providers.CtfResolutionProvider",
       "tier": "advanced",
-      "methods": ["ensure_polygon", "payout_vector"]
+      "methods": [
+        "ensure_polygon",
+        "payout_vector"
+      ]
     }
   ]
 }

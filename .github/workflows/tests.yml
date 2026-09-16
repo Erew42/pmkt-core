@@ -93,21 +93,17 @@ jobs:
           - name: feeds-streaming
             paths: >-
               tests/test_capture_storage_backends.py
-              tests/test_connection_partitions.py
-              tests/test_cr18_9_capture_completeness.py
               tests/test_cr18_book_reconstruction.py
               tests/test_cr18_foundations.py
-              tests/test_cr18_health_emission.py
               tests/test_cr18_instrument_evidence.py
               tests/test_cr18_observations.py
               tests/test_cr18_tape_durability.py
               tests/test_cr18_topbook_emission.py
-              tests/test_feed_control.py
               tests/test_kalshi_integration.py
-              tests/test_kalshi_order_book_stream.py
               tests/test_kalshi_ws.py
               tests/test_live_feed_supervisor.py
-              tests/test_order_book_stream.py
+              tests/test_recording.py
+              tests/test_recording_cli.py
               tests/test_streaming_collector.py
               tests/test_streaming_measurement.py
               tests/test_ws_transport.py
@@ -115,7 +111,6 @@ jobs:
           - name: cli
             paths: >-
               tests/test_cli.py
-              tests/test_cr18_cli_profiles.py
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6

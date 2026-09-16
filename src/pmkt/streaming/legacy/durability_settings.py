@@ -5,7 +5,7 @@ from enum import Enum
 from math import isfinite
 from typing import Any, Mapping, Sequence
 
-from pmkt.streaming.recovery_contracts import CAPTURE_COMMIT_JOURNAL_V2_FORMAT
+from pmkt.streaming.legacy.recovery_contracts import CAPTURE_COMMIT_JOURNAL_V2_FORMAT
 
 DEFAULT_SEGMENT_ROWS = 50_000
 DEFAULT_SEGMENT_SECONDS = 30.0

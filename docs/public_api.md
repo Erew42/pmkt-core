@@ -443,7 +443,7 @@ history: CandleHistoryResult = await kalshi.get_candles(
 `period_minutes` is exactly `1`, `60`, or `1440`. Both bounds must be aware;
 they are normalized to UTC before ordering. Returned candles are fully
 contained in the original window and complete against one UTC clock value
-frozen at operation start. Thus 10:30–12:00 includes the 11:00–12:00 hourly
+frozen at operation start. Thus 10:30â€“12:00 includes the 11:00â€“12:00 hourly
 bar only. Inclusive native end-label requests may overlap at internal adapter
 boundaries; all valid keys are reconciled before original-window containment,
 completion filtering, and the output cap. Chunk size is 5,000 elapsed periods
@@ -698,8 +698,13 @@ separate `pmkt.catalog` facade.
 
 `MarketCatalogService` remains the mutable maintenance service and the CLI
 `query` command exposes an unmanaged DuckDB connection. Use `pmkt.catalog` for
-the pinned reader and bounded managed query result. WebSocket and capture
-helpers retain their existing recovery and evidence behavior.
+the pinned reader and bounded managed query result. WebSocket clients retain their transport and book-state behavior. The two
+`stream_*_order_book_data` recording entrypoints now implement
+[the simplified recording contract](stream_recording_contract.md). Historical
+storage-profile arguments are removed; use `mode`, `depth_check_interval_s`,
+`depth_on_best_price_change` and `raw_messages`. Both modes retain public trade
+observations. `pmkt.streaming.export_recording` exports committed SQLite rows
+from stopped recordings, including after an interrupted process.
 
 ## Optional dependencies
 

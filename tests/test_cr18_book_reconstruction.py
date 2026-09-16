@@ -43,25 +43,20 @@ from pmkt.data.kalshi_quotes import KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT
 from pmkt.data.normalize_books import kalshi_ws_snapshot_to_topbook
 from pmkt.data.registry import DEPTH_SCHEMA_VERSION, TOPBOOK_SCHEMA_VERSION
 from pmkt.data.validation import validate_frame
-from pmkt.exchanges.kalshi.order_book_stream import stream_kalshi_order_book_data
 from pmkt.exchanges.kalshi.ws import apply_kalshi_orderbook_message
-from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
-from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     COMMIT_JOURNAL_V1_NAME,
     COMMIT_JOURNAL_V2_NAME,
     RUN_STATE_NAME,
     file_sha256,
 )
-from pmkt.streaming.instrument_evidence import CAPTURE_INSTRUMENT_EVIDENCE_ROLE
-from pmkt.streaming.profiles import select_storage_profile
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.instrument_evidence import CAPTURE_INSTRUMENT_EVIDENCE_ROLE
+from pmkt.streaming.legacy.recovery_contracts import (
     CaptureCommitRecordV1,
     CaptureCommitRecordV2,
     RunStateV1,
 )
-from pmkt.streaming.storage_backends import CaptureStorageBackend
-from pmkt.streaming.tape import NativeBookLevel, post_book_hash
+from pmkt.streaming.legacy.tape import NativeBookLevel, post_book_hash
 
 
 class FakeReadAuth:
@@ -251,65 +246,11 @@ class _FakeWebSocket:
         raise StopAsyncIteration
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-@pytest.mark.parametrize("profile_name", ["full", "book-tape"])
-async def test_v3_intact_one_sided_and_empty_books_reconstruct(tmp_path, venue, profile_name) -> None:
-    if venue == "polymarket":
-        messages = [{"event_type": "book", "asset_id": "token-1", "market": "market-1",
-                     "bids": [], "asks": [{"price": "0.6", "size": "5"}]}]
-        for side, price, size in [("SELL", "0.6", "0"), ("BUY", "0.4", "8"), ("SELL", "0.6", "3")]:
-            messages.append({"event_type": "price_change", "asset_id": "token-1", "market": "market-1",
-                             "price_changes": [{"asset_id": "token-1", "side": side, "price": price, "size": size}]})
-    else:
-        messages = [{"type": "orderbook_snapshot", "sid": 1, "seq": 1,
-                     "msg": {"market_ticker": "KXTEST", "no_dollars": [["0.6", 5]]}}]
-        for seq, (side, price, delta) in enumerate([("no", "0.6", -5), ("yes", "0.4", 8), ("no", "0.6", 3)], 2):
-            messages.append({"type": "orderbook_delta", "sid": 1, "seq": seq,
-                             "msg": {"market_ticker": "KXTEST", "side": side, "price_dollars": price, "delta": delta}})
-    fake = _FakeWebSocket([json.dumps(message) for message in messages])
-
-    async def connect_factory(*args, **kwargs):
-        return fake
-
-    kwargs = dict(output_root=tmp_path, run_name="intact", max_messages=len(messages), capture_intent="smoke",
-                  instrument_eligibility_evidence=_eligibility_evidence("token-1" if venue == "polymarket" else "KXTEST"),
-                  max_reconnects=0, connect_factory=connect_factory,
-                  storage_profile=select_storage_profile(profile_name, profile_version="3"))
-    if venue == "polymarket":
-        await stream_order_book_data(["token-1"], **kwargs)
-    else:
-        await stream_kalshi_order_book_data(["KXTEST"], auth=FakeReadAuth(), **kwargs)
-    manifest_path = tmp_path / "intact" / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
-    completeness = manifest["capture_completeness"]
-    assert completeness["policy_version"] == "capture_completeness.v3"
-    assert completeness["evidence_artifact_reconciled"] is True
-    assert completeness["initial_snapshot_count"] == 1
-    assert completeness["evidence_row_count"] == 1
-    evidence = pd.read_parquet(manifest_path.parent / manifest["dataset_artifacts"]["instrument_evidence"]["path"])
-    assert evidence["first_snapshot_received_at_utc"].notna().all()
-    assert evidence["first_integrity_valid_book_at_utc"].notna().all()
-    assert evidence["first_valid_snapshot_at_utc"].notna().all()
-    assert evidence["book_integrity_valid"].all()
-    for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
-        result = reconstruct(manifest_path)
-        assert result.report["status"] == "success"
-        assert result.topbooks["book_integrity_valid"].all()
-        assert (~result.topbooks["valid_state"]).any()
-        assert (result.topbooks["best_bid_dollars"].isna() & result.topbooks["best_ask_dollars"].isna()).any()
-        assert set(result.topbooks["schema_version"]) == {"topbook.v2"}
-    from pmkt.data.manifests import validate_run_manifest
-    manifest["capture_completeness"]["evidence_artifact_role"] = None
-    manifest_path.write_text(json.dumps(manifest))
-    validation = validate_run_manifest(manifest_path)
-    assert not validation.ok
-    assert any("evidence_artifact_role" in error for error in validation.all_errors)
 
 
 def test_timestamp_inversion_preserves_sequence_across_journal_groups():
     from pmkt.exchanges.polymarket.ws import MarketBookState
-    from pmkt.streaming.tape_producers import PolymarketTapeProducer
+    from pmkt.streaming.legacy.tape_producers import PolymarketTapeProducer
     from pmkt.data.registry import get_table_spec
 
     state = MarketBookState("a")
@@ -432,129 +373,12 @@ def test_streamed_publication_persists_parity_mismatch_report(
     assert report["outputs"] == {}
 
 
-@pytest.mark.asyncio
-async def test_promoted_sqlite_capture_reconstructs_through_both_readers(
-    tmp_path,
-) -> None:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "token-1",
-                    "market": "market-1",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                }
-            ),
-            json.dumps(
-                {
-                    "event_type": "price_change",
-                    "asset_id": "token-1",
-                    "market": "market-1",
-                    "price_changes": [
-                        {
-                            "asset_id": "token-1",
-                            "side": "SELL",
-                            "price": "0.55",
-                            "size": "7",
-                        },
-                        {
-                            "asset_id": "token-1",
-                            "side": "SELL",
-                            "price": "0.60",
-                            "size": "0",
-                        },
-                    ],
-                }
-            ),
-        ]
-    )
-
-    async def connect_factory(_: str) -> _FakeWebSocket:
-        return fake
-
-    await stream_order_book_data(
-        ["token-1"],
-        output_root=tmp_path,
-        run_name="sqlite-poly-reconstruct",
-        duration_s=10,
-        max_messages=2,
-        capture_intent="smoke",
-        instrument_eligibility_evidence=_eligibility_evidence("token-1"),
-        heartbeat_interval=None,
-        connect_factory=connect_factory,
-        storage_profile=select_storage_profile("book-tape"),
-        capture_storage_backend=CaptureStorageBackend.SQLITE_WAL,
-    )
-    manifest = tmp_path / "sqlite-poly-reconstruct" / "manifest.json"
-
-    materialized = reconstruct_book_tape(manifest)
-    streamed = stream_reconstruct_book_tape(manifest, batch_rows=1)
-    streamed_batches = list(streamed)
-
-    assert materialized.report["status"] == "success"
-    assert materialized.report["journal_coverage_complete"] is True
-    assert materialized.topbooks.iloc[-1]["best_ask_dollars"] == 0.55
-    assert streamed.report["status"] == "success"
-    assert streamed_batches
 
 
 @pytest.fixture
 def polymarket_tape_manifest(tmp_path: Path) -> Path:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "token-1",
-                    "market": "market-1",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                }
-            ),
-            json.dumps(
-                {
-                    "event_type": "price_change",
-                    "asset_id": "token-1",
-                    "market": "market-1",
-                    "price_changes": [
-                        {
-                            "asset_id": "token-1",
-                            "side": "SELL",
-                            "price": "0.55",
-                            "size": "7",
-                        },
-                        {
-                            "asset_id": "token-1",
-                            "side": "SELL",
-                            "price": "0.60",
-                            "size": "0",
-                        },
-                    ],
-                }
-            ),
-        ]
-    )
-
-    async def connect_factory(_: str) -> _FakeWebSocket:
-        return fake
-
-    asyncio.run(
-        stream_order_book_data(
-            ["token-1"],
-            output_root=tmp_path,
-            run_name="poly-reconstruct",
-            duration_s=10,
-            max_messages=2,
-            capture_intent="smoke",
-            instrument_eligibility_evidence=_eligibility_evidence("token-1"),
-            heartbeat_interval=None,
-            connect_factory=connect_factory,
-            storage_profile=select_storage_profile("book-tape"),
-        )
-    )
-    return tmp_path / "poly-reconstruct" / "manifest.json"
+    from legacy_recording_fixture import historical_polymarket_tape
+    return historical_polymarket_tape(tmp_path)
 
 
 @pytest.fixture
@@ -1073,283 +897,12 @@ def test_reconstruction_rejects_duplicate_commit_group(
         reconstruct_book_tape(manifest)
 
 
-@pytest.mark.asyncio
-async def test_reconstruction_reads_legacy_v1_journal_capture(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "token-1",
-                    "market": "market-1",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                }
-            )
-        ]
-    )
-
-    async def connect_factory(_: str) -> _FakeWebSocket:
-        return fake
-
-    await stream_order_book_data(
-        ["token-1"],
-        output_root=tmp_path,
-        run_name="poly-v1-reconstruct",
-        duration_s=10,
-        max_messages=1,
-        capture_intent="smoke",
-        instrument_eligibility_evidence=_eligibility_evidence("token-1"),
-        heartbeat_interval=None,
-        connect_factory=connect_factory,
-        storage_profile=select_storage_profile("book-tape"),
-    )
-    manifest = tmp_path / "poly-v1-reconstruct" / "manifest.json"
-    _downgrade_capture_journal_to_v1(manifest)
-
-    recovery_calls = 0
-    real_recover = reconstruction_streaming.recover_stream_run
-
-    def counted_recover(*args: Any, **kwargs: Any) -> Any:
-        nonlocal recovery_calls
-        recovery_calls += 1
-        return real_recover(*args, **kwargs)
-
-    monkeypatch.setattr(
-        reconstruction_streaming,
-        "recover_stream_run",
-        counted_recover,
-    )
-    result = reconstruct_book_tape(manifest)
-
-    assert result.report["status"] == "success"
-    assert result.report["source_journal"].endswith(COMMIT_JOURNAL_V1_NAME)
-    assert len(result.topbooks) == 1
-    assert recovery_calls == 1
 
 
-@pytest.mark.asyncio
-async def test_ignores_nonreconstructible_checkpoint_outside_epoch(
-    tmp_path,
-) -> None:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "invalid-token",
-                    "market": "invalid-market",
-                    "bids": [],
-                    "asks": [],
-                }
-            )
-        ]
-    )
-
-    async def connect_factory(_: str) -> _FakeWebSocket:
-        return fake
-
-    await stream_order_book_data(
-        ["invalid-token"],
-        output_root=tmp_path,
-        run_name="nonreconstructible-checkpoint",
-        duration_s=10,
-        max_messages=1,
-        capture_intent="smoke",
-        heartbeat_interval=None,
-        connect_factory=connect_factory,
-        storage_profile=select_storage_profile("book-tape", profile_version="1"),
-    )
-
-    result = reconstruct_book_tape(
-        tmp_path / "nonreconstructible-checkpoint" / "manifest.json"
-    )
-
-    assert result.report["status"] == "success"
-    assert result.report["topbook_comparison"]["excluded_invalid_source_row_count"] == 3
-    assert result.topbooks.empty
-    assert result.depths.empty
-    assert [item["reason"] for item in result.report["ignored_events"]] == [
-        "non_reconstructible_checkpoint_outside_epoch"
-    ]
 
 
-@pytest.mark.asyncio
-async def test_reconstructs_periodic_polymarket_checkpoint_with_full_depth_parity(
-    tmp_path,
-) -> None:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "event_type": "book",
-                    "asset_id": "periodic-token",
-                    "market": "periodic-market",
-                    "bids": [{"price": "0.40", "size": "10"}],
-                    "asks": [{"price": "0.60", "size": "5"}],
-                }
-            )
-        ],
-        # Keep the transport open beyond the capture deadline. A clean remote
-        # close is intentionally a stream failure, not a successful boundary.
-        idle_after_messages_s=2.0,
-    )
-
-    async def connect_factory(_: str) -> _FakeWebSocket:
-        return fake
-
-    supervisor = LiveFeedSupervisor(
-        [
-            FeedShardHealth(
-                venue="polymarket",
-                shard_id="polymarket-0",
-                subscribed_instruments=("periodic-token",),
-            )
-        ],
-        max_message_age_ms=50,
-        max_valid_book_age_ms=1_000,
-    )
-
-    manifest = await stream_order_book_data(
-        ["periodic-token"],
-        output_root=tmp_path,
-        run_name="poly-periodic-reconstruct",
-        duration_s=1,
-        max_messages=2,
-        capture_intent="smoke",
-        max_reconnects=0,
-        instrument_eligibility_evidence=_eligibility_evidence("periodic-token"),
-        heartbeat_interval=None,
-        connect_factory=connect_factory,
-        feed_supervisor=supervisor,
-        storage_profile=select_storage_profile(
-            "full",
-            book_checkpoint_interval_seconds=0.01,
-        ),
-    )
-
-    assert manifest["capture_completeness"]["terminal_reason"] == "deadline_reached"
-
-    result = reconstruct_book_tape(
-        tmp_path / "poly-periodic-reconstruct" / "manifest.json"
-    )
-
-    periodic_epochs = [
-        epoch
-        for epoch in result.report["epoch_coverage"]
-        if epoch["checkpoint_reason"] == "periodic"
-    ]
-    assert periodic_epochs
-    assert any(
-        epoch["closed_by_checkpoint_event_id"] is not None
-        for epoch in result.report["epoch_coverage"]
-    )
-    assert result.report["status"] == "success"
-    assert result.report["topbook_comparison"]["status"] == "match"
-    depth = result.report["depth_comparison"]
-    assert depth["status"] == "match"
-    assert depth["periodic_checkpoint_row_count"] > 0
-    assert (
-        depth["periodic_checkpoint_compared_row_count"]
-        == depth["periodic_checkpoint_row_count"]
-    )
 
 
-@pytest.mark.asyncio
-async def test_reconstructs_kalshi_native_yes_no_sides(tmp_path) -> None:
-    fake = _FakeWebSocket(
-        [
-            json.dumps(
-                {
-                    "type": "orderbook_snapshot",
-                    "sid": 1,
-                    "seq": 1,
-                    "msg": {
-                        "market_ticker": "KXTEST",
-                        "market_id": "market-id",
-                        "yes_dollars_fp": [["0.40", "10"]],
-                        "no_dollars_fp": [["0.65", "5"]],
-                    },
-                }
-            ),
-            json.dumps(
-                {
-                    "type": "orderbook_delta",
-                    "sid": 1,
-                    "seq": 2,
-                    "msg": {
-                        "market_ticker": "KXTEST",
-                        "side": "yes",
-                        "price_dollars": "0.40",
-                        "delta_fp": "2",
-                    },
-                }
-            ),
-        ],
-        idle_after_messages_s=0.12,
-    )
-
-    async def connect_factory(_: str, __: dict[str, str]) -> _FakeWebSocket:
-        return fake
-
-    manifest = await stream_kalshi_order_book_data(
-        ["KXTEST"],
-        output_root=tmp_path,
-        run_name="kalshi-reconstruct",
-        duration_s=10,
-        max_messages=2,
-        capture_intent="smoke",
-        instrument_eligibility_evidence=_eligibility_evidence("KXTEST"),
-        connect_factory=connect_factory,
-        auth=FakeReadAuth(),
-        storage_profile=select_storage_profile(
-            "full",
-            book_checkpoint_interval_seconds=0.01,
-        ),
-    )
-    assert (
-        manifest["request"]["quote_normalization_policy"]
-        == KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT
-    )
-    run_state = json.loads(
-        (tmp_path / "kalshi-reconstruct" / RUN_STATE_NAME).read_text(
-            encoding="utf-8"
-        )
-    )
-    assert run_state["adapter_settings_by_venue"]["kalshi"] == {
-        "quote_normalization_policy": KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT,
-        "use_yes_price": True,
-    }
-    result = reconstruct_book_tape(tmp_path / "kalshi-reconstruct" / "manifest.json")
-    assert set(result.topbooks["instrument_id"]) == {"KXTEST:YES", "KXTEST:NO"}
-    yes_depth = result.depths[result.depths["instrument_id"] == "KXTEST:YES"]
-    final_yes = yes_depth[
-        yes_depth["local_sequence"] == yes_depth["local_sequence"].max()
-    ]
-    assert final_yes.iloc[0]["venue_sequence"] == 2
-    assert final_yes.iloc[0]["size_contracts"] == 12.0
-    assert set(result.depths["side"]) == {"yes", "no"}
-    source_pairs = {
-        (row.best_bid_source, row.best_ask_source)
-        for row in result.topbooks.itertuples()
-        if row.outcome == "NO"
-    }
-    assert source_pairs == {("complement_derived", "complement_derived")}
-    assert result.report["topbook_comparison"]["status"] == "match"
-    assert result.report["depth_comparison"]["status"] == "match"
-    depth = result.report["depth_comparison"]
-    assert depth["periodic_checkpoint_row_count"] > 0
-    assert (
-        depth["periodic_checkpoint_compared_row_count"]
-        == depth["periodic_checkpoint_row_count"]
-    )
-    assert any(
-        epoch["checkpoint_reason"] == "periodic"
-        for epoch in result.report["epoch_coverage"]
-    )
 
 
 @pytest.mark.parametrize(
@@ -1878,84 +1431,3 @@ def test_depth_comparison_is_separate_and_reports_source_coordinates() -> None:
     assert mismatch["source_provenance"]["role"] == "depth_main"
     assert set(mismatch["fields"]) == {"size_contracts"}
     assert comparison["excluded_fields"] == ["book_hash"]
-
-
-@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-def test_v3_process_loss_finalizes_without_claiming_reconstructible_capture(tmp_path, venue):
-    from pmkt.data.manifests import validate_run_manifest
-    from pmkt.streaming.recovery import recover_stream_run
-
-    script = r"""
-import asyncio, json, os, sys
-from pathlib import Path
-from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
-from pmkt.exchanges.kalshi.order_book_stream import stream_kalshi_order_book_data
-from pmkt.streaming.profiles import select_storage_profile
-
-root, venue = sys.argv[1:]
-class ReadAuth:
-    def headers_for_get(self, path): return {}
-class Socket:
-    closed = False
-    seen = False
-    async def send(self, payload): pass
-    async def close(self): self.closed = True
-    def __aiter__(self): return self
-    async def __anext__(self):
-        if self.seen:
-            journal = Path(root) / "crashed" / "capture_commit_journal.v2.jsonl"
-            # Receiving the next frame no longer implies the collector has
-            # processed the previous one. Kill at the durable boundary itself.
-            for _ in range(500):
-                if journal.exists() and journal.stat().st_size:
-                    os._exit(92)
-                await asyncio.sleep(0.01)
-            raise RuntimeError("capture did not journal its initial snapshot")
-        self.seen = True
-        if venue == "polymarket":
-            return json.dumps({"event_type":"book", "asset_id":"a", "market":"m",
-                               "bids":[["0.4","3"]], "asks":[["0.6","5"]]})
-        return json.dumps({"type":"orderbook_snapshot", "sid":1, "seq":1,
-                           "msg":{"market_ticker":"a", "yes_dollars_fp":[["0.4","3"]],
-                                  "no_dollars_fp":[["0.6","5"]]}})
-async def connect(*args): return Socket()
-async def main():
-    kwargs = dict(output_root=root, run_name="crashed", duration_s=10,
-                  capture_intent="smoke", connect_factory=connect,
-                  storage_profile=select_storage_profile("full", profile_version="3"))
-    if venue == "polymarket":
-        await stream_order_book_data(["a"], heartbeat_interval=None, **kwargs)
-    else:
-        await stream_kalshi_order_book_data(["a"], auth=ReadAuth(), **kwargs)
-asyncio.run(main())
-"""
-    completed = subprocess.run(
-        [sys.executable, "-c", script, str(tmp_path), venue],
-        capture_output=True, text=True, timeout=30,
-    )
-    assert completed.returncode == 92, completed.stderr
-    recovered = recover_stream_run(tmp_path / "crashed", finalize=True)
-    assert not recovered.journal_errors
-    assert recovered.valid_group_count > 0
-    assert recovered.finalized_manifest_path is not None
-    manifest_path = Path(recovered.finalized_manifest_path)
-    manifest = json.loads(manifest_path.read_text())
-    assert manifest["capture_termination"] == "crashed"
-    assert manifest["status"] != "success"
-    validation = validate_run_manifest(manifest_path)
-    assert validation.ok, validation.all_errors
-    assert manifest["capture_completeness"]["evidence_row_count"] == 0
-    assert manifest["capture_completeness"]["acceptance_eligible"] is False
-    # Recovery preserves journaled data, but partial runs are deliberately
-    # outside the accepted reconstruction API contract.
-    for reconstruct in (reconstruct_book_tape, reconstruction_data._reconstruct_book_tape_legacy):
-        with pytest.raises(BookTapeReconstructionError, match="successful clean capture"):
-            reconstruct(manifest_path)
-
-    manifest["capture_completeness"]["evidence_row_count"] = 1
-    manifest_path.write_text(json.dumps(manifest))
-    assert not validate_run_manifest(manifest_path).ok
-    manifest["capture_completeness"]["evidence_row_count"] = 0
-    manifest["capture_completeness"]["acceptance_eligible"] = True
-    manifest_path.write_text(json.dumps(manifest))
-    assert not validate_run_manifest(manifest_path).ok

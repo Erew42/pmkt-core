@@ -56,19 +56,19 @@ from pmkt.data.validation import (
     validate_book_control_evidence,
     validate_book_tape_bundle,
 )
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     RUN_STATE_NAME,
     normalize_capture_value,
 )
-from pmkt.streaming.profiles import DatasetRole
-from pmkt.streaming.recovery import (
+from pmkt.streaming.legacy.profiles import DatasetRole
+from pmkt.streaming.legacy.recovery import (
     ArtifactStatFingerprint,
     _artifact_stat_fingerprint,
     _normalize_profile_v1_capture_flags,
     recover_stream_run,
     resolve_commit_journal_path,
 )
-from pmkt.streaming.recovery_contracts import CaptureCommitRecord, RunStateV1
+from pmkt.streaming.legacy.recovery_contracts import CaptureCommitRecord, RunStateV1
 
 DEFAULT_RECONSTRUCTION_BATCH_ROWS = 50_000
 MAX_RECONSTRUCTION_MATERIALIZED_ROWS = 250_000

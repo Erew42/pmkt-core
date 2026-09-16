@@ -4,7 +4,7 @@ from typing import Any, Iterable, Mapping
 
 from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.exchanges.polymarket.ws import MarketBookState
-from pmkt.streaming.tape import NativeBookLevel, canonical_decimal
+from pmkt.streaming.legacy.tape import NativeBookLevel, canonical_decimal
 
 
 def polymarket_book_levels(state: MarketBookState) -> tuple[NativeBookLevel, ...]:

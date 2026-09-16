@@ -19,18 +19,18 @@ from pmkt.data.validation import (
     validate_book_tape_bundle,
     validate_frame,
 )
-from pmkt.streaming.durability_settings import (
+from pmkt.streaming.legacy.durability_settings import (
     CaptureDurabilitySettings,
     PublicationMode,
 )
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.recovery_contracts import (
     CaptureCommitArtifactV1,
     CaptureCommitCause,
     CaptureCommitRecordV2,
     RunStateV1,
     resolve_run_relative_path,
 )
-from pmkt.streaming.tape import (
+from pmkt.streaming.legacy.tape import (
     NativeBookLevel,
     canonical_json_bytes,
     post_book_hash,
@@ -38,7 +38,7 @@ from pmkt.streaming.tape import (
     recompute_tape_event_payload_hash,
     semantic_hash,
 )
-from pmkt.streaming.storage_backends import (
+from pmkt.streaming.legacy.storage_backends import (
     CaptureStorageBackend,
     CaptureStorageSettings,
     sample_summary,

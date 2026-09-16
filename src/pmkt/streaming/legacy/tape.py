@@ -14,7 +14,33 @@ from pmkt.data.canonical import (
     book_tape_level_row,
     canonical_fixed_decimal,
 )
-from pmkt.streaming.capture import TapeBatchIntent
+
+
+@dataclass(frozen=True)
+class TapeBatchIntent:
+    event: Mapping[str, Any]
+    levels: tuple[Mapping[str, Any], ...]
+
+    @classmethod
+    def materialize(
+        cls,
+        *,
+        event: Mapping[str, Any],
+        levels: Sequence[Mapping[str, Any]],
+    ) -> "TapeBatchIntent":
+        frozen_levels = tuple(
+            dict(row)
+            for row in sorted(
+                levels,
+                key=lambda row: (
+                    str(row.get("source_side") or ""),
+                    str(row.get("price_key") or ""),
+                    int(row.get("level_ordinal") or 0),
+                ),
+            )
+        )
+        return cls(event=dict(event), levels=frozen_levels)
+
 
 TAPE_ENCODING_VERSION = "book-tape.v1"
 TAPE_ID_VERSION = "capture-id.v1"

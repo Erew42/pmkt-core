@@ -207,6 +207,10 @@ def validate_run_manifest(
             errors=("manifest root must be a JSON object",),
         )
 
+    if "recording_format" in payload:
+        from pmkt.streaming.recording_store import validate_recording_manifest
+        return ManifestValidationReport(str(manifest_path), errors=validate_recording_manifest(manifest_path))
+
     if payload.get("schema_version") == RUN_MANIFEST_SCHEMA_VERSION:
         from pmkt.data.validation import validate_frame
 
@@ -659,7 +663,7 @@ def _segment_manifest_errors(
 def _storage_profile_errors(
     payload: Mapping[str, Any], artifacts: Mapping[str, Any]
 ) -> list[str]:
-    from pmkt.streaming.profiles import (
+    from pmkt.streaming.legacy.profiles import (
         PROFILE_DEFINITIONS_BY_VERSION,
         DatasetRole,
         StorageProfileOverrides,
@@ -905,7 +909,7 @@ def _capture_instrument_evidence_errors(
     profile = payload.get("storage_profile")
     if not isinstance(profile, Mapping) or profile.get("profile_version") not in {"2", "3"}:
         return []
-    from pmkt.streaming.instrument_evidence import (
+    from pmkt.streaming.legacy.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
         evidence_manifest_reconciliation_errors,
     )
@@ -1190,13 +1194,13 @@ def _journal_artifact_run_binding(
     if raw_journal is None:
         return frozenset(), []
 
-    from pmkt.streaming.durability import (
+    from pmkt.streaming.legacy.durability import (
         COMMIT_JOURNAL_V1_NAME,
         COMMIT_JOURNAL_V2_NAME,
         RUN_STATE_NAME,
     )
-    from pmkt.streaming.recovery import validate_commit_journal
-    from pmkt.streaming.recovery_contracts import (
+    from pmkt.streaming.legacy.recovery import validate_commit_journal
+    from pmkt.streaming.legacy.recovery_contracts import (
         CaptureCommitCause,
         CaptureCommitRecordV2,
         RunStateV1,
@@ -1250,7 +1254,7 @@ def _journal_artifact_run_binding(
     if isinstance(profile, Mapping):
         state_profile = state.storage_profile
         if state_profile is None:
-            from pmkt.streaming.profiles import select_storage_profile
+            from pmkt.streaming.legacy.profiles import select_storage_profile
 
             try:
                 state_profile = select_storage_profile(
@@ -1303,7 +1307,7 @@ def _journal_artifact_run_binding(
             )
         else:
             try:
-                from pmkt.streaming.storage_backends import CaptureStorageSettings
+                from pmkt.streaming.legacy.storage_backends import CaptureStorageSettings
 
                 CaptureStorageSettings.from_mapping(storage_configuration)
             except (KeyError, TypeError, ValueError) as exc:

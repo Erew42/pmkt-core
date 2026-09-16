@@ -13,7 +13,7 @@ import pandas as pd
 
 from pmkt.data.manifests import build_run_manifest, validate_run_manifest
 from pmkt.data.registry import arrow_schema, get_table_spec
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     COMMIT_JOURNAL_V1_NAME,
     COMMIT_JOURNAL_V2_NAME,
     RUN_STATE_NAME,
@@ -25,8 +25,8 @@ from pmkt.streaming.durability import (
     write_json_atomic_fsync,
     write_run_state,
 )
-from pmkt.streaming.durability_settings import CaptureDurabilitySettings
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.durability_settings import CaptureDurabilitySettings
+from pmkt.streaming.legacy.recovery_contracts import (
     CAPTURE_COMMIT_JOURNAL_V1_FORMAT,
     CAPTURE_COMMIT_JOURNAL_V2_FORMAT,
     CaptureCommitCause,
@@ -37,13 +37,13 @@ from pmkt.streaming.recovery_contracts import (
     parse_capture_commit_record,
     resolve_run_relative_path,
 )
-from pmkt.streaming.profiles import (
+from pmkt.streaming.legacy.profiles import (
     build_storage_profile_manifest_mapping,
     select_storage_profile,
 )
-from pmkt.streaming.tape import NativeBookLevel
-from pmkt.streaming.storage_backends import sample_summary
-from pmkt.streaming.storage_backends import (
+from pmkt.streaming.legacy.tape import NativeBookLevel
+from pmkt.streaming.legacy.storage_backends import sample_summary
+from pmkt.streaming.legacy.storage_backends import (
     CaptureStorageBackend,
     CaptureStorageSettings,
 )
@@ -237,7 +237,7 @@ def _recover_sqlite_stream_run(
         raise ValueError(
             "artifact_roles is unavailable before sqlite capture promotion"
         )
-    from pmkt.streaming.sqlite_durability import (
+    from pmkt.streaming.legacy.sqlite_durability import (
         SQLITE_CAPTURE_FORMAT,
         inspect_sqlite_capture,
         promote_sqlite_capture,
@@ -945,8 +945,8 @@ def _recovered_capture_completeness(
 ) -> dict[str, Any] | None:
     if state.profile_version not in {"2", "3"}:
         return None
-    from pmkt.streaming.capture_completeness import eligibility_evaluation_status
-    from pmkt.streaming.instrument_evidence import (
+    from pmkt.streaming.legacy.capture_completeness import eligibility_evaluation_status
+    from pmkt.streaming.legacy.instrument_evidence import (
         CAPTURE_INSTRUMENT_EVIDENCE_POLICY_VERSION,
         CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
         summarize_capture_instrument_evidence,
@@ -1028,7 +1028,7 @@ def _recovered_storage_mapping(
 ) -> dict[str, Any]:
     settings = CaptureStorageSettings.from_mapping(state.capture_storage or {})
     if settings.backend is CaptureStorageBackend.SQLITE_WAL:
-        from pmkt.streaming.sqlite_durability import sqlite_storage_manifest
+        from pmkt.streaming.legacy.sqlite_durability import sqlite_storage_manifest
 
         return sqlite_storage_manifest(root, state)
     row_counts = [sum(item.row_count for item in record.artifacts) for record in records]

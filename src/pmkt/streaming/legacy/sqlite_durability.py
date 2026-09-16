@@ -16,7 +16,7 @@ import pandas as pd
 
 from pmkt.data.registry import arrow_schema, get_table_spec
 from pmkt.data.validation import coerce_frame, validate_frame
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     COMMIT_JOURNAL_NAME,
     COMMIT_JOURNAL_V1_NAME,
     SCHEMA_MAP_NAME,
@@ -29,20 +29,20 @@ from pmkt.streaming.durability import (
     normalize_capture_value,
     validate_committed_capture_group,
 )
-from pmkt.streaming.durability_settings import CaptureDurabilitySettings
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.durability_settings import CaptureDurabilitySettings
+from pmkt.streaming.legacy.recovery_contracts import (
     CaptureCommitArtifactV1,
     CaptureCommitCause,
     CaptureCommitRecordV2,
     RunStateV1,
     resolve_run_relative_path,
 )
-from pmkt.streaming.storage_backends import (
+from pmkt.streaming.legacy.storage_backends import (
     CaptureStorageBackend,
     CaptureStorageSettings,
     sample_summary,
 )
-from pmkt.streaming.tape import canonical_json_bytes, semantic_hash
+from pmkt.streaming.legacy.tape import canonical_json_bytes, semantic_hash
 
 SQLITE_CAPTURE_FORMAT = "pmkt.sqlite_capture.v1"
 SQLITE_SCHEMA_VERSION = 1

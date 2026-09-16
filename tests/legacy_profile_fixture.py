@@ -1,3 +1,4 @@
+"""Test-only builder for synthetic historical storage fixtures."""
 from __future__ import annotations
 
 import asyncio
@@ -6,11 +7,11 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from pmkt.streaming.collector import StreamDatasetSpec
-from pmkt.streaming.durability import DurableCaptureCoordinator
-from pmkt.streaming.durability_settings import CaptureDurabilitySettings
-from pmkt.streaming.profiles import DatasetRole, StorageProfileSelection
-from pmkt.streaming.recovery_contracts import RunStateV1
-from pmkt.streaming.storage_backends import (
+from pmkt.streaming.legacy.durability import DurableCaptureCoordinator
+from pmkt.streaming.legacy.durability_settings import CaptureDurabilitySettings
+from pmkt.streaming.legacy.profiles import DatasetRole, StorageProfileSelection
+from pmkt.streaming.legacy.recovery_contracts import RunStateV1
+from pmkt.streaming.legacy.storage_backends import (
     CaptureCoordinator,
     CaptureStorageBackend,
     CaptureStorageSettings,
@@ -44,7 +45,7 @@ class ProfileCaptureRuntime:
         self.coordinator.finalize_segments()
 
     async def force_finalize_async(self) -> None:
-        from pmkt.streaming.sqlite_durability import SQLiteCaptureCoordinator
+        from pmkt.streaming.legacy.sqlite_durability import SQLiteCaptureCoordinator
 
         if isinstance(self.coordinator, SQLiteCaptureCoordinator):
             # Capture acknowledgement remains the inline SQLite transaction.
@@ -122,7 +123,7 @@ def create_profile_runtime(
     )
     coordinator_class: type[DurableCaptureCoordinator]
     if storage_settings.backend is CaptureStorageBackend.SQLITE_WAL:
-        from pmkt.streaming.sqlite_durability import SQLiteCaptureCoordinator
+        from pmkt.streaming.legacy.sqlite_durability import SQLiteCaptureCoordinator
 
         coordinator_class = SQLiteCaptureCoordinator
     else:

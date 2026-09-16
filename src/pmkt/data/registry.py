@@ -3328,6 +3328,9 @@ SCHEMA_REGISTRY: dict[str, TableSpec] = {
     ),
 }
 
+from pmkt.data.recording_schema import recording_specs  # noqa: E402
+
+SCHEMA_REGISTRY.update(recording_specs(FieldSpec, TableSpec))
 _NAME_TO_VERSION = {spec.name: version for version, spec in SCHEMA_REGISTRY.items()}
 
 # Explicit migration: historical schema IDs and unversioned aliases retain their
