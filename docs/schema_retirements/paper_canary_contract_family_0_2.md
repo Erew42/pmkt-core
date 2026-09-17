@@ -39,6 +39,22 @@ The complete source and artifact inventories required by the lifecycle policy
 must be regenerated immediately before the schema-removal commit. Any
 unexplained unreadable retained root stops removal.
 
+The 2026-09-17 reports scanned 235 core text files, 44,116 trading text files,
+19,917 research text files, 108,913 trading Parquet files, and 762 research
+Parquet files. Every declared root existed and was traversed. Six files in one
+unrelated `live_arbitrage_watch_20260605_001/kalshi/monitor_kalshi_001`
+directory had a valid `PAR1` header but no Parquet footer, identifying them as
+pre-existing truncated monitor outputs rather than paper-canary contracts. The
+other attribution blockers were ordinary unversioned/empty Parquet and the six
+now-retired versions themselves; none is an unexplained unreadable root.
+
+Across all retained roots, the exhaustive scan found the retired versions in
+19 canary-candidate files (814 rows), 19 canary-rejection files (614,249 rows),
+19 scan-cycle files (844 rows), and one file each for basket intents, fills, and
+positions (2, 2, and 1 rows). These broader retained-root totals include runs
+outside the adjudicated June campaign described below. No manifest reference
+to any retired version was found.
+
 ## June campaign evidence
 
 The ignored local paper-canary evidence contains 17 runs and 102 Parquet files.
@@ -64,4 +80,3 @@ Rollback is Git restoration: revert the family-removal commit to restore the
 registry specifications, builders, exports, tests, and documentation, then
 restore the paper-canary producer from its separate trading commit if needed.
 No data rollback is required because retained artifacts remain untouched.
-

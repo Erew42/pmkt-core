@@ -21,12 +21,10 @@ rewriting, moving, or deleting an artifact.
 - `removal_candidate`: current evidence favors retirement, subject to every
   stop condition in the catalog.
 
-The execution, paper, canary, and soak schemas remain `active_experiment` and
-frozen for this phase except for the six-schema paper-canary family explicitly
-approved in the
+The remaining execution, paper, and soak schemas remain `active_experiment` and
+frozen for this phase. The six-schema paper-canary family was retired under the
 [`0.2 retirement packet`](schema_retirements/paper_canary_contract_family_0_2.md).
-That exception ends the freeze only for the named family; simplification or
-removal of the remaining contracts is deliberately out of scope.
+That decision did not end or weaken the freeze for any remaining contract.
 
 ## Current decisions
 
@@ -37,7 +35,7 @@ removal of the remaining contracts is deliberately out of scope.
 | `event.v1` / `market.v1` | `provisional_unintegrated` | Propose retirement after exhaustive zero-use evidence. Active venue-specific market frames are separate contracts. |
 | `instrument.v1` | `provisional_unintegrated` | Retire unless a future proposal supplies a writer, stable identity and update semantics, a persistence location, and consumer joins. |
 | `market_taxonomy_evidence.v1` | `active_experiment` | Retain. It has hash-pinned retained research data, but still needs a tracked producer/reader workflow and artifact-level schema, grain, key, and provenance metadata. |
-| Paper-canary contract family (six schemas) | `active_experiment` pending approved removal | Retire atomically during the 0.2 breaking-release window under the tracked family retirement packet. The remaining `execution_deferred` contracts stay frozen. |
+| Paper-canary contract family (six schemas) | retired in 0.2 | Removed atomically under the tracked family retirement packet. The remaining `execution_deferred` contracts stay frozen. |
 
 The evidence baseline recorded on 2026-08-20 found no snapshot-v2,
 `market_match.v1`, `event.v1`, `market.v1`, or `instrument.v1` artifacts in the
@@ -59,10 +57,11 @@ is not an ownership violation. Existing exports remain compatible. No schemas
 are removed by this refresh, and the five proposed dimension/snapshot removals
 still require complete retained-artifact and consumer evidence.
 
-The dashboard's generic reader is now
-`pmkt-trading:src/pmkt_trading/dashboard/data/artifacts.py`. Literal token scans
+The generic trading reader is now
+`pmkt-trading:src/pmkt_trading/data/artifact_discovery.py`. Literal token scans
 cannot enumerate its runtime manifest-supplied versions. Review it and actual
-producer functions before concluding that a schema is unused.
+producer functions before concluding that a schema is unused. Unknown retired
+versions are reported as validation warnings rather than crashing discovery.
 
 ## Reproducing the evidence report
 

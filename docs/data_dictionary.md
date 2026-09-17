@@ -160,11 +160,6 @@ sections below or in the registry descriptions.
 | --- | --- | --- |
 | `arbitrage_candidate.v1` | `arbitrage_candidate` | Manual-review apparent-edge candidate. |
 | `backtest_report.v1` | `backtest_report` | Unified return-centric backtest report for taker and maker replay paths. |
-| `basket_order_intent.v1` | `basket_order_intent` | Paper-only basket leg order intent. |
-| `basket_paper_fill.v1` | `basket_paper_fill` | Paper-only basket leg fill event. |
-| `basket_paper_position.v1` | `basket_paper_position` | Paper-only basket position and reconciliation summary. |
-| `canary_candidate.v1` | `canary_candidate` | Basket-aware pre-trade canary candidate with formula proof and gates. |
-| `canary_rejection.v1` | `canary_rejection` | Rejected or observe-only canary formula with explicit reason. |
 | `co_resolution_observation.v1` | `co_resolution_observation` | Offline co-resolution observations built from match candidates and authoritative resolution-cache labels. |
 | `co_resolution_score.v1` | `co_resolution_score` | Research-only Bayesian co-resolution score sidecar for match candidates. |
 | `convergence_observation.v1` | `convergence_observation` | Decision-time opportunity markout and convergence/divergence observation. |
@@ -202,7 +197,6 @@ sections below or in the registry descriptions.
 | `polymarket_market_snapshot.v1` | `polymarket_market_snapshot` | Legacy Polymarket Gamma market snapshot export used by matchers and stream selectors. |
 | `polymarket_market_snapshot.v2` | `polymarket_market_snapshot_v2` | Trimmed Polymarket Gamma market snapshot export without legacy resolution metadata. |
 | `run_manifest.v1` | `run_manifest` | Auditable run metadata. |
-| `scan_cycle.v1` | `scan_cycle` | One live/paper canary scan cycle summary. |
 | `signal.v1` | `signal` | Price-aware cross-venue signal state before order intent. |
 | `soak_run_plan.v1` | `soak_run_plan` | Read-only long-duration soak evidence plan; does not start runtime processes. |
 | `soak_run_report.v1` | `soak_run_report` | Summary of recorded no-order soak evidence from runtime store and artifacts. |
