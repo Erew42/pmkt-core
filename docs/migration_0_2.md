@@ -6,6 +6,10 @@ formats remain available except for the explicitly documented experimental
 paper-canary contract family. No runtime compatibility aliases are supplied for
 that retirement or for other 0.2 changes.
 
+The experimental `pmkt.market_structure` package and its `discover-structures`
+and `build-groups` commands are removed. Venue-supplied event/family metadata
+and the independent production matching contracts are unchanged.
+
 ## Configuration and runtime
 
 `PmktConfig(...)` validates explicit values and defaults without reading the

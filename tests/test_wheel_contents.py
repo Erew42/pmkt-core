@@ -17,6 +17,7 @@ FORBIDDEN_WHEEL_PREFIXES = (
     "pmkt/cross_platform/",
     "pmkt/execution/",
     "pmkt/matching/",
+    "pmkt/market_structure/",
     "pmkt/opportunities/",
     "pmkt/strategies/",
     "pmkt/tracking/",

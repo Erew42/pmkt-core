@@ -688,8 +688,8 @@ new quickstarts.
 ## Inherited advanced surfaces
 
 The complete inherited facade membership is recorded in the machine-readable
-inventory. It currently includes `pmkt.data.market_catalog`,
-`pmkt.market_structure`, `pmkt.streaming`, `pmkt.text`, `VenueAdapter`, the
+inventory. It currently includes `pmkt.data.market_catalog`, `pmkt.streaming`,
+`pmkt.text`, `VenueAdapter`, the
 Polymarket Data API and Subgraph clients, venue WebSocket clients and decoding
 helpers, capture stream entry points, and Kalshi normalization/dataframe
 helpers. These imports remain available. They have not been qualified as the

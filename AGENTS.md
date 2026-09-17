@@ -5,7 +5,7 @@
 This is the `pmkt-core` Git root. Run Git, tests, and repository scripts here.
 It builds the public `pmkt` distribution from `src/pmkt`. It is a
 read-only prediction-market data plane. Keep venue REST/WebSocket reads,
-canonical schemas, storage, capture, reconstruction, market structure, and
+canonical schemas, storage, capture, reconstruction, and
 resolution here.
 
 Do not add matching policy, tracking, opportunity selection, strategies,

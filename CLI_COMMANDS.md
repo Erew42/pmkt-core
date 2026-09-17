@@ -1,7 +1,7 @@
 # `pmkt` command reference
 
 The public CLI exposes only data acquisition, validation, storage, streaming,
-reconstruction, market-structure, and resolution workflows. Run
+reconstruction, and resolution workflows. Run
 `pmkt COMMAND --help` for the complete option reference generated from the
 installed version.
 
@@ -32,10 +32,8 @@ installed version.
 - `recover-stream-run`: validate and recover a durable capture run.
 - `reconstruct-book-tape`: reconstruct books from committed capture evidence.
 
-## Structure and resolution commands
+## Resolution commands
 
-- `discover-structures`: discover threshold, range, and outcome structures.
-- `build-groups`: materialize discovered structures as canonical group tables.
 - `resolve-market-resolutions`: build canonical market-resolution evidence.
 
 ## Excluded interfaces

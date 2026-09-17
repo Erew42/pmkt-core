@@ -16,7 +16,7 @@ The following paths are owned by `pmkt-core`:
   transports, authenticated user streams, and SDK execution clients.
 - `src/pmkt/streaming/**`, including the neutral feed supervisor and injected
   feed-state sink protocols.
-- `src/pmkt/market_structure/**`, `src/pmkt/resolution/**`, and generic
+- `src/pmkt/resolution/**` and generic
   `src/pmkt/text/**` utilities and taxonomy data.
 - The core CLI modules and commands documented in `CLI_COMMANDS.md`.
 - `openapi/**`, `docs/api/**`, `docs/data_dictionary.md`,

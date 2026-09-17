@@ -17,7 +17,6 @@ from pmkt.cli.streaming import (
     stream_books,
     stream_kalshi_books,
 )
-from pmkt.cli.structures import build_groups, discover_structures_cmd
 
 
 app = typer.Typer(help="Prediction-market data utilities.")
@@ -36,8 +35,6 @@ app.command("stream-kalshi-books")(stream_kalshi_books)
 app.command("compute-features")(compute_features_cmd)
 app.command("backfill-venue-history")(backfill_venue_history_cmd)
 app.command("record-topbooks")(record_topbooks_cmd)
-app.command("build-groups")(build_groups)
-app.command("discover-structures")(discover_structures_cmd)
 app.command("resolve-market-resolutions")(resolve_market_resolutions_cmd)
 app.command("recover-stream-run")(recover_stream_run_cmd)
 app.command("reconstruct-book-tape")(reconstruct_book_tape_cmd)

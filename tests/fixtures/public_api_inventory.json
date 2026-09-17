@@ -380,25 +380,6 @@
         "KalshiMarketRef": "supported"
       }
     },
-    "pmkt.market_structure": {
-      "default_tier": "advanced",
-      "exports": [
-        "Interval",
-        "build_market_groups",
-        "canonical_signature",
-        "coverage_looks_complete",
-        "discover_structures",
-        "extract_bounds_heuristic",
-        "group_key",
-        "infer_group_type",
-        "interval_order_key",
-        "intervals_disjoint_and_ordered",
-        "parse_interval",
-        "structures_to_group_records",
-        "sum_prob_sanity"
-      ],
-      "tier_overrides": {}
-    },
     "pmkt.resolution": {
       "default_tier": "native",
       "exports": [

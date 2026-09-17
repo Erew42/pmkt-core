@@ -2,8 +2,8 @@
 
 `pmkt` is the public, read-only data plane for prediction-market research. It
 provides venue clients, canonical schemas, local storage, streaming capture,
-historical book reconstruction, market-structure discovery, and resolution
-utilities for Polymarket and Kalshi.
+historical book reconstruction, and resolution utilities for Polymarket and
+Kalshi.
 
 This repository deliberately contains no order signing or submission,
 credential derivation, matching policy, opportunity selection, OMS/risk logic,
@@ -28,7 +28,6 @@ DuckDB, and WebSocket support.
 pmkt --help
 pmkt ingest-markets --out data/polymarket_markets.parquet
 pmkt ingest-kalshi-markets --out data/kalshi_markets.parquet
-pmkt discover-structures --markets data/polymarket_markets.parquet
 pmkt resolve-market-resolutions --help
 ```
 
