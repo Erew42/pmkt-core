@@ -29,34 +29,34 @@ from pmkt.data.validation import (
     validate_book_tape_bundle,
 )
 
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.durability import (
     RUN_STATE_NAME,
     file_sha256,
     read_committed_capture_rows,
 )
-from pmkt.streaming.profiles import (
+from pmkt.streaming.legacy.profiles import (
     DatasetRole,
     StorageProfileDefinition,
     get_storage_profile_definition,
 )
-from pmkt.streaming.recovery import (
+from pmkt.streaming.legacy.recovery import (
     recover_stream_run,
     resolve_commit_journal_path,
     validate_commit_journal,
 )
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.recovery_contracts import (
     CaptureCommitArtifactV1,
     CaptureCommitRecord,
     RunStateV1,
     resolve_run_relative_path,
 )
-from pmkt.streaming.tape import (
+from pmkt.streaming.legacy.tape import (
     NativeBookLevel,
     canonical_decimal,
     post_book_hash,
     semantic_hash,
 )
-from pmkt.streaming.topbook_emission import topbook_state_fingerprint
+from pmkt.streaming.legacy.topbook_emission import topbook_state_fingerprint
 
 RECONSTRUCTION_REPORT_VERSION = "book_tape_reconstruction_report.v1"
 _TAPE_SCHEMAS = {

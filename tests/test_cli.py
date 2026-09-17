@@ -7,12 +7,10 @@ from pmkt.cli.app import app
 
 PUBLIC_COMMANDS = {
     "backfill-venue-history",
-    "build-groups",
     "collect-books",
     "collect-kalshi-books",
     "compute-features",
     "dataset",
-    "discover-structures",
     "ingest-kalshi-markets",
     "ingest-markets",
     "ingest-markets-keyset",

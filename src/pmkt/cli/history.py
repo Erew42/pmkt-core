@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.config import PmktConfig
+
 import asyncio
 from collections.abc import Iterable
 from pathlib import Path
@@ -94,7 +96,7 @@ def backfill_venue_history_cmd(
 
     async def run():
         if normalized_venue == "polymarket":
-            async with AsyncClobClient() as client:
+            async with AsyncClobClient( config=PmktConfig.from_env()) as client:
                 return await backfill_venue_history(
                     normalized_venue,
                     instruments,
@@ -107,7 +109,7 @@ def backfill_venue_history_cmd(
                 )
         if normalized_venue != "kalshi":
             raise typer.BadParameter("--venue must be polymarket or kalshi")
-        async with AsyncKalshiClient() as client:
+        async with AsyncKalshiClient( config=PmktConfig.from_env()) as client:
             return await backfill_venue_history(
                 normalized_venue,
                 instruments,
@@ -151,7 +153,7 @@ def record_topbooks_cmd(
     """Record public topbooks for instrument relations supplied as data."""
 
     async def run():
-        async with AsyncClobClient() as polymarket, AsyncKalshiClient() as kalshi:
+        async with AsyncClobClient( config=PmktConfig.from_env()) as polymarket, AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
             return await record_topbooks(
                 _read_table(relations),
                 polymarket_client=polymarket,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pmkt.config import PmktConfig
+
 from typing import Annotated, Any, Literal, cast
 import asyncio
 from datetime import datetime, timezone
@@ -10,10 +12,10 @@ from pathlib import Path
 
 import typer
 
-from pmkt._http import RequestPolicy
+from pmkt.runtime import RequestPolicy
 from pmkt.data.market_catalog import DiscoveryStream, MarketCatalogService
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
-from pmkt.exchanges.polymarket.gamma import GammaClient
+from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 
 
 markets_app = typer.Typer(
@@ -24,7 +26,7 @@ markets_app = typer.Typer(
 # state across a temporary network or DNS outage instead of discarding every page
 # after the default short request retry window.
 MARKET_CATALOG_REQUEST_POLICY = RequestPolicy(
-    max_retries=20,
+    max_attempts=20,
     backoff_base_s=5.0,
     backoff_max_s=60.0,
     max_retry_after_s=300.0,
@@ -104,9 +106,9 @@ def discover_new_cmd(
         for item in requested:
             stream_name = cast(DiscoveryStream, item)
             client_context = (
-                GammaClient(request_policy=MARKET_CATALOG_REQUEST_POLICY)
+                AsyncGammaClient(request_policy=MARKET_CATALOG_REQUEST_POLICY, config=PmktConfig.from_env())
                 if stream_name == "polymarket"
-                else AsyncKalshiClient(request_policy=MARKET_CATALOG_REQUEST_POLICY)
+                else AsyncKalshiClient(request_policy=MARKET_CATALOG_REQUEST_POLICY, config=PmktConfig.from_env())
             )
             async with client_context as client:
                 result = await service.discover(
@@ -168,11 +170,11 @@ def refresh_current_cmd(
         raise typer.BadParameter("must be at least 1", param_hint="--max-pages")
 
     async def run() -> dict[str, Any]:
-        async with GammaClient(
+        async with AsyncGammaClient(
             request_policy=MARKET_CATALOG_REQUEST_POLICY
-        ) as polymarket, AsyncKalshiClient(
+        , config=PmktConfig.from_env()) as polymarket, AsyncKalshiClient(
             request_policy=MARKET_CATALOG_REQUEST_POLICY
-        ) as kalshi:
+        , config=PmktConfig.from_env()) as kalshi:
             return await MarketCatalogService(market_root).refresh_current(
                 scope=cast(Literal["standard", "all"], scope),
                 bootstrap_cutoff=_cutoff(bootstrap_cutoff),
@@ -207,11 +209,11 @@ def compact_history_cmd(
     """Write a new latest-row base; never delete prior releases or missing markets."""
 
     async def run() -> dict[str, Any]:
-        async with GammaClient(
+        async with AsyncGammaClient(
             request_policy=MARKET_CATALOG_REQUEST_POLICY
-        ) as polymarket, AsyncKalshiClient(
+        , config=PmktConfig.from_env()) as polymarket, AsyncKalshiClient(
             request_policy=MARKET_CATALOG_REQUEST_POLICY
-        ) as kalshi:
+        , config=PmktConfig.from_env()) as kalshi:
             return await MarketCatalogService(market_root).compact_history(
                 force=force,
                 polymarket_client=polymarket,

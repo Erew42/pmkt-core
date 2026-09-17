@@ -7,9 +7,9 @@ from fractions import Fraction
 from typing import Any
 
 from pmkt.resolution.models import (
+    COMPATIBLE_RESOLVER_VERSIONS,
     CONFIDENCE_CANONICAL,
     CONFIDENCE_PLATFORM_CONFIRMED,
-    RESOLVER_VERSION,
     RESULT_TYPE_SCALAR,
     STATE_FINAL,
     STATE_INCONSISTENT,
@@ -24,7 +24,7 @@ EXACT_SCALAR_LABEL_PREFIX = "scalar:"
 class ResolutionLabelPolicy:
     policy_id: str = "canonical_final_binary.v1"
     allowed_sources: Mapping[str, tuple[str, ...]] | None = None
-    allowed_resolver_versions: tuple[str, ...] = (RESOLVER_VERSION,)
+    allowed_resolver_versions: tuple[str, ...] = COMPATIBLE_RESOLVER_VERSIONS
     require_canonical: bool = True
     allow_platform_confirmed: bool = False
     allow_market_fallback_for_scoring: bool = True

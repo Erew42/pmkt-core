@@ -42,14 +42,8 @@ from pmkt.data.registry import (
     PASSIVE_MARKOUT_SCHEMA_VERSION,
     ARBITRAGE_CANDIDATE_SCHEMA_VERSION,
     RUN_MANIFEST_SCHEMA_VERSION,
-    SCAN_CYCLE_SCHEMA_VERSION,
-    CANARY_CANDIDATE_SCHEMA_VERSION,
-    CANARY_REJECTION_SCHEMA_VERSION,
     SOAK_RUN_PLAN_SCHEMA_VERSION,
     SOAK_RUN_REPORT_SCHEMA_VERSION,
-    BASKET_ORDER_INTENT_SCHEMA_VERSION,
-    BASKET_PAPER_FILL_SCHEMA_VERSION,
-    BASKET_PAPER_POSITION_SCHEMA_VERSION,
     HISTORICAL_PRICE_SCHEMA_VERSION,
     VENUE_HISTORY_CAPABILITY_SCHEMA_VERSION,
     HISTORICAL_BACKFILL_GAP_SCHEMA_VERSION,
@@ -88,14 +82,8 @@ from pmkt.data.registry import (
     PASSIVE_MARKOUT_COLUMNS,
     ARBITRAGE_CANDIDATE_COLUMNS,
     RUN_MANIFEST_COLUMNS,
-    SCAN_CYCLE_COLUMNS,
-    CANARY_CANDIDATE_COLUMNS,
-    CANARY_REJECTION_COLUMNS,
     SOAK_RUN_PLAN_COLUMNS,
     SOAK_RUN_REPORT_COLUMNS,
-    BASKET_ORDER_INTENT_COLUMNS,
-    BASKET_PAPER_FILL_COLUMNS,
-    BASKET_PAPER_POSITION_COLUMNS,
     HISTORICAL_PRICE_COLUMNS,
     VENUE_HISTORY_CAPABILITY_COLUMNS,
     HISTORICAL_BACKFILL_GAP_COLUMNS,
@@ -328,36 +316,12 @@ def run_manifest_row(**values: Any) -> dict[str, Any]:
     return canonical_row(RUN_MANIFEST_SCHEMA_VERSION, **values)
 
 
-def scan_cycle_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(SCAN_CYCLE_SCHEMA_VERSION, **values)
-
-
-def canary_candidate_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(CANARY_CANDIDATE_SCHEMA_VERSION, **values)
-
-
-def canary_rejection_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(CANARY_REJECTION_SCHEMA_VERSION, **values)
-
-
 def soak_run_plan_row(**values: Any) -> dict[str, Any]:
     return canonical_row(SOAK_RUN_PLAN_SCHEMA_VERSION, **values)
 
 
 def soak_run_report_row(**values: Any) -> dict[str, Any]:
     return canonical_row(SOAK_RUN_REPORT_SCHEMA_VERSION, **values)
-
-
-def basket_order_intent_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BASKET_ORDER_INTENT_SCHEMA_VERSION, **values)
-
-
-def basket_paper_fill_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BASKET_PAPER_FILL_SCHEMA_VERSION, **values)
-
-
-def basket_paper_position_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BASKET_PAPER_POSITION_SCHEMA_VERSION, **values)
 
 
 def historical_price_row(**values: Any) -> dict[str, Any]:
@@ -393,21 +357,11 @@ __all__ = [
     "ARBITRAGE_CANDIDATE_SCHEMA_VERSION",
     "BACKTEST_REPORT_COLUMNS",
     "BACKTEST_REPORT_SCHEMA_VERSION",
-    "BASKET_ORDER_INTENT_COLUMNS",
-    "BASKET_ORDER_INTENT_SCHEMA_VERSION",
-    "BASKET_PAPER_FILL_COLUMNS",
-    "BASKET_PAPER_FILL_SCHEMA_VERSION",
-    "BASKET_PAPER_POSITION_COLUMNS",
-    "BASKET_PAPER_POSITION_SCHEMA_VERSION",
     "CONVERGENCE_OBSERVATION_COLUMNS",
     "CONVERGENCE_OBSERVATION_SCHEMA_VERSION",
     "CONVERGENCE_SUMMARY_COLUMNS",
     "CONVERGENCE_SUMMARY_SCHEMA_VERSION",
     "CANONICAL_SCHEMA_VERSION",
-    "CANARY_CANDIDATE_COLUMNS",
-    "CANARY_CANDIDATE_SCHEMA_VERSION",
-    "CANARY_REJECTION_COLUMNS",
-    "CANARY_REJECTION_SCHEMA_VERSION",
     "CO_RESOLUTION_OBSERVATION_COLUMNS",
     "CO_RESOLUTION_OBSERVATION_SCHEMA_VERSION",
     "CO_RESOLUTION_SCORE_COLUMNS",
@@ -463,8 +417,6 @@ __all__ = [
     "RUN_MANIFEST_COLUMNS",
     "RUN_MANIFEST_SCHEMA_VERSION",
     "SCHEMA_SPECS",
-    "SCAN_CYCLE_COLUMNS",
-    "SCAN_CYCLE_SCHEMA_VERSION",
     "SOAK_RUN_PLAN_COLUMNS",
     "SOAK_RUN_REPORT_COLUMNS",
     "SOAK_RUN_PLAN_SCHEMA_VERSION",
@@ -488,15 +440,10 @@ __all__ = [
     "VENUES",
     "SchemaSpec",
     "arbitrage_candidate_row",
-    "basket_order_intent_row",
-    "basket_paper_fill_row",
-    "basket_paper_position_row",
     "backtest_report_row",
     "book_tape_control_row",
     "book_tape_event_row",
     "book_tape_level_row",
-    "canary_candidate_row",
-    "canary_rejection_row",
     "canonical_fixed_decimal",
     "canonical_row",
     "co_resolution_observation_row",
@@ -527,7 +474,6 @@ __all__ = [
     "polymarket_market_snapshot_row",
     "polymarket_market_snapshot_v2_row",
     "run_manifest_row",
-    "scan_cycle_row",
     "soak_run_plan_row",
     "soak_run_report_row",
     "signal_row",

@@ -25,7 +25,7 @@ from pmkt.data.registry import (
 )
 from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.validation import coerce_frame, validate_frame
-from pmkt.streaming.durability import write_json_atomic_fsync
+from pmkt.streaming.legacy.durability import write_json_atomic_fsync
 
 PARITY_MISMATCH_REPORT_SUFFIX = ".parity-mismatch.json"
 

@@ -322,13 +322,12 @@ async def test_cancellation_wins_concurrent_bounded_operation_completion(retry_f
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
 @pytest.mark.parametrize("boundary", ["connect", "receive", "reconnect", "backoff", "close"])
-async def test_capture_cancellation_persists_v3_manifest_at_lifecycle_boundaries(
+async def test_recording_cancellation_persists_manifest_at_lifecycle_boundaries(
     monkeypatch, tmp_path, venue, boundary,
 ):
     import importlib
     import json
-    from pmkt.data.manifests import validate_run_manifest
-    from pmkt.streaming.profiles import select_storage_profile
+    from pmkt.streaming import recording_feed
 
     module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
     capture = (module.stream_order_book_data if venue == "polymarket"
@@ -369,12 +368,12 @@ async def test_capture_cancellation_persists_v3_manifest_at_lifecycle_boundaries
     def budget(*args, **kwargs):
         return WebSocketRetryBudget(*args, **kwargs, sleep=backoff)
 
-    monkeypatch.setattr(module, "WebSocketRetryBudget", budget)
+    monkeypatch.setattr(recording_feed, "WebSocketRetryBudget", budget)
     kwargs = {"heartbeat_interval": None} if venue == "polymarket" else {"auth": FakeReadAuth()}
     task = asyncio.create_task(capture(
         ["a"], output_root=tmp_path, run_name="cancelled", duration_s=60,
         max_messages=1, connect_factory=factory,
-        storage_profile=select_storage_profile("full", profile_version="3"), **kwargs,
+        **kwargs,
     ))
     try:
         await asyncio.wait_for(entered.wait(), timeout=3)
@@ -387,9 +386,9 @@ async def test_capture_cancellation_persists_v3_manifest_at_lifecycle_boundaries
         assert connections == previous_connections
         manifest_path = tmp_path / "cancelled" / "manifest.json"
         manifest = json.loads(manifest_path.read_text())
-        assert manifest["capture_completeness"]["terminal_reason"] == "cancelled"
-        validation = validate_run_manifest(manifest_path)
-        assert validation.ok, validation.all_errors
+        assert manifest["stop_reason"] == "cancelled"
+        assert manifest["export_status"] == "complete"
+        assert manifest["status"] in {"partial", "failed"}
     finally:
         if not task.done():
             task.cancel()
@@ -468,9 +467,8 @@ async def test_reconnect_diagnostic_write_failure_is_a_persistence_failure(
 ):
     import importlib
     import json
-    from pathlib import Path
 
-    from pmkt.streaming.profiles import select_storage_profile
+    from pmkt.streaming.recording_store import RecordingStore
 
     module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
     capture = (
@@ -478,26 +476,26 @@ async def test_reconnect_diagnostic_write_failure_is_a_persistence_failure(
         if venue == "polymarket"
         else module.stream_kalshi_order_book_data
     )
-    original_open = Path.open
+    original_append = RecordingStore.append
     connections = 0
 
-    def fail_diagnostic_open(path, *args, **kwargs):
-        if path.name == "reconnect_diagnostics.jsonl":
+    def fail_diagnostic_write(store, table, row):
+        if table == "events" and row.get("kind") == "reconnect_attempt":
             raise OSError("diagnostic disk failure")
-        return original_open(path, *args, **kwargs)
+        return original_append(store, table, row)
 
     async def connect(*args):
         nonlocal connections
         connections += 1
         return RetrySocket("receive")
 
-    monkeypatch.setattr(Path, "open", fail_diagnostic_open)
+    monkeypatch.setattr(RecordingStore, "append", fail_diagnostic_write)
     kwargs = (
         {"heartbeat_interval": None}
         if venue == "polymarket"
         else {"auth": FakeReadAuth()}
     )
-    with pytest.raises(OSError, match="diagnostic disk failure"):
+    with pytest.raises(RuntimeError, match="store has failed"):
         await capture(
             ["A"],
             output_root=tmp_path,
@@ -505,14 +503,11 @@ async def test_reconnect_diagnostic_write_failure_is_a_persistence_failure(
             duration_s=10,
             max_reconnects=1,
             connect_factory=connect,
-            storage_profile=select_storage_profile("full", profile_version="3"),
             **kwargs,
         )
     manifest = json.loads(
-        (tmp_path / "diagnostic-failure" / "manifest.json").read_text()
+        (tmp_path / "diagnostic-failure" / "failure.json").read_text()
     )
     assert connections == 1
-    assert manifest["capture_completeness"]["terminal_reason"] == "persistence_error"
-    assert manifest["capture_completeness"]["capture_status"] == "failed"
-    assert manifest["reconnect_count"] == 0
-    assert manifest["reconnect_diagnostics"] == []
+    assert manifest["phase"] == "persistence"
+    assert manifest["status"] == "failed"

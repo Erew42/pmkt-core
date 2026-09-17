@@ -8,12 +8,12 @@ import pandas as pd
 import pytest
 
 from pmkt.data.validation import validate_frame
-from pmkt.streaming.capture_completeness import (
+from pmkt.streaming.legacy.capture_completeness import (
     CaptureIntent,
     CaptureStatus,
     evaluate_capture_completeness,
 )
-from pmkt.streaming.instrument_evidence import (
+from pmkt.streaming.legacy.instrument_evidence import (
     CAPTURE_INSTRUMENT_EVIDENCE_ROLE,
     CaptureInstrumentEvidencePolicy,
     CaptureInstrumentEvidenceTracker,
@@ -21,7 +21,7 @@ from pmkt.streaming.instrument_evidence import (
     evidence_manifest_reconciliation_errors,
     summarize_capture_instrument_evidence,
 )
-from pmkt.streaming.profiles import DatasetRole, select_storage_profile
+from pmkt.streaming.legacy.profiles import DatasetRole, select_storage_profile
 
 _NOW = datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)
 _SHA = "a" * 64
@@ -117,7 +117,7 @@ def test_eligibility_reporting_preserves_capture_verdicts(statuses, expected, te
 
 def test_v3_recovered_evidence_stays_partial_and_provisional(tmp_path):
     from types import SimpleNamespace
-    from pmkt.streaming.recovery import _recovered_capture_completeness
+    from pmkt.streaming.legacy.recovery import _recovered_capture_completeness
 
     tracker = CaptureInstrumentEvidenceTracker(collector_run_id="v3", venue="kalshi",
         shard_id="s", instrument_ids=["one"], integrity_evidence=True,

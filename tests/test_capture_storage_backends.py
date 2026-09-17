@@ -7,7 +7,7 @@ from pathlib import Path
 import pyarrow as pa
 import pytest
 
-import pmkt.streaming.durability as durability_module
+import pmkt.streaming.legacy.durability as durability_module
 from pmkt.data.canonical import book_tape_control_row
 from pmkt.data.manifests import validate_run_manifest
 from pmkt.data.registry import (
@@ -18,25 +18,25 @@ from pmkt.data.registry import (
     get_table_spec,
 )
 from pmkt.data.schemas import topbook_evidence_id, topbook_row
-from pmkt.exchanges.polymarket.order_book_stream import STREAM_DATASETS
+from pmkt.streaming.legacy.datasets import CANONICAL_PROFILE_DATASETS as STREAM_DATASETS
 from pmkt.streaming.supervisor import (
     FEED_HEALTH_SCHEMA,
     FeedShardHealth,
     LiveFeedSupervisor,
 )
-from pmkt.streaming.datasets import merge_profile_dataset_specs
-from pmkt.streaming.durability import RUN_STATE_NAME, DurableCaptureCoordinator
-from pmkt.streaming.durability_settings import CaptureDurabilitySettings
-from pmkt.streaming.profile_runtime import create_profile_runtime
-from pmkt.streaming.profiles import resolve_dataset_specs, select_storage_profile
-from pmkt.streaming.recovery import recover_stream_run
-from pmkt.streaming.recovery_contracts import RunStateV1
-from pmkt.streaming.sqlite_durability import (
+from pmkt.streaming.legacy.datasets import merge_profile_dataset_specs
+from pmkt.streaming.legacy.durability import RUN_STATE_NAME, DurableCaptureCoordinator
+from pmkt.streaming.legacy.durability_settings import CaptureDurabilitySettings
+from legacy_profile_fixture import create_profile_runtime
+from pmkt.streaming.legacy.profiles import resolve_dataset_specs, select_storage_profile
+from pmkt.streaming.legacy.recovery import recover_stream_run
+from pmkt.streaming.legacy.recovery_contracts import RunStateV1
+from pmkt.streaming.legacy.sqlite_durability import (
     SQLiteCaptureCoordinator,
     inspect_sqlite_capture,
     promote_sqlite_capture,
 )
-from pmkt.streaming.storage_backends import (
+from pmkt.streaming.legacy.storage_backends import (
     CAPTURE_STORAGE_FORMAT,
     CaptureStorageBackend,
     CaptureStorageSettings,
@@ -453,8 +453,8 @@ def test_sqlite_promotion_failure_retains_recoverable_authority(
     promoted.close()
 
 
-def test_full_profile_crash_recovery_restores_legacy_arrow_schemas(tmp_path) -> None:
-    selection = select_storage_profile("full")
+def test_tape_profile_crash_recovery_restores_canonical_arrow_schemas(tmp_path) -> None:
+    selection = select_storage_profile("book-tape")
     specs = resolve_dataset_specs(
         selection,
         merge_profile_dataset_specs(STREAM_DATASETS),

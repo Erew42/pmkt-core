@@ -1,3 +1,6 @@
+> Historical reference: these live writer profiles are retired. For current
+> recording, use [the recording contract](stream_recording_contract.md).
+
 # Storage Profile Capture Runbook
 
 This runbook covers CR-18 profile captures, crash recovery, and offline tape
@@ -137,8 +140,8 @@ explicit maintainer acceptance. That leaf is intentionally not auto-merged.
 
 Storage figures are reference targets, not cutoffs. Report measured sizes
 against them with the exact universe and window stated. A missed target needs a
-target-variance record — enumerating every known remaining reduction with its
-measured benefit — reviewed independently and decided by the maintainer.
+target-variance record â€” enumerating every known remaining reduction with its
+measured benefit â€” reviewed independently and decided by the maintainer.
 Until that exists, profile stabilization and the default flip stay blocked; the
 rest of the leaf does not.
 

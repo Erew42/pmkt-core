@@ -50,6 +50,31 @@ def test_public_clob_read_endpoints_are_in_openapi_contract() -> None:
         assert path in paths
 
 
+def test_gamma_keyset_contract_uses_qualified_arrays_and_envelope() -> None:
+    spec = load_json(SPEC_PATH)
+    operation = spec["paths"]["/markets/keyset"]["get"]
+    params = {parameter["name"]: parameter for parameter in operation["parameters"]}
+
+    assert set(params) == {
+        "limit",
+        "after_cursor",
+        "closed",
+        "tag_id",
+        "related_tags",
+        "condition_ids",
+    }
+    assert params["limit"]["schema"]["maximum"] == 100
+    assert params["closed"]["schema"]["default"] is False
+    assert params["tag_id"]["schema"]["type"] == "array"
+    assert params["tag_id"]["schema"]["items"]["type"] == "integer"
+    assert params["condition_ids"]["schema"]["type"] == "array"
+    response = operation["responses"]["200"]["content"]["application/json"][
+        "schema"
+    ]
+    assert response["required"] == ["markets"]
+    assert "next_cursor" not in response["required"]
+
+
 def test_trading_methods_are_not_exposed_without_openapi_contract() -> None:
     assert not hasattr(AsyncClobClient, "post_order")
     assert not hasattr(AsyncClobClient, "cancel_order")

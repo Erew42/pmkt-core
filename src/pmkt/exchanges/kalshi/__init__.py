@@ -1,7 +1,19 @@
 from __future__ import annotations
 
 from importlib import import_module
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from pmkt.exchanges.kalshi.client import (
+        AsyncKalshiClient as AsyncKalshiClient,
+
+    )
+    from pmkt.records import (
+        KalshiFilter as KalshiFilter,
+        KalshiInstrumentRef as KalshiInstrumentRef,
+        KalshiMarket as KalshiMarket,
+        KalshiMarketRef as KalshiMarketRef,
+    )
 
 _LAZY_MODULES: dict[str, str] = {
     "client": "pmkt.exchanges.kalshi.client",
@@ -20,8 +32,11 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT",
     ),
     "KalshiBookSnapshot": ("pmkt.exchanges.kalshi.ws", "KalshiBookSnapshot"),
-    "KalshiClient": ("pmkt.exchanges.kalshi.client", "KalshiClient"),
+    "KalshiFilter": ("pmkt.records", "KalshiFilter"),
     "KalshiConnectFactory": ("pmkt.exchanges.kalshi.ws", "KalshiConnectFactory"),
+    "KalshiInstrumentRef": ("pmkt.records", "KalshiInstrumentRef"),
+    "KalshiMarket": ("pmkt.records", "KalshiMarket"),
+    "KalshiMarketRef": ("pmkt.records", "KalshiMarketRef"),
     "KalshiOrderBookState": ("pmkt.exchanges.kalshi.ws", "KalshiOrderBookState"),
     "KalshiSubscriptionAck": ("pmkt.exchanges.kalshi.ws", "KalshiSubscriptionAck"),
     "KalshiTickerUpdate": ("pmkt.exchanges.kalshi.ws", "KalshiTickerUpdate"),

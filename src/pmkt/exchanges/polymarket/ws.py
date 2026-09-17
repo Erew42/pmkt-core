@@ -22,7 +22,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from pmkt.exchanges.book_integrity import finite_number, well_formed_levels
-from pmkt.config import get_config
+from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
@@ -587,7 +587,7 @@ class AsyncMarketWebSocketClient:
         on_subscription_start: Callable[[], None] | None = None,
         on_subscription_established: Callable[[str, str], None] | None = None,
     ) -> None:
-        self.ws_url = ws_url or get_config().clob_ws_url
+        self.ws_url = ws_url or PmktConfig().clob_ws_url
         self.asset_ids = _normalize_asset_ids(asset_ids) if asset_ids else []
         self.custom_feature_enabled = bool(custom_feature_enabled)
         self.heartbeat_interval = heartbeat_interval

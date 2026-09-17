@@ -30,10 +30,8 @@ from pmkt.data.validation import (
     validate_book_tape_bundle,
     validate_frame,
 )
-from pmkt.streaming.capture import CaptureRouter, CaptureWriteIntent
-from pmkt.streaming.collector import StreamDatasetSpec, StreamRunOutputs
-from pmkt.streaming.datasets import merge_profile_dataset_specs
-from pmkt.streaming.profiles import (
+from pmkt.streaming.legacy.datasets import merge_profile_dataset_specs
+from pmkt.streaming.legacy.profiles import (
     PROFILE_DEFINITIONS,
     PROFILE_DEFINITIONS_BY_VERSION,
     get_storage_profile_definition,
@@ -42,7 +40,7 @@ from pmkt.streaming.profiles import (
     resolve_dataset_specs,
     select_storage_profile,
 )
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.recovery_contracts import (
     CaptureCommitArtifactV1,
     CaptureCommitRecordV1,
     RunStateV1,
@@ -776,7 +774,7 @@ def test_profile_authority_is_deeply_immutable_and_schema_exact() -> None:
             {"trade.v1"}
         )
 
-    from pmkt.exchanges.polymarket.order_book_stream import STREAM_DATASETS
+    from pmkt.streaming.legacy.datasets import CANONICAL_PROFILE_DATASETS as STREAM_DATASETS
 
     selection = select_storage_profile("mm-compact")
     specs = list(merge_profile_dataset_specs(STREAM_DATASETS))
@@ -799,65 +797,8 @@ def test_profile_authority_is_deeply_immutable_and_schema_exact() -> None:
         resolve_dataset_specs(selection, specs)
 
 
-def test_both_venue_catalogs_resolve_every_named_profile_role() -> None:
-    from pmkt.exchanges.kalshi.order_book_stream import (
-        STREAM_DATASETS as KALSHI_STREAM_DATASETS,
-    )
-    from pmkt.exchanges.polymarket.order_book_stream import (
-        STREAM_DATASETS as POLYMARKET_STREAM_DATASETS,
-    )
-
-    for venue_specs in (POLYMARKET_STREAM_DATASETS, KALSHI_STREAM_DATASETS):
-        complete_specs = merge_profile_dataset_specs(venue_specs)
-        for name in ("full", "book-tape", "mm-compact"):
-            selection = select_storage_profile(name)
-            resolved = resolve_dataset_specs(selection, complete_specs)
-            assert {spec.role for spec in resolved} == {
-                role.value
-                for role in selection.enabled_roles
-                if role is not DatasetRole.RAW_JSONL
-            }
 
 
-@pytest.mark.asyncio
-async def test_capture_router_noops_disabled_roles_and_tracks_exact_outputs(
-    tmp_path,
-) -> None:
-    selection = select_storage_profile("mm-compact")
-    schema = pa.schema([("value", pa.string())])
-    specs = tuple(
-        StreamDatasetSpec(
-            file_key=role.value,
-            filename=f"{role.value}.parquet",
-            schema=schema,
-            role=role.value,
-        )
-        for role in sorted(
-            selection.enabled_roles - {DatasetRole.RAW_JSONL},
-            key=lambda item: item.value,
-        )
-    )
-    outputs = StreamRunOutputs(
-        run_dir=tmp_path,
-        datasets=specs,
-        include_raw_jsonl=False,
-        parquet_segment_rows=None,
-        parquet_segment_seconds=None,
-    )
-    router = CaptureRouter(selection=selection, outputs=outputs)
-
-    async with router:
-        assert not await router.write(
-            CaptureWriteIntent(DatasetRole.DEPTH_MAIN, {"value": "ignored"})
-        )
-        assert await router.write_health({"value": "health"})
-
-    assert "raw_events_jsonl" not in outputs.files
-    assert set(outputs.dataset_specs_by_role) == {
-        role.value for role in selection.enabled_roles
-    }
-    assert router.completeness().complete
-    assert router.completeness().row_counts == {"health": 1}
 
 
 def test_recovery_json_contracts_are_strict_and_checksummed() -> None:

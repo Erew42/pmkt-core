@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.config import PmktConfig
+
 import asyncio
 import json
 import shutil
@@ -12,7 +14,7 @@ from typing import Annotated, Any
 import httpx
 import typer
 
-from pmkt.exchanges.polymarket.gamma import GammaClient
+from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.exchanges.kalshi.client import (
     AsyncKalshiClient,
     kalshi_markets_dataframe,
@@ -265,7 +267,7 @@ async def _ingest_markets_async(
     offset = 0
     page_count = 0
     stop_reason = "page_limit_reached"
-    async with GammaClient() as gamma:
+    async with AsyncGammaClient( config=PmktConfig.from_env()) as gamma:
         for _ in range(pages):
             try:
                 page = await _gamma_markets_payload_page(
@@ -382,7 +384,7 @@ async def _ingest_markets_keyset_async(
     stop_reason = "not_started"
     errors: list[str] = []
     try:
-        async with GammaClient() as gamma:
+        async with AsyncGammaClient( config=PmktConfig.from_env()) as gamma:
             while True:
                 if max_pages is not None and page_count >= max_pages:
                     stop_reason = "max_pages_reached"
@@ -575,7 +577,7 @@ async def _ingest_kalshi_markets_async(
     errors: list[str] = []
     page_limit: int | None = None if complete else max_pages
     try:
-        async with AsyncKalshiClient() as kalshi:
+        async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
             while True:
                 if page_limit is not None and page_count >= page_limit:
                     stop_reason = "max_pages_reached"
