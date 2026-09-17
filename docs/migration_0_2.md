@@ -2,7 +2,9 @@
 
 Version 0.2 deliberately breaks the experimental Python API. Endpoint coverage,
 canonical dataset schemas, resolution serialization, and existing catalog
-formats remain available. No runtime compatibility aliases are supplied.
+formats remain available except for the explicitly documented experimental
+paper-canary contract family. No runtime compatibility aliases are supplied for
+that retirement or for other 0.2 changes.
 
 ## Configuration and runtime
 

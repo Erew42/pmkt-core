@@ -118,7 +118,7 @@
       "id": "execution_deferred",
       "owner": "pmkt-core",
       "status": "active_experiment",
-      "summary": "Execution, paper, canary, and soak contracts are deliberately frozen in this phase rather than assessed for removal.",
+      "summary": "Execution, paper, canary, and soak contracts remain frozen except for the six-schema paper-canary family explicitly approved for atomic retirement in the 0.2 breaking-release window.",
       "schemas": [
         "basket_order_intent.v1",
         "basket_paper_fill.v1",
