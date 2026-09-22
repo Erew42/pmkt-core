@@ -1,28 +1,24 @@
 from __future__ import annotations
 
+from pmkt.config import PmktConfig
+
 import asyncio
 import importlib
 import sys
-from collections.abc import Mapping
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Annotated, Any, Optional, Sequence
+from typing import Annotated, Any, Optional
 
 import pandas as pd
 import typer
 
 from pmkt.tokens import flatten_token_ids
-from pmkt.exchanges.polymarket.clob import ClobClient
+from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
-    ReadAuthenticationRequiredError,
 )
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
-from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
-from pmkt.data.io import (
-    RECOMMENDED_PARQUET_SEGMENT_ROWS,
-)
 from pmkt.data.manifests import (
     build_run_manifest,
     count_quality_flags,
@@ -41,21 +37,6 @@ from pmkt.exchanges.ws_transport import (
     WS_MAX_QUEUE_FRAMES,
     WS_MAX_SIZE_BYTES,
 )
-from pmkt.streaming import capture_group
-from pmkt.streaming.capture_completeness import CaptureIntent
-from pmkt.streaming.connection_partitions import (
-    ConnectionPartition,
-    build_connection_partitions,
-    subscription_plan_relation_ids_by_instrument,
-)
-from pmkt.streaming.durability_settings import MAX_SEGMENT_SECONDS
-from pmkt.streaming.profiles import (
-    ContractStatus,
-    StorageProfileOverrides,
-    StorageProfileSelection,
-    select_storage_profile,
-)
-from pmkt.streaming.storage_backends import CaptureStorageBackend
 
 from pmkt.cli.shared import error_exit, required_column, unique_nonempty_strings
 
@@ -65,8 +46,6 @@ class BookOutputFormat(str, Enum):
     TOPBOOK = "topbook"
 
 
-DEFAULT_CONNECTION_START_STAGGER_SECONDS = 0.1
-DEFAULT_EXTENDED_SEGMENT_LIMIT_SECONDS = 30.0
 DEFAULT_ORDER_BOOK_STREAM_ROOT = Path("generated/order_book_streams")
 DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT = Path("generated/kalshi_order_book_streams")
 
@@ -89,6 +68,7 @@ async def _lazy_stream_order_book_data(*args: Any, **kwargs: Any) -> dict[str, A
     collector = _load_stream_collector(
         "pmkt.exchanges.polymarket.order_book_stream", "stream_order_book_data"
     )
+    kwargs.setdefault("ws_url", PmktConfig.from_env().clob_ws_url)
     return await collector(*args, **kwargs)
 
 
@@ -98,6 +78,7 @@ async def _lazy_stream_kalshi_order_book_data(
     collector = _load_stream_collector(
         "pmkt.exchanges.kalshi.order_book_stream", "stream_kalshi_order_book_data"
     )
+    kwargs.setdefault("ws_url", PmktConfig.from_env().resolved_kalshi_ws_url)
     return await collector(*args, **kwargs)
 
 
@@ -106,200 +87,16 @@ stream_order_book_data = _lazy_stream_order_book_data
 stream_kalshi_order_book_data = _lazy_stream_kalshi_order_book_data
 
 
-def _default_feed_supervisor(
-    *, venue: str, instruments: Sequence[str]
-) -> LiveFeedSupervisor:
-    return LiveFeedSupervisor(
-        [
-            FeedShardHealth(
-                venue=venue,
-                shard_id=f"{venue}-0",
-                subscribed_instruments=tuple(instruments),
-            )
-        ]
-    )
 
 
-def _capture_connection_partitions(
-    *,
-    venue: str,
-    instruments: Sequence[str],
-    supervisor: LiveFeedSupervisor | None,
-    plan_payload: Mapping[str, Any] | None,
-    connection_batch_size: int | None,
-    affinity_key_by_instrument: Mapping[str, str] | None = None,
-) -> tuple[ConnectionPartition, ...]:
-    resolved_supervisor = supervisor or _default_feed_supervisor(
-        venue=venue,
-        instruments=instruments,
-    )
-    return build_connection_partitions(
-        resolved_supervisor,
-        venue=venue,
-        instruments=instruments,
-        max_instruments=connection_batch_size,
-        relation_ids_by_instrument=(
-            subscription_plan_relation_ids_by_instrument(plan_payload, venue=venue)
-            if plan_payload is not None
-            else None
-        ),
-        affinity_key_by_instrument=affinity_key_by_instrument,
-    )
 
 
-def _capture_summary_suffix(manifest: Mapping[str, Any]) -> str:
-    summary = manifest.get("capture_summary")
-    if not isinstance(summary, Mapping):
-        summary = manifest.get("capture_completeness")
-    if not isinstance(summary, Mapping):
-        return ""
-    requested = int(summary.get("requested_instrument_count") or 0)
-    initial = int(summary.get("initial_snapshot_count") or 0)
-    reconnects = int(
-        summary.get("reconnect_count") or manifest.get("reconnect_count") or 0
-    )
-    if requested <= 0:
-        return ""
-    suffix = f", {initial}/{requested} initial snapshots, {reconnects} reconnects"
-    eligibility = summary.get("eligibility_evaluation_status")
-    if eligibility is not None:
-        unknown = int(summary.get("unknown_instrument_count") or 0)
-        eligible = int(summary.get("eligible_instrument_count") or 0)
-        eligible_snapshots = int(summary.get("eligible_initial_snapshot_count") or 0)
-        suffix += (
-            f", eligibility {eligibility} ({unknown} unknown)"
-            f", {eligible_snapshots}/{eligible} eligible initial snapshots"
-        )
-    return suffix
 
 
-def _storage_profile_selection(
-    *,
-    name: str,
-    profile_version: str | None,
-    acknowledge_experimental: bool,
-    keep_raw_jsonl: bool,
-    topbook_emission_per_event: bool,
-    emit_full_depth: bool,
-    emit_legacy_book_artifacts: bool,
-    feed_health_interval_seconds: float | None,
-    topbook_checkpoint_interval_seconds: float | None,
-    book_checkpoint_interval_seconds: float | None,
-) -> StorageProfileSelection:
-    try:
-        selection = select_storage_profile(
-            name,
-            profile_version=profile_version,
-            overrides=StorageProfileOverrides(
-                keep_raw_jsonl=keep_raw_jsonl,
-                topbook_emission_per_event=topbook_emission_per_event,
-                emit_full_depth=emit_full_depth,
-                emit_legacy_book_artifacts=emit_legacy_book_artifacts,
-            ),
-            experimental_profile_acknowledged=acknowledge_experimental,
-            feed_health_interval_seconds=feed_health_interval_seconds,
-            topbook_checkpoint_interval_seconds=topbook_checkpoint_interval_seconds,
-            book_checkpoint_interval_seconds=book_checkpoint_interval_seconds,
-        )
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc), param_hint="--storage-profile") from exc
-    if (
-        selection.definition.contract_status is ContractStatus.EXPERIMENTAL
-        and not acknowledge_experimental
-    ):
-        raise typer.BadParameter(
-            f"storage profile {name!r} is experimental; pass "
-            "--acknowledge-experimental-profile",
-            param_hint="--storage-profile",
-        )
-    return selection
 
 
-def _validate_stream_capture_cli_inputs(
-    *,
-    duration: float,
-    max_messages: int | None,
-    max_reconnects: int,
-    parquet_segment_rows: int | None,
-    parquet_segment_seconds: float | None,
-    websocket_max_size_bytes: int,
-    websocket_max_queue_frames: int,
-    connection_batch_size: int | None = None,
-    connection_processes: int = 1,
-    connection_start_stagger_seconds: float = DEFAULT_CONNECTION_START_STAGGER_SECONDS,
-    acknowledge_extended_durability_window: bool = False,
-) -> None:
-    if duration <= 0 and max_messages is None:
-        raise typer.BadParameter(
-            "must be > 0 unless --max-messages is set",
-            param_hint="--duration",
-        )
-    if max_messages is not None and max_messages < 1:
-        raise typer.BadParameter("must be >= 1", param_hint="--max-messages")
-    if max_reconnects < 0:
-        raise typer.BadParameter("must be >= 0", param_hint="--max-reconnects")
-    if parquet_segment_rows is not None and parquet_segment_rows <= 0:
-        raise typer.BadParameter(
-            "must be > 0",
-            param_hint="--parquet-segment-rows",
-        )
-    if parquet_segment_seconds is not None and parquet_segment_seconds <= 0:
-        raise typer.BadParameter(
-            "must be > 0",
-            param_hint="--parquet-segment-seconds",
-        )
-    if (
-        parquet_segment_seconds is not None
-        and parquet_segment_seconds > MAX_SEGMENT_SECONDS
-    ):
-        raise typer.BadParameter(
-            f"must be <= {MAX_SEGMENT_SECONDS:g}",
-            param_hint="--parquet-segment-seconds",
-        )
-    if (
-        parquet_segment_seconds is not None
-        and parquet_segment_seconds > DEFAULT_EXTENDED_SEGMENT_LIMIT_SECONDS
-        and not acknowledge_extended_durability_window
-    ):
-        raise typer.BadParameter(
-            "values above 30 seconds increase crash-loss exposure; pass "
-            "--acknowledge-extended-durability-window",
-            param_hint="--parquet-segment-seconds",
-        )
-    if connection_batch_size is not None and connection_batch_size <= 0:
-        raise typer.BadParameter(
-            "must be > 0",
-            param_hint="--connection-batch-size",
-        )
-    if connection_processes <= 0:
-        raise typer.BadParameter(
-            "must be > 0",
-            param_hint="--connection-processes",
-        )
-    if connection_start_stagger_seconds < 0:
-        raise typer.BadParameter(
-            "must be >= 0",
-            param_hint="--connection-start-stagger-seconds",
-        )
-    if websocket_max_size_bytes <= 0:
-        raise typer.BadParameter(
-            "must be > 0", param_hint="--websocket-max-size-bytes"
-        )
-    if websocket_max_queue_frames <= 0:
-        raise typer.BadParameter(
-            "must be > 0", param_hint="--websocket-max-queue-frames"
-        )
 
 
-def _warn_experimental_profile(selection: StorageProfileSelection) -> None:
-    if selection.definition.contract_status is not ContractStatus.EXPERIMENTAL:
-        return
-    typer.echo(
-        "Warning: using experimental storage profile "
-        f"{selection.definition.name!r}; acknowledgement will be recorded "
-        "in capture provenance.",
-        err=True,
-    )
 
 
 def _filter_markets(df, *, min_volume: float, min_liquidity: float):
@@ -327,48 +124,6 @@ def _tokens_from_markets_parquet(markets_path: Path) -> list[str]:
     return _token_ids_from_markets_df(markets_df, path=markets_path)
 
 
-def _polymarket_affinity_keys_from_markets_df(
-    markets_df: pd.DataFrame, *, path: Path
-) -> dict[str, str]:
-    token_column = required_column(
-        markets_df, ("token_ids",), path=path, label="markets"
-    )
-    market_column = next(
-        (
-            column
-            for column in (
-                "market_id",
-                "market_key",
-                "id",
-                "condition_id",
-                "venue_market_id",
-            )
-            if column in markets_df.columns
-        ),
-        None,
-    )
-    if market_column is None:
-        return {}
-    result: dict[str, str] = {}
-    for token_value, market_value in zip(
-        markets_df[token_column].tolist(),
-        markets_df[market_column].tolist(),
-        strict=True,
-    ):
-        if pd.isna(market_value):
-            continue
-        market_key = str(market_value).strip()
-        if not market_key:
-            continue
-        for token in flatten_token_ids(token_value):
-            previous = result.get(token)
-            if previous is not None and previous != market_key:
-                raise ValueError(
-                    "markets parquet maps a Polymarket token to multiple markets: "
-                    f"{token} -> {previous!r}, {market_key!r}"
-                )
-            result[token] = market_key
-    return result
 
 
 def _tickers_from_kalshi_markets_parquet(markets_path: Path) -> list[str]:
@@ -510,7 +265,7 @@ async def _collect_books_async(
             )
         resolved_run_id = run_id or _default_one_shot_run_id("polymarket")
         started_at_utc = _utc_now_iso()
-        async with ClobClient() as clob:
+        async with AsyncClobClient( config=PmktConfig.from_env()) as clob:
             path = await collect_order_book_topbooks_parquet(
                 clob,
                 token_ids,
@@ -540,7 +295,7 @@ async def _collect_books_async(
     if manifest_out is not None:
         error_exit("--manifest-out requires --output-format topbook")
 
-    async with ClobClient() as clob:
+    async with AsyncClobClient( config=PmktConfig.from_env()) as clob:
         path = await collect_order_book_summaries_parquet(
             clob,
             token_ids,
@@ -699,7 +454,7 @@ async def _collect_kalshi_books_async(
             )
         resolved_run_id = run_id or _default_one_shot_run_id("kalshi")
         started_at_utc = _utc_now_iso()
-        async with AsyncKalshiClient() as kalshi:
+        async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
             batches = await asyncio.gather(
                 *(
                     fetch_topbooks(
@@ -738,7 +493,7 @@ async def _collect_kalshi_books_async(
     if manifest_out is not None:
         error_exit("--manifest-out requires --output-format topbook")
 
-    async with AsyncKalshiClient() as kalshi:
+    async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
         rows = await asyncio.gather(
             *(fetch_summary(kalshi, ticker) for ticker in tickers)
         )
@@ -846,556 +601,94 @@ def collect_kalshi_books(
     )
 
 
+
+
+
+
 def stream_books(
-    token_id: Annotated[
-        Optional[list[str]],
-        typer.Option(
-            "--token-id",
-            "-t",
-            help="CLOB asset/token id to stream. Repeat for multiple tokens.",
-        ),
-    ] = None,
-    markets: Annotated[
-        Optional[Path],
-        typer.Option(help="Optional markets parquet with a token_ids column."),
-    ] = None,
-    output_dir: Annotated[
-        Path,
-        typer.Option(help="Root output directory for stream run folders."),
-    ] = DEFAULT_ORDER_BOOK_STREAM_ROOT,
-    duration: Annotated[
-        float,
-        typer.Option(help="Collection duration in seconds."),
-    ] = 300.0,
-    max_messages: Annotated[
-        Optional[int],
-        typer.Option(help="Optional cap on websocket messages before stopping."),
-    ] = None,
-    capture_intent: Annotated[
-        CaptureIntent,
-        typer.Option(
-            "--capture-intent",
-            help="Capture lifecycle intent: operational or explicit smoke.",
-        ),
-    ] = CaptureIntent.OPERATIONAL,
-    websocket_max_size_bytes: Annotated[
-        int,
-        typer.Option(
-            "--websocket-max-size-bytes",
-            help="Maximum accepted WebSocket message size in bytes.",
-        ),
-    ] = WS_MAX_SIZE_BYTES,
-    websocket_max_queue_frames: Annotated[
-        int,
-        typer.Option(
-            "--websocket-max-queue-frames",
-            help="Maximum buffered WebSocket frames per connection.",
-        ),
-    ] = WS_MAX_QUEUE_FRAMES,
-    parquet_segment_rows: Annotated[
-        Optional[int],
-        typer.Option(
-            "--parquet-segment-rows",
-            help=(
-                "Opt in to durable parquet directory datasets by rotating after this "
-                f"many rows. Suggested value: {RECOMMENDED_PARQUET_SEGMENT_ROWS}."
-            ),
-        ),
-    ] = None,
-    parquet_segment_seconds: Annotated[
-        Optional[float],
-        typer.Option(
-            "--parquet-segment-seconds",
-            help=(
-                "Opt in to durable parquet directory datasets by rotating after this "
-                "many seconds. The safe default bound is 30; acknowledged "
-                "read-only captures may use up to 300."
-            ),
-        ),
-    ] = None,
-    acknowledge_extended_durability_window: Annotated[
-        bool,
-        typer.Option(
-            "--acknowledge-extended-durability-window",
-            help=(
-                "Acknowledge that a Parquet segment interval above 30 seconds "
-                "increases the maximum data lost by a process or host crash."
-            ),
-        ),
-    ] = False,
-    max_reconnects: Annotated[
-        int,
-        typer.Option(
-            "--max-reconnects",
-            help="Maximum Polymarket websocket reconnect attempts during the run.",
-        ),
-    ] = 1000,
-    max_tokens: Annotated[
-        Optional[int],
-        typer.Option(
-            help="Optional cap on tokens from --markets after explicit --token-id values."
-        ),
-    ] = None,
-    connection_batch_size: Annotated[
-        Optional[int],
-        typer.Option(
-            "--connection-batch-size",
-            help=(
-                "Maximum instruments per real WebSocket connection. Existing "
-                "market affinity boundaries are preserved and may be split further."
-            ),
-        ),
-    ] = None,
-    connection_processes: Annotated[
-        int,
-        typer.Option(
-            "--connection-processes",
-            help=(
-                "Polymarket worker processes hosting the partitioned WebSocket "
-                "connections. Use 2 to spread collector CPU across two cores."
-            ),
-        ),
-    ] = 1,
-    connection_start_stagger_seconds: Annotated[
-        float,
-        typer.Option(
-            "--connection-start-stagger-seconds",
-            help="Delay successive shard connections to avoid a subscription burst.",
-        ),
-    ] = DEFAULT_CONNECTION_START_STAGGER_SECONDS,
-    run_name: Annotated[
-        Optional[str],
-        typer.Option(help="Optional run folder name. Defaults to a UTC timestamp."),
-    ] = None,
-    storage_profile: Annotated[
-        str,
-        typer.Option(
-            "--storage-profile", help="Storage profile: full, book-tape, or mm-compact."
-        ),
-    ] = "full",
-    profile_version: Annotated[
-        Optional[str],
-        typer.Option("--profile-version", help="Explicit storage contract version; defaults remain v2."),
-    ] = None,
-    capture_storage_backend: Annotated[
-        CaptureStorageBackend,
-        typer.Option(
-            "--capture-storage-backend",
-            help=(
-                "Durable capture backend. parquet_segments remains the default; "
-                "sqlite_wal_v1 is opt-in and promotes on finalization."
-            ),
-        ),
-    ] = CaptureStorageBackend.PARQUET_SEGMENTS,
-    acknowledge_experimental_profile: Annotated[
-        bool,
-        typer.Option(
-            "--acknowledge-experimental-profile",
-            help="Acknowledge use of an experimental reduced profile.",
-        ),
-    ] = False,
-    feed_health_interval_seconds: Annotated[
-        Optional[float], typer.Option("--feed-health-interval-seconds")
-    ] = None,
-    topbook_checkpoint_interval_seconds: Annotated[
-        Optional[float], typer.Option("--topbook-checkpoint-interval-seconds")
-    ] = None,
-    book_checkpoint_interval_seconds: Annotated[
-        Optional[float], typer.Option("--book-checkpoint-interval-seconds")
-    ] = None,
-    keep_raw_jsonl: Annotated[bool, typer.Option("--keep-raw-jsonl")] = False,
-    topbook_emission_per_event: Annotated[
-        bool, typer.Option("--topbook-emission-per-event")
-    ] = False,
-    emit_full_depth: Annotated[bool, typer.Option("--emit-full-depth")] = False,
-    emit_legacy_book_artifacts: Annotated[
-        bool, typer.Option("--emit-legacy-book-artifacts")
-    ] = False,
+    token_id: Annotated[Optional[list[str]], typer.Option("--token-id", "-t", help="Instrument to record; repeat for multiple instruments.")] = None,
+    markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
+    output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_ORDER_BOOK_STREAM_ROOT,
+    run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
+    duration: Annotated[float, typer.Option(help="Recording duration in seconds.")] = 300.0,
+    max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
+    mode: Annotated[str, typer.Option(help="topbook or full; full adds selected depth snapshots.")] = "full",
+    depth_check_interval_s: Annotated[str, typer.Option(help="Seconds between changed-book checks; 'off' disables periodic checks.")] = "10",
+    depth_on_best_price_change: Annotated[bool, typer.Option(help="Save depth immediately on best bid/ask price changes.")] = False,
+    raw_messages: Annotated[bool, typer.Option(help="Also save diagnostic raw_messages.jsonl.")] = False,
+    max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,
+    websocket_max_size_bytes: Annotated[int, typer.Option()] = WS_MAX_SIZE_BYTES,
+    websocket_max_queue_frames: Annotated[int, typer.Option()] = WS_MAX_QUEUE_FRAMES,
 ) -> None:
-    """Stream websocket order-book events into analysis-ready files."""
-    _validate_stream_capture_cli_inputs(
-        duration=duration,
-        max_messages=max_messages,
-        max_reconnects=max_reconnects,
-        parquet_segment_rows=parquet_segment_rows,
-        parquet_segment_seconds=parquet_segment_seconds,
-        websocket_max_size_bytes=websocket_max_size_bytes,
-        websocket_max_queue_frames=websocket_max_queue_frames,
-        connection_batch_size=connection_batch_size,
-        connection_processes=connection_processes,
-        connection_start_stagger_seconds=connection_start_stagger_seconds,
-        acknowledge_extended_durability_window=(
-            acknowledge_extended_durability_window
-        ),
-    )
-    selection = _storage_profile_selection(
-        name=storage_profile,
-        profile_version=profile_version,
-        acknowledge_experimental=acknowledge_experimental_profile,
-        keep_raw_jsonl=keep_raw_jsonl,
-        topbook_emission_per_event=topbook_emission_per_event,
-        emit_full_depth=emit_full_depth,
-        emit_legacy_book_artifacts=emit_legacy_book_artifacts,
-        feed_health_interval_seconds=feed_health_interval_seconds,
-        topbook_checkpoint_interval_seconds=topbook_checkpoint_interval_seconds,
-        book_checkpoint_interval_seconds=book_checkpoint_interval_seconds,
-    )
-    if (
-        capture_storage_backend is CaptureStorageBackend.SQLITE_WAL
-        and keep_raw_jsonl
-    ):
-        raise typer.BadParameter(
-            "sqlite_wal_v1 does not yet support --keep-raw-jsonl",
-            param_hint="--capture-storage-backend",
-        )
-    token_ids: list[str] = []
-    affinity_key_by_instrument: dict[str, str] = {}
-    for token in token_id or []:
-        token_text = str(token).strip()
-        if token_text and token_text not in token_ids:
-            token_ids.append(token_text)
+    """Record live books and public trades into SQLite, then export Parquet."""
+    instruments = list(dict.fromkeys(token_id or []))
     if markets:
-        markets_df = read_parquet(markets)
-        affinity_key_by_instrument = _polymarket_affinity_keys_from_markets_df(
-            markets_df, path=markets
-        )
-        for token in _token_ids_from_markets_df(markets_df, path=markets):
-            if token not in token_ids:
-                token_ids.append(token)
-    if max_tokens is not None:
-        token_ids = token_ids[:max_tokens]
-    if not token_ids:
-        if markets:
-            error_exit(f"no token ids found in markets parquet {markets}")
+        instruments = list(dict.fromkeys([*instruments, *_tokens_from_markets_parquet(markets)]))
+    if not instruments:
         error_exit("provide --token-id or --markets")
-    collector = stream_order_book_data
-    if collector is _lazy_stream_order_book_data:
-        collector = _load_stream_collector(
-            "pmkt.exchanges.polymarket.order_book_stream", "stream_order_book_data"
-        )
-    _warn_experimental_profile(selection)
-    partitions = _capture_connection_partitions(
-        venue="polymarket",
-        instruments=token_ids,
-        supervisor=None,
-        plan_payload=None,
-        connection_batch_size=connection_batch_size,
-        affinity_key_by_instrument=affinity_key_by_instrument,
-    )
-    if len(partitions) > 1 and max_messages is not None:
-        raise typer.BadParameter(
-            "is ambiguous across multiple connections; use --duration",
-            param_hint="--max-messages",
-        )
-    manifest = asyncio.run(
-        capture_group.run_connection_partition_group(
-            venue="polymarket",
-            partitions=partitions,
-            collector=collector,
-            output_dir=output_dir,
-            run_name=run_name,
-            start_stagger_seconds=connection_start_stagger_seconds,
-            collector_kwargs={
-                "duration_s": duration,
-                "max_messages": max_messages,
-                "capture_intent": capture_intent,
-                "websocket_max_size_bytes": websocket_max_size_bytes,
-                "websocket_max_queue_frames": websocket_max_queue_frames,
-                "parquet_segment_rows": parquet_segment_rows,
-                "parquet_segment_seconds": parquet_segment_seconds,
-                "max_reconnects": max_reconnects,
-                "command": _current_command(),
-                "git_cwd": Path.cwd(),
-                "subscription_plan_metadata": None,
-                "storage_profile": selection,
-                "capture_storage_backend": capture_storage_backend,
-            },
-            process_count=connection_processes,
-        )
-    )
-    counts = manifest["counts"]
-    print(
-        "Wrote order-book stream to "
-        f"{manifest['run_dir']} "
-        f"({counts.get('events', 0)} events, {counts.get('snapshots', 0)} snapshots, "
-        f"{counts.get('levels', 0)} levels{_capture_summary_suffix(manifest)})"
-    )
+    interval = _recording_interval(depth_check_interval_s)
+    try:
+        manifest = asyncio.run(stream_order_book_data(
+            instruments, output_root=output_dir, run_name=run_name,
+            duration_s=duration, max_messages=max_messages, mode=mode,
+            depth_check_interval_s=interval,
+            depth_on_best_price_change=depth_on_best_price_change,
+            raw_messages=raw_messages, max_reconnects=max_reconnects,
+            websocket_max_size_bytes=websocket_max_size_bytes,
+            websocket_max_queue_frames=websocket_max_queue_frames,
+        ))
+    except (ValueError, RuntimeError) as exc:
+        error_exit(str(exc))
+    print(f"Recording {manifest['status']}: {manifest['run_dir']}")
+    if manifest["status"] != "complete":
+        raise typer.Exit(code=1)
 
 
 def stream_kalshi_books(
-    ticker: Annotated[
-        Optional[list[str]],
-        typer.Option(
-            "--ticker",
-            "-t",
-            help="Kalshi market ticker to stream. Repeat for multiple tickers.",
-        ),
-    ] = None,
-    markets: Annotated[
-        Optional[Path],
-        typer.Option(
-            help="Optional Kalshi markets parquet with market_key/ticker column."
-        ),
-    ] = None,
-    header_provider: Annotated[
-        Optional[str],
-        typer.Option(
-            "--header-provider",
-            help="Import path MODULE:ATTRIBUTE for a read-auth header provider.",
-        ),
-    ] = None,
-    max_markets: Annotated[
-        Optional[int],
-        typer.Option(
-            help="Optional cap on tickers from --markets after explicit --ticker values."
-        ),
-    ] = None,
-    output_dir: Annotated[
-        Path,
-        typer.Option(help="Root output directory for Kalshi stream run folders."),
-    ] = DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
-    duration: Annotated[
-        float,
-        typer.Option(help="Collection duration in seconds."),
-    ] = 300.0,
-    max_messages: Annotated[
-        Optional[int],
-        typer.Option(help="Optional cap on websocket messages before stopping."),
-    ] = None,
-    capture_intent: Annotated[
-        CaptureIntent,
-        typer.Option(
-            "--capture-intent",
-            help="Capture lifecycle intent: operational or explicit smoke.",
-        ),
-    ] = CaptureIntent.OPERATIONAL,
-    websocket_max_size_bytes: Annotated[
-        int,
-        typer.Option(
-            "--websocket-max-size-bytes",
-            help="Maximum accepted WebSocket message size in bytes.",
-        ),
-    ] = WS_MAX_SIZE_BYTES,
-    websocket_max_queue_frames: Annotated[
-        int,
-        typer.Option(
-            "--websocket-max-queue-frames",
-            help="Maximum buffered WebSocket frames per connection.",
-        ),
-    ] = WS_MAX_QUEUE_FRAMES,
-    parquet_segment_rows: Annotated[
-        Optional[int],
-        typer.Option(
-            "--parquet-segment-rows",
-            help=(
-                "Opt in to durable parquet directory datasets by rotating after this "
-                f"many rows. Suggested value: {RECOMMENDED_PARQUET_SEGMENT_ROWS}."
-            ),
-        ),
-    ] = None,
-    parquet_segment_seconds: Annotated[
-        Optional[float],
-        typer.Option(
-            "--parquet-segment-seconds",
-            help=(
-                "Opt in to durable parquet directory datasets by rotating after this "
-                "many seconds. The safe default bound is 30; acknowledged "
-                "read-only captures may use up to 300."
-            ),
-        ),
-    ] = None,
-    acknowledge_extended_durability_window: Annotated[
-        bool,
-        typer.Option(
-            "--acknowledge-extended-durability-window",
-            help=(
-                "Acknowledge that a Parquet segment interval above 30 seconds "
-                "increases the maximum data lost by a process or host crash."
-            ),
-        ),
-    ] = False,
-    max_reconnects: Annotated[
-        int,
-        typer.Option(
-            "--max-reconnects",
-            help="Maximum Kalshi websocket reconnect attempts during the run.",
-        ),
-    ] = 1000,
-    connection_batch_size: Annotated[
-        Optional[int],
-        typer.Option(
-            "--connection-batch-size",
-            help=(
-                "Maximum markets per real WebSocket connection. Existing "
-                "instrument partitions may be split further."
-            ),
-        ),
-    ] = None,
-    connection_start_stagger_seconds: Annotated[
-        float,
-        typer.Option(
-            "--connection-start-stagger-seconds",
-            help="Delay successive shard connections to avoid a subscription burst.",
-        ),
-    ] = DEFAULT_CONNECTION_START_STAGGER_SECONDS,
-    run_name: Annotated[
-        Optional[str],
-        typer.Option(help="Optional run folder name. Defaults to a UTC timestamp."),
-    ] = None,
-    storage_profile: Annotated[
-        str,
-        typer.Option(
-            "--storage-profile", help="Storage profile: full, book-tape, or mm-compact."
-        ),
-    ] = "full",
-    profile_version: Annotated[
-        Optional[str],
-        typer.Option("--profile-version", help="Explicit storage contract version; defaults remain v2."),
-    ] = None,
-    capture_storage_backend: Annotated[
-        CaptureStorageBackend,
-        typer.Option(
-            "--capture-storage-backend",
-            help=(
-                "Durable capture backend. parquet_segments remains the default; "
-                "sqlite_wal_v1 is opt-in and promotes on finalization."
-            ),
-        ),
-    ] = CaptureStorageBackend.PARQUET_SEGMENTS,
-    acknowledge_experimental_profile: Annotated[
-        bool,
-        typer.Option(
-            "--acknowledge-experimental-profile",
-            help="Acknowledge use of an experimental reduced profile.",
-        ),
-    ] = False,
-    feed_health_interval_seconds: Annotated[
-        Optional[float], typer.Option("--feed-health-interval-seconds")
-    ] = None,
-    topbook_checkpoint_interval_seconds: Annotated[
-        Optional[float], typer.Option("--topbook-checkpoint-interval-seconds")
-    ] = None,
-    book_checkpoint_interval_seconds: Annotated[
-        Optional[float], typer.Option("--book-checkpoint-interval-seconds")
-    ] = None,
-    keep_raw_jsonl: Annotated[bool, typer.Option("--keep-raw-jsonl")] = False,
-    topbook_emission_per_event: Annotated[
-        bool, typer.Option("--topbook-emission-per-event")
-    ] = False,
-    emit_full_depth: Annotated[bool, typer.Option("--emit-full-depth")] = False,
-    emit_legacy_book_artifacts: Annotated[
-        bool, typer.Option("--emit-legacy-book-artifacts")
-    ] = False,
+    ticker: Annotated[Optional[list[str]], typer.Option("--ticker", "-t", help="Instrument to record; repeat for multiple instruments.")] = None,
+    markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
+    output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
+    run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
+    duration: Annotated[float, typer.Option(help="Recording duration in seconds.")] = 300.0,
+    max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
+    mode: Annotated[str, typer.Option(help="topbook or full; full adds selected depth snapshots.")] = "full",
+    depth_check_interval_s: Annotated[str, typer.Option(help="Seconds between changed-book checks; 'off' disables periodic checks.")] = "10",
+    depth_on_best_price_change: Annotated[bool, typer.Option(help="Save depth immediately on best bid/ask price changes.")] = False,
+    raw_messages: Annotated[bool, typer.Option(help="Also save diagnostic raw_messages.jsonl.")] = False,
+    max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,
+    websocket_max_size_bytes: Annotated[int, typer.Option()] = WS_MAX_SIZE_BYTES,
+    websocket_max_queue_frames: Annotated[int, typer.Option()] = WS_MAX_QUEUE_FRAMES,
+    header_provider: Annotated[Optional[str], typer.Option(help="Read-auth provider MODULE:ATTRIBUTE.")] = None,
 ) -> None:
-    """Stream Kalshi order-book websocket events into analysis-ready files."""
-    _validate_stream_capture_cli_inputs(
-        duration=duration,
-        max_messages=max_messages,
-        max_reconnects=max_reconnects,
-        parquet_segment_rows=parquet_segment_rows,
-        parquet_segment_seconds=parquet_segment_seconds,
-        websocket_max_size_bytes=websocket_max_size_bytes,
-        websocket_max_queue_frames=websocket_max_queue_frames,
-        connection_batch_size=connection_batch_size,
-        connection_start_stagger_seconds=connection_start_stagger_seconds,
-        acknowledge_extended_durability_window=(
-            acknowledge_extended_durability_window
-        ),
-    )
-    selection = _storage_profile_selection(
-        name=storage_profile,
-        profile_version=profile_version,
-        acknowledge_experimental=acknowledge_experimental_profile,
-        keep_raw_jsonl=keep_raw_jsonl,
-        topbook_emission_per_event=topbook_emission_per_event,
-        emit_full_depth=emit_full_depth,
-        emit_legacy_book_artifacts=emit_legacy_book_artifacts,
-        feed_health_interval_seconds=feed_health_interval_seconds,
-        topbook_checkpoint_interval_seconds=topbook_checkpoint_interval_seconds,
-        book_checkpoint_interval_seconds=book_checkpoint_interval_seconds,
-    )
-    if (
-        capture_storage_backend is CaptureStorageBackend.SQLITE_WAL
-        and keep_raw_jsonl
-    ):
-        raise typer.BadParameter(
-            "sqlite_wal_v1 does not yet support --keep-raw-jsonl",
-            param_hint="--capture-storage-backend",
-        )
-    tickers: list[str] = []
-    for item in ticker or []:
-        ticker_text = str(item).strip()
-        if ticker_text and ticker_text not in tickers:
-            tickers.append(ticker_text)
+    """Record live books and public trades into SQLite, then export Parquet."""
+    instruments = list(dict.fromkeys(ticker or []))
     if markets:
-        for item in _tickers_from_kalshi_markets_parquet(markets):
-            if item not in tickers:
-                tickers.append(item)
-    if max_markets is not None:
-        tickers = tickers[:max_markets]
-    if not tickers:
-        if markets:
-            error_exit(f"no tickers found in Kalshi markets parquet {markets}")
+        instruments = list(dict.fromkeys([*instruments, *_tickers_from_kalshi_markets_parquet(markets)]))
+    if not instruments:
         error_exit("provide --ticker or --markets")
-    resolved_header_provider = _load_read_auth_header_provider(header_provider)
-    collector = stream_kalshi_order_book_data
-    if collector is _lazy_stream_kalshi_order_book_data:
-        collector = _load_stream_collector(
-            "pmkt.exchanges.kalshi.order_book_stream",
-            "stream_kalshi_order_book_data",
-        )
-    _warn_experimental_profile(selection)
-    partitions = _capture_connection_partitions(
-        venue="kalshi",
-        instruments=tickers,
-        supervisor=None,
-        plan_payload=None,
-        connection_batch_size=connection_batch_size,
-    )
-    if len(partitions) > 1 and max_messages is not None:
-        raise typer.BadParameter(
-            "is ambiguous across multiple connections; use --duration",
-            param_hint="--max-messages",
-        )
-
+    interval = _recording_interval(depth_check_interval_s)
     try:
-        manifest = asyncio.run(
-            capture_group.run_connection_partition_group(
-                venue="kalshi",
-                partitions=partitions,
-                collector=collector,
-                output_dir=output_dir,
-                run_name=run_name,
-                start_stagger_seconds=connection_start_stagger_seconds,
-                collector_kwargs={
-                    "duration_s": duration,
-                    "max_messages": max_messages,
-                    "capture_intent": capture_intent,
-                    "websocket_max_size_bytes": websocket_max_size_bytes,
-                    "websocket_max_queue_frames": websocket_max_queue_frames,
-                    "parquet_segment_rows": parquet_segment_rows,
-                    "parquet_segment_seconds": parquet_segment_seconds,
-                    "max_reconnects": max_reconnects,
-                    "command": _current_command(),
-                    "git_cwd": Path.cwd(),
-                    "use_yes_price": (
-                        True
-                    ),
-                    "subscription_plan_metadata": None,
-                    "auth": resolved_header_provider,
-                    "storage_profile": selection,
-                    "capture_storage_backend": capture_storage_backend,
-                },
-            )
-        )
-    except ReadAuthenticationRequiredError as exc:
-        print(f"Error: {exc}", flush=True)
-        raise typer.Exit(code=1) from exc
+        manifest = asyncio.run(stream_kalshi_order_book_data(
+            instruments, output_root=output_dir, run_name=run_name,
+            duration_s=duration, max_messages=max_messages, mode=mode,
+            depth_check_interval_s=interval,
+            depth_on_best_price_change=depth_on_best_price_change,
+            raw_messages=raw_messages, max_reconnects=max_reconnects,
+            websocket_max_size_bytes=websocket_max_size_bytes,
+            websocket_max_queue_frames=websocket_max_queue_frames,
+        auth=_load_read_auth_header_provider(header_provider),
+        ))
+    except (ValueError, RuntimeError) as exc:
+        error_exit(str(exc))
+    print(f"Recording {manifest['status']}: {manifest['run_dir']}")
+    if manifest["status"] != "complete":
+        raise typer.Exit(code=1)
 
-    counts = manifest["counts"]
-    print(
-        "Wrote Kalshi order-book stream to "
-        f"{manifest['run_dir']} "
-        f"({counts.get('events', 0)} events, {counts.get('snapshots', 0)} snapshots, "
-        f"{counts.get('levels', 0)} levels{_capture_summary_suffix(manifest)})"
-    )
+
+def _recording_interval(value: str) -> float | None:
+    if value.strip().lower() in {"off", "none"}:
+        return None
+    try:
+        return float(value)
+    except ValueError as exc:
+        raise typer.BadParameter("use a positive number of seconds or 'off'", param_hint="--depth-check-interval-s") from exc

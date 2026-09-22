@@ -22,7 +22,7 @@ from pmkt.data.schemas import (
     topbook_evidence_id,
 )
 from pmkt.exchanges.kalshi.ws import apply_kalshi_orderbook_message
-from pmkt.streaming.topbook_emission import topbook_state_fingerprint
+from pmkt.streaming.legacy.topbook_emission import topbook_state_fingerprint
 
 
 _FIXTURE_ROOT = Path(__file__).with_name("fixtures")

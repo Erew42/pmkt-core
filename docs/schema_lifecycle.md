@@ -21,8 +21,10 @@ rewriting, moving, or deleting an artifact.
 - `removal_candidate`: current evidence favors retirement, subject to every
   stop condition in the catalog.
 
-The execution, paper, canary, and soak schemas remain `active_experiment` for
-this phase. Their internal simplification is deliberately out of scope.
+The remaining execution, paper, and soak schemas remain `active_experiment` and
+frozen for this phase. The six-schema paper-canary family was retired under the
+[`0.2 retirement packet`](schema_retirements/paper_canary_contract_family_0_2.md).
+That decision did not end or weaken the freeze for any remaining contract.
 
 ## Current decisions
 
@@ -33,6 +35,7 @@ this phase. Their internal simplification is deliberately out of scope.
 | `event.v1` / `market.v1` | `provisional_unintegrated` | Propose retirement after exhaustive zero-use evidence. Active venue-specific market frames are separate contracts. |
 | `instrument.v1` | `provisional_unintegrated` | Retire unless a future proposal supplies a writer, stable identity and update semantics, a persistence location, and consumer joins. |
 | `market_taxonomy_evidence.v1` | `active_experiment` | Retain. It has hash-pinned retained research data, but still needs a tracked producer/reader workflow and artifact-level schema, grain, key, and provenance metadata. |
+| Paper-canary contract family (six schemas) | retired in 0.2 | Removed atomically under the tracked family retirement packet. The remaining `execution_deferred` contracts stay frozen. |
 
 The evidence baseline recorded on 2026-08-20 found no snapshot-v2,
 `market_match.v1`, `event.v1`, `market.v1`, or `instrument.v1` artifacts in the
@@ -54,10 +57,11 @@ is not an ownership violation. Existing exports remain compatible. No schemas
 are removed by this refresh, and the five proposed dimension/snapshot removals
 still require complete retained-artifact and consumer evidence.
 
-The dashboard's generic reader is now
-`pmkt-trading:src/pmkt_trading/dashboard/data/artifacts.py`. Literal token scans
+The generic trading reader is now
+`pmkt-trading:src/pmkt_trading/data/artifact_discovery.py`. Literal token scans
 cannot enumerate its runtime manifest-supplied versions. Review it and actual
-producer functions before concluding that a schema is unused.
+producer functions before concluding that a schema is unused. Unknown retired
+versions are reported as validation warnings rather than crashing discovery.
 
 ## Reproducing the evidence report
 
@@ -114,8 +118,11 @@ validation fails when any current or future candidate omits them.
 
 ## Removal packet
 
-Actual removal belongs in a later phase and a separate commit per contract. A
-removal packet must contain:
+Actual removal belongs in a later phase and normally uses a separate commit per
+contract. One atomic commit may instead retire a producer-owned contract family
+when one reviewed removal packet covers every member and records why splitting
+the change would leave partial producer contracts behind. A removal packet must
+contain:
 
 1. Reviewed zero-use producer/reader evidence across package source,
    applications, scripts, generic consumers, and external/manual callers;
@@ -134,7 +141,8 @@ validated before any projection.
 
 ## Scope boundaries
 
-This lifecycle phase does not perform structural registry rewrites, broad public
-API cleanup, dataset moves, per-file reorganization, execution cleanup, or
-artifact conversion. Exact run directories and evidence bundles remain
-byte-identical. Catalog and report updates are reversible metadata changes.
+Except for the explicitly approved paper-canary retirement, this lifecycle
+phase does not perform structural registry rewrites, broad public API cleanup,
+dataset moves, per-file reorganization, execution cleanup, or artifact
+conversion. Exact run directories and evidence bundles remain byte-identical.
+Catalog and report updates are reversible metadata changes.

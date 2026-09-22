@@ -9,12 +9,12 @@ from pmkt.data.registry import STREAM_LIFECYCLE_SCHEMA_VERSION, TRADE_SCHEMA_VER
 from pmkt.data.storage.duckdb import query_parquet
 from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.validation import validate_frame
-from pmkt.streaming.observations import (
+from pmkt.streaming.legacy.observations import (
     KALSHI_LIFECYCLE_EVENTS,
     ObservationValidationError,
     StreamObservationProducer,
 )
-from pmkt.streaming.tape import CaptureCoordinate, deterministic_merge_key
+from pmkt.streaming.legacy.tape import CaptureCoordinate, deterministic_merge_key
 
 _UTC = "2026-07-19T10:00:00.000000Z"
 

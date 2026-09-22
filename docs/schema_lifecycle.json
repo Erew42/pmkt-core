@@ -1,12 +1,12 @@
 {
   "catalog_version": "pmkt.schema_lifecycle.v2",
   "evidence_as_of": {
-    "date": "2026-09-11",
-    "scope": "Post-split source inventory and ownership review. No new exhaustive artifact scan; historical retained-data findings remain unqualified for removal.",
+    "date": "2026-09-17",
+    "scope": "Fresh post-split source inventories plus a complete read-only scan of the declared trading and research retained roots for the paper-canary family retirement.",
     "repositories": {
       "pmkt-core": {
-        "source_commit": "709ad73c0f7ecb29049473ef62aff1a923671c2d",
-        "worktree_state": "implementation in progress",
+        "source_commit": "bcf73d8606612ade2d256340bb72d66520813749",
+        "worktree_state": "schema retirement in progress; report records the working tree",
         "text_roots": [
           "docs",
           "scripts",
@@ -15,7 +15,7 @@
         ]
       },
       "pmkt-trading": {
-        "source_commit": "f633c40c645d1495f6c0ebbf70754602b53aa680",
+        "source_commit": "c8e3b7912be45101d5c1b286304c4c1c1232de72",
         "worktree_state": "clean",
         "text_roots": [
           "docs",
@@ -38,10 +38,10 @@
   },
   "generic_consumers": [
     {
-      "path": "src/pmkt_trading/dashboard/data/artifacts.py:_validate_manifest_candidate",
+      "path": "src/pmkt_trading/data/artifact_discovery.py:_validate_manifest_candidate",
       "kind": "runtime_schema_reader",
       "mechanism": "Resolves schema versions supplied by discovered manifests through get_table_spec(schema_version).",
-      "scope": "Any registered schema version referenced by a dashboard-discovered manifest.",
+      "scope": "Any registered schema version referenced by a discovered manifest.",
       "removal_effect": "A zero literal-reference count cannot establish zero production readers; each removal packet must review manifest compatibility and generic consumers.",
       "repository": "pmkt-trading"
     }
@@ -118,20 +118,14 @@
       "id": "execution_deferred",
       "owner": "pmkt-core",
       "status": "active_experiment",
-      "summary": "Execution, paper, canary, and soak contracts are deliberately frozen in this phase rather than assessed for removal.",
+      "summary": "The remaining execution, paper, and soak contracts stay deliberately frozen after the separately documented six-schema paper-canary family retirement.",
       "schemas": [
-        "basket_order_intent.v1",
-        "basket_paper_fill.v1",
-        "basket_paper_position.v1",
-        "canary_candidate.v1",
-        "canary_rejection.v1",
         "execution_sizing_plan.v1",
         "maker_quote_plan.v1",
         "order_intent.v1",
         "order_state.v1",
         "paper_fill.v1",
         "paper_position.v1",
-        "scan_cycle.v1",
         "soak_run_plan.v1",
         "soak_run_report.v1"
       ],
@@ -173,6 +167,21 @@
       ],
       "contract_owner": "pmkt-core",
       "consumer_policy_owner": "per-schema repository_ownership"
+    },
+    {
+      "id": "stream_recording",
+      "owner": "pmkt-core",
+      "status": "active_core",
+      "summary": "Changed topbooks, selected full snapshots, public trades and recording events in SQLite and Parquet.",
+      "schemas": [
+        "recording_topbook.v1",
+        "recording_book_snapshots.v1",
+        "recording_book_levels.v1",
+        "recording_trades.v1",
+        "recording_events.v1"
+      ],
+      "contract_owner": "pmkt-core",
+      "consumer_policy_owner": "pmkt-core"
     }
   ],
   "evidence_overrides": {
@@ -305,21 +314,6 @@
       "classification": "cross_repository_contract",
       "consumer_policy_owner": "pmkt-trading"
     },
-    "basket_order_intent.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
-    },
-    "basket_paper_fill.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
-    },
-    "basket_paper_position.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
-    },
     "book_tape_control.v1": {
       "contract_owner": "pmkt-core",
       "classification": "core_owned",
@@ -344,16 +338,6 @@
       "contract_owner": "pmkt-core",
       "classification": "core_owned",
       "consumer_policy_owner": null
-    },
-    "canary_candidate.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
-    },
-    "canary_rejection.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
     },
     "capture_instrument_evidence.v1": {
       "contract_owner": "pmkt-core",
@@ -535,11 +519,6 @@
       "classification": "core_owned",
       "consumer_policy_owner": null
     },
-    "scan_cycle.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "cross_repository_contract",
-      "consumer_policy_owner": "pmkt-trading"
-    },
     "signal.v1": {
       "contract_owner": "pmkt-core",
       "classification": "cross_repository_contract",
@@ -594,6 +573,31 @@
       "contract_owner": "pmkt-core",
       "classification": "core_owned",
       "consumer_policy_owner": null
+    },
+    "recording_topbook.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_book_snapshots.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_book_levels.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_trades.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
+    },
+    "recording_events.v1": {
+      "contract_owner": "pmkt-core",
+      "classification": "core_owned",
+      "consumer_policy_owner": "pmkt-core"
     }
   },
   "source_inventory_summary": {
@@ -636,21 +640,12 @@
     "trading": {
       "schemas_with_source_literals": [
         "backtest_report.v1",
-        "basket_order_intent.v1",
-        "basket_paper_fill.v1",
-        "basket_paper_position.v1",
-        "book_tape_control.v1",
-        "book_tape_event.v1",
-        "book_tape_event.v2",
-        "canary_candidate.v1",
-        "canary_rejection.v1",
         "co_resolution_score.v1",
         "contract_evidence.v1",
         "convergence_observation.v1",
         "convergence_summary.v1",
         "depth.v1",
         "execution_sizing_plan.v1",
-        "feed_health.v1",
         "maker_quote_plan.v1",
         "market_match.v2",
         "match_relation.v1",
@@ -659,25 +654,17 @@
         "paper_fill.v1",
         "paper_position.v1",
         "passive_fill.v1",
-        "scan_cycle.v1",
         "signal.v1",
         "soak_run_plan.v1",
-        "stream_lifecycle.v1",
         "topbook.v1",
         "topbook_capture_gap.v1",
         "tracking_health.v1",
-        "tracking_match.v1",
-        "trade.v1"
+        "tracking_match.v1"
       ],
       "artifact_attribution_complete": false
     },
     "research": {
-      "schemas_with_source_literals": [
-        "depth.v1",
-        "depth.v2",
-        "topbook.v1",
-        "topbook.v2"
-      ],
+      "schemas_with_source_literals": [],
       "artifact_attribution_complete": false
     }
   },
@@ -689,8 +676,8 @@
   "reviewed_consumer_interfaces": [
     {
       "repository": "pmkt-trading",
-      "path": "src/pmkt_trading/dashboard/data/artifacts.py:_validate_manifest_candidate",
-      "behavior": "Calls get_table_spec with the manifest-supplied version before shallow or deep artifact validation. Preserve registered schema lookup compatibility."
+      "path": "src/pmkt_trading/data/artifact_discovery.py:_validate_manifest_candidate",
+      "behavior": "Calls get_table_spec with the manifest-supplied version before shallow or deep artifact validation. Unknown retired versions produce validation warnings instead of crashing discovery."
     },
     {
       "repository": "pmkt-trading",

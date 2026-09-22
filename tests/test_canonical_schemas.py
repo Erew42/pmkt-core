@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 import pmkt.data as data_module
 import pmkt.data.canonical as canonical_module
 import pmkt.data.registry as registry_module
@@ -8,16 +10,6 @@ import pmkt.data.validation as validation_module
 from pmkt.data.canonical import (
     ARBITRAGE_CANDIDATE_COLUMNS,
     ARBITRAGE_CANDIDATE_SCHEMA_VERSION,
-    BASKET_ORDER_INTENT_COLUMNS,
-    BASKET_ORDER_INTENT_SCHEMA_VERSION,
-    BASKET_PAPER_FILL_COLUMNS,
-    BASKET_PAPER_FILL_SCHEMA_VERSION,
-    BASKET_PAPER_POSITION_COLUMNS,
-    BASKET_PAPER_POSITION_SCHEMA_VERSION,
-    CANARY_CANDIDATE_COLUMNS,
-    CANARY_CANDIDATE_SCHEMA_VERSION,
-    CANARY_REJECTION_COLUMNS,
-    CANARY_REJECTION_SCHEMA_VERSION,
     EVENT_COLUMNS,
     EVENT_SCHEMA_VERSION,
     EXECUTION_SIZING_PLAN_COLUMNS,
@@ -47,8 +39,6 @@ from pmkt.data.canonical import (
     RUN_MANIFEST_COLUMNS,
     RUN_MANIFEST_SCHEMA_VERSION,
     SCHEMA_SPECS,
-    SCAN_CYCLE_COLUMNS,
-    SCAN_CYCLE_SCHEMA_VERSION,
     SIGNAL_COLUMNS,
     SIGNAL_SCHEMA_VERSION,
     TRACKING_MATCH_COLUMNS,
@@ -58,11 +48,6 @@ from pmkt.data.canonical import (
     TRADE_COLUMNS,
     TRADE_SCHEMA_VERSION,
     arbitrage_candidate_row,
-    basket_order_intent_row,
-    basket_paper_fill_row,
-    basket_paper_position_row,
-    canary_candidate_row,
-    canary_rejection_row,
     event_row,
     execution_sizing_plan_row,
     feed_health_row,
@@ -77,7 +62,6 @@ from pmkt.data.canonical import (
     paper_position_row,
     polymarket_market_snapshot_row,
     run_manifest_row,
-    scan_cycle_row,
     signal_row,
     tracking_match_row,
     tracking_health_row,
@@ -123,6 +107,39 @@ def test_canonical_schema_specs_are_complete() -> None:
     assert {spec.version for spec in SCHEMA_SPECS.values()} == {
         spec.version for spec in registry_specs.values()
     }
+
+
+def test_retired_paper_canary_contract_family_is_absent() -> None:
+    retired_versions = (
+        "basket_order_intent.v1",
+        "basket_paper_fill.v1",
+        "basket_paper_position.v1",
+        "canary_candidate.v1",
+        "canary_rejection.v1",
+        "scan_cycle.v1",
+    )
+    retired_exports = (
+        "BASKET_ORDER_INTENT_SCHEMA_VERSION",
+        "BASKET_PAPER_FILL_SCHEMA_VERSION",
+        "BASKET_PAPER_POSITION_SCHEMA_VERSION",
+        "CANARY_CANDIDATE_SCHEMA_VERSION",
+        "CANARY_REJECTION_SCHEMA_VERSION",
+        "SCAN_CYCLE_SCHEMA_VERSION",
+        "basket_order_intent_row",
+        "basket_paper_fill_row",
+        "basket_paper_position_row",
+        "canary_candidate_row",
+        "canary_rejection_row",
+        "scan_cycle_row",
+    )
+
+    for version in retired_versions:
+        with pytest.raises(KeyError):
+            registry_module.get_table_spec(version)
+    for name in retired_exports:
+        assert not hasattr(registry_module, name)
+        assert not hasattr(canonical_module, name)
+        assert not hasattr(data_module, name)
 
 
 def test_event_row_drops_unknown_fields_and_preserves_order() -> None:
@@ -277,70 +294,6 @@ def test_research_artifact_rows_have_stable_versions() -> None:
         match_id="match-1",
     )
     manifest = run_manifest_row(run_id="run-1")
-    scan_cycle = scan_cycle_row(run_id="run-1", cycle_id="cycle-1", cycle_index=1)
-    canary_candidate = canary_candidate_row(
-        candidate_id="candidate-1",
-        run_id="run-1",
-        cycle_id="cycle-1",
-        strategy_version="strategy",
-        detector_name="detector",
-        observed_at_utc="2026-06-02T00:00:00+00:00",
-        formula_type="exhaustive_buy_all_yes",
-        decision="reject",
-        execution_allowed=False,
-    )
-    canary_rejection = canary_rejection_row(
-        rejection_id="rejection-1",
-        run_id="run-1",
-        cycle_id="cycle-1",
-        strategy_version="strategy",
-        detector_name="detector",
-        decision_reason="blocked",
-    )
-    basket_intent = basket_order_intent_row(
-        basket_order_intent_id="basket-intent-1",
-        candidate_id="candidate-1",
-        run_id="run-1",
-        cycle_id="cycle-1",
-        venue="polymarket",
-        instrument_id="token-1",
-        action="buy",
-        book_side="ask",
-        limit_price=0.4,
-        size_contracts=5.0,
-        client_order_id="client-1",
-        risk_check_status="passed",
-        created_at_utc="2026-06-02T00:00:00+00:00",
-        mode="paper",
-    )
-    basket_fill = basket_paper_fill_row(
-        basket_paper_fill_id="basket-fill-1",
-        basket_order_intent_id="basket-intent-1",
-        candidate_id="candidate-1",
-        client_order_id="client-1",
-        venue="polymarket",
-        instrument_id="token-1",
-        action="buy",
-        book_side="ask",
-        fill_price_dollars=0.4,
-        size_contracts=5.0,
-        notional_dollars=2.0,
-        fees_dollars=0.0,
-        filled_at_utc="2026-06-02T00:00:00+00:00",
-        simulator_version="sim",
-        fill_type="full",
-    )
-    basket_position = basket_paper_position_row(
-        basket_paper_position_id="basket-position-1",
-        candidate_id="candidate-1",
-        run_id="run-1",
-        cycle_id="cycle-1",
-        opened_at_utc="2026-06-02T00:00:00+00:00",
-        as_of_utc="2026-06-02T00:00:00+00:00",
-        status="open",
-        filled_size_contracts=5.0,
-        net_pnl_dollars=0.1,
-    )
 
     assert list(trade) == TRADE_COLUMNS
     assert list(match) == MATCH_COLUMNS
@@ -356,12 +309,6 @@ def test_research_artifact_rows_have_stable_versions() -> None:
     assert list(position) == PAPER_POSITION_COLUMNS
     assert list(candidate) == ARBITRAGE_CANDIDATE_COLUMNS
     assert list(manifest) == RUN_MANIFEST_COLUMNS
-    assert list(scan_cycle) == SCAN_CYCLE_COLUMNS
-    assert list(canary_candidate) == CANARY_CANDIDATE_COLUMNS
-    assert list(canary_rejection) == CANARY_REJECTION_COLUMNS
-    assert list(basket_intent) == BASKET_ORDER_INTENT_COLUMNS
-    assert list(basket_fill) == BASKET_PAPER_FILL_COLUMNS
-    assert list(basket_position) == BASKET_PAPER_POSITION_COLUMNS
     assert trade["schema_version"] == TRADE_SCHEMA_VERSION
     assert match["schema_version"] == MATCH_SCHEMA_VERSION
     assert tracking_match["schema_version"] == TRACKING_MATCH_SCHEMA_VERSION
@@ -376,12 +323,6 @@ def test_research_artifact_rows_have_stable_versions() -> None:
     assert position["schema_version"] == PAPER_POSITION_SCHEMA_VERSION
     assert candidate["schema_version"] == ARBITRAGE_CANDIDATE_SCHEMA_VERSION
     assert manifest["schema_version"] == RUN_MANIFEST_SCHEMA_VERSION
-    assert scan_cycle["schema_version"] == SCAN_CYCLE_SCHEMA_VERSION
-    assert canary_candidate["schema_version"] == CANARY_CANDIDATE_SCHEMA_VERSION
-    assert canary_rejection["schema_version"] == CANARY_REJECTION_SCHEMA_VERSION
-    assert basket_intent["schema_version"] == BASKET_ORDER_INTENT_SCHEMA_VERSION
-    assert basket_fill["schema_version"] == BASKET_PAPER_FILL_SCHEMA_VERSION
-    assert basket_position["schema_version"] == BASKET_PAPER_POSITION_SCHEMA_VERSION
     assert match["polymarket_instrument_key"] == "token-1"
     assert match["kalshi_instrument_key"] == "KXTEST:YES"
     assert match["review_status"] == "candidate"

@@ -13,8 +13,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import pmkt.streaming.durability as durability_module
-import pmkt.streaming.recovery as recovery_module
+import pmkt.streaming.legacy.durability as durability_module
+import pmkt.streaming.legacy.recovery as recovery_module
 
 from pmkt.data.manifests import (
     _durability_latency_metric_errors,
@@ -30,8 +30,8 @@ from pmkt.data.schemas import topbook_row
 from pmkt.data.validation import validate_book_tape_bundle
 from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.exchanges.polymarket.ws import MarketBookState
-from pmkt.streaming.capture import TapeBatchIntent
-from pmkt.streaming.durability import (
+from pmkt.streaming.legacy.tape import TapeBatchIntent
+from pmkt.streaming.legacy.durability import (
     COMMIT_JOURNAL_NAME,
     COMMIT_JOURNAL_V1_NAME,
     COMMIT_JOURNAL_V2_NAME,
@@ -39,13 +39,13 @@ from pmkt.streaming.durability import (
     DurableCaptureCoordinator,
     file_sha256,
 )
-from pmkt.streaming.durability_settings import CaptureDurabilitySettings
-from pmkt.streaming.recovery import (
+from pmkt.streaming.legacy.durability_settings import CaptureDurabilitySettings
+from pmkt.streaming.legacy.recovery import (
     recover_stream_run,
     resolve_commit_journal_path,
     validate_commit_journal,
 )
-from pmkt.streaming.recovery_contracts import (
+from pmkt.streaming.legacy.recovery_contracts import (
     CAPTURE_COMMIT_JOURNAL_V1_FORMAT,
     CAPTURE_COMMIT_JOURNAL_V2_FORMAT,
     COALESCIBLE_COMMIT_CAUSES,
@@ -56,8 +56,8 @@ from pmkt.streaming.recovery_contracts import (
     CaptureCommitRecordV2,
     RunStateV1,
 )
-from pmkt.streaming.profiles import select_storage_profile
-from pmkt.streaming.tape import (
+from pmkt.streaming.legacy.profiles import select_storage_profile
+from pmkt.streaming.legacy.tape import (
     CaptureCoordinate,
     NativeBookLevel,
     build_tape_batch,
@@ -69,12 +69,12 @@ from pmkt.streaming.tape import (
     recompute_tape_event_id,
     recompute_tape_event_payload_hash,
 )
-from pmkt.streaming.tape_producers import (
+from pmkt.streaming.legacy.tape_producers import (
     CompactValidityProducer,
     KalshiTapeProducer,
     PolymarketTapeProducer,
 )
-from pmkt.streaming.venue_tape import (
+from pmkt.streaming.legacy.venue_tape import (
     kalshi_book_levels,
     kalshi_delta_levels,
     polymarket_book_levels,
@@ -1562,8 +1562,8 @@ def test_real_child_process_crash_respects_journal_boundary(
         import os
         import sys
         import pyarrow as pa
-        from pmkt.streaming.durability import DurableCaptureCoordinator
-        from pmkt.streaming.recovery_contracts import RunStateV1, CaptureCommitCause
+        from pmkt.streaming.legacy.durability import DurableCaptureCoordinator
+        from pmkt.streaming.legacy.recovery_contracts import RunStateV1, CaptureCommitCause
 
         run_dir, crash_point = sys.argv[1:]
         state = RunStateV1(

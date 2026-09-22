@@ -33,37 +33,6 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "pmkt.data.registry",
         "ARBITRAGE_CANDIDATE_SCHEMA_VERSION",
     ),
-    "BASKET_ORDER_INTENT_COLUMNS": (
-        "pmkt.data.registry",
-        "BASKET_ORDER_INTENT_COLUMNS",
-    ),
-    "BASKET_ORDER_INTENT_SCHEMA_VERSION": (
-        "pmkt.data.registry",
-        "BASKET_ORDER_INTENT_SCHEMA_VERSION",
-    ),
-    "BASKET_PAPER_FILL_COLUMNS": ("pmkt.data.registry", "BASKET_PAPER_FILL_COLUMNS"),
-    "BASKET_PAPER_FILL_SCHEMA_VERSION": (
-        "pmkt.data.registry",
-        "BASKET_PAPER_FILL_SCHEMA_VERSION",
-    ),
-    "BASKET_PAPER_POSITION_COLUMNS": (
-        "pmkt.data.registry",
-        "BASKET_PAPER_POSITION_COLUMNS",
-    ),
-    "BASKET_PAPER_POSITION_SCHEMA_VERSION": (
-        "pmkt.data.registry",
-        "BASKET_PAPER_POSITION_SCHEMA_VERSION",
-    ),
-    "CANARY_CANDIDATE_COLUMNS": ("pmkt.data.registry", "CANARY_CANDIDATE_COLUMNS"),
-    "CANARY_CANDIDATE_SCHEMA_VERSION": (
-        "pmkt.data.registry",
-        "CANARY_CANDIDATE_SCHEMA_VERSION",
-    ),
-    "CANARY_REJECTION_COLUMNS": ("pmkt.data.registry", "CANARY_REJECTION_COLUMNS"),
-    "CANARY_REJECTION_SCHEMA_VERSION": (
-        "pmkt.data.registry",
-        "CANARY_REJECTION_SCHEMA_VERSION",
-    ),
     "CsvSink": ("pmkt.data.io", "CsvSink"),
     "DEFAULT_BOOK_BATCH_SIZE": ("pmkt.data.market_data", "DEFAULT_BOOK_BATCH_SIZE"),
     "DEFAULT_EVENT_SLUG": ("pmkt.data.market_data", "DEFAULT_EVENT_SLUG"),
@@ -188,8 +157,6 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
         "RUN_MANIFEST_SCHEMA_VERSION",
     ),
     "SCHEMA_SPECS": ("pmkt.data.canonical", "SCHEMA_SPECS"),
-    "SCAN_CYCLE_COLUMNS": ("pmkt.data.registry", "SCAN_CYCLE_COLUMNS"),
-    "SCAN_CYCLE_SCHEMA_VERSION": ("pmkt.data.registry", "SCAN_CYCLE_SCHEMA_VERSION"),
     "SIGNAL_COLUMNS": ("pmkt.data.registry", "SIGNAL_COLUMNS"),
     "SIGNAL_SCHEMA_VERSION": ("pmkt.data.registry", "SIGNAL_SCHEMA_VERSION"),
     "Sink": ("pmkt.data.io", "Sink"),
@@ -206,12 +173,7 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "TRADE_SCHEMA_VERSION": ("pmkt.data.registry", "TRADE_SCHEMA_VERSION"),
     "arbitrage_candidate_row": ("pmkt.data.canonical", "arbitrage_candidate_row"),
     "arrow_schema": ("pmkt.data.registry", "arrow_schema"),
-    "basket_order_intent_row": ("pmkt.data.canonical", "basket_order_intent_row"),
-    "basket_paper_fill_row": ("pmkt.data.canonical", "basket_paper_fill_row"),
-    "basket_paper_position_row": ("pmkt.data.canonical", "basket_paper_position_row"),
     "batched": ("pmkt.data.market_data", "batched"),
-    "canary_candidate_row": ("pmkt.data.canonical", "canary_candidate_row"),
-    "canary_rejection_row": ("pmkt.data.canonical", "canary_rejection_row"),
     "collect_order_book_summaries_parquet": (
         "pmkt.data.market_data",
         "collect_order_book_summaries_parquet",
@@ -290,7 +252,6 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "quality_flag_counts": ("pmkt.data.validation", "quality_flag_counts"),
     "paper_position_row": ("pmkt.data.canonical", "paper_position_row"),
     "run_manifest_row": ("pmkt.data.canonical", "run_manifest_row"),
-    "scan_cycle_row": ("pmkt.data.canonical", "scan_cycle_row"),
     "signal_row": ("pmkt.data.canonical", "signal_row"),
     "stable_evidence_projection_hash": (
         "pmkt.data.contract_evidence",

@@ -5,6 +5,10 @@ from pathlib import Path
 import sys
 
 import httpx
+import pytest
+
+from pmkt._http import HttpClient
+from pmkt.runtime import RequestPolicy
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,21 +21,22 @@ import sync_upstream_docs  # noqa: E402
 import update_openapi_examples  # noqa: E402
 
 
-def test_contract_check_selects_later_token_with_orderbook_offline() -> None:
+@pytest.mark.asyncio
+async def test_contract_check_selects_later_token_with_orderbook_offline() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/book"
         if request.url.params.get("token_id") == "token-without-book":
             return httpx.Response(404, json={"error": "not found"})
         return httpx.Response(200, json={"bids": [], "asks": []})
 
-    with httpx.Client(
+    async with HttpClient(
         base_url="https://clob.test",
+        request_policy=RequestPolicy(max_attempts=1),
         transport=httpx.MockTransport(handler),
     ) as client:
-        token, result = contract_check.select_token_with_orderbook(
+        token, result = await contract_check.select_token_with_orderbook(
             client,
             ["token-without-book", "token-with-book"],
-            max_retries=0,
         )
 
     assert token == "token-with-book"
@@ -39,7 +44,8 @@ def test_contract_check_selects_later_token_with_orderbook_offline() -> None:
     assert result.ok
 
 
-def test_update_openapi_examples_finds_later_clob_token_offline() -> None:
+@pytest.mark.asyncio
+async def test_update_openapi_examples_finds_later_clob_token_offline() -> None:
     def gamma_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/markets"
         return httpx.Response(
@@ -58,17 +64,21 @@ def test_update_openapi_examples_finds_later_clob_token_offline() -> None:
             return httpx.Response(404, json={"error": "not found"})
         return httpx.Response(200, json={"bids": [], "asks": []})
 
-    with httpx.Client(
-        base_url="https://gamma.test",
-        transport=httpx.MockTransport(gamma_handler),
-    ) as gamma_client, httpx.Client(
-        base_url="https://clob.test",
-        transport=httpx.MockTransport(clob_handler),
-    ) as clob_client:
-        token = update_openapi_examples.find_clob_token(
+    async with (
+        HttpClient(
+            base_url="https://gamma.test",
+            request_policy=RequestPolicy(max_attempts=1),
+            transport=httpx.MockTransport(gamma_handler),
+        ) as gamma_client,
+        HttpClient(
+            base_url="https://clob.test",
+            request_policy=RequestPolicy(max_attempts=1),
+            transport=httpx.MockTransport(clob_handler),
+        ) as clob_client,
+    ):
+        token = await update_openapi_examples.find_clob_token(
             gamma_client,
             clob_client,
-            max_retries=0,
         )
 
     assert token == "token-with-book"

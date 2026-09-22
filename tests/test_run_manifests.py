@@ -29,7 +29,7 @@ def test_run_manifest_records_core_and_caller_provenance(tmp_path) -> None:
     )
 
     assert manifest["caller_git_commit"] == "caller-commit"
-    assert manifest["pmkt_core_version"] == "0.1.1"
+    assert manifest["pmkt_core_version"] == "0.2.0"
     assert manifest["pmkt_core_commit"]
 
 

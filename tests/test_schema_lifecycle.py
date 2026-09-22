@@ -48,7 +48,7 @@ def test_lifecycle_catalog_covers_registry_exactly_once() -> None:
     entries = validate_lifecycle_catalog(catalog, registered)
 
     assert set(entries) == set(registered)
-    assert len(entries) == len(registered) == 60
+    assert len(entries) == len(registered) == 59
     assert entries["market_match.v2"]["status"] == "active_core"
     assert entries["market_match.v1"]["status"] == "compatibility_legacy"
     assert entries["instrument.v1"]["status"] == "provisional_unintegrated"

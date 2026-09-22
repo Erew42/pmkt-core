@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pmkt"
-version = "0.1.1"
+version = "0.2.0"
 description = "Read-only prediction-market data infrastructure for Polymarket and Kalshi"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -27,6 +27,7 @@ dependencies = [
   "aiolimiter>=1.1.0",
   "typer>=0.9.0",
   "pydantic-settings>=2.0",
+  "tzdata>=2026.3",
 ]
 
 
@@ -37,12 +38,12 @@ pmkt = "pmkt.cli.entrypoint:main"
 data = [
   "pandas>=2.1,<3",
   "pyarrow>=14",
-  "duckdb>=1.0",
+  "duckdb>=1.5.5",
 ]
 storage = [
   "pandas>=2.1,<3",
   "pyarrow>=14",
-  "duckdb>=1.0",
+  "duckdb>=1.5.5",
 ]
 streaming = [
   "pandas>=2.1,<3",
@@ -53,7 +54,7 @@ test = [
   "pandas>=2.1,<3",
   "numpy>=1.26,<2.5",
   "pyarrow>=14",
-  "duckdb>=1.0",
+  "duckdb>=1.5.5",
   "websockets>=12.0",
   "build>=1.2",
   "setuptools>=68",

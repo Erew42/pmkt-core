@@ -13,6 +13,18 @@
         }
       }
     },
+    "/markets/keyset": {
+      "get": {
+        "params": {
+          "limit": {"required": false},
+          "after_cursor": {"required": false},
+          "closed": {"required": false},
+          "tag_id": {"required": false},
+          "related_tags": {"required": false},
+          "condition_ids": {"required": false}
+        }
+      }
+    },
     "/events": {
       "get": {
         "params": {

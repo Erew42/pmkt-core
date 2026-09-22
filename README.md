@@ -2,8 +2,8 @@
 
 `pmkt` is the public, read-only data plane for prediction-market research. It
 provides venue clients, canonical schemas, local storage, streaming capture,
-historical book reconstruction, market-structure discovery, and resolution
-utilities for Polymarket and Kalshi.
+historical book reconstruction, and resolution utilities for Polymarket and
+Kalshi.
 
 This repository deliberately contains no order signing or submission,
 credential derivation, matching policy, opportunity selection, OMS/risk logic,
@@ -28,7 +28,6 @@ DuckDB, and WebSocket support.
 pmkt --help
 pmkt ingest-markets --out data/polymarket_markets.parquet
 pmkt ingest-kalshi-markets --out data/kalshi_markets.parquet
-pmkt discover-structures --markets data/polymarket_markets.parquet
 pmkt resolve-market-resolutions --help
 ```
 
@@ -109,3 +108,8 @@ The caller owns any relocation policy. Exact artifact paths must still be
 canonical and contained within the authoritative manifest directory; hashes,
 schemas, counts, and journal bindings are always validated after resolution.
 With no callback, existing path behavior is unchanged.
+
+## Python API 0.2
+
+See [the 0.2 migration guide](docs/migration_0_2.md) for deterministic configuration,
+typed workflow inputs, shared request deadlines, and consolidated result provenance.

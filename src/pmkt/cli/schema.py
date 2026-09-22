@@ -10,7 +10,7 @@ import typer
 from pmkt.data.manifests import validate_run_manifest
 from pmkt.data.registry import TableSpec, get_table_spec, infer_table_spec, list_table_specs
 from pmkt.data.validation import infer_and_validate_frame, quality_flag_counts, validate_frame
-from pmkt.streaming.capture_archive import archive_capture
+from pmkt.streaming.legacy.capture_archive import archive_capture
 
 schema_app = typer.Typer(help="Inspect canonical schema registry.")
 dataset_app = typer.Typer(help="Validate and summarize local datasets.")

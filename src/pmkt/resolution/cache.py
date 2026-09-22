@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pmkt.records import PolymarketMarketRef, KalshiMarketRef
+
 import asyncio
 import json
 from collections import Counter
@@ -18,6 +20,7 @@ from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.resolution.evm import PolygonCtfClient
 from pmkt.resolution.kalshi import KalshiResolutionResolver
 from pmkt.resolution.models import (
+    COMPATIBLE_RESOLVER_VERSIONS,
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
     CONFIDENCE_METADATA_ONLY,
@@ -259,7 +262,7 @@ def _existing_current_rows(
         return {}
     if "resolver_version" not in existing.columns:
         return {}
-    current_version = existing["resolver_version"] == RESOLVER_VERSION
+    current_version = existing["resolver_version"].isin(COMPATIBLE_RESOLVER_VERSIONS)
     canonical_final = (existing["resolution_state"] == STATE_FINAL) & (
         existing["confidence"] == CONFIDENCE_CANONICAL
     )
@@ -565,7 +568,7 @@ async def resolve_market_resolution_cache(
             if platform == "polymarket":
                 key = str(row["market_id"])
                 try:
-                    record = await polymarket_resolver.resolve(key, snapshot=row)
+                    record = await polymarket_resolver.resolve(PolymarketMarketRef(key), snapshot=row)
                 except Exception as exc:
                     record = error_record(
                         platform="polymarket",
@@ -576,7 +579,7 @@ async def resolve_market_resolution_cache(
                 return record.to_row()
             key = str(row["market_key"])
             try:
-                record = await kalshi_resolver.resolve(key, snapshot=row)
+                record = await kalshi_resolver.resolve(KalshiMarketRef(key), snapshot=row)
             except Exception as exc:
                 record = error_record(
                     platform="kalshi",

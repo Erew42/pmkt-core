@@ -9,22 +9,39 @@ the public repository by accident.
 
 The following paths are owned by `pmkt-core`:
 
-- `src/pmkt/{__init__,_http,config,models,pagination,tokens}.py` and
+- `src/pmkt/{__init__,_http,_observations,_operation,catalog,config,errors,models,pagination,records,tokens}.py` and
   `src/pmkt/py.typed`.
 - `src/pmkt/data/**`, except semantic sports-corpus and matching-policy code.
 - `src/pmkt/exchanges/**`, except credential/private-key loaders, generic signed
   transports, authenticated user streams, and SDK execution clients.
 - `src/pmkt/streaming/**`, including the neutral feed supervisor and injected
   feed-state sink protocols.
-- `src/pmkt/market_structure/**`, `src/pmkt/resolution/**`, and generic
+- `src/pmkt/resolution/**` and generic
   `src/pmkt/text/**` utilities and taxonomy data.
 - The core CLI modules and commands documented in `CLI_COMMANDS.md`.
 - `openapi/**`, `docs/api/**`, `docs/data_dictionary.md`,
-  `docs/schema_lifecycle.{md,json}`, and
+  `docs/public_api.md`, `docs/schema_lifecycle.{md,json}`, and
   `docs/storage_profile_capture_runbook.md`.
 - Read-only capture/contract/example scripts retained under `scripts/` and the
   tests for the public modules.
 - The two normalized Kalshi order-book fixtures under `tests/fixtures/`.
+- `tests/test_public_api_inventory.py` and
+  `tests/fixtures/public_api_inventory.json`, which classify the current public
+  facade without reserving future workflow modules.
+- `tests/test_catalog.py` and `scripts/create_synthetic_catalog_fixture.py`,
+  which verify the pinned read-only catalog contract and provide its offline
+  synthetic fixture recipe.
+- The supported Polymarket discovery, typed-book, and sampled CLOB history
+  workflows, their private decoders, OpenAPI contracts, offline examples, and
+  focused records/Gamma/CLOB/package tests.
+- The supported Kalshi standard-market discovery, source-scoped detail,
+  projected current-book, and explicit-window candle workflows, their private
+  decoders and routing planner, offline examples, and focused
+  records/Kalshi/package tests.
+- The supported typed single-market and ordered bounded-batch resolution
+  workflows, explicit borrowed Polygon CTF evidence client, v2/v3 cache and
+  label compatibility, sanitized evidence errors, offline examples, and
+  focused resolution/package tests.
 
 ## Private trading
 

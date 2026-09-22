@@ -160,11 +160,6 @@ sections below or in the registry descriptions.
 | --- | --- | --- |
 | `arbitrage_candidate.v1` | `arbitrage_candidate` | Manual-review apparent-edge candidate. |
 | `backtest_report.v1` | `backtest_report` | Unified return-centric backtest report for taker and maker replay paths. |
-| `basket_order_intent.v1` | `basket_order_intent` | Paper-only basket leg order intent. |
-| `basket_paper_fill.v1` | `basket_paper_fill` | Paper-only basket leg fill event. |
-| `basket_paper_position.v1` | `basket_paper_position` | Paper-only basket position and reconciliation summary. |
-| `canary_candidate.v1` | `canary_candidate` | Basket-aware pre-trade canary candidate with formula proof and gates. |
-| `canary_rejection.v1` | `canary_rejection` | Rejected or observe-only canary formula with explicit reason. |
 | `co_resolution_observation.v1` | `co_resolution_observation` | Offline co-resolution observations built from match candidates and authoritative resolution-cache labels. |
 | `co_resolution_score.v1` | `co_resolution_score` | Research-only Bayesian co-resolution score sidecar for match candidates. |
 | `convergence_observation.v1` | `convergence_observation` | Decision-time opportunity markout and convergence/divergence observation. |
@@ -202,7 +197,6 @@ sections below or in the registry descriptions.
 | `polymarket_market_snapshot.v1` | `polymarket_market_snapshot` | Legacy Polymarket Gamma market snapshot export used by matchers and stream selectors. |
 | `polymarket_market_snapshot.v2` | `polymarket_market_snapshot_v2` | Trimmed Polymarket Gamma market snapshot export without legacy resolution metadata. |
 | `run_manifest.v1` | `run_manifest` | Auditable run metadata. |
-| `scan_cycle.v1` | `scan_cycle` | One live/paper canary scan cycle summary. |
 | `signal.v1` | `signal` | Price-aware cross-venue signal state before order intent. |
 | `soak_run_plan.v1` | `soak_run_plan` | Read-only long-duration soak evidence plan; does not start runtime processes. |
 | `soak_run_report.v1` | `soak_run_report` | Summary of recorded no-order soak evidence from runtime store and artifacts. |
@@ -1625,3 +1619,141 @@ Near-term code can keep accepting legacy/ad hoc columns for compatibility. New
 persisted research datasets should prefer these schemas. Matching and arbitrage
 outputs should gradually add stable ids that link back to `market.v1`,
 `instrument.v1`, `topbook.v1`, and `market_match.v2` records.
+
+
+## Stream recording format
+
+`recording.v1` replaces the live storage-profile writer. These tables are new
+schemas; historical tape and topbook/depth versions retain their meanings.
+Prices are dollars per contract (0 through 1); quantities are contracts. All
+UTC times use ISO-8601 with a timezone. `observed_at_utc` is emission/sample time,
+`received_at_utc` is recorder receipt time and `venue_time_utc` is nullable source
+time. `received_monotonic_ns` is a process-local observation coordinate, not a
+portable exchange clock. JSON fields are UTF-8 strings. Record sequence is unique
+within a run; level rows reference the header's snapshot ID. Kalshi books use
+`TICKER:YES`: YES bids and YES asks with `use_yes_price=True`; the NO book can be
+derived by complementing and swapping sides. Polymarket uses native token IDs.
+See [recording behavior](stream_recording_contract.md).
+
+### `recording_topbook.v1`
+
+Primary key: `run_id`, `record_sequence`.
+
+| Column | Type | Nullable |
+|---|---|---|
+| `schema_version` | `string` | no |
+| `run_id` | `string` | no |
+| `record_sequence` | `int64` | no |
+| `venue` | `string` | no |
+| `instrument_id` | `string` | yes |
+| `venue_market_id` | `string` | yes |
+| `connection_generation` | `int64` | no |
+| `source_sequence` | `int64` | yes |
+| `received_at_utc` | `string` | yes |
+| `received_monotonic_ns` | `int64` | yes |
+| `venue_time_utc` | `string` | yes |
+| `observed_at_utc` | `string` | no |
+| `initialized` | `bool` | no |
+| `integrity_valid` | `bool` | no |
+| `quote_valid` | `bool` | no |
+| `tick_size` | `float64` | yes |
+| `minimum_order_size` | `float64` | yes |
+| `quality_flags_json` | `string` | no |
+| `bid_price` | `float64` | yes |
+| `bid_quantity` | `float64` | yes |
+| `ask_price` | `float64` | yes |
+| `ask_quantity` | `float64` | yes |
+
+### `recording_book_snapshots.v1`
+
+Primary key: `run_id`, `snapshot_id`.
+
+| Column | Type | Nullable |
+|---|---|---|
+| `schema_version` | `string` | no |
+| `run_id` | `string` | no |
+| `record_sequence` | `int64` | no |
+| `venue` | `string` | no |
+| `instrument_id` | `string` | yes |
+| `venue_market_id` | `string` | yes |
+| `connection_generation` | `int64` | no |
+| `source_sequence` | `int64` | yes |
+| `received_at_utc` | `string` | yes |
+| `received_monotonic_ns` | `int64` | yes |
+| `venue_time_utc` | `string` | yes |
+| `observed_at_utc` | `string` | no |
+| `initialized` | `bool` | no |
+| `integrity_valid` | `bool` | no |
+| `quote_valid` | `bool` | no |
+| `tick_size` | `float64` | yes |
+| `minimum_order_size` | `float64` | yes |
+| `quality_flags_json` | `string` | no |
+| `snapshot_id` | `int64` | no |
+| `causes_json` | `string` | no |
+| `bid_level_count` | `int64` | no |
+| `ask_level_count` | `int64` | no |
+
+### `recording_book_levels.v1`
+
+Primary key: `run_id`, `snapshot_id`, `side`, `price`.
+
+| Column | Type | Nullable |
+|---|---|---|
+| `schema_version` | `string` | no |
+| `run_id` | `string` | no |
+| `snapshot_id` | `int64` | no |
+| `side` | `string` | no |
+| `price` | `float64` | no |
+| `quantity` | `float64` | no |
+
+### `recording_trades.v1`
+
+Primary key: `run_id`, `record_sequence`.
+
+| Column | Type | Nullable |
+|---|---|---|
+| `schema_version` | `string` | no |
+| `run_id` | `string` | no |
+| `record_sequence` | `int64` | no |
+| `venue` | `string` | no |
+| `instrument_id` | `string` | yes |
+| `venue_market_id` | `string` | yes |
+| `connection_generation` | `int64` | no |
+| `source_sequence` | `int64` | yes |
+| `received_at_utc` | `string` | yes |
+| `received_monotonic_ns` | `int64` | yes |
+| `venue_time_utc` | `string` | yes |
+| `observed_at_utc` | `string` | no |
+| `venue_trade_id` | `string` | yes |
+| `price` | `float64` | no |
+| `quantity` | `float64` | yes |
+| `reported_side` | `string` | yes |
+
+### `recording_events.v1`
+
+Primary key: `run_id`, `record_sequence`.
+
+| Column | Type | Nullable |
+|---|---|---|
+| `schema_version` | `string` | no |
+| `run_id` | `string` | no |
+| `record_sequence` | `int64` | no |
+| `venue` | `string` | no |
+| `instrument_id` | `string` | yes |
+| `venue_market_id` | `string` | yes |
+| `connection_generation` | `int64` | no |
+| `source_sequence` | `int64` | yes |
+| `received_at_utc` | `string` | yes |
+| `received_monotonic_ns` | `int64` | yes |
+| `venue_time_utc` | `string` | yes |
+| `observed_at_utc` | `string` | no |
+| `kind` | `string` | no |
+| `details_json` | `string` | no |
+
+`book_levels` has a foreign key `(run_id, snapshot_id)` into `book_snapshots`.
+Header side counts must exactly match levels; empty books have headers and zero
+levels. `trades.venue_trade_id` is null for Polymarket observations and is Kalshi's
+native ID when present, unique within a run. A missing quantity or venue time is
+unknown. `reported_side` retains venue semantics. Raw payloads are optional JSONL
+only; these tables do not embed raw messages. `events.details_json` holds bounded
+lifecycle/connection facts and liveness summaries, not a copy of every message.

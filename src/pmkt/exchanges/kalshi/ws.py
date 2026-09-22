@@ -24,7 +24,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from pmkt.exchanges.book_integrity import finite_number, well_formed_levels, snapshot_ladder
-from pmkt.config import get_config
+from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
@@ -723,7 +723,7 @@ class AsyncKalshiWebSocketClient:
         on_subscription_start: Callable[[], None] | None = None,
         on_subscription_established: Callable[[str, str], None] | None = None,
     ) -> None:
-        self.ws_url = ws_url or get_config().resolved_kalshi_ws_url
+        self.ws_url = ws_url or PmktConfig().resolved_kalshi_ws_url
         self.market_tickers = (
             normalize_market_tickers(market_tickers) if market_tickers else []
         )
@@ -743,6 +743,7 @@ class AsyncKalshiWebSocketClient:
         self._ws: Any | None = None
         self._message_id = 1
         self._last_subscription_message_id: int | None = None
+        self.last_frame_received_at_utc: str | None = None
 
     @property
     def is_connected(self) -> bool:
@@ -925,6 +926,7 @@ class AsyncKalshiWebSocketClient:
                 return
             try:
                 async for raw in ws:
+                    self.last_frame_received_at_utc = isoformat_source_timestamp(time.time(), epoch_unit="seconds")
                     if on_raw_frame is not None:
                         callback_result = on_raw_frame(raw)
                         if inspect.isawaitable(callback_result):
