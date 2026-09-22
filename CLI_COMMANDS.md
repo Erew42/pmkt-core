@@ -11,7 +11,11 @@ installed version.
 - `dataset validate|validate-manifest|stats|archive-run`: validate and manage
   local read-only dataset artifacts.
 - `markets discover-new|refresh-current|promote-history|compact-history|status`:
-  maintain a local market catalog.
+  maintain a local market catalog. Without `history/LATEST.json`,
+  `discover-new` bootstraps from the current snapshot (`LATEST.json`): its
+  census as_of sets the first cutoff and its markets are the known keys, so a
+  market that closed before that census is reported as new. `promote-history`
+  and `compact-history` still require history.
 
 ## Data and query commands
 

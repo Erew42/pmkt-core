@@ -530,6 +530,161 @@ async def test_discovery_pointer_ignores_orphan_and_cache_rebuilds_when_stale(
     assert service.status()["known_key_cache"]["state"] == "current"
 
 
+CURRENT_AS_OF = NOW - timedelta(hours=1)
+
+
+def _current_only_catalog(tmp_path: Path) -> MarketCatalogService:
+    """A catalog with a current census and no history, as on a fresh host."""
+    service = MarketCatalogService(tmp_path / "data" / "markets")
+    release = service.releases_root / "current_only"
+    frames = {
+        "polymarket_open_markets": (
+            markets_dataframe(
+                [
+                    # Created inside the 24h bootstrap overlap, so discovery sees them.
+                    _pm("pm-known", created=NOW - timedelta(hours=2)),
+                    _pm("pm-stale", created=NOW - timedelta(hours=2)),
+                ]
+            ),
+            POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
+        ),
+        "kalshi_open_markets": (
+            kalshi_markets_dataframe(
+                [_kx("KXDUP", created=NOW - timedelta(days=3))]
+            ),
+            KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
+        ),
+        "kalshi_lifecycle_upserts": (
+            kalshi_markets_dataframe(
+                [
+                    _kx(
+                        "KXDUP",
+                        created=NOW - timedelta(days=3),
+                        updated=NOW - timedelta(hours=2),
+                        status="finalized",
+                    )
+                ]
+            ),
+            KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
+        ),
+    }
+    pointer: dict[str, Any] = {
+        "dataset_family": "markets",
+        "release_id": "current_only",
+        "updated_at_utc": CURRENT_AS_OF.isoformat(),
+    }
+    for name, (frame, schema) in frames.items():
+        path = release / f"{name.upper()}.parquet"
+        write_parquet(frame, path, schema=schema, strict=True)
+        pointer[name] = {
+            "path": str(path.resolve()),
+            "rows": len(frame),
+            "sha256": _sha(path),
+            "as_of_utc": CURRENT_AS_OF.isoformat(),
+        }
+    _write_json(service.current_pointer_path, pointer)
+    return service
+
+
+def test_current_snapshot_bootstraps_discovery_without_history(
+    tmp_path: Path,
+) -> None:
+    service = _current_only_catalog(tmp_path)
+
+    assert service.known_key_basis() == "current_snapshot"
+    assert service.bootstrap_cutoff("polymarket") == CURRENT_AS_OF - timedelta(hours=24)
+    assert service.bootstrap_cutoff("kalshi-conventional") == (
+        CURRENT_AS_OF - timedelta(hours=24)
+    )
+    with pytest.raises(CatalogError, match="kalshi_mve_current_markets"):
+        service.bootstrap_cutoff("kalshi-mve")
+    status = service.status()
+    assert status["known_key_basis"] == "current_snapshot"
+    assert status["history_integrity"] is None
+
+    with duckdb.connect(str(service.ensure_known_key_index()), read_only=True) as db:
+        rows = db.execute(
+            "SELECT venue, market_key, updated_at_utc, native_family "
+            "FROM known_keys ORDER BY venue, market_key"
+        ).fetchall()
+    assert [(row[0], row[1], row[3]) for row in rows] == [
+        ("kalshi", "KXDUP", "kalshi_conventional"),
+        ("polymarket", "pm-known", "polymarket"),
+        ("polymarket", "pm-stale", "polymarket"),
+    ]
+    # The key in both the census and a lifecycle upsert keeps the newer row.
+    assert rows[0][2] == NOW - timedelta(hours=2)
+
+
+def test_history_remains_the_basis_when_both_catalogs_exist(tmp_path: Path) -> None:
+    service = _catalog(tmp_path)
+    _seed_current(service, pm_rows=[_pm("pm-current")], kx_rows=[])
+
+    assert service.known_key_basis() == "history"
+    assert service.bootstrap_cutoff("polymarket") == datetime(
+        2026, 8, 21, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.asyncio
+async def test_discovery_without_history_classifies_against_current_snapshot(
+    tmp_path: Path,
+) -> None:
+    service = _current_only_catalog(tmp_path)
+    client = FakeGamma(
+        {
+            (False, None): {
+                "markets": [
+                    _pm("pm-new"),
+                    _pm(
+                        "pm-stale",
+                        created=NOW - timedelta(hours=2),
+                        updated=NOW,
+                        question="Edited question?",
+                    ),
+                    _pm("pm-known", created=NOW - timedelta(hours=2)),
+                ],
+                "next_cursor": "",
+            },
+            (True, None): {"markets": [], "next_cursor": ""},
+        }
+    )
+
+    result = await service.discover("polymarket", client=client)
+
+    assert result["counts"]["new"] == 1
+    assert result["counts"]["upsert"] == 1
+    assert result["counts"]["unchanged_or_not_newer"] == 1
+    assert result["cutoff_source"] == "current_snapshot_bootstrap"
+    assert result["known_key_basis"] == "current_snapshot"
+    reference = service.read_discovery_pointer()["streams"]["polymarket"]
+    manifest = json.loads(
+        service._resolve_ref(reference).read_text(encoding="utf-8")
+    )
+    assert manifest["known_key_basis"] == "current_snapshot"
+    assert datetime.fromisoformat(manifest["previous_cutoff_utc"]) == (
+        CURRENT_AS_OF - timedelta(hours=24)
+    )
+
+    again = await service.discover("polymarket", client=client)
+    assert again["cutoff_source"] == "discovery_watermark"
+    assert again["counts"]["new"] == 0
+
+
+def test_current_snapshot_index_rebuilds_when_the_census_changes(
+    tmp_path: Path,
+) -> None:
+    service = _current_only_catalog(tmp_path)
+    service.ensure_known_key_index()
+    assert service.status()["known_key_cache"]["state"] == "current"
+
+    pointer = json.loads(service.current_pointer_path.read_text(encoding="utf-8"))
+    pointer["updated_at_utc"] = NOW.isoformat()
+    _write_json(service.current_pointer_path, pointer)
+
+    assert service.status()["known_key_cache"]["state"] == "stale"
+
+
 @pytest.mark.asyncio
 async def test_discovery_pointer_rejects_corrupted_artifact(tmp_path: Path) -> None:
     service = _catalog(tmp_path)
