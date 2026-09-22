@@ -17,6 +17,11 @@ installed version.
   market that closed before that census is reported as new. The `kalshi-mve`
   stream needs `--bootstrap-cutoff` unless the snapshot holds its MVE census.
   `promote-history` and `compact-history` still require history.
+  Discovery reports a known Polymarket market as an upsert only when a
+  contract or lifecycle field changes (question, rules, outcomes, dates, line,
+  closed/active status, resolution, fees, tick size); price, volume and
+  liquidity changes are counted as `payload_only_changes`. Kalshi upserts
+  follow Kalshi's `updated_time`, which does not move on trading.
 
 ## Data and query commands
 

@@ -812,6 +812,81 @@ async def test_current_bootstrap_includes_prior_lifecycle_releases(
     assert service.status()["current_integrity"]["status"] == "valid"
 
 
+def _pm_traded(key: str, **changes: Any) -> dict[str, Any]:
+    row = _pm(key, created=NOW - timedelta(hours=2))
+    row.update(
+        {
+            "outcomes": '["Yes", "No"]',
+            "outcomePrices": '["0.4", "0.6"]',
+            "volume": "100",
+            "liquidity": "50",
+            "line": 20.5,
+            "events": [{"id": "e1", "volume": 100}],
+        }
+    )
+    row.update(changes)
+    return row
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("changes", "expected_upsert"),
+    [
+        (
+            {
+                "outcomePrices": '["0.55", "0.45"]',
+                "volume": "250",
+                "liquidity": "80",
+                "events": [{"id": "e1", "volume": 250}],
+            },
+            False,
+        ),
+        ({"question": "Reworded question?"}, True),
+        ({"closed": True}, True),
+        ({"line": 21.5}, True),
+    ],
+)
+async def test_polymarket_upserts_follow_contract_fields_not_trading(
+    tmp_path: Path,
+    changes: dict[str, Any],
+    expected_upsert: bool,
+) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm_traded("pm-traded")])
+    # Polymarket bumps updatedAt on trading too, so it is newer in every case.
+    observed = _pm_traded(
+        "pm-traded", updatedAt=(NOW + timedelta(hours=1)).isoformat(), **changes
+    )
+
+    result = await service.discover(
+        "polymarket",
+        client=FakeGamma(
+            {
+                (False, None): {"markets": [observed], "next_cursor": ""},
+                (True, None): {"markets": [], "next_cursor": ""},
+            }
+        ),
+        bootstrap_cutoff=NOW - timedelta(days=1),
+    )
+
+    assert result["counts"]["known"] == 1
+    assert result["counts"]["upsert"] == int(expected_upsert)
+    assert result["counts"]["payload_only_changes"] == int(not expected_upsert)
+
+
+def test_known_key_index_fingerprints_polymarket_contracts_only(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm_traded("pm-traded")])
+
+    with duckdb.connect(str(service.ensure_known_key_index()), read_only=True) as db:
+        rows = dict(
+            db.execute("SELECT venue, contract_hash FROM known_keys").fetchall()
+        )
+
+    assert rows["polymarket"] is not None
+    assert rows["kalshi"] is None
+
+
 def test_current_snapshot_index_rebuilds_when_the_census_changes(
     tmp_path: Path,
 ) -> None:
