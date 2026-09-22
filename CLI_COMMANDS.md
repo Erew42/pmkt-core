@@ -14,8 +14,9 @@ installed version.
   maintain a local market catalog. Without `history/LATEST.json`,
   `discover-new` bootstraps from the current snapshot (`LATEST.json`): its
   census as_of sets the first cutoff and its markets are the known keys, so a
-  market that closed before that census is reported as new. `promote-history`
-  and `compact-history` still require history.
+  market that closed before that census is reported as new. The `kalshi-mve`
+  stream needs `--bootstrap-cutoff` unless the snapshot holds its MVE census.
+  `promote-history` and `compact-history` still require history.
 
 ## Data and query commands
 

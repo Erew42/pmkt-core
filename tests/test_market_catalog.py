@@ -671,6 +671,147 @@ async def test_discovery_without_history_classifies_against_current_snapshot(
     assert again["counts"]["new"] == 0
 
 
+def _replace_current_artifact(
+    service: MarketCatalogService, name: str, frame: pd.DataFrame, schema: str
+) -> None:
+    pointer = json.loads(service.current_pointer_path.read_text(encoding="utf-8"))
+    path = service.releases_root / "later_census" / f"{name.upper()}.parquet"
+    write_parquet(frame, path, schema=schema, strict=True)
+    pointer[name] = {
+        **pointer[name],
+        "path": str(path.resolve()),
+        "rows": len(frame),
+        "sha256": _sha(path),
+    }
+    _write_json(service.current_pointer_path, pointer)
+
+
+@pytest.mark.asyncio
+async def test_older_discovery_rows_do_not_replace_a_newer_census_row(
+    tmp_path: Path,
+) -> None:
+    service = _current_only_catalog(tmp_path)
+    first = _pm("pm-new")
+    await service.discover(
+        "polymarket",
+        client=FakeGamma(
+            {
+                (False, None): {"markets": [first], "next_cursor": ""},
+                (True, None): {"markets": [], "next_cursor": ""},
+            }
+        ),
+    )
+    # A later census observed pm-new after the discovery that introduced it.
+    census_row = _pm("pm-new", updated=NOW + timedelta(hours=1), question="Edited?")
+    _replace_current_artifact(
+        service,
+        "polymarket_open_markets",
+        markets_dataframe([census_row]),
+        POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
+    )
+
+    again = await service.discover(
+        "polymarket",
+        client=FakeGamma(
+            {
+                (False, None): {"markets": [census_row], "next_cursor": ""},
+                (True, None): {"markets": [], "next_cursor": ""},
+            }
+        ),
+    )
+
+    assert again["counts"]["upsert"] == 0
+    assert again["counts"]["unchanged_or_not_newer"] == 1
+
+
+def test_missing_referenced_current_artifact_fails_closed(tmp_path: Path) -> None:
+    service = _current_only_catalog(tmp_path)
+    pointer = json.loads(service.current_pointer_path.read_text(encoding="utf-8"))
+    Path(pointer["kalshi_open_markets"]["path"]).unlink()
+
+    with pytest.raises(CatalogError, match="kalshi_open_markets"):
+        service.ensure_known_key_index()
+    with pytest.raises(CatalogError, match="kalshi_open_markets"):
+        service.status()
+
+
+@pytest.mark.asyncio
+async def test_current_bootstrap_includes_prior_lifecycle_releases(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(
+        tmp_path,
+        pm_rows=[_pm("pm-old", created=NOW - timedelta(days=2))],
+        kx_rows=[_kx("KXOLD", created=NOW - timedelta(days=2))],
+    )
+    mve_closed = _kx("KXMVE-CLOSED", status="finalized")
+    await service.refresh_current(
+        scope="all",
+        polymarket_client=FakeGamma(
+            current_pages={None: {"markets": [_pm("pm-old")], "next_cursor": ""}}
+        ),
+        kalshi_client=FakeKalshi(
+            {
+                ("exclude", "open"): [_kx("KXOLD")],
+                ("exclude", "unopened"): [],
+                ("exclude", "paused"): [],
+                ("only", "open"): [],
+                ("only", "unopened"): [],
+                ("only", "paused"): [],
+                ("only", "closed"): [mve_closed],
+                ("only", "settled"): [],
+            }
+        ),
+    )
+    await service.refresh_current(
+        scope="standard",
+        polymarket_client=FakeGamma(
+            current_pages={None: {"markets": [_pm("pm-live")], "next_cursor": ""}},
+            targets={
+                "pm-old": _pm("pm-old", closed=True, updated=NOW + timedelta(hours=1))
+            },
+        ),
+        kalshi_client=FakeKalshi(
+            {
+                ("exclude", "open"): [_kx("KXLIVE")],
+                ("exclude", "unopened"): [],
+                ("exclude", "paused"): [],
+            },
+            targets={
+                "KXOLD": _kx(
+                    "KXOLD", status="finalized", updated=NOW + timedelta(hours=1)
+                )
+            },
+        ),
+    )
+    # The latest census neither lists nor corrects the markets closed earlier.
+    await service.refresh_current(
+        scope="standard",
+        polymarket_client=FakeGamma(
+            current_pages={None: {"markets": [_pm("pm-live")], "next_cursor": ""}}
+        ),
+        kalshi_client=FakeKalshi(
+            {
+                ("exclude", "open"): [_kx("KXLIVE")],
+                ("exclude", "unopened"): [],
+                ("exclude", "paused"): [],
+            }
+        ),
+    )
+    service.history_pointer_path.unlink()
+    assert service.known_key_basis() == "current_snapshot"
+
+    with duckdb.connect(str(service.ensure_known_key_index()), read_only=True) as db:
+        families = dict(
+            db.execute("SELECT market_key, native_family FROM known_keys").fetchall()
+        )
+    assert {"pm-old", "pm-live", "KXOLD", "KXLIVE"} <= set(families)
+    # MVE rows reach the shared lifecycle artifact and keep their own family.
+    assert families["KXMVE-CLOSED"] == "kalshi_mve"
+    assert families["KXOLD"] == "kalshi_conventional"
+    assert service.status()["current_integrity"]["status"] == "valid"
+
+
 def test_current_snapshot_index_rebuilds_when_the_census_changes(
     tmp_path: Path,
 ) -> None:
@@ -753,6 +894,8 @@ async def test_filter_disagreement_records_failed_manifest_without_pointer(
     assert manifest["status"] == "failed"
     assert manifest["filter_agreement"]["conflicting_keys"] == ["KXMVE-CONFLICT"]
     assert manifest["pointer_updated"] is False
+    assert manifest["cutoff_source"] == "history_bootstrap"
+    assert manifest["known_key_basis"] == "history"
 
 
 @pytest.mark.asyncio

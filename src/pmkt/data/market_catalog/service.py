@@ -292,6 +292,8 @@ class MarketCatalogService:
         stream: DiscoveryStream,
         started: datetime,
         cutoff: datetime,
+        cutoff_source: str,
+        known_key_basis: str,
         report: Mapping[str, Any],
     ) -> Path:
         release_id = fs._run_id(f"market_discovery_{stream.replace('-', '_')}_failed")
@@ -307,6 +309,8 @@ class MarketCatalogService:
             "started_at_utc": iso_utc(started),
             "failed_at_utc": iso_utc(utc_now()),
             "previous_cutoff_utc": iso_utc(cutoff),
+            "cutoff_source": cutoff_source,
+            "known_key_basis": known_key_basis,
             "failure": "kalshi_filter_agreement",
             "filter_agreement": dict(report),
             "collection_complete": False,
@@ -744,13 +748,21 @@ class MarketCatalogService:
                             if venue == "polymarket"
                             else "try_cast(updated_time AS TIMESTAMPTZ)"
                         )
+                        # Newest observation wins: a discovery release can be
+                        # older than the census or history row it overlaps.
                         connection.execute(
                             f"""
-                            INSERT OR REPLACE INTO known_keys
+                            INSERT INTO known_keys
                             SELECT {_quote_sql(venue)}, CAST({key_column} AS VARCHAR),
                                    raw_json_sha256, {updated_sql}, {_quote_sql(family)}
                             FROM {_parquet_sql(path)}
                             WHERE {key_column} IS NOT NULL
+                            ON CONFLICT (venue, market_key) DO UPDATE SET
+                                payload_hash = excluded.payload_hash,
+                                updated_at_utc = excluded.updated_at_utc,
+                                native_family = excluded.native_family
+                            WHERE known_keys.updated_at_utc IS NULL
+                               OR excluded.updated_at_utc >= known_keys.updated_at_utc
                             """
                         )
             connection.execute(
@@ -760,18 +772,59 @@ class MarketCatalogService:
         os.replace(temporary, target)
         return target
 
-    def _insert_current_known_keys(self, connection: Any) -> None:
-        """Seed known keys from the current census when history is absent.
+    def _current_known_key_sources(self) -> list[tuple[str, str, Path]]:
+        """Return (venue, artifact name, path) for current-only known keys.
 
-        A market that closed before the census and never appears in it is
-        unknown here, so a later discovery reports it as new; history is the
-        only complete record of terminal markets.
+        These are the latest census lists plus every lifecycle artifact on the
+        current release chain: a refresh replaces the pointer's lifecycle
+        artifact, so terminal corrections from earlier refreshes are reachable
+        only through their manifests. A referenced artifact that is missing or
+        hash-invalid fails closed.
         """
         pointer = _read_json(self.current_pointer_path)
-        selects: list[str] = []
+        sources: list[tuple[str, str, Path]] = []
         for venue, name in _CURRENT_KNOWN_KEY_ARTIFACTS:
+            if name not in pointer:
+                continue
             path = self._pointer_artifact_path(pointer, name)
             if path is None:
+                raise CatalogError(f"current artifact {name} is missing or empty")
+            sources.append((venue, name, path))
+        for _manifest_path, manifest in self.reachable_current_manifests():
+            for venue, name in (
+                ("polymarket", "polymarket_lifecycle_upserts"),
+                ("kalshi", "kalshi_lifecycle_upserts"),
+            ):
+                artifact = manifest["artifacts"][name]
+                sources.append(
+                    (
+                        venue,
+                        name,
+                        _resolve_stored_path(
+                            str(artifact["path"]),
+                            repository_root=self.repository_root,
+                        ),
+                    )
+                )
+        unique: dict[Path, tuple[str, str, Path]] = {}
+        for source in sources:
+            unique.setdefault(source[2].resolve(), source)
+        if not unique:
+            raise CatalogError(
+                "the current snapshot has no market artifacts to seed discovery"
+            )
+        return list(unique.values())
+
+    def _insert_current_known_keys(self, connection: Any) -> None:
+        """Seed known keys from the current catalog when history is absent.
+
+        A market that closed before the first census and never appears in it
+        is unknown here, so a later discovery reports it as new; history is the
+        only complete record of terminal markets.
+        """
+        selects: list[str] = []
+        for venue, name, path in self._current_known_key_sources():
+            if parquet_row_count(path) == 0:
                 continue
             if venue == "polymarket":
                 selects.append(
@@ -783,23 +836,24 @@ class MarketCatalogService:
                     f"FROM {_parquet_sql(path)} WHERE market_id IS NOT NULL"
                 )
             else:
-                family = (
-                    "kalshi_mve"
-                    if name == "kalshi_mve_current_markets"
-                    else "kalshi_conventional"
-                )
+                # Census lists are collected per family; lifecycle upserts mix
+                # conventional and MVE rows, so classify those by ticker.
+                if name == "kalshi_mve_current_markets":
+                    family_sql = _quote_sql("kalshi_mve")
+                elif name == "kalshi_lifecycle_upserts":
+                    family_sql = _kalshi_family_sql("market_key")
+                else:
+                    family_sql = _quote_sql("kalshi_conventional")
                 selects.append(
                     "SELECT 'kalshi' AS venue, CAST(market_key AS VARCHAR) AS market_key, "
                     "raw_json_sha256 AS payload_hash, "
                     "try_cast(updated_time AS TIMESTAMPTZ) AS updated_at_utc, "
-                    f"{_quote_sql(family)} AS native_family "
+                    f"{family_sql} AS native_family "
                     f"FROM {_parquet_sql(path)} WHERE market_key IS NOT NULL"
                 )
         if not selects:
-            raise CatalogError(
-                "the current snapshot has no market artifacts to seed discovery"
-            )
-        # A key can sit in a census list and a lifecycle upsert; keep the newest.
+            return
+        # A key can sit in several census and lifecycle artifacts; keep the newest.
         connection.execute(
             "INSERT INTO known_keys "
             "SELECT venue, market_key, payload_hash, updated_at_utc, native_family "
@@ -950,6 +1004,8 @@ class MarketCatalogService:
                             stream=stream,
                             started=started,
                             cutoff=cutoff,
+                            cutoff_source=cutoff_source,
+                            known_key_basis=known_key_basis,
                             report=exc.report,
                         )
                     raise
@@ -1710,10 +1766,15 @@ class MarketCatalogService:
     def status(self, *, deep: bool = False) -> dict[str, Any]:
         pointer = self.read_discovery_pointer()
         history_integrity: dict[str, Any] | None = None
+        current_integrity: dict[str, Any] | None = None
         if self.known_key_basis() == "history":
             _history_path, _history_manifest, history_integrity = self._history_state(
                 deep=deep
             )
+        else:
+            # Validates every referenced census and lifecycle artifact.
+            sources = self._current_known_key_sources()
+            current_integrity = {"status": "valid", "artifacts": len(sources)}
         index_state = "absent"
         if self.index_path.is_file():
             try:
@@ -1737,6 +1798,7 @@ class MarketCatalogService:
             "history_pointer_present": self.history_pointer_path.is_file(),
             "history_integrity": history_integrity,
             "known_key_basis": self.known_key_basis(),
+            "current_integrity": current_integrity,
             "known_key_cache": {"path": str(self.index_path), "state": index_state},
             "scheduling_enabled": False,
             "execution_authority": False,
