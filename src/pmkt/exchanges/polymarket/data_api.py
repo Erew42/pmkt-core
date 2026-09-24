@@ -274,18 +274,24 @@ def _position(
     if condition_id is not None and found_condition != condition_id:
         raise InvalidDataError("Data API v2 position condition differs from the request")
     current_size = _decimal(row, "current_size", required=True)
+    total_size = _decimal(row, "total_size")
+    avg_price = _decimal(row, "avg_price")
     assert current_size is not None
     if current_size < 0:
         raise InvalidDataError("Data API v2 current_size must be nonnegative")
+    if total_size is not None and total_size < 0:
+        raise InvalidDataError("Data API v2 total_size must be nonnegative")
+    if avg_price is not None and not 0 <= avg_price <= 1:
+        raise InvalidDataError("Data API v2 avg_price must be between 0 and 1")
     return PolymarketPosition(
         wallet=found_wallet,
         condition_id=found_condition,
         token_id=_text(row, "token_id"),
         status=_text(row, "status"),
         current_size=current_size,
-        total_size=_decimal(row, "total_size"),
+        total_size=total_size,
         outcome=_optional_text(row, "outcome"),
-        avg_price=_decimal(row, "avg_price"),
+        avg_price=avg_price,
         current_value=_decimal(row, "current_value"),
         realized_pnl=_decimal(row, "realized_pnl"),
         unrealized_pnl=_decimal(row, "unrealized_pnl"),
