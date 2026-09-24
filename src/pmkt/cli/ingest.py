@@ -3,6 +3,7 @@ from __future__ import annotations
 from pmkt.config import PmktConfig
 
 import asyncio
+import hashlib
 import json
 import shutil
 import tempfile
@@ -10,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping
 from typing import Annotated, Any
+from uuid import uuid4
 
 import httpx
 import typer
@@ -49,6 +51,37 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     )
 
 
+def _distinct_parquet_json_hash(
+    connection: Any,
+    path: Path,
+    column: str,
+    *,
+    skip_empty: bool = False,
+) -> str:
+    """Hash a sorted distinct JSON string array without materializing it."""
+    if column not in {"evidence_id", "raw_payload_hash"}:
+        raise ValueError(f"unsupported evidence column: {column}")
+    predicate = f"WHERE nullif(trim({column}), '') IS NOT NULL" if skip_empty else ""
+    rows = connection.execute(
+        f"SELECT DISTINCT coalesce(trim({column}), '') AS value FROM read_parquet(?) "
+        f"{predicate} ORDER BY value",
+        [str(path)],
+    )
+    digest = hashlib.sha256()
+    digest.update(b"[")
+    first = True
+    while batch := rows.fetchmany(10_000):
+        for (value,) in batch:
+            if not first:
+                digest.update(b",")
+            digest.update(
+                json.dumps(str(value or ""), ensure_ascii=True).encode("utf-8")
+            )
+            first = False
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
 class _StreamingContractEvidenceBundle:
     """Bounded-memory builder for the existing immutable evidence bundle."""
 
@@ -60,12 +93,14 @@ class _StreamingContractEvidenceBundle:
         source_endpoint: str,
         payload_scope: str,
         observed_at_utc: str,
+        bounded_memory: bool = False,
     ) -> None:
         self.out = out
         self.venue = venue
         self.source_endpoint = source_endpoint
         self.payload_scope = payload_scope
         self.observed_at_utc = observed_at_utc
+        self.bounded_memory = bounded_memory
         self.derived_at_utc = _utc_now_iso()
         self.destination = contract_evidence_bundle_path(out)
         self.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -100,19 +135,20 @@ class _StreamingContractEvidenceBundle:
             derived_at_utc=self.derived_at_utc,
             source_payload_kind="venue_api_response",
         )
-        page_ids = {str(value).strip() for value in evidence["evidence_id"].tolist()}
-        duplicates = page_ids & self.evidence_ids
-        if duplicates:
-            raise ValueError(
-                "duplicate contract evidence identities across pages: "
-                + ", ".join(sorted(duplicates)[:5])
+        if not self.bounded_memory:
+            page_ids = {str(value).strip() for value in evidence["evidence_id"].tolist()}
+            duplicates = page_ids & self.evidence_ids
+            if duplicates:
+                raise ValueError(
+                    "duplicate contract evidence identities across pages: "
+                    + ", ".join(sorted(duplicates)[:5])
+                )
+            self.evidence_ids.update(page_ids)
+            self.payload_hashes.update(
+                str(value).strip()
+                for value in evidence["raw_payload_hash"].tolist()
+                if str(value).strip()
             )
-        self.evidence_ids.update(page_ids)
-        self.payload_hashes.update(
-            str(value).strip()
-            for value in evidence["raw_payload_hash"].tolist()
-            if str(value).strip()
-        )
         observations = [
             str(value).strip() for value in evidence["observed_at_utc"].tolist()
         ]
@@ -149,6 +185,36 @@ class _StreamingContractEvidenceBundle:
     ) -> tuple[Path, int, Path]:
         try:
             artifact = self.writer.finish()
+            evidence_digest: str | None = None
+            payload_digest: str | None = None
+            if self.bounded_memory:
+                import duckdb
+
+                spill = self.staging / "duckdb-spill"
+                spill.mkdir()
+                connection = duckdb.connect(
+                    database=":memory:",
+                    config={"temp_directory": str(spill), "memory_limit": "1GB"},
+                )
+                try:
+                    duplicate = connection.execute(
+                        "SELECT evidence_id FROM read_parquet(?) "
+                        "GROUP BY evidence_id HAVING count(*) > 1 LIMIT 1",
+                        [str(artifact)],
+                    ).fetchone()
+                    if duplicate is not None:
+                        raise ValueError(
+                            f"duplicate contract evidence identity: {duplicate[0]}"
+                        )
+                    evidence_digest = _distinct_parquet_json_hash(
+                        connection, artifact, "evidence_id"
+                    )
+                    payload_digest = _distinct_parquet_json_hash(
+                        connection, artifact, "raw_payload_hash", skip_empty=True
+                    )
+                finally:
+                    connection.close()
+                    shutil.rmtree(spill, ignore_errors=True)
             normalized_errors = sorted(set(collection_errors))
             normalized_cursor = (
                 str(continuation_cursor).strip() if continuation_cursor else None
@@ -188,6 +254,8 @@ class _StreamingContractEvidenceBundle:
                 evidence_ids=self.evidence_ids,
                 payload_hashes=self.payload_hashes,
                 payload_authority_valid=self.payload_authority_valid,
+                evidence_ids_sha256=evidence_digest,
+                payload_hashes_sha256=payload_digest,
             )
             manifest_path = self.staging / "manifest.json"
             _write_json(manifest_path, manifest)
@@ -686,6 +754,179 @@ async def _ingest_kalshi_markets_async(
     print(message)
 
 
+def _validate_historical_market_keys(path: Path) -> None:
+    """Check the archived snapshot's one-row-per-ticker grain on disk."""
+    import duckdb
+
+    with tempfile.TemporaryDirectory(prefix="kalshi-history-check-", dir=path.parent) as spill:
+        connection = duckdb.connect(
+            database=":memory:",
+            config={"temp_directory": spill, "memory_limit": "1GB"},
+        )
+        try:
+            invalid = connection.execute(
+                "SELECT market_key, count(*) AS row_count FROM read_parquet(?) "
+                "GROUP BY market_key HAVING market_key IS NULL "
+                "OR trim(market_key) = '' OR count(*) > 1 LIMIT 1",
+                [str(path)],
+            ).fetchone()
+        finally:
+            connection.close()
+    if invalid is not None:
+        raise ValueError(f"invalid or duplicate Kalshi historical market key: {invalid[0]}")
+
+
+async def _ingest_kalshi_historical_markets_async(
+    out: Path,
+    *,
+    limit: int,
+    max_pages: int,
+    complete: bool,
+    event_ticker: str | None,
+    series_ticker: str | None,
+    tickers: str | None,
+    manifest_out: Path | None,
+    contract_evidence_out: Path | None,
+) -> None:
+    if sum(value is not None for value in (event_ticker, series_ticker, tickers)) > 1:
+        raise ValueError("historical market filters are mutually exclusive")
+    if max_pages < 1:
+        raise ValueError("max_pages must be positive")
+    if out.exists():
+        raise FileExistsError(f"refusing to overwrite historical markets: {out}")
+    if manifest_out is not None:
+        if manifest_out.resolve() == out.resolve():
+            raise ValueError("manifest_out must differ from out")
+        if manifest_out.exists():
+            raise FileExistsError(f"refusing to overwrite historical manifest: {manifest_out}")
+    started_at = _utc_now_iso()
+    staging = out.with_name(f".{out.name}.{uuid4().hex}.staged.parquet")
+    writer = AtomicParquetWriter(
+        staging, schema_version=KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION
+    )
+    try:
+        evidence_writer = (
+            _StreamingContractEvidenceBundle(
+                out=contract_evidence_out,
+                venue="kalshi",
+                source_endpoint="kalshi:/historical/markets",
+                payload_scope="cursor_list",
+                observed_at_utc=started_at,
+                bounded_memory=True,
+            )
+            if contract_evidence_out is not None
+            else None
+        )
+    except BaseException:
+        writer.abort()
+        raise
+    page_count = 0
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    stop_reason = "not_started"
+    published = False
+    try:
+        async with AsyncKalshiClient(config=PmktConfig.from_env()) as kalshi:
+            while True:
+                if not complete and page_count >= max_pages:
+                    stop_reason = "max_pages_reached"
+                    break
+                page = await kalshi.historical_markets_page(
+                    limit=limit,
+                    cursor=cursor,
+                    event_ticker=event_ticker,
+                    series_ticker=series_ticker,
+                    tickers=tickers,
+                )
+                page_count += 1
+                markets = page.get("markets")
+                if not isinstance(markets, list) or any(
+                    not isinstance(market, dict) for market in markets
+                ):
+                    raise TypeError("Kalshi historical response has invalid markets")
+                if markets:
+                    writer.append(kalshi_markets_dataframe(markets))
+                    if evidence_writer is not None:
+                        evidence_writer.append(markets)
+                next_cursor = str(page.get("cursor") or "").strip() or None
+                cursor = next_cursor
+                if next_cursor is None:
+                    stop_reason = "cursor_exhausted"
+                    break
+                if next_cursor in seen_cursors:
+                    raise RuntimeError("Kalshi historical markets cursor repeated")
+                seen_cursors.add(next_cursor)
+        writer.finish()
+        _validate_historical_market_keys(staging)
+        staging.replace(out)
+        published = True
+        evidence_path: Path | None = None
+        evidence_manifest_path: Path | None = None
+        evidence_count = 0
+        if evidence_writer is not None:
+            evidence_path, evidence_count, evidence_manifest_path = evidence_writer.finish(
+                collection_complete=stop_reason == "cursor_exhausted",
+                stop_reason=stop_reason,
+                continuation_cursor=cursor,
+                collection_errors=(),
+                page_count=page_count,
+            )
+        if manifest_out is not None:
+            dataset_paths = {"output": str(out)}
+            schema_versions = {"output": KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION}
+            row_counts = {"output": writer.row_count}
+            if evidence_path is not None and evidence_manifest_path is not None:
+                dataset_paths["contract_evidence"] = str(evidence_path)
+                dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path)
+                schema_versions["contract_evidence"] = CONTRACT_EVIDENCE_SCHEMA_VERSION
+                schema_versions["contract_evidence_manifest"] = (
+                    CONTRACT_EVIDENCE_MANIFEST_VERSION
+                )
+                row_counts["contract_evidence"] = evidence_count
+            _write_json(
+                manifest_out,
+                {
+                    "endpoint": "/historical/markets",
+                    "mode": (
+                        "kalshi_historical_markets_cursor_complete"
+                        if complete
+                        else "kalshi_historical_markets_cursor_bounded"
+                    ),
+                    "filters": {
+                        "event_ticker": event_ticker,
+                        "series_ticker": series_ticker,
+                        "tickers": tickers,
+                    },
+                    "started_at_utc": started_at,
+                    "finished_at_utc": _utc_now_iso(),
+                    "page_count": page_count,
+                    "row_count": writer.row_count,
+                    "unique_market_count": writer.row_count,
+                    "final_cursor": cursor,
+                    "stop_reason": stop_reason,
+                    "collection_complete": stop_reason == "cursor_exhausted",
+                    "errors": [],
+                    "output_path": str(out),
+                    "dataset_paths": dataset_paths,
+                    "schema_versions": schema_versions,
+                    "row_counts": row_counts,
+                },
+            )
+    except BaseException:
+        writer.abort()
+        if evidence_writer is not None:
+            evidence_writer.abort()
+            if evidence_writer.destination.exists():
+                shutil.rmtree(evidence_writer.destination, ignore_errors=True)
+        staging.unlink(missing_ok=True)
+        if published:
+            out.unlink(missing_ok=True)
+        if manifest_out is not None:
+            manifest_out.unlink(missing_ok=True)
+        raise
+    print(f"Wrote {writer.row_count} historical Kalshi markets to {out}")
+
+
 def _write_contract_evidence(
     markets: list[dict[str, object]],
     *,
@@ -780,6 +1021,47 @@ def ingest_kalshi_markets(
             max_pages=max_pages,
             status=status_value,
             complete=complete,
+            manifest_out=manifest_out,
+            contract_evidence_out=contract_evidence_out,
+        )
+    )
+
+
+def ingest_kalshi_historical_markets(
+    out: Annotated[Path, typer.Option(help="New Parquet output path.")],
+    limit: Annotated[int, typer.Option(help="Markets per page, up to 1000.")] = 100,
+    max_pages: Annotated[int, typer.Option(help="Maximum pages in bounded mode.")] = 1,
+    complete: Annotated[
+        bool,
+        typer.Option("--complete", help="Scan until the historical cursor is exhausted."),
+    ] = False,
+    event_ticker: Annotated[
+        str | None, typer.Option(help="Filter by one event ticker.")
+    ] = None,
+    series_ticker: Annotated[
+        str | None, typer.Option(help="Filter by one series ticker.")
+    ] = None,
+    tickers: Annotated[
+        str | None, typer.Option(help="Filter by comma-separated market tickers.")
+    ] = None,
+    manifest_out: Annotated[
+        Path | None, typer.Option(help="Optional collection manifest JSON path.")
+    ] = None,
+    contract_evidence_out: Annotated[
+        Path | None,
+        typer.Option(help="Optional immutable contract evidence bundle target."),
+    ] = None,
+) -> None:
+    """Fetch archived Kalshi markets and write normalized Parquet."""
+    asyncio.run(
+        _ingest_kalshi_historical_markets_async(
+            out,
+            limit=limit,
+            max_pages=max_pages,
+            complete=complete,
+            event_ticker=event_ticker,
+            series_ticker=series_ticker,
+            tickers=tickers,
             manifest_out=manifest_out,
             contract_evidence_out=contract_evidence_out,
         )

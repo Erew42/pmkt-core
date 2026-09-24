@@ -1,7 +1,8 @@
 # Venue Historical Data Capabilities
 
-Checked for CR-10.0 on 2026-06-17 and the public sampled-price and Kalshi
-candle-history workflows on 2026-09-11.
+Checked for CR-10.0 on 2026-06-17, the public sampled-price and Kalshi
+candle-history workflows on 2026-09-11, and archived market listing on
+2026-09-24.
 
 ## Polymarket
 
@@ -19,6 +20,10 @@ candle-history workflows on 2026-09-11.
 
 ## Kalshi
 
+- `/historical/markets` lists archived market metadata and settlement fields with
+  cursor pagination. Market, event, and series filters are mutually exclusive;
+  this is a market listing, not historical order-book evidence. Source:
+  <https://docs.kalshi.com/api-reference/historical/get-historical-markets>
 - `/series/{series_ticker}/markets/{ticker}/candlesticks` provides live-dataset market candlesticks with price, yes-bid, yes-ask, volume, and open-interest context. `start_ts`/`end_ts` are inclusive end-labels. Source: <https://docs.kalshi.com/api-reference/market/get-market-candlesticks>
 - `/markets/candlesticks` provides batched live-dataset candlesticks for up to 100 market tickers and up to 10,000 candles total. Source: <https://docs.kalshi.com/api-reference/market/batch-get-market-candlesticks>
 - `/historical/markets/{ticker}/candlesticks` provides archived market candlesticks after Kalshi's historical cutoff, with the same inclusive `start_ts`/`end_ts` labels. The single-market live and historical endpoints do not publish a numeric cap. Source: <https://docs.kalshi.com/api-reference/historical/get-historical-market-candlesticks>

@@ -29,6 +29,13 @@ installed version.
 - `ingest-markets`: fetch normalized Polymarket market snapshots.
 - `ingest-markets-keyset`: fetch Polymarket markets by keyset pagination.
 - `ingest-kalshi-markets`: fetch normalized Kalshi market snapshots.
+- `ingest-kalshi-historical-markets`: fetch archived Kalshi market snapshots from
+  `/historical/markets`. Use one of `--event-ticker`, `--series-ticker`, or
+  `--tickers`, or omit filters to scan the archive. The default fetches one page;
+  `--complete` follows the cursor to exhaustion. The command writes the existing
+  `kalshi_market_snapshot.v1` schema, refuses to overwrite the output, and checks
+  duplicate market tickers on disk before publishing. Optional manifest and
+  contract evidence outputs identify the historical endpoint and completion state.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
