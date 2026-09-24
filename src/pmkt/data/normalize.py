@@ -97,6 +97,10 @@ START_TIME_FALLBACK_KEYS = (
     "startDateIso",
     "start_date_iso",
 )
+EVENT_ID_KEYS = ("event_id", "eventId", "eventID")
+NESTED_EVENT_ID_KEYS = ("id", "event_id", "eventId")
+EVENT_SLUG_KEYS = ("event_slug", "eventSlug")
+ENABLE_ORDERBOOK_KEYS = ("enableOrderBook", "enable_orderbook", "enable_order_book")
 
 
 def parse_float(value: Any) -> float | None:
@@ -104,13 +108,13 @@ def parse_float(value: Any) -> float | None:
 
 
 def extract_event_id(market: dict[str, Any]) -> str | None:
-    for key in ("event_id", "eventId", "eventID"):
+    for key in EVENT_ID_KEYS:
         value = market.get(key)
         if value is not None:
             return str(value)
     event = market.get("event")
     if isinstance(event, dict):
-        for key in ("id", "event_id", "eventId"):
+        for key in NESTED_EVENT_ID_KEYS:
             value = event.get(key)
             if value is not None:
                 return str(value)
@@ -118,7 +122,7 @@ def extract_event_id(market: dict[str, Any]) -> str | None:
     if isinstance(events, list) and events:
         first = events[0]
         if isinstance(first, dict):
-            for key in ("id", "event_id", "eventId"):
+            for key in NESTED_EVENT_ID_KEYS:
                 value = first.get(key)
                 if value is not None:
                     return str(value)
@@ -126,7 +130,7 @@ def extract_event_id(market: dict[str, Any]) -> str | None:
 
 
 def extract_event_slug(market: dict[str, Any]) -> str | None:
-    for key in ("event_slug", "eventSlug"):
+    for key in EVENT_SLUG_KEYS:
         value = market.get(key)
         if isinstance(value, str) and value:
             return value
@@ -206,7 +210,7 @@ def extract_start_time(market: dict[str, Any]) -> Any:
 
 
 def extract_enable_orderbook(market: dict[str, Any]) -> bool | None:
-    for key in ("enableOrderBook", "enable_orderbook", "enable_order_book"):
+    for key in ENABLE_ORDERBOOK_KEYS:
         if key in market:
             return _normalize_bool(market.get(key))
     tokens = market.get("clobTokenIds") or market.get("clob_token_ids")

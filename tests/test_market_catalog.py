@@ -844,6 +844,22 @@ def _pm_traded(key: str, **changes: Any) -> dict[str, Any]:
         ({"question": "Reworded question?"}, True),
         ({"closed": True}, True),
         ({"line": 21.5}, True),
+        # Each of these sets a canonical time or identity column.
+        ({"eventStartTime": (NOW + timedelta(days=3)).isoformat()}, True),
+        ({"acceptingOrdersTimestamp": (NOW + timedelta(days=3)).isoformat()}, True),
+        (
+            {
+                "events": [
+                    {
+                        "id": "e1",
+                        "volume": 100,
+                        "startTime": (NOW + timedelta(days=3)).isoformat(),
+                    }
+                ]
+            },
+            True,
+        ),
+        ({"events": [{"id": "e2", "volume": 100}]}, True),
     ],
 )
 async def test_polymarket_upserts_follow_contract_fields_not_trading(

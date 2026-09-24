@@ -17,11 +17,28 @@ from pmkt.data.canonical import (
     POLYMARKET_MARKET_SNAPSHOT_COLUMNS,
     POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
 )
-from pmkt.data.normalize import markets_dataframe
+from pmkt.data.normalize import (
+    CLOSE_TIME_KEYS,
+    CONDITION_ID_KEYS,
+    ENABLE_ORDERBOOK_KEYS,
+    EVENT_ID_KEYS,
+    EVENT_SLUG_KEYS,
+    NESTED_EVENT_ID_KEYS,
+    NESTED_EVENT_START_TIME_KEYS,
+    OPEN_TIME_KEYS,
+    QUESTION_ID_KEYS,
+    RESOLUTION_SOURCE_KEYS,
+    RESOLVED_BY_KEYS,
+    START_TIME_FALLBACK_KEYS,
+    TOP_LEVEL_START_TIME_KEYS,
+    UMA_RESOLUTION_STATUS_KEYS,
+    markets_dataframe,
+)
 from pmkt.data.normalize_kalshi import (
     normalize_kalshi_market_status,
 )
 from pmkt.data.storage.parquet import write_parquet
+from pmkt.tokens import TOKEN_LIST_KEYS, TOKEN_VALUE_KEYS
 
 from . import fs
 from . import history
@@ -91,51 +108,89 @@ _CURRENT_KNOWN_KEY_ARTIFACTS: tuple[tuple[str, str], ...] = (
 # volume, liquidity, the nested event), so discovery decides whether a known
 # market changed from these contract and lifecycle fields instead. Kalshi's
 # updated_time already ignores trading, so Kalshi keeps the payload hash.
-POLYMARKET_CONTRACT_FIELDS: tuple[str, ...] = (
-    "question",
-    "description",
-    "slug",
-    "conditionId",
-    "questionID",
-    "outcomes",
-    "clobTokenIds",
-    "startDate",
-    "endDate",
-    "gameStartTime",
-    "line",
-    "groupItemTitle",
-    "groupItemThreshold",
-    "negRisk",
-    "negRiskMarketID",
-    "negRiskRequestID",
-    "resolutionSource",
-    "resolvedBy",
-    "closed",
-    "active",
-    "archived",
-    "acceptingOrders",
-    "enableOrderBook",
-    "umaResolutionStatus",
-    "umaResolutionStatuses",
-    "feesEnabled",
-    "feeType",
-    "makerBaseFee",
-    "takerBaseFee",
-    "orderMinSize",
-    "orderPriceMinTickSize",
+# The fields are every key normalize.extract_market_rows reads for a
+# non-trading column, taken from its own key lists so the two cannot drift,
+# plus contract terms that have no canonical column.
+POLYMARKET_CONTRACT_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            "question",
+            "title",
+            "slug",
+            "closed",
+            "outcomes",
+            *EVENT_ID_KEYS,
+            *EVENT_SLUG_KEYS,
+            *OPEN_TIME_KEYS,
+            *TOP_LEVEL_START_TIME_KEYS,
+            *START_TIME_FALLBACK_KEYS,
+            *CLOSE_TIME_KEYS,
+            *ENABLE_ORDERBOOK_KEYS,
+            *TOKEN_LIST_KEYS,
+            *TOKEN_VALUE_KEYS,
+            *CONDITION_ID_KEYS,
+            *QUESTION_ID_KEYS,
+            *UMA_RESOLUTION_STATUS_KEYS,
+            *RESOLVED_BY_KEYS,
+            *RESOLUTION_SOURCE_KEYS,
+            "description",
+            "line",
+            "groupItemTitle",
+            "groupItemThreshold",
+            "negRisk",
+            "negRiskMarketID",
+            "negRiskRequestID",
+            "active",
+            "archived",
+            "acceptingOrders",
+            "umaResolutionStatuses",
+            "feesEnabled",
+            "feeType",
+            "makerBaseFee",
+            "takerBaseFee",
+            "orderMinSize",
+            "orderPriceMinTickSize",
+        )
+    )
 )
 
-# Bump when the known-key table changes so cached indexes are rebuilt.
-KNOWN_KEY_INDEX_VERSION = "known_keys.v2"
+# Normalization reads event identity and times from the nested `event` object
+# and every `events` entry; their volume and liquidity are left out.
+POLYMARKET_EVENT_CONTRACT_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            *NESTED_EVENT_ID_KEYS,
+            "slug",
+            *NESTED_EVENT_START_TIME_KEYS,
+            *START_TIME_FALLBACK_KEYS,
+            *OPEN_TIME_KEYS,
+            *CLOSE_TIME_KEYS,
+        )
+    )
+)
+
+# Bump when the known-key table or contract hash changes so cached indexes are
+# rebuilt.
+KNOWN_KEY_INDEX_VERSION = "known_keys.v3"
+
+
+def _json_paths_sql(prefix: str, fields: Sequence[str]) -> str:
+    return "[" + ", ".join(_quote_sql(f"{prefix}.{field}") for field in fields) + "]"
 
 
 def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
-    """Hash POLYMARKET_CONTRACT_FIELDS; the same SQL serves known and observed rows."""
-    parts = ", ".join(
-        f"coalesce(json_extract_string({raw_json_sql}, {_quote_sql('$.' + field)}), chr(0))"
-        for field in POLYMARKET_CONTRACT_FIELDS
+    """Hash the contract fields; the same SQL serves known and observed rows."""
+    event_paths = _json_paths_sql("$", POLYMARKET_EVENT_CONTRACT_FIELDS)
+    return (
+        "md5(to_json(struct_pack("
+        f"market := json_extract_string({raw_json_sql}, "
+        f"{_json_paths_sql('$', POLYMARKET_CONTRACT_FIELDS)}), "
+        f"event := json_extract_string({raw_json_sql}, "
+        f"{_json_paths_sql('$.event', POLYMARKET_EVENT_CONTRACT_FIELDS)}), "
+        f"events := list_transform(json_extract({raw_json_sql}, '$.events[*]'), "
+        f"e -> json_extract_string(e, {event_paths}))"
+        ")))"
     )
-    return f"md5(concat_ws(chr(31), {parts}))"
 
 
 class MarketCatalogService:
