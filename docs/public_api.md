@@ -456,6 +456,10 @@ size of 0.01 shares even when a caller asks for zero. Those limits remain
 explicit on `PolymarketMarketTradesPage`; exhausting its cursor does not make
 the result a lifetime trade ledger. The existing `trades_page(wallet=...)`
 keeps its full-history `start=1` behavior and `(rows, cursor)` return shape.
+Wallet-scoped trade rows preserve a source hex condition ID even when the
+source shortens it; condition-scoped reads still reject rows that do not match
+the requested canonical ID. Consumers should validate a source ID before
+using it as a canonical market key.
 
 `activity_page(wallet=..., condition_id=...)` requests `start=1` wallet
 history and returns typed events, a cursor, and an observation. It retains

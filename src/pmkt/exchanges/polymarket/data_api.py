@@ -27,6 +27,7 @@ DEFAULT_DATA_API_PERIOD_SECONDS = 1
 MAX_V2_PAGE_SIZE = 1000
 _WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 _CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+_SOURCE_CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{1,64}\Z")
 _RowT = TypeVar("_RowT")
 
 
@@ -328,6 +329,18 @@ def _row_identifier(row: Mapping[str, Any], key: str, pattern: re.Pattern[str]) 
         raise InvalidDataError(str(exc)) from exc
 
 
+def _source_condition_id(
+    row: Mapping[str, Any], *, requested: str | None, feed: str,
+) -> str:
+    value = _text(row, "condition_id")
+    if _SOURCE_CONDITION_RE.fullmatch(value) is None:
+        raise InvalidDataError("Data API v2 condition_id must be hexadecimal")
+    found = value.lower()
+    if requested is not None and found != requested:
+        raise InvalidDataError(f"Data API v2 {feed} condition differs from the request")
+    return found
+
+
 def _position(
     row: Mapping[str, Any], *, wallet: str | None, condition_id: str | None,
     request_id: str,
@@ -371,9 +384,7 @@ def _trade(
     found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
     if wallet is not None and found_wallet != wallet:
         raise InvalidDataError("Data API v2 trade wallet differs from the request")
-    found_condition = _row_identifier(row, "condition_id", _CONDITION_RE)
-    if condition_id is not None and found_condition != condition_id:
-        raise InvalidDataError("Data API v2 trade condition differs from the request")
+    found_condition = _source_condition_id(row, requested=condition_id, feed="trade")
     size = _decimal(row, "size", required=True)
     price = _decimal(row, "price", required=True)
     assert size is not None and price is not None
@@ -428,11 +439,9 @@ def _activity(
     request_id: str,
 ) -> PolymarketWalletActivity:
     found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
-    found_condition = _row_identifier(row, "condition_id", _CONDITION_RE)
+    found_condition = _source_condition_id(row, requested=condition_id, feed="activity")
     if found_wallet != wallet:
         raise InvalidDataError("Data API v2 activity wallet differs from the request")
-    if condition_id is not None and found_condition != condition_id:
-        raise InvalidDataError("Data API v2 activity condition differs from the request")
     timestamp = row.get("timestamp")
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
         raise InvalidDataError("Data API v2 activity timestamp must be epoch seconds")

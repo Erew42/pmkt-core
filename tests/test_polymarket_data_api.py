@@ -270,6 +270,27 @@ async def test_market_trades_page_is_maker_inclusive_and_condition_scoped() -> N
     assert result.minimum_size_shares == Decimal("0.01")
 
 
+async def test_wallet_trade_preserves_short_source_condition_id() -> None:
+    short_condition = "0x" + "a" * 62
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        row = _trade(WALLET_A)
+        row["condition_id"] = short_condition
+        return httpx.Response(200, json={
+            "data": [row], "pagination": {"has_more": False},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        wallet_trades, cursor = await client.trades_page(wallet=WALLET_A)
+        with pytest.raises(InvalidDataError, match="condition differs"):
+            await client.market_trades_page(condition_id=CONDITION)
+
+    assert cursor is None
+    assert wallet_trades[0].condition_id == short_condition
+
+
 async def test_activity_page_requests_full_history_and_preserves_unknown_type() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v2/activity"
