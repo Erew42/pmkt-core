@@ -179,17 +179,23 @@ def _json_paths_sql(prefix: str, fields: Sequence[str]) -> str:
 
 
 def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
-    """Hash the contract fields; the same SQL serves known and observed rows."""
+    """Hash the contract fields; the same SQL serves known and observed rows.
+
+    raw_json is nullable, so a row without it gets a NULL hash and discovery
+    falls back to the payload hash. The cast lets an all-NULL column bind.
+    """
+    raw = f"CAST({raw_json_sql} AS VARCHAR)"
     event_paths = _json_paths_sql("$", POLYMARKET_EVENT_CONTRACT_FIELDS)
     return (
+        f"CASE WHEN {raw} IS NULL THEN NULL ELSE "
         "md5(to_json(struct_pack("
-        f"market := json_extract_string({raw_json_sql}, "
+        f"market := json_extract_string({raw}, "
         f"{_json_paths_sql('$', POLYMARKET_CONTRACT_FIELDS)}), "
-        f"event := json_extract_string({raw_json_sql}, "
+        f"event := json_extract_string({raw}, "
         f"{_json_paths_sql('$.event', POLYMARKET_EVENT_CONTRACT_FIELDS)}), "
-        f"events := list_transform(json_extract({raw_json_sql}, '$.events[*]'), "
+        f"events := list_transform(json_extract({raw}, '$.events[*]'), "
         f"e -> json_extract_string(e, {event_paths}))"
-        ")))"
+        "))) END"
     )
 
 

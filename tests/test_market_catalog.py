@@ -161,13 +161,19 @@ def _catalog(
     *,
     pm_rows: list[dict[str, Any]] | None = None,
     kx_rows: list[dict[str, Any]] | None = None,
+    pm_null_raw_json: tuple[str, ...] = (),
 ) -> MarketCatalogService:
     root = tmp_path / "data" / "markets"
     release = root / "history" / "releases" / "base"
     pm_path = release / "POLYMARKET_ALL_MARKETS.parquet"
     kx_path = release / "KALSHI_ALL_MARKETS.parquet"
+    pm_frame = markets_dataframe(
+        pm_rows or [_pm("pm-base", created=NOW - timedelta(days=2))]
+    )
+    # raw_json is nullable; these rows keep only their payload hash.
+    pm_frame.loc[pm_frame["market_id"].isin(pm_null_raw_json), "raw_json"] = None
     write_parquet(
-        markets_dataframe(pm_rows or [_pm("pm-base", created=NOW - timedelta(days=2))]),
+        pm_frame,
         pm_path,
         schema=POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
         strict=True,
@@ -914,6 +920,30 @@ async def test_polymarket_upserts_follow_contract_fields_not_trading(
     assert result["counts"]["known"] == 1
     assert result["counts"]["upsert"] == int(expected_upsert)
     assert result["counts"]["payload_only_changes"] == int(not expected_upsert)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("null_keys", [("pm-a",), ("pm-a", "pm-b")])
+async def test_known_rows_without_raw_json_fall_back_to_payload_hash(
+    tmp_path: Path, null_keys: tuple[str, ...]
+) -> None:
+    rows = [_pm_traded("pm-a"), _pm_traded("pm-b")]
+    # Mixed rows and an all-NULL raw_json column both keep the base behavior.
+    service = _catalog(tmp_path, pm_rows=rows, pm_null_raw_json=null_keys)
+    result = await service.discover(
+        "polymarket",
+        client=FakeGamma(
+            {
+                (False, None): {"markets": [rows[0]], "next_cursor": ""},
+                (True, None): {"markets": [], "next_cursor": ""},
+            }
+        ),
+        bootstrap_cutoff=NOW - timedelta(days=1),
+    )
+
+    assert result["counts"]["known"] == 1
+    assert result["counts"]["upsert"] == 0
+    assert result["counts"]["unchanged_or_not_newer"] == 1
 
 
 def test_known_key_index_fingerprints_polymarket_contracts_only(
