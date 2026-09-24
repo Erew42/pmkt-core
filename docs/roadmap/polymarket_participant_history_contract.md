@@ -1,8 +1,9 @@
 # Polymarket participant and holder history: architecture contract
 
 Status: proposed contract for the read-side milestones after participant discovery
-PR #9. This document fixes meanings and acceptance gates; it does not add an
-endpoint, persisted schema, or indexer.
+PR #9. The pilot below decides whether a chain indexer is needed. This document
+proposes meanings and decision gates; it does not add an endpoint, persisted
+schema, or indexer.
 
 ## Scope and existing behavior
 
@@ -10,6 +11,13 @@ endpoint, persisted schema, or indexer.
 reconstruction. Wallet selection, monitoring cadence, alerts, and trading
 interpretation belong to downstream consumers. A Polymarket wallet in this
 work is an **address**, not an inferred person or a transaction sender.
+
+The concrete consumer questions are: for a market, which addresses currently
+or previously held each outcome and what were their balances on a requested
+date; and for a chosen address, what trades and other events explain its
+current positions? The pilot first tests whether the Data API can answer those
+questions at a declared level of coverage. Build a chain indexer only if the
+required answer cannot be supported by the API and the chain source is viable.
 
 PR #9 reads `OPEN` and `CLOSED` positions for a market and reads a wallet's
 trades and positions. Its `complete` property means that the requested page
@@ -28,9 +36,9 @@ The user-facing evidence classes are distinct:
 | Replayed chain transfers | The address held a calculated token balance at a covered canonical block. |
 
 Participant discovery may union these addresses, but each result retains its
-evidence type and source scope. API observations stay alongside the chain
-ledger; reconciliation reports differences and never silently changes the
-ledger.
+evidence type and source scope. If a chain ledger is built, API observations
+stay alongside it; reconciliation reports differences and never silently
+changes its balances.
 
 ## Identity and grain
 
@@ -55,13 +63,16 @@ ledger.
 
 ## Time and coverage
 
-An API page records request start, response receipt, exact query parameters,
-incoming and outgoing cursor, and raw response. A scan records its first
-request and final response times. Rows on different pages may reflect
-different source states: exhausting a holder cursor does **not** create an
-atomic snapshot. The same wallet/token may appear more than once and each
-observation remains evidence. `last_event_at` on a position is last reported
-activity, not the start of ownership.
+An API scan needs request start, response receipt, exact query parameters,
+incoming and outgoing cursor, and first/final response times. The pending
+provenance update in PR #9 retains request metadata in memory but deliberately
+leaves `raw_responses` empty; raw response retention belongs to a separate
+durable capture path. Rows on different pages may reflect different source
+states:
+exhausting a holder cursor does **not** create an atomic snapshot. The same
+wallet/token may appear more than once and each observation remains evidence.
+`last_event_at` on a position is last reported activity, not the start of
+ownership.
 
 Keep these coverage statements separate:
 
@@ -89,26 +100,25 @@ time of each contributing page. The answer is "reported during this interval,"
 not "held at exactly T." Differences between scans bound changes in reported
 state only; they do not date the underlying transfer.
 
-For a historical chain query at `T`, first resolve the highest applicable
-canonical block whose timestamp is at or before `T`. Balances mean
-**end-of-block** state. If that block is beyond coverage or inside a gap, return
-`uncovered` with the reason. A prior covered block may be returned only by a
-separately requested stale mode that labels its actual block and timestamp.
-Positive-balance intervals use an inclusive first end-of-block state and an
-exclusive first subsequent end-of-block state without that positive balance.
-An exit followed by re-entry yields two intervals. Event history retains
-intra-transaction and intra-block changes; intervals do not present those as
-sustained holdings.
+If a chain-backed historical query is needed, resolve time `T` to the highest
+applicable canonical block whose timestamp is at or before `T`. Balances mean
+**end-of-block** state. A block beyond coverage or inside a gap is `uncovered`,
+not the last known balance; any stale convenience answer must label its actual
+block. Positive-balance intervals start at the first positive end-of-block
+state and end before the first subsequent nonpositive one. Exit and re-entry
+yield separate intervals. Intra-transaction changes remain event evidence,
+not sustained holdings.
 
 ## Durable API observations
 
-The capture unit is an immutable page attempt, not a final Parquet file. As
-capture progresses, persist the raw response, request identity, cursor chain,
-receipt times, and a content hash. Repeating an identical attempt is
-idempotent; a later response to the same cursor with changed content remains
-distinct evidence. The scan manifest identifies the accepted page chain and
-whether it ended exhausted, capped, interrupted, or failed. A delayed resume
-extends the recorded observation interval rather than making it appear
+If durable capture is built, its unit is an immutable page attempt, not a
+final Parquet file. As capture progresses, persist the raw response, request
+identity, cursor chain, receipt times, and a content hash. Repeating an
+identical attempt is idempotent; a later response to the same cursor with
+changed content remains distinct evidence. The scan manifest identifies the
+accepted page chain and whether it ended exhausted, capped, interrupted, or
+failed. A delayed resume extends the recorded observation interval rather than
+making it appear
 instantaneous.
 
 Publish a manifest only after all files it names are durable, using an atomic
@@ -119,7 +129,7 @@ For holdings capture, compare gross per-token semantics from market-scoped
 checking coverage and request cost. The default holder net balance remains a
 separate view. Neither API mode implies a simultaneous snapshot.
 
-## Chain evidence and ledger publication
+## Chain evidence if the pilot requires it
 
 Retain `TransferSingle` and each item of `TransferBatch`, including mint and
 burn, with chain ID, contract, block number/hash/timestamp, transaction hash,
@@ -130,12 +140,11 @@ is zero only when indexing begins before that token's creation and all
 intervening transfers are covered; a later start requires an independently
 established opening state for every address claimed.
 
-Keep source events, derived balances/intervals, and coverage metadata in one
-published ledger generation. Checkpoint only durable event ranges; on restart,
-recheck an overlap and replace derived state after a reorganization. A new
-generation becomes visible to readers atomically. Direct historical
-`balanceOf` checks require an RPC provider and an `eth_call` block parameter;
-the current `PolygonCtfClient.eth_call` uses `latest` only.
+If a production indexer is justified, publish source events, derived balances,
+and coverage consistently, and handle chain reorganizations before claiming
+canonical history. Direct historical `balanceOf` checks require an RPC
+provider and an `eth_call` block parameter; the current
+`PolygonCtfClient.eth_call` uses `latest` only.
 
 ## Trading-history promise
 
@@ -143,22 +152,58 @@ Expose wallet trades, activity, and current positions as separate feeds with
 their query scope. Activity can duplicate a trade; transaction hash alone is
 not a unique fill key. The current Data API specification describes a fixed
 three-year window for condition-scoped trades, wallet-anchored `start=1`
-history, a trade-size floor, and position visibility that excludes inactive
-markets even when archived positions are requested. Record those limits, the
-exact query sent, and any future source changes before a completeness claim.
+history for both trades and activity, a trade-size floor, and position
+visibility that excludes inactive markets even when archived positions are
+requested. Trade reads also default to `taker_only=true`, which omits maker
+fills; market discovery and wallet reconstruction must request
+`taker_only=false`. Record those limits, the exact query sent, and any future
+source changes before a completeness claim.
 
-The pilot tests whether the available wallet feed actually covers historical
-executions and prices for representative wallets. If it does not, either
-backfill the missing execution events before promising full trading history or
-publish the narrower contract: complete reconstructed holdings for declared
-chain assets and blocks, alongside source-limited wallet trade history.
-Transfer replay alone does not reconstruct every trade price.
+If the available wallet feed omits historical executions or prices, either
+backfill them before promising full trading history or publish an explicitly
+source-limited wallet trade history. Transfer replay alone does not
+reconstruct every trade price.
 
-## Acceptance cases before implementation is called complete
+## API-only reconstruction pilot and decision
+
+Before implementing chain ingestion, try the smallest answer to the consumer
+questions above. For selected markets, discover candidate addresses from
+market positions, holders, and maker-inclusive trades. For each candidate,
+replay wallet trades and lifecycle activity (including splits, merges,
+redeems, and conversions) from a documented opening state. Match overlapping
+trade and activity records without transaction-hash-only deduplication. Keep
+feed-specific timestamps and unknown activity types rather than inventing
+balance changes. This can be a bounded research script using public reads; it
+does not require a persisted schema or a production indexer.
+
+Test active, resolved, negative-risk, older, and inactive markets; maker-only
+wallets; repeated entry and exit; small fills near the source floor; and
+addresses that received tokens without a reported trade. Compare balances at
+several intermediate dates, not just final `total_size`, against independent
+historical `balanceOf` checks or bounded chain-transfer evidence. Check
+whether market-wide discovery found transfer-only recipients. A final match
+for three wallets is encouraging but cannot establish complete history.
+
+The pilot records three answers separately: (1) how much of the requested
+market/wallet history the API can retrieve, (2) which intermediate balances
+reconcile, and (3) whether the declared consumer question is answered at its
+required precision. If API evidence suffices for that question, stop before a
+chain indexer and label the result as API-derived with its measured limits. If
+important holders or intervals remain missing, decide whether a narrower
+answer is acceptable. Only an unmet concrete requirement proceeds to a bounded
+chain-extraction and cost pilot; only a feasible pilot justifies production
+ingestion, replay, and reorganization recovery. If neither path covers a
+date, return `uncovered`. An API-derived result cannot be labeled exact
+all-holder history without independent evidence that its sources cover every
+relevant balance-changing event and address.
+
+## Acceptance cases for the relevant path
 
 | Case | Required result |
 | --- | --- |
 | Holder ranking changes between pages; a wallet repeats or disappears | Preserve both page observations and times. Exhausted pagination does not become a consistent snapshot; absence is not zero. |
+| API-only replay matches a current position but misses an intermediate balance | Record the gap and withhold an exact historical-holding claim. |
+| Maker-only wallet or transfer-only recipient | Find the maker with maker-inclusive trades; test independently whether the API can discover and account for the recipient. |
 | Capture stops after durable pages and resumes much later | Retain prior evidence, resume the exact query/cursor, avoid duplicate identical attempts, and expose the long scan interval. |
 | Manifest publication is interrupted | Readers see the prior published state, not a manifest pointing to missing files. |
 | Requested date falls after the covered head or inside a gap | Return uncovered; do not substitute the last covered balance unless stale mode was requested. |
@@ -168,7 +213,8 @@ Transfer replay alone does not reconstruct every trade price.
 | Several fills share one transaction hash | Preserve distinct fill evidence; no hash-only deduplication. |
 | Combo is compressed after partial resolution | Preserve its position class, token mappings, and history without reclassifying it as direct holdings of underlying legs. |
 
-The extraction pilot must establish an opening boundary, compare event
+If the API-only pilot fails its declared question and chain extraction is
+considered, the chain pilot must establish an opening boundary, compare event
 identities over bounded ranges, check intermediate and final balances, and
 measure both full-contract scan work and relevant-token output. These are
 separate claims: event-range coverage, reconstructed balances, and sampled
@@ -176,24 +222,27 @@ reconciliation.
 
 ## Delivery order and release gates
 
-1. Add typed `/v2/holders` reads. Then add condition-scoped trades and wallet
-   activity as separate, opt-in changes; preserve PR #9 defaults.
-2. Capture durable gross-balance observations once the holder source and query
-   contract are settled. It need not wait for wallet activity.
-3. Run the one-market chain extraction and historical-trade pilot early. Choose
-   an indexed provider or direct RPC using measured completeness, throughput,
-   and cost. ERC-1155 token IDs are not indexed event topics, so a direct
-   market-wide token scan may require broad contract-log retrieval.
-4. Build transfer ingestion, replay/publication, and reorganization recovery
-   as separate reviewable changes. Add strict dated queries after the
-   coverage contract is demonstrated.
-5. Extend to negative-risk semantics and combinatorial assets. Publish coverage
-   by position class, source feed, asset, and block range. Do not label CTF-only
-   coverage as complete for combinatorial positions.
+1. Add typed `/v2/holders` reads, then condition-scoped trades and wallet
+   activity as separate, opt-in changes; preserve PR #9 defaults. Sync the
+   upstream OpenAPI contract before each new endpoint.
+2. Run the API-only reconstruction pilot against the stated consumer questions.
+   Capture durable gross-balance observations if dated *observations* are
+   useful; they need not wait for wallet activity or a chain decision.
+3. Stop at the API path when its measured coverage answers the declared
+   question. Otherwise, test a bounded chain extraction for the specific gap.
+   Choose an indexed provider or direct RPC using measured completeness,
+   throughput, and cost. ERC-1155 token IDs are not indexed event topics, so a
+   direct market-wide token scan may require broad contract-log retrieval.
+4. Only if that second pilot establishes need and feasibility, build transfer
+   ingestion, replay/publication, and reorganization recovery as separate
+   reviewable changes. Add strict dated queries after coverage is demonstrated.
+5. Extend to negative-risk and combinatorial assets only as required by the
+   declared consumer scope. Publish coverage by position class, source feed,
+   asset, and block range; CTF-only coverage cannot include combos.
 
-The architecture contract is stable; source selection, capture-source choice,
-token scale, and actual historical trade coverage are empirical pilot results,
-not assumptions to encode in advance.
+This contract remains proposed until the pilot resolves API coverage,
+capture-source choice, chain need and feasibility, token scale, and actual
+historical trade coverage.
 
 ## Source references
 
