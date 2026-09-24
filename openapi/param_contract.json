@@ -83,7 +83,34 @@
           "start": {"required": false},
           "taker_only": {"required": false},
           "limit": {"required": false},
-          "cursor": {"required": false}
+          "cursor": {"required": false},
+          "filter_type": {"required": false},
+          "filter_amount": {"required": false}
+        }
+      }
+    },
+    "/v2/holders": {
+      "get": {
+        "params": {
+          "condition": {"required": false},
+          "limit": {"required": false},
+          "cursor": {"required": false},
+          "min_balance": {"required": false},
+          "include_pnl": {"required": false}
+        }
+      }
+    },
+    "/v2/activity": {
+      "get": {
+        "params": {
+          "user": {"required": false},
+          "limit": {"required": false},
+          "cursor": {"required": false},
+          "type": {"required": false},
+          "condition": {"required": false},
+          "start": {"required": false},
+          "sort_direction": {"required": false},
+          "exclude_deposits_withdrawals": {"required": false}
         }
       }
     },
