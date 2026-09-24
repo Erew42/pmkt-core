@@ -4,6 +4,13 @@ from importlib import import_module
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from pmkt.exchanges.polymarket.data_api import (
+        PolymarketMarketParticipants as PolymarketMarketParticipants,
+        PolymarketParticipant as PolymarketParticipant,
+        PolymarketPosition as PolymarketPosition,
+        PolymarketWalletHistory as PolymarketWalletHistory,
+        PolymarketWalletTrade as PolymarketWalletTrade,
+    )
     from pmkt.exchanges.polymarket.clob import (
         AsyncClobClient as AsyncClobClient,
 
@@ -57,8 +64,21 @@ _LAZY_ATTRS: dict[str, tuple[str, str]] = {
     "MarketStreamSnapshot": ("pmkt.exchanges.polymarket.ws", "MarketStreamSnapshot"),
     "PolymarketFilter": ("pmkt.records", "PolymarketFilter"),
     "PolymarketInstrumentRef": ("pmkt.records", "PolymarketInstrumentRef"),
+    "PolymarketMarketParticipants": (
+        "pmkt.exchanges.polymarket.data_api", "PolymarketMarketParticipants"
+    ),
     "PolymarketMarket": ("pmkt.records", "PolymarketMarket"),
     "PolymarketMarketRef": ("pmkt.records", "PolymarketMarketRef"),
+    "PolymarketParticipant": (
+        "pmkt.exchanges.polymarket.data_api", "PolymarketParticipant"
+    ),
+    "PolymarketPosition": ("pmkt.exchanges.polymarket.data_api", "PolymarketPosition"),
+    "PolymarketWalletHistory": (
+        "pmkt.exchanges.polymarket.data_api", "PolymarketWalletHistory"
+    ),
+    "PolymarketWalletTrade": (
+        "pmkt.exchanges.polymarket.data_api", "PolymarketWalletTrade"
+    ),
     "WebSocketProtocolError": ("pmkt.exchanges.polymarket.ws", "WebSocketProtocolError"),
     "apply_market_message": ("pmkt.exchanges.polymarket.ws", "apply_market_message"),
     "collect_market_snapshots": ("pmkt.exchanges.polymarket.ws", "collect_market_snapshots"),

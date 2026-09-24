@@ -353,6 +353,91 @@ covers transport, decoding, and normalization. Expiry raises
 remains reusable. Malformed or contradictory upstream workflow data raises
 `InvalidDataError`.
 
+## Polymarket participants and wallet history
+
+`AsyncPolymarketDataClient.market_participants(condition_id)` reads Data API v2
+`/positions` for `OPEN` and `CLOSED` positions anchored on one condition ID. It
+groups the returned proxy wallets and keeps current and past position rows
+separate. `OPEN` is the venue's held-position superset, including unredeemed
+resolved positions; `CLOSED` means exited positions. The query status selects
+the feed, while `PolymarketPosition.status` preserves the row's own lifecycle
+status: an `OPEN` query can return `REDEEMABLE` rows in `current_positions`.
+The upstream API also has `REDEEMABLE`, user-required `REDEEMABLE_LOST`, and
+`MERGEABLE` query filters. This client deliberately accepts only `OPEN` and
+`CLOSED` queries; it does not restrict returned row statuses to those two values.
+Both requests use a zero
+token threshold rather than the API's default 0.1-share floor. The
+`OPEN` request includes archived markets. The Data API rejects
+`include_archived` for `CLOSED`, so that request omits it. The result exposes
+the page count and next cursor for each status. `complete` means both requested
+walks reached a terminal cursor, not that the two live reads formed an atomic
+point-in-time snapshot. The result's
+UTC start and completion times bound the local observation interval.
+
+`AsyncPolymarketDataClient.wallet_history(wallet)` reads that wallet's
+`start=1` trade feed plus its `OPEN` and `CLOSED` positions. The v2 trade
+endpoint defaults to a three-year window when `start` is omitted; it ignores
+the `full_history` query parameter. The request sends `taker_only=false`:
+the API default returns only the wallet's
+taker fills, which omits every maker fill. Rows carry no maker or taker role,
+and `side` is the wallet's own side. It retains
+trade sizes and prices as `Decimal`, with source timestamps in epoch seconds.
+These are public proxy-wallet observations, not verified human identities or
+authenticated fills. The result's three next cursors and `complete` property
+make page-cap truncation visible. `positions_page` and `trades_page` accept a
+cursor for callers that need to resume individual feeds. Each workflow shares
+one finite deadline across its pages and uses at most 20 pages per feed by
+default; callers can raise `max_pages_per_status` or `max_pages_per_feed`.
+
+Page caps intentionally return bounded partial results with `complete=False`
+and a continuation cursor for every unfinished feed. They do not raise
+`ResultLimitExceededError`, unlike the point-count limits on sampled price
+history. Consumers must inspect `complete` before treating traversal as finished.
+A terminal page reached exactly at the cap still makes that feed complete.
+Pagination completion never certifies exhaustive historical source coverage.
+HTTP and transport failures, malformed responses, and deadline expiry still
+raise and return no partial result. Invalid JSON, malformed rows or envelopes,
+identity mismatches, and repeated scan cursors raise `InvalidDataError`.
+Invalid caller arguments remain ordinary `ValueError`/`TypeError` failures.
+
+Both workflow results expose `provenance: ResultProvenance`, with one
+`RequestObservation` per successful page, including empty pages. Each position
+and trade's `request_id` links it to that observation. Observations retain the
+sanitized source origin, endpoint, sent query parameters (including status,
+cursor, page size, and history/maker filters), request/receipt times, attempt
+count, and HTTP status. The query status is recorded here rather than repeated
+on every position. `interpretation_id` and `package_version` identify the
+interpretation contract. To keep these bounded scans small, `raw_responses` is
+empty; this is request metadata, not retained raw-response evidence. The native
+one-page methods retain their `(rows, next_cursor)` return shape and do not
+return the workflow provenance collection.
+
+```python
+from pmkt.exchanges.polymarket import AsyncPolymarketDataClient
+
+async with AsyncPolymarketDataClient() as data:
+    market = await data.market_participants(condition_id)
+    if not market.complete:
+        print("Partial participant scan:", market.current_next_cursor, market.past_next_cursor)
+    if market.participants:
+        history = await data.wallet_history(market.participants[0].wallet)
+        if not history.complete:
+            print("Partial wallet history; resume the unfinished feeds with their cursors.")
+```
+
+The position API reports the venue's current lifecycle classification. It does
+not provide a dated ledger of every past ownership interval. A wallet that
+changed exposure within an outcome can have one aggregate position row, so
+position rows must not be interpreted as individual fills. Trades do not
+reconcile to positions: splits, merges, negative-risk conversions, redemptions,
+and token transfers can change holdings without corresponding trade rows.
+A held position can report `avg_price=0` and `total_size=0`; these source values
+must not be used to infer zero holdings or reconstruct an acquisition history.
+Trade rows carry no maker/taker role, and the separate position and trade reads
+are not atomic. These feeds are insufficient to reconstruct historical balances.
+This feature adds no participant fields to
+the existing public trade recording or canonical `trade.v1` schema.
+
 ## Kalshi discovery, detail, and current books
 
 The supported Kalshi facade exports `AsyncKalshiClient`, `KalshiFilter`,
