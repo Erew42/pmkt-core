@@ -1022,6 +1022,85 @@ class AsyncKalshiClient:
             return market
         return data
 
+    async def historical_markets_page(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        event_ticker: str | None = None,
+        series_ticker: str | None = None,
+        tickers: str | Iterable[str] | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> dict[str, Any]:
+        """Fetch one page of markets from Kalshi's historical archive."""
+        self._validate_limit(limit)
+        normalized_tickers = _normalize_tickers(tickers)
+        if tickers is not None and normalized_tickers is None:
+            raise ValueError("tickers must not be empty")
+        selectors = (event_ticker, series_ticker, normalized_tickers)
+        if sum(value is not None for value in selectors) > 1:
+            raise ValueError("historical market filters are mutually exclusive")
+        for name, value in (
+            ("event_ticker", event_ticker),
+            ("series_ticker", series_ticker),
+            ("tickers", normalized_tickers),
+        ):
+            if value is not None:
+                _require_nonempty_string(value, name)
+        data = await self._http.request_json(
+            "GET",
+            "/historical/markets",
+            params={
+                "limit": limit,
+                "cursor": cursor,
+                "event_ticker": event_ticker,
+                "series_ticker": series_ticker,
+                "tickers": normalized_tickers,
+            },
+            expiry=expiry,
+        )
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict, got {type(data)}")
+        return data
+
+    async def iter_historical_markets(
+        self,
+        *,
+        limit: int = 100,
+        cursor: str | None = None,
+        event_ticker: str | None = None,
+        series_ticker: str | None = None,
+        tickers: str | Iterable[str] | None = None,
+        max_pages: int | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        """Yield archived markets until the cursor ends or max_pages is reached."""
+        seen_cursors = {cursor} if cursor else set()
+        pages = 0
+        while max_pages is None or pages < max_pages:
+            page = await self.historical_markets_page(
+                limit=limit,
+                cursor=cursor,
+                event_ticker=event_ticker,
+                series_ticker=series_ticker,
+                tickers=tickers,
+                expiry=expiry,
+            )
+            pages += 1
+            markets = page.get("markets")
+            if not isinstance(markets, list):
+                raise TypeError("Expected response field 'markets' to be a list")
+            for market in markets:
+                if isinstance(market, dict):
+                    yield market
+            next_cursor = str(page.get("cursor") or "").strip() or None
+            if next_cursor is None:
+                break
+            if next_cursor in seen_cursors:
+                raise RuntimeError("Kalshi historical markets cursor repeated")
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+
     async def iter_markets(
         self,
         *,
