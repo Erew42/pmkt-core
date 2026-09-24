@@ -12,9 +12,10 @@ The pilot read the [official Data API v2 OpenAPI document](https://data-api.poly
 `/v2/trades?condition=...&taker_only=false`, and wallet
 `/v2/activity?start=1&condition=...`. Wallet `/v2/trades?start=1` was also
 walked up to five 1,000-row pages per sampled wallet. The market scans used
-one 100-row page per feed. The wallets below were selected from the returned
-market positions, holders, and trades. All source reads were live and
-non-atomic; page caps and cursor exhaustion are reported separately.
+one 100-row page per feed. The market-page sample finished near 21:10 UTC and
+the wallet replay near 21:30 UTC. The exact replay wallets are listed below.
+All source reads were live and non-atomic; page caps and cursor exhaustion
+are reported separately.
 
 | Case | Gamma market ID and condition | OPEN / CLOSED position page | Gross holder page | Condition trade page |
 | --- | --- | --- | --- | --- |
@@ -24,6 +25,15 @@ non-atomic; page caps and cursor exhaustion are reported separately.
 | Older closed, created 2020 | `12`, `0xe3b423dfad8c22ff75c9899c4e8176f628cf4ad4caa00481764d320e7415f7a9` | 25 / 7, cursors exhausted | 31, cursor exhausted | 0, cursor exhausted |
 
 `+` means the page returned a continuation cursor, not an estimated total.
+The selected wallets were:
+
+| Case | Replay wallets |
+| --- | --- |
+| Active | `0x0224bb9eb0a5c9fd261ac9123a72cbdd5748292a`, `0x000d257d2dc7616feaef4ae0f14600fdf50a758e` |
+| Recently closed | `0x04c2f84c8a94637144f694be9ed45921dfd943c4`, `0x0539490293b8d671188fdf900de22de501746c1f`, `0x071f9c6bfa9cb3c609fe8e9ffbf43521cb1892bd` |
+| Negative risk | `0x04b26f4f28716d305e7eb746e8953de5833de801`, `0x03805a13a0b3e058f55f6c6af95389d4f431073d` |
+| Older closed | `0x0fecb2d97acad2d6dee3f1d04d3c868a2829c9f7`, `0x37ed804f6e56ab691ad6c77d78dca41a505e13e4` |
+
 Gamma reports the older market as `active=true`, `closed=true`,
 `archived=false`; it is **not** an inactive-market test. A bounded Gamma
 search did not find a genuinely inactive candidate, so that contract case
@@ -33,8 +43,9 @@ inactive positions are excluded even with `include_archived`.
 The official trade contract fixes condition queries to three years and floors
 size at 0.01 shares. These source limits make the old market's empty condition
 trade response expected; it does not prove no trading occurred. The activity
-default omits opt-in `TIP` rows. Neither cursor exhaustion nor `start=1`
-certifies all token transfers.
+default omits opt-in `TIP` pUSD transfers. Outcome-token transfers need
+separate ERC-1155 evidence; neither cursor exhaustion nor `start=1`
+certifies them.
 
 ## API-only balance replay
 
@@ -126,11 +137,35 @@ market-wide extraction must read and decode CTF transfers across a bounded
 block range before filtering token IDs. Address-indexed topics may help a
 known-wallet query, but cannot discover all holders of a token alone.
 
+## Coverage recheck
+
+A follow-up at approximately 21:54 UTC compared completed gross-holder and
+`OPEN` position scans for two markets. In the recently closed market, gross
+holders contained 25 wallet/token rows and `OPEN` positions 24; the extra
+holder had a positive `CLOSED` position. In the older market, gross holders
+contained 31 rows and `OPEN` positions 25; all six extra holder rows were
+positive residual balances in `CLOSED`. One such wallet had two gross amounts
+of 0.062071 and 0.061887 shares; latest CTF `balanceOf` returned 62071 and
+61887 raw units. Position `current_size` displayed 0.062 and 0.0618. Across
+matched rows, the largest gross-versus-position display difference was below
+0.0001 shares. The recently closed market's holder count changed from the
+earlier sample, illustrating that these live scans are not a shared snapshot.
+`OPEN` alone therefore misses some observed current holders; gross holders
+are the better current per-token observation, with their own scan limits.
+
+The same recently closed market had exhausted trade cursors with 197
+`taker_only=true` rows and 522 `taker_only=false` rows. Twenty-five wallets
+appeared only on the maker-inclusive side of this complete market feed. For
+one such wallet (`0x33ab58e55895f39619815d31dfc92d90d65f9523`), a
+maker-side fill appeared in both the wallet trade and condition activity
+feeds. This verifies the need for `taker_only=false` in market discovery and
+shows that overlapping activity TRADE rows must not be added again.
+
 ## Decision
 
 | Consumer answer | Decision | Evidence boundary |
 | --- | --- | --- |
-| Current observed holders | Supported with gaps | Gross holder and OPEN-position pages are available, but scans are not atomic and capped pages must be resumed. |
+| Current observed holders | Supported with gaps | Gross holder pages include small positive balances classified `CLOSED` by positions. `OPEN` alone misses them; scans are not atomic and capped pages must be resumed. |
 | Known-wallet API-derived dated timeline | Supported with gaps | Trades and lifecycle activity explain some sampled balances; blank-token lifecycle rows, direct transfers, older coverage, source floors, and unavailable historical checks prevent exactness. Dates without covered opening/events must be `uncovered`, never zero. |
 | Exact market-wide dated holder history | Unsupported by API-only evidence | The old market has an on-chain holder whose API trade/activity feeds contain no event, and market-wide transfer recipients cannot be proven from these feeds. |
 

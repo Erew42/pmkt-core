@@ -130,10 +130,13 @@ instantaneous.
 Publish a manifest only after all files it names are durable, using an atomic
 publication pattern like `contract_evidence_manifest.py`. An interrupted scan
 retains recoverable page evidence but is not presented as an exhausted scan.
-For holdings capture, compare gross per-token semantics from market-scoped
-`OPEN` positions with `/v2/holders?include_pnl=true`; choose the source after
-checking coverage and request cost. The default holder net balance remains a
-separate view. Neither API mode implies a simultaneous snapshot.
+For holdings capture, compare market-scoped `OPEN` and `CLOSED` positions with
+`/v2/holders?include_pnl=true`. The bounded pilot found positive residual
+balances in `CLOSED` rows that were absent from `OPEN` but present in gross
+holders and latest CTF balances. Use gross holders for observed current
+per-token balances, and treat position status as a lifecycle classification.
+The default holder net balance remains a separate view. These API reads do
+not form a simultaneous snapshot.
 
 ## Chain evidence if the pilot requires it
 
