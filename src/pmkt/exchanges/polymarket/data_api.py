@@ -441,7 +441,11 @@ def _activity(
     request_id: str,
 ) -> PolymarketWalletActivity:
     found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
-    found_condition = _source_condition_id(row, requested=condition_id, feed="activity")
+    # REWARD, YIELD and rebate rows are wallet cash flows with no market.
+    found_condition = (
+        "" if condition_id is None and row.get("condition_id") == ""
+        else _source_condition_id(row, requested=condition_id, feed="activity")
+    )
     if found_wallet != wallet:
         raise InvalidDataError("Data API v2 activity wallet differs from the request")
     timestamp = row.get("timestamp")

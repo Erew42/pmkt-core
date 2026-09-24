@@ -341,6 +341,33 @@ async def test_activity_page_allows_empty_token_for_merge() -> None:
     assert result.activities[0].event_type == "MERGE"
 
 
+async def test_wallet_activity_keeps_cash_flow_rows_without_market() -> None:
+    # Live wallet pages mix REWARD/YIELD/rebate rows with blank market IDs into
+    # ordinary history; rejecting them made most wallet-wide pages unreadable.
+    reward = {
+        "proxy_wallet": WALLET_A, "condition_id": "", "token_id": "",
+        "type": "REWARD", "side": "", "size": 30.29, "usdc_size": 30.29,
+        "price": 0, "timestamp": 1782752879, "outcome_index": 999,
+        "transaction_hash": "0x" + "e" * 64,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "data": [reward], "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.activity_page(wallet=WALLET_A)
+        with pytest.raises(InvalidDataError):
+            await client.activity_page(wallet=WALLET_A, condition_id=CONDITION)
+
+    assert result.activities[0].event_type == "REWARD"
+    assert result.activities[0].condition_id == ""
+    assert result.activities[0].usdc_size == Decimal("30.29")
+
+
 async def test_market_participants_reports_page_cap_and_cursor() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.params["status"] == "OPEN":

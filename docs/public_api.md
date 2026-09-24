@@ -468,7 +468,9 @@ using it as a canonical market key.
 `activity_page(wallet=..., condition_id=...)` requests `start=1` wallet
 history and returns typed events, a cursor, and an observation. It retains
 unknown event types, empty outcome token IDs on events such as `MERGE`, and
-source timestamps. `TRADE` activity overlaps the trade feed: consumers must
+source timestamps. Wallet-wide pages also return cash-flow rows such as
+`REWARD`, `YIELD`, `MAKER_REBATE`, and `TAKER_REBATE` with empty
+`condition_id` and `token_id`; condition-scoped pages never accept them. `TRADE` activity overlaps the trade feed: consumers must
 choose one trade source before adding lifecycle changes. Transaction hash alone
 does not uniquely identify a fill. The default activity type set excludes
 opt-in `TIP` pUSD transfers. This activity feed does not establish a complete
