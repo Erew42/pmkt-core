@@ -369,8 +369,10 @@ point-in-time snapshot. The result's
 UTC start and completion times bound the local observation interval.
 
 `AsyncPolymarketDataClient.wallet_history(wallet)` reads that wallet's
-`full_history=true` trade feed plus its `OPEN` and `CLOSED` positions. The trade
-request sends `taker_only=false`: the API default returns only the wallet's
+`start=1` trade feed plus its `OPEN` and `CLOSED` positions. The v2 trade
+endpoint defaults to a three-year window when `start` is omitted; it ignores
+the `full_history` query parameter. The request sends `taker_only=false`:
+the API default returns only the wallet's
 taker fills, which omits every maker fill. Rows carry no maker or taker role,
 and `side` is the wallet's own side. It retains
 trade sizes and prices as `Decimal`, with source timestamps in epoch seconds.

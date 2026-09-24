@@ -433,7 +433,7 @@ class AsyncPolymarketDataClient:
             "/v2/trades",
             {
                 "user": user,
-                "full_history": True,
+                "start": 1,
                 "taker_only": False,
                 "limit": page_size,
                 "cursor": cursor,

@@ -80,7 +80,7 @@
         "params": {
           "user": {"required": false},
           "condition": {"required": false},
-          "full_history": {"required": false},
+          "start": {"required": false},
           "taker_only": {"required": false},
           "limit": {"required": false},
           "cursor": {"required": false}
