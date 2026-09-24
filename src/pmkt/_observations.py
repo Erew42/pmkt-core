@@ -14,6 +14,7 @@ from pmkt.records import DataScope, TransportOrigin
 _QUALIFIED_ENDPOINTS: dict[tuple[str, str, str], DataScope] = {
     ("gamma", "gamma-api.polymarket.com", ""): "production",
     ("clob", "clob.polymarket.com", ""): "production",
+    ("data", "data-api.polymarket.com", ""): "production",
     ("kalshi", "external-api.kalshi.com", "/trade-api/v2"): "production",
     ("kalshi", "external-api.demo.kalshi.co", "/trade-api/v2"): "demo",
 }
@@ -86,7 +87,7 @@ def source_after_response(source: RequestSource, response_url: str) -> RequestSo
         )
     ):
         path = parsed.path.rstrip("/")
-        if source.service in {"gamma", "clob"}:
+        if source.service in {"gamma", "clob", "data"}:
             service_path = ""
         elif source.service == "kalshi" and (
             path == "/trade-api/v2" or path.startswith("/trade-api/v2/")

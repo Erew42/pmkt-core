@@ -47,6 +47,7 @@ class VenueRequests:
         expiry: OperationExpiry | None = None,
         response_identities: Callable[[Any], Sequence[str]] | None = None,
         record_observation: Callable[[RequestObservation], None] | None = None,
+        parse_float: Callable[[str], Any] | None = None,
     ) -> tuple[Any, RequestObservation]:
         """Fetch decoded JSON and return sanitized operation-local provenance."""
 
@@ -81,7 +82,9 @@ class VenueRequests:
             received = trace.received_at_utc
             status_code = trace.status_code
             source = source_after_response(source, str(response.url))
-            data = await self.http._decode_response(response, expiry=expiry)
+            data = await self.http._decode_response(
+                response, expiry=expiry, parse_float=parse_float,
+            )
             response = None
             if response_identities is not None:
                 if expiry is not None:
@@ -102,7 +105,7 @@ class VenueRequests:
         except httpx.RequestError:
             outcome = "transport_error"
             raise
-        except JSONDecodeError:
+        except (JSONDecodeError, UnicodeDecodeError):
             outcome = "invalid_response"
             raise
         except InvalidDataError:

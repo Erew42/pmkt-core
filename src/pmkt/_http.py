@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import math
-from typing import Any, Collection, Mapping
+from typing import Any, Callable, Collection, Mapping
 
 import httpx
 from aiolimiter import AsyncLimiter
@@ -271,12 +271,13 @@ class HttpClient:
         response: httpx.Response,
         *,
         expiry: OperationExpiry | None,
+        parse_float: Callable[[str], Any] | None = None,
     ) -> Any:
         try:
             response.raise_for_status()
             if expiry is not None:
                 expiry.checkpoint()
-            data = response.json()
+            data = response.json() if parse_float is None else response.json(parse_float=parse_float)
             if expiry is not None:
                 expiry.checkpoint()
             return data

@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import re
-from typing import Any, Mapping, Sequence
+from typing import Any, Generic, Mapping, Sequence, TypeVar
+from uuid import uuid4
 
 import httpx
 from pmkt.runtime import OperationExpiry
@@ -14,6 +15,10 @@ from aiolimiter import AsyncLimiter
 from pmkt.runtime import RequestPolicy
 from pmkt._http import HttpClient
 from pmkt.config import PmktConfig
+from pmkt import __version__
+from pmkt.errors import InvalidDataError
+from pmkt.exchanges._requests import VenueRequests
+from pmkt.records import RequestObservation, ResultProvenance
 
 
 MAX_OPEN_INTEREST_MARKETS = 25
@@ -22,6 +27,7 @@ DEFAULT_DATA_API_PERIOD_SECONDS = 1
 MAX_V2_PAGE_SIZE = 1000
 _WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 _CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
+_RowT = TypeVar("_RowT")
 
 
 def normalize_condition_ids(condition_ids: Sequence[object]) -> tuple[str, ...]:
@@ -104,7 +110,7 @@ def normalize_polymarket_open_interest(
 
 @dataclass(frozen=True)
 class PolymarketPosition:
-    """One Data API v2 position, retaining its source lifecycle status."""
+    """One position; source status may differ from the query (e.g. REDEEMABLE)."""
 
     wallet: str
     condition_id: str
@@ -117,6 +123,7 @@ class PolymarketPosition:
     current_value: Decimal | None
     realized_pnl: Decimal | None
     unrealized_pnl: Decimal | None
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +139,7 @@ class PolymarketWalletTrade:
     timestamp_s: int
     transaction_hash: str
     outcome: str | None
+    request_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -151,9 +159,11 @@ class PolymarketMarketParticipants:
     past_next_cursor: str | None
     started_at_utc: datetime
     completed_at_utc: datetime
+    provenance: ResultProvenance
 
     @property
     def complete(self) -> bool:
+        """Whether both walks exhausted pagination, not historical coverage."""
         return self.current_next_cursor is None and self.past_next_cursor is None
 
 
@@ -171,9 +181,11 @@ class PolymarketWalletHistory:
     past_next_cursor: str | None
     started_at_utc: datetime
     completed_at_utc: datetime
+    provenance: ResultProvenance
 
     @property
     def complete(self) -> bool:
+        """Whether all walks exhausted pagination, not historical coverage."""
         return (
             self.trades_next_cursor is None
             and self.current_next_cursor is None
@@ -182,9 +194,19 @@ class PolymarketWalletHistory:
 
 
 @dataclass(frozen=True)
-class _DataPage:
-    rows: tuple[dict[str, Any], ...]
+class _DataPage(Generic[_RowT]):
+    rows: tuple[_RowT, ...]
     next_cursor: str | None
+    observation: RequestObservation
+
+
+def _provenance(observations: Sequence[RequestObservation]) -> ResultProvenance:
+    return ResultProvenance(
+        observations=tuple(observations),
+        interpretation_id="polymarket_data_api_wallet_reads.v1",
+        package_version=__version__,
+        raw_responses=(),
+    )
 
 
 def _identifier(value: str, *, name: str, pattern: re.Pattern[str]) -> str:
@@ -204,7 +226,7 @@ def _positive_int(value: int, *, name: str, maximum: int | None = None) -> int:
 def _text(row: Mapping[str, Any], key: str) -> str:
     value = row.get(key)
     if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"Data API v2 row lacks {key}")
+        raise InvalidDataError(f"Data API v2 row lacks {key}")
     return value
 
 
@@ -213,7 +235,7 @@ def _optional_text(row: Mapping[str, Any], key: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValueError(f"Data API v2 {key} must be a string or null")
+        raise InvalidDataError(f"Data API v2 {key} must be a string or null")
     return value
 
 
@@ -221,30 +243,40 @@ def _decimal(row: Mapping[str, Any], key: str, *, required: bool = False) -> Dec
     value = row.get(key)
     if value is None:
         if required:
-            raise ValueError(f"Data API v2 row lacks {key}")
+            raise InvalidDataError(f"Data API v2 row lacks {key}")
         return None
     if isinstance(value, bool):
-        raise ValueError(f"Data API v2 {key} must be numeric")
+        raise InvalidDataError(f"Data API v2 {key} must be numeric")
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError) as exc:
-        raise ValueError(f"Data API v2 {key} must be numeric") from exc
+        raise InvalidDataError(f"Data API v2 {key} must be numeric") from exc
     if not result.is_finite():
-        raise ValueError(f"Data API v2 {key} must be finite")
+        raise InvalidDataError(f"Data API v2 {key} must be finite")
     return result
 
 
-def _position(row: Mapping[str, Any], *, wallet: str | None, condition_id: str | None) -> PolymarketPosition:
-    found_wallet = _identifier(_text(row, "proxy_wallet"), name="proxy_wallet", pattern=_WALLET_RE)
-    found_condition = _identifier(_text(row, "condition_id"), name="condition_id", pattern=_CONDITION_RE)
+def _row_identifier(row: Mapping[str, Any], key: str, pattern: re.Pattern[str]) -> str:
+    try:
+        return _identifier(_text(row, key), name=key, pattern=pattern)
+    except ValueError as exc:
+        raise InvalidDataError(str(exc)) from exc
+
+
+def _position(
+    row: Mapping[str, Any], *, wallet: str | None, condition_id: str | None,
+    request_id: str,
+) -> PolymarketPosition:
+    found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
+    found_condition = _row_identifier(row, "condition_id", _CONDITION_RE)
     if wallet is not None and found_wallet != wallet:
-        raise ValueError("Data API v2 position wallet differs from the request")
+        raise InvalidDataError("Data API v2 position wallet differs from the request")
     if condition_id is not None and found_condition != condition_id:
-        raise ValueError("Data API v2 position condition differs from the request")
+        raise InvalidDataError("Data API v2 position condition differs from the request")
     current_size = _decimal(row, "current_size", required=True)
     assert current_size is not None
     if current_size < 0:
-        raise ValueError("Data API v2 current_size must be nonnegative")
+        raise InvalidDataError("Data API v2 current_size must be nonnegative")
     return PolymarketPosition(
         wallet=found_wallet,
         condition_id=found_condition,
@@ -257,24 +289,25 @@ def _position(row: Mapping[str, Any], *, wallet: str | None, condition_id: str |
         current_value=_decimal(row, "current_value"),
         realized_pnl=_decimal(row, "realized_pnl"),
         unrealized_pnl=_decimal(row, "unrealized_pnl"),
+        request_id=request_id,
     )
 
 
-def _trade(row: Mapping[str, Any], *, wallet: str) -> PolymarketWalletTrade:
-    found_wallet = _identifier(_text(row, "proxy_wallet"), name="proxy_wallet", pattern=_WALLET_RE)
+def _trade(row: Mapping[str, Any], *, wallet: str, request_id: str) -> PolymarketWalletTrade:
+    found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
     if found_wallet != wallet:
-        raise ValueError("Data API v2 trade wallet differs from the request")
+        raise InvalidDataError("Data API v2 trade wallet differs from the request")
     size = _decimal(row, "size", required=True)
     price = _decimal(row, "price", required=True)
     assert size is not None and price is not None
     if size <= 0 or not 0 <= price <= 1:
-        raise ValueError("Data API v2 trade size or price is invalid")
+        raise InvalidDataError("Data API v2 trade size or price is invalid")
     timestamp = row.get("timestamp")
     if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
-        raise ValueError("Data API v2 trade timestamp must be epoch seconds")
+        raise InvalidDataError("Data API v2 trade timestamp must be epoch seconds")
     return PolymarketWalletTrade(
         wallet=found_wallet,
-        condition_id=_identifier(_text(row, "condition_id"), name="condition_id", pattern=_CONDITION_RE),
+        condition_id=_row_identifier(row, "condition_id", _CONDITION_RE),
         token_id=_text(row, "token_id"),
         side=_text(row, "side"),
         size=size,
@@ -282,6 +315,7 @@ def _trade(row: Mapping[str, Any], *, wallet: str) -> PolymarketWalletTrade:
         timestamp_s=timestamp,
         transaction_hash=_text(row, "transaction_hash"),
         outcome=_optional_text(row, "outcome"),
+        request_id=request_id,
     )
 
 
@@ -316,6 +350,7 @@ class AsyncPolymarketDataClient:
             timeout_s=timeout_s,
             request_policy=request_policy,
         )
+        self._requests = VenueRequests(self._http, venue="polymarket", service="data")
 
     async def __aenter__(self) -> "AsyncPolymarketDataClient":
         await self._http.__aenter__()
@@ -342,32 +377,37 @@ class AsyncPolymarketDataClient:
 
     async def _v2_page(
         self, path: str, params: dict[str, Any], *, expiry: OperationExpiry | None
-    ) -> _DataPage:
-        response = await self._http.request_response("GET", path, params=params, expiry=expiry)
-        response.raise_for_status()
-        if expiry is not None:
-            expiry.checkpoint()
-        payload = json.loads(response.content, parse_float=Decimal)
+    ) -> _DataPage[dict[str, Any]]:
+        try:
+            payload, observation = await self._requests.request_json_observed(
+                "GET", path, params=params, expiry=expiry,
+                request_id=f"data-api-{uuid4().hex}",
+                endpoint_template=path,
+                effective_parameters={key: value for key, value in params.items() if value is not None},
+                parse_float=Decimal,
+            )
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise InvalidDataError(f"{path} response must be valid JSON") from exc
         if expiry is not None:
             expiry.checkpoint()
         if not isinstance(payload, dict):
-            raise TypeError(f"{path} response must be an object")
+            raise InvalidDataError(f"{path} response must be an object")
         rows = payload.get("data")
         pagination = payload.get("pagination")
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-            raise TypeError(f"{path} data must be a list of objects")
+            raise InvalidDataError(f"{path} data must be a list of objects")
         if not isinstance(pagination, dict):
-            raise TypeError(f"{path} pagination must be an object")
+            raise InvalidDataError(f"{path} pagination must be an object")
         has_more = pagination.get("has_more")
         next_cursor = pagination.get("next_cursor")
         if not isinstance(has_more, bool):
-            raise TypeError(f"{path} pagination.has_more must be boolean")
+            raise InvalidDataError(f"{path} pagination.has_more must be boolean")
         if has_more:
             if not isinstance(next_cursor, str) or not next_cursor:
-                raise ValueError(f"{path} has_more requires next_cursor")
+                raise InvalidDataError(f"{path} has_more requires next_cursor")
         elif next_cursor is not None:
-            raise ValueError(f"{path} terminal page has next_cursor")
-        return _DataPage(tuple(rows), next_cursor)
+            raise InvalidDataError(f"{path} terminal page has next_cursor")
+        return _DataPage(tuple(rows), next_cursor, observation)
 
     async def positions_page(
         self,
@@ -379,7 +419,17 @@ class AsyncPolymarketDataClient:
         cursor: str | None = None,
         expiry: OperationExpiry | None = None,
     ) -> tuple[tuple[PolymarketPosition, ...], str | None]:
-        """Read one current or exited-position page for a wallet or one market."""
+        """Read an OPEN or CLOSED query page, preserving each row's own status."""
+        page = await self._positions_page(
+            condition_id=condition_id, wallet=wallet, status=status,
+            page_size=page_size, cursor=cursor, expiry=expiry,
+        )
+        return page.rows, page.next_cursor
+
+    async def _positions_page(
+        self, *, condition_id: str | None, wallet: str | None, status: str,
+        page_size: int, cursor: str | None, expiry: OperationExpiry | None,
+    ) -> _DataPage[PolymarketPosition]:
         if condition_id is None and wallet is None:
             raise ValueError("condition_id or wallet is required")
         condition = (
@@ -410,11 +460,14 @@ class AsyncPolymarketDataClient:
             expiry=expiry,
         )
         positions = tuple(
-            _position(row, wallet=user, condition_id=condition) for row in page.rows
+            _position(
+                row, wallet=user, condition_id=condition,
+                request_id=page.observation.request_id,
+            ) for row in page.rows
         )
         if expiry is not None:
             expiry.checkpoint()
-        return positions, page.next_cursor
+        return _DataPage(positions, page.next_cursor, page.observation)
 
     async def trades_page(
         self,
@@ -425,6 +478,15 @@ class AsyncPolymarketDataClient:
         expiry: OperationExpiry | None = None,
     ) -> tuple[tuple[PolymarketWalletTrade, ...], str | None]:
         """Read one wallet trade page, maker and taker fills, from the full-history feed."""
+        page = await self._trades_page(
+            wallet=wallet, page_size=page_size, cursor=cursor, expiry=expiry,
+        )
+        return page.rows, page.next_cursor
+
+    async def _trades_page(
+        self, *, wallet: str, page_size: int, cursor: str | None,
+        expiry: OperationExpiry | None,
+    ) -> _DataPage[PolymarketWalletTrade]:
         user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
         _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
         if cursor is not None and (not isinstance(cursor, str) or not cursor):
@@ -440,10 +502,13 @@ class AsyncPolymarketDataClient:
             },
             expiry=expiry,
         )
-        trades = tuple(_trade(row, wallet=user) for row in page.rows)
+        trades = tuple(
+            _trade(row, wallet=user, request_id=page.observation.request_id)
+            for row in page.rows
+        )
         if expiry is not None:
             expiry.checkpoint()
-        return trades, page.next_cursor
+        return _DataPage(trades, page.next_cursor, page.observation)
 
     async def _scan_positions(
         self,
@@ -454,12 +519,13 @@ class AsyncPolymarketDataClient:
         page_size: int,
         max_pages: int,
         expiry: OperationExpiry,
+        observations: list[RequestObservation],
     ) -> tuple[tuple[PolymarketPosition, ...], int, str | None]:
         rows: list[PolymarketPosition] = []
         seen_cursors: set[str] = set()
         cursor: str | None = None
         for page_count in range(1, max_pages + 1):
-            page_rows, next_cursor = await self.positions_page(
+            page = await self._positions_page(
                 condition_id=condition_id,
                 wallet=wallet,
                 status=status,
@@ -467,11 +533,13 @@ class AsyncPolymarketDataClient:
                 cursor=cursor,
                 expiry=expiry,
             )
-            rows.extend(page_rows)
+            rows.extend(page.rows)
+            observations.append(page.observation)
+            next_cursor = page.next_cursor
             if next_cursor is None:
                 return tuple(rows), page_count, None
             if next_cursor in seen_cursors:
-                raise ValueError("Data API v2 repeated a positions cursor")
+                raise InvalidDataError("Data API v2 repeated a positions cursor")
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return tuple(rows), max_pages, cursor
@@ -483,19 +551,22 @@ class AsyncPolymarketDataClient:
         page_size: int,
         max_pages: int,
         expiry: OperationExpiry,
+        observations: list[RequestObservation],
     ) -> tuple[tuple[PolymarketWalletTrade, ...], int, str | None]:
         rows: list[PolymarketWalletTrade] = []
         seen_cursors: set[str] = set()
         cursor: str | None = None
         for page_count in range(1, max_pages + 1):
-            page_rows, next_cursor = await self.trades_page(
+            page = await self._trades_page(
                 wallet=wallet, page_size=page_size, cursor=cursor, expiry=expiry
             )
-            rows.extend(page_rows)
+            rows.extend(page.rows)
+            observations.append(page.observation)
+            next_cursor = page.next_cursor
             if next_cursor is None:
                 return tuple(rows), page_count, None
             if next_cursor in seen_cursors:
-                raise ValueError("Data API v2 repeated a trades cursor")
+                raise InvalidDataError("Data API v2 repeated a trades cursor")
             seen_cursors.add(next_cursor)
             cursor = next_cursor
         return tuple(rows), max_pages, cursor
@@ -512,19 +583,21 @@ class AsyncPolymarketDataClient:
 
         The two status walks are not an atomic historical snapshot. A retained
         cursor means the corresponding walk stopped at the caller's page cap.
+        Caps return partial results, not ResultLimitExceededError; check complete.
         """
         condition = _identifier(condition_id, name="condition_id", pattern=_CONDITION_RE)
         _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
         _positive_int(max_pages_per_status, name="max_pages_per_status")
         started = datetime.now(timezone.utc)
         expiry = OperationExpiry.bounded(deadline_s)
+        observations: list[RequestObservation] = []
         current, current_pages, current_cursor = await self._scan_positions(
             condition_id=condition, wallet=None, status="OPEN", page_size=page_size,
-            max_pages=max_pages_per_status, expiry=expiry,
+            max_pages=max_pages_per_status, expiry=expiry, observations=observations,
         )
         past, past_pages, past_cursor = await self._scan_positions(
             condition_id=condition, wallet=None, status="CLOSED", page_size=page_size,
-            max_pages=max_pages_per_status, expiry=expiry,
+            max_pages=max_pages_per_status, expiry=expiry, observations=observations,
         )
         by_wallet: dict[str, tuple[list[PolymarketPosition], list[PolymarketPosition]]] = {}
         for position in current:
@@ -539,6 +612,7 @@ class AsyncPolymarketDataClient:
         return PolymarketMarketParticipants(
             condition, participants, current_pages, past_pages,
             current_cursor, past_cursor, started, datetime.now(timezone.utc),
+            _provenance(observations),
         )
 
     async def wallet_history(
@@ -549,27 +623,34 @@ class AsyncPolymarketDataClient:
         max_pages_per_feed: int = 20,
         deadline_s: float = 120.0,
     ) -> PolymarketWalletHistory:
-        """Read a wallet's full trade feed and its current and exited positions."""
+        """Read bounded trade and position feeds, which do not reconcile balances.
+
+        Caps return partial results, not ResultLimitExceededError; check complete
+        and resume each unfinished feed with its cursor. Failures still raise.
+        """
         user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
         _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
         _positive_int(max_pages_per_feed, name="max_pages_per_feed")
         started = datetime.now(timezone.utc)
         expiry = OperationExpiry.bounded(deadline_s)
+        observations: list[RequestObservation] = []
         trades, trade_pages, trades_cursor = await self._scan_trades(
-            wallet=user, page_size=page_size, max_pages=max_pages_per_feed, expiry=expiry
+            wallet=user, page_size=page_size, max_pages=max_pages_per_feed,
+            expiry=expiry, observations=observations,
         )
         current, current_pages, current_cursor = await self._scan_positions(
             condition_id=None, wallet=user, status="OPEN", page_size=page_size,
-            max_pages=max_pages_per_feed, expiry=expiry,
+            max_pages=max_pages_per_feed, expiry=expiry, observations=observations,
         )
         past, past_pages, past_cursor = await self._scan_positions(
             condition_id=None, wallet=user, status="CLOSED", page_size=page_size,
-            max_pages=max_pages_per_feed, expiry=expiry,
+            max_pages=max_pages_per_feed, expiry=expiry, observations=observations,
         )
         expiry.checkpoint()
         return PolymarketWalletHistory(
             user, trades, current, past, trade_pages, current_pages, past_pages,
             trades_cursor, current_cursor, past_cursor, started, datetime.now(timezone.utc),
+            _provenance(observations),
         )
 
 
