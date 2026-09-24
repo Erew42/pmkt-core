@@ -5,6 +5,12 @@ PR #9. The pilot below decides whether a chain indexer is needed. This document
 proposes meanings and decision gates; it does not add an endpoint, persisted
 schema, or indexer.
 
+The bounded API-only pilot and chain capability observations are recorded in
+[`polymarket_participant_api_pilot_2026-09-24.md`](polymarket_participant_api_pilot_2026-09-24.md).
+They support current holder observations and a source-limited wallet timeline,
+but not exact market-wide dated balances from the API alone. A production chain
+indexer remains subject to the archival-source and full-range extraction gate.
+
 ## Scope and existing behavior
 
 `pmkt-core` owns public venue reads, evidence capture, storage, and balance
