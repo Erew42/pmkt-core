@@ -17,11 +17,28 @@ from pmkt.data.canonical import (
     POLYMARKET_MARKET_SNAPSHOT_COLUMNS,
     POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
 )
-from pmkt.data.normalize import markets_dataframe
+from pmkt.data.normalize import (
+    CLOSE_TIME_KEYS,
+    CONDITION_ID_KEYS,
+    ENABLE_ORDERBOOK_KEYS,
+    EVENT_ID_KEYS,
+    EVENT_SLUG_KEYS,
+    NESTED_EVENT_ID_KEYS,
+    NESTED_EVENT_START_TIME_KEYS,
+    OPEN_TIME_KEYS,
+    QUESTION_ID_KEYS,
+    RESOLUTION_SOURCE_KEYS,
+    RESOLVED_BY_KEYS,
+    START_TIME_FALLBACK_KEYS,
+    TOP_LEVEL_START_TIME_KEYS,
+    UMA_RESOLUTION_STATUS_KEYS,
+    markets_dataframe,
+)
 from pmkt.data.normalize_kalshi import (
     normalize_kalshi_market_status,
 )
 from pmkt.data.storage.parquet import write_parquet
+from pmkt.tokens import TOKEN_LIST_KEYS, TOKEN_VALUE_KEYS
 
 from . import fs
 from . import history
@@ -86,6 +103,100 @@ _CURRENT_KNOWN_KEY_ARTIFACTS: tuple[tuple[str, str], ...] = (
     ("kalshi", "kalshi_lifecycle_upserts"),
     ("kalshi", "kalshi_mve_current_markets"),
 )
+
+# Polymarket moves updatedAt and the payload on ordinary trading (prices,
+# volume, liquidity, the nested event), so discovery decides whether a known
+# market changed from these contract and lifecycle fields instead. Kalshi's
+# updated_time already ignores trading, so Kalshi keeps the payload hash.
+# The fields are every key normalize.extract_market_rows reads for a
+# non-trading column, taken from its own key lists so the two cannot drift,
+# plus contract terms that have no canonical column.
+POLYMARKET_CONTRACT_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            "question",
+            "title",
+            "slug",
+            "closed",
+            "outcomes",
+            *EVENT_ID_KEYS,
+            *EVENT_SLUG_KEYS,
+            *OPEN_TIME_KEYS,
+            *TOP_LEVEL_START_TIME_KEYS,
+            *START_TIME_FALLBACK_KEYS,
+            *CLOSE_TIME_KEYS,
+            *ENABLE_ORDERBOOK_KEYS,
+            *TOKEN_LIST_KEYS,
+            *TOKEN_VALUE_KEYS,
+            *CONDITION_ID_KEYS,
+            *QUESTION_ID_KEYS,
+            *UMA_RESOLUTION_STATUS_KEYS,
+            *RESOLVED_BY_KEYS,
+            *RESOLUTION_SOURCE_KEYS,
+            "description",
+            "line",
+            "groupItemTitle",
+            "groupItemThreshold",
+            "negRisk",
+            "negRiskMarketID",
+            "negRiskRequestID",
+            "active",
+            "archived",
+            "acceptingOrders",
+            "umaResolutionStatuses",
+            "feesEnabled",
+            "feeType",
+            "makerBaseFee",
+            "takerBaseFee",
+            "orderMinSize",
+            "orderPriceMinTickSize",
+        )
+    )
+)
+
+# Normalization reads event identity and times from the nested `event` object
+# and every `events` entry; their volume and liquidity are left out.
+POLYMARKET_EVENT_CONTRACT_FIELDS: tuple[str, ...] = tuple(
+    dict.fromkeys(
+        (
+            *NESTED_EVENT_ID_KEYS,
+            "slug",
+            *NESTED_EVENT_START_TIME_KEYS,
+            *START_TIME_FALLBACK_KEYS,
+            *OPEN_TIME_KEYS,
+            *CLOSE_TIME_KEYS,
+        )
+    )
+)
+
+# Bump when the known-key table or contract hash changes so cached indexes are
+# rebuilt.
+KNOWN_KEY_INDEX_VERSION = "known_keys.v3"
+
+
+def _json_paths_sql(prefix: str, fields: Sequence[str]) -> str:
+    return "[" + ", ".join(_quote_sql(f"{prefix}.{field}") for field in fields) + "]"
+
+
+def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
+    """Hash the contract fields; the same SQL serves known and observed rows.
+
+    raw_json is nullable, so a row without it gets a NULL hash and discovery
+    falls back to the payload hash. The cast lets an all-NULL column bind.
+    """
+    raw = f"CAST({raw_json_sql} AS VARCHAR)"
+    event_paths = _json_paths_sql("$", POLYMARKET_EVENT_CONTRACT_FIELDS)
+    return (
+        f"CASE WHEN {raw} IS NULL THEN NULL ELSE "
+        "md5(to_json(struct_pack("
+        f"market := json_extract_string({raw}, "
+        f"{_json_paths_sql('$', POLYMARKET_CONTRACT_FIELDS)}), "
+        f"event := json_extract_string({raw}, "
+        f"{_json_paths_sql('$.event', POLYMARKET_EVENT_CONTRACT_FIELDS)}), "
+        f"events := list_transform(json_extract({raw}, '$.events[*]'), "
+        f"e -> json_extract_string(e, {event_paths}))"
+        "))) END"
+    )
 
 
 def _polymarket_updated_at_sql(raw_json_sql: str) -> str:
@@ -648,7 +759,7 @@ class MarketCatalogService:
         return watermark, None
 
     def _index_fingerprint(self) -> str:
-        digest = hashlib.sha256()
+        digest = hashlib.sha256(KNOWN_KEY_INDEX_VERSION.encode("utf-8"))
         pointer_paths = [self.history_pointer_path, self.discovery_pointer_path]
         if self.known_key_basis() == "current_snapshot":
             pointer_paths.append(self.current_pointer_path)
@@ -703,14 +814,15 @@ class MarketCatalogService:
             connection.execute(
                 "CREATE TABLE known_keys(venue VARCHAR NOT NULL, market_key VARCHAR NOT NULL, "
                 "payload_hash VARCHAR, updated_at_utc TIMESTAMPTZ, native_family VARCHAR, "
-                "PRIMARY KEY(venue, market_key))"
+                "contract_hash VARCHAR, PRIMARY KEY(venue, market_key))"
             )
             if from_history:
                 connection.execute(
                     f"""
                     INSERT INTO known_keys
                     SELECT 'polymarket', CAST(market_id AS VARCHAR), raw_json_sha256,
-                           {_polymarket_updated_at_sql("raw_json")}, 'polymarket'
+                           {_polymarket_updated_at_sql("raw_json")}, 'polymarket',
+                           {_polymarket_contract_hash_sql("raw_json")}
                     FROM {_parquet_sql(pm_path)}
                     WHERE market_id IS NOT NULL
                     """
@@ -720,7 +832,8 @@ class MarketCatalogService:
                     INSERT INTO known_keys
                     SELECT 'kalshi', CAST(market_key AS VARCHAR), raw_json_sha256,
                            try_cast(updated_time AS TIMESTAMPTZ),
-                           {_kalshi_family_sql("market_key", filename_sql="filename")}
+                           {_kalshi_family_sql("market_key", filename_sql="filename")},
+                           NULL
                     FROM {_parquet_sql(kx_path, filename=True)}
                     WHERE market_key IS NOT NULL
                     """
@@ -755,19 +868,26 @@ class MarketCatalogService:
                             if venue == "polymarket"
                             else "try_cast(updated_time AS TIMESTAMPTZ)"
                         )
+                        contract_sql = (
+                            _polymarket_contract_hash_sql("raw_json")
+                            if venue == "polymarket"
+                            else "NULL"
+                        )
                         # Newest observation wins: a discovery release can be
                         # older than the census or history row it overlaps.
                         connection.execute(
                             f"""
                             INSERT INTO known_keys
                             SELECT {_quote_sql(venue)}, CAST({key_column} AS VARCHAR),
-                                   raw_json_sha256, {updated_sql}, {_quote_sql(family)}
+                                   raw_json_sha256, {updated_sql}, {_quote_sql(family)},
+                                   {contract_sql}
                             FROM {_parquet_sql(path)}
                             WHERE {key_column} IS NOT NULL
                             ON CONFLICT (venue, market_key) DO UPDATE SET
                                 payload_hash = excluded.payload_hash,
                                 updated_at_utc = excluded.updated_at_utc,
-                                native_family = excluded.native_family
+                                native_family = excluded.native_family,
+                                contract_hash = excluded.contract_hash
                             WHERE known_keys.updated_at_utc IS NULL
                                OR excluded.updated_at_utc >= known_keys.updated_at_utc
                             """
@@ -838,7 +958,8 @@ class MarketCatalogService:
                     "SELECT 'polymarket' AS venue, CAST(market_id AS VARCHAR) AS market_key, "
                     "raw_json_sha256 AS payload_hash, "
                     f"{_polymarket_updated_at_sql('raw_json')} AS updated_at_utc, "
-                    "'polymarket' AS native_family "
+                    "'polymarket' AS native_family, "
+                    f"{_polymarket_contract_hash_sql('raw_json')} AS contract_hash "
                     f"FROM {_parquet_sql(path)} WHERE market_id IS NOT NULL"
                 )
             else:
@@ -854,7 +975,7 @@ class MarketCatalogService:
                     "SELECT 'kalshi' AS venue, CAST(market_key AS VARCHAR) AS market_key, "
                     "raw_json_sha256 AS payload_hash, "
                     "try_cast(updated_time AS TIMESTAMPTZ) AS updated_at_utc, "
-                    f"{family_sql} AS native_family "
+                    f"{family_sql} AS native_family, NULL AS contract_hash "
                     f"FROM {_parquet_sql(path)} WHERE market_key IS NOT NULL"
                 )
         if not selects:
@@ -862,7 +983,8 @@ class MarketCatalogService:
         # A key can sit in several census and lifecycle artifacts; keep the newest.
         connection.execute(
             "INSERT INTO known_keys "
-            "SELECT venue, market_key, payload_hash, updated_at_utc, native_family "
+            "SELECT venue, market_key, payload_hash, updated_at_utc, native_family, "
+            "contract_hash "
             f"FROM ({' UNION ALL '.join(selects)}) "
             "QUALIFY row_number() OVER (PARTITION BY venue, market_key "
             "ORDER BY updated_at_utc DESC NULLS LAST, payload_hash) = 1"
@@ -899,13 +1021,22 @@ class MarketCatalogService:
                     )
                 ],
                 "observed_hash": normalized["raw_json_sha256"],
+                "raw_json": normalized["raw_json"],
             }
+        )
+        observed_contract_sql = (
+            _polymarket_contract_hash_sql("o.raw_json")
+            if venue == "polymarket"
+            else "NULL"
         )
         with duckdb.connect(str(index_path), read_only=True) as connection:
             connection.register("observations", observations)
             classified = connection.execute(
-                """
-                SELECT o.*, k.payload_hash AS known_hash, k.updated_at_utc AS known_updated_at
+                f"""
+                SELECT o.market_key, o.observed_updated_at, o.observed_hash,
+                       {observed_contract_sql} AS observed_contract,
+                       k.payload_hash AS known_hash, k.contract_hash AS known_contract,
+                       k.updated_at_utc AS known_updated_at
                 FROM observations o
                 LEFT JOIN known_keys k
                   ON k.venue = ? AND k.market_key = o.market_key
@@ -915,9 +1046,19 @@ class MarketCatalogService:
         is_new = classified["known_hash"].isna()
         observed_time = pd.to_datetime(classified["observed_updated_at"], utc=True)
         known_time = pd.to_datetime(classified["known_updated_at"], utc=True)
+        payload_changed = classified["observed_hash"].ne(classified["known_hash"])
+        # Polymarket compares contract fields where both sides have them.
+        comparable = (
+            classified["observed_contract"].notna()
+            & classified["known_contract"].notna()
+        )
+        changed = payload_changed.where(
+            ~comparable,
+            classified["observed_contract"].ne(classified["known_contract"]),
+        )
         is_upsert = (
             ~is_new
-            & classified["observed_hash"].ne(classified["known_hash"])
+            & changed
             & observed_time.notna()
             & (known_time.isna() | observed_time.gt(known_time))
         )
@@ -937,6 +1078,9 @@ class MarketCatalogService:
                 "new": len(new_frame),
                 "upsert": len(upsert_frame),
                 "unchanged_or_not_newer": int((~is_new & ~is_upsert).sum()),
+                "payload_only_changes": int(
+                    (~is_new & payload_changed & ~changed).sum()
+                ),
             },
         )
 
