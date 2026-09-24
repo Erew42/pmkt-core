@@ -724,6 +724,33 @@ async def test_older_discovery_rows_do_not_replace_a_newer_census_row(
     assert again["counts"]["unchanged_or_not_newer"] == 1
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["updated_at", "updated"])
+async def test_replayed_upsert_reads_every_updated_alias(
+    tmp_path: Path, alias: str
+) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm("pm-a", created=NOW - timedelta(hours=2))])
+    edited = _pm("pm-a", created=NOW - timedelta(hours=2), question="Edited?")
+    del edited["updatedAt"]
+    edited[alias] = (NOW + timedelta(hours=1)).isoformat()
+    upserts = []
+    for _ in range(2):
+        result = await service.discover(
+            "polymarket",
+            client=FakeGamma(
+                {
+                    (False, None): {"markets": [edited], "next_cursor": ""},
+                    (True, None): {"markets": [], "next_cursor": ""},
+                }
+            ),
+            bootstrap_cutoff=NOW - timedelta(days=1),
+        )
+        upserts.append(result["counts"]["upsert"])
+
+    # The published upsert must replace the known row, so a replay is a no-op.
+    assert upserts == [1, 0]
+
+
 def test_missing_referenced_current_artifact_fails_closed(tmp_path: Path) -> None:
     service = _current_only_catalog(tmp_path)
     pointer = json.loads(service.current_pointer_path.read_text(encoding="utf-8"))
