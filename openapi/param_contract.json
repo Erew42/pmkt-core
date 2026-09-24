@@ -61,6 +61,31 @@
         }
       }
     },
+    "/v2/positions": {
+      "get": {
+        "params": {
+          "user": {"required": false},
+          "condition": {"required": false},
+          "status": {"required": false},
+          "limit": {"required": false},
+          "cursor": {"required": false},
+          "filter_type": {"required": false},
+          "filter_amount": {"required": false},
+          "include_archived": {"required": false}
+        }
+      }
+    },
+    "/v2/trades": {
+      "get": {
+        "params": {
+          "user": {"required": false},
+          "condition": {"required": false},
+          "full_history": {"required": false},
+          "limit": {"required": false},
+          "cursor": {"required": false}
+        }
+      }
+    },
     "/prices-history": {
       "get": {
         "params": {

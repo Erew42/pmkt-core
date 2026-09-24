@@ -353,6 +353,46 @@ covers transport, decoding, and normalization. Expiry raises
 remains reusable. Malformed or contradictory upstream workflow data raises
 `InvalidDataError`.
 
+## Polymarket participants and wallet history
+
+`AsyncPolymarketDataClient.market_participants(condition_id)` reads Data API v2
+`/positions` for `OPEN` and `CLOSED` positions anchored on one condition ID. It
+groups the returned proxy wallets and keeps current and past position rows
+separate. `OPEN` is the venue's held-position superset, including unredeemed
+resolved positions; `CLOSED` means exited positions. Both requests use a zero
+token threshold rather than the API's default 0.1-share floor. The
+`OPEN` request includes archived markets. The Data API rejects
+`include_archived` for `CLOSED`, so that request omits it. The result exposes
+the page count and next cursor for each status. `complete` means both requested
+walks reached a terminal cursor, not that the two live reads formed an atomic
+point-in-time snapshot. The result's
+UTC start and completion times bound the local observation interval.
+
+`AsyncPolymarketDataClient.wallet_history(wallet)` reads that wallet's
+`full_history=true` trade feed plus its `OPEN` and `CLOSED` positions. It retains
+trade sizes and prices as `Decimal`, with source timestamps in epoch seconds.
+These are public proxy-wallet observations, not verified human identities or
+authenticated fills. The result's three next cursors and `complete` property
+make page-cap truncation visible. `positions_page` and `trades_page` accept a
+cursor for callers that need to resume individual feeds. Each workflow shares
+one finite deadline across its pages and uses at most 20 pages per feed by
+default; callers can raise `max_pages_per_status` or `max_pages_per_feed`.
+
+```python
+from pmkt.exchanges.polymarket import AsyncPolymarketDataClient
+
+async with AsyncPolymarketDataClient() as data:
+    market = await data.market_participants(condition_id)
+    history = await data.wallet_history(market.participants[0].wallet)
+```
+
+The position API reports the venue's current lifecycle classification. It does
+not provide a dated ledger of every past ownership interval. A wallet that
+changed exposure within an outcome can have one aggregate position row, so
+position rows must not be interpreted as individual fills. The trade feed is
+the separate execution history. This feature adds no participant fields to
+the existing public trade recording or canonical `trade.v1` schema.
+
 ## Kalshi discovery, detail, and current books
 
 The supported Kalshi facade exports `AsyncKalshiClient`, `KalshiFilter`,
