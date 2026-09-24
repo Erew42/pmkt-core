@@ -227,7 +227,7 @@ async def test_holders_page_preserves_groups_basis_cursor_and_observation() -> N
         return httpx.Response(200, json={
             "data": [{"token_id": "123", "holders": [{
                 "proxy_wallet": WALLET_A, "token_id": "123", "outcome_index": 0,
-                "amount": 4, "avg_price": 0.25, "entry_cost_usdc": 1,
+                "amount": 0.016591, "avg_price": 0.25, "entry_cost_usdc": 1,
             }]}, {"token_id": "456", "holders": []}],
             "pagination": {"has_more": True, "next_cursor": "next-holders"},
         })
@@ -242,7 +242,7 @@ async def test_holders_page_preserves_groups_basis_cursor_and_observation() -> N
     assert result.balance_basis == "GROSS"
     assert result.next_cursor == "next-holders"
     assert [group.token_id for group in result.groups] == ["123", "456"]
-    assert result.groups[0].holders[0].amount == Decimal("4")
+    assert result.groups[0].holders[0].amount == Decimal("0.016591")
     assert result.groups[0].holders[0].request_id == result.observation.request_id
     assert seen == [{"condition": CONDITION, "include_pnl": "true",
                      "min_balance": "0", "limit": "100"}]
@@ -252,7 +252,8 @@ async def test_market_trades_page_is_maker_inclusive_and_condition_scoped() -> N
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v2/trades"
         assert dict(request.url.params) == {
-            "condition": CONDITION, "taker_only": "false", "limit": "10",
+            "condition": CONDITION, "taker_only": "false",
+            "filter_type": "TOKENS", "filter_amount": "0.01", "limit": "10",
         }
         return httpx.Response(200, json={
             "data": [_trade(WALLET_A), _trade(WALLET_B)],

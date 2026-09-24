@@ -357,9 +357,10 @@ remains reusable. Malformed or contradictory upstream workflow data raises
 
 `AsyncPolymarketDataClient.market_participants(condition_id)` reads Data API v2
 `/positions` for `OPEN` and `CLOSED` positions anchored on one condition ID. It
-groups the returned proxy wallets and keeps current and past position rows
-separate. `OPEN` is the venue's held-position superset, including unredeemed
-resolved positions; `CLOSED` means exited positions. The query status selects
+groups the returned proxy wallets and keeps the two query partitions
+separate. `OPEN` is the venue's active lifecycle bucket, including unredeemed
+resolved positions. `CLOSED` includes exited positions but can retain a small
+positive `current_size`; it is not proof of zero balance. The query status selects
 the feed, while `PolymarketPosition.status` preserves the row's own lifecycle
 status: an `OPEN` query can return `REDEEMABLE` rows in `current_positions`.
 The upstream API also has `REDEEMABLE`, user-required `REDEEMABLE_LOST`, and
@@ -445,12 +446,15 @@ token groups, an opaque continuation cursor, and the request observation.
 The default `balance_basis="NET"` is the venue's cross-outcome net amount.
 `include_pnl=True` changes the page to per-side gross amounts and position
 economics, with at most 100 rows per token page. `min_balance=0` is sent so
-zero-net rows remain visible. A cursor walk is a sequence of live observations,
-not an atomic snapshot or a list of historical holders. Each holder has a
+zero-net rows remain visible. Gross holders can include positive residual
+balances absent from the `OPEN` position query; use them for observed current
+holder discovery. A cursor walk is a sequence of live observations, not an
+atomic snapshot or a list of historical holders. Each holder has a
 `request_id` linking it to the page observation.
 
 `market_trades_page(condition_id=...)` returns wallet-attributed trades from
-one condition. It sends `taker_only=false` to include maker fills. The source
+one condition. It sends `taker_only=false` to include maker fills and explicitly
+requests the `TOKENS` filter with a 0.01-share minimum. The source
 fixes condition-scoped queries to a three-year window and applies a minimum
 size of 0.01 shares even when a caller asks for zero. Those limits remain
 explicit on `PolymarketMarketTradesPage`; exhausting its cursor does not make
@@ -467,7 +471,8 @@ unknown event types, empty outcome token IDs on events such as `MERGE`, and
 source timestamps. `TRADE` activity overlaps the trade feed: consumers must
 choose one trade source before adding lifecycle changes. Transaction hash alone
 does not uniquely identify a fill. The default activity type set excludes
-opt-in `TIP` events, so the page is not a complete token-transfer ledger.
+opt-in `TIP` pUSD transfers. This activity feed does not establish a complete
+ERC-1155 outcome-token transfer ledger.
 Position `avg_price` is preserved when the source reports a value above one;
 it is a cost-basis field, not a bounded execution price.
 

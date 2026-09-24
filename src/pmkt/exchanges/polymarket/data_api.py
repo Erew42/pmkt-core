@@ -111,7 +111,7 @@ def normalize_polymarket_open_interest(
 
 @dataclass(frozen=True)
 class PolymarketPosition:
-    """One position; source status may differ from the query (e.g. REDEEMABLE)."""
+    """One position; status may differ from the query and CLOSED can retain dust."""
 
     wallet: str
     condition_id: str
@@ -210,6 +210,8 @@ class PolymarketActivityPage:
 
 @dataclass(frozen=True)
 class PolymarketParticipant:
+    """Position rows split by OPEN/CLOSED query, not by actual zero balance."""
+
     wallet: str
     current_positions: tuple[PolymarketPosition, ...]
     past_positions: tuple[PolymarketPosition, ...]
@@ -724,7 +726,14 @@ class AsyncPolymarketDataClient:
             raise ValueError("cursor must be a nonempty string or None")
         page = await self._v2_page(
             "/v2/trades",
-            {"condition": condition, "taker_only": False, "limit": page_size, "cursor": cursor},
+            {
+                "condition": condition,
+                "taker_only": False,
+                "filter_type": "TOKENS",
+                "filter_amount": "0.01",
+                "limit": page_size,
+                "cursor": cursor,
+            },
             expiry=expiry,
         )
         trades = tuple(
@@ -843,9 +852,11 @@ class AsyncPolymarketDataClient:
         max_pages_per_status: int = 20,
         deadline_s: float = 120.0,
     ) -> PolymarketMarketParticipants:
-        """Find current and exited positions in one Polymarket condition.
+        """Read OPEN and CLOSED position queries in one Polymarket condition.
 
-        The two status walks are not an atomic historical snapshot. A retained
+        CLOSED rows can retain positive residual balances; use gross holders
+        for a current balance observation. The two walks are not an atomic
+        historical snapshot. A retained
         cursor means the corresponding walk stopped at the caller's page cap.
         Caps return partial results, not ResultLimitExceededError; check complete.
         """
