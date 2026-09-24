@@ -64,8 +64,8 @@ changes its balances.
 ## Time and coverage
 
 An API scan needs request start, response receipt, exact query parameters,
-incoming and outgoing cursor, and first/final response times. The pending
-provenance update in PR #9 retains request metadata in memory but deliberately
+incoming and outgoing cursor, and first/final response times. PR #9's
+provenance update retains request metadata in memory but deliberately
 leaves `raw_responses` empty; raw response retention belongs to a separate
 durable capture path. Rows on different pages may reflect different source
 states:
