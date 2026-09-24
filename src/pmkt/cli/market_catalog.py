@@ -67,7 +67,10 @@ def discover_new_cmd(
     bootstrap_cutoff: Annotated[
         str | None,
         typer.Option(
-            help="Required ISO-8601 cutoff only when history bootstrap evidence is absent."
+            help=(
+                "ISO-8601 cutoff for a stream's first run; otherwise taken from "
+                "history, or from the current snapshot when history is absent."
+            )
         ),
     ] = None,
     overlap_seconds: Annotated[

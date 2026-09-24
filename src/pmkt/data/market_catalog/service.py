@@ -71,6 +71,33 @@ from .types import (
 )
 
 
+# Current-pointer artifacts that seed discovery when no history catalog exists.
+_CURRENT_BOOTSTRAP_ARTIFACTS: dict[str, str] = {
+    "polymarket": "polymarket_open_markets",
+    "kalshi-conventional": "kalshi_open_markets",
+    "kalshi-mve": "kalshi_mve_current_markets",
+}
+_CURRENT_KNOWN_KEY_ARTIFACTS: tuple[tuple[str, str], ...] = (
+    ("polymarket", "polymarket_open_markets"),
+    ("polymarket", "polymarket_lifecycle_upserts"),
+    ("kalshi", "kalshi_open_markets"),
+    ("kalshi", "kalshi_unopened_markets"),
+    ("kalshi", "kalshi_paused_markets"),
+    ("kalshi", "kalshi_lifecycle_upserts"),
+    ("kalshi", "kalshi_mve_current_markets"),
+)
+
+
+def _polymarket_updated_at_sql(raw_json_sql: str) -> str:
+    """Read the first parseable _PM_UPDATED_KEYS alias, as discovery observes it."""
+    parts = ", ".join(
+        f"try_cast(json_extract_string({raw_json_sql}, {_quote_sql('$.' + key)}) "
+        "AS TIMESTAMPTZ)"
+        for key in _PM_UPDATED_KEYS
+    )
+    return f"coalesce({parts})"
+
+
 class MarketCatalogService:
     """Own catalog lineage, collection, publication, and reader registration."""
 
@@ -275,6 +302,8 @@ class MarketCatalogService:
         stream: DiscoveryStream,
         started: datetime,
         cutoff: datetime,
+        cutoff_source: str,
+        known_key_basis: str,
         report: Mapping[str, Any],
     ) -> Path:
         release_id = fs._run_id(f"market_discovery_{stream.replace('-', '_')}_failed")
@@ -290,6 +319,8 @@ class MarketCatalogService:
             "started_at_utc": iso_utc(started),
             "failed_at_utc": iso_utc(utc_now()),
             "previous_cutoff_utc": iso_utc(cutoff),
+            "cutoff_source": cutoff_source,
+            "known_key_basis": known_key_basis,
             "failure": "kalshi_filter_agreement",
             "filter_agreement": dict(report),
             "collection_complete": False,
@@ -537,7 +568,18 @@ class MarketCatalogService:
         path, manifest, _integrity = self._history_state(deep=deep)
         return path, manifest
 
+    def known_key_basis(self) -> Literal["history", "current_snapshot"]:
+        """Name the catalog that seeds discovery's known keys and bootstrap."""
+        if (
+            self.history_pointer_path.is_file()
+            or not self.current_pointer_path.is_file()
+        ):
+            return "history"
+        return "current_snapshot"
+
     def bootstrap_cutoff(self, stream: DiscoveryStream) -> datetime:
+        if self.known_key_basis() == "current_snapshot":
+            return self._current_bootstrap_cutoff(stream)
         _path, manifest = self._history_manifest()
         evidence = manifest.get("as_of")
         if not isinstance(evidence, dict):
@@ -563,6 +605,27 @@ class MarketCatalogService:
                 )
         return value - timedelta(hours=24)
 
+    def _current_bootstrap_cutoff(self, stream: DiscoveryStream) -> datetime:
+        # Without history, the current census is the known universe: every
+        # nonterminal market created before its as_of is already listed there.
+        name = _CURRENT_BOOTSTRAP_ARTIFACTS[stream]
+        pointer = _read_json(self.current_pointer_path)
+        reference = pointer.get(name)
+        if not isinstance(reference, dict):
+            raise CatalogError(
+                f"{stream} bootstrap needs --bootstrap-cutoff; "
+                f"the current snapshot has no {name}"
+            )
+        value = parse_timestamp(
+            reference.get("as_of_utc") or pointer.get("updated_at_utc")
+        )
+        if value is None:
+            raise CatalogError(
+                f"{stream} bootstrap needs --bootstrap-cutoff; "
+                f"the current snapshot has no as_of evidence for {name}"
+            )
+        return value - timedelta(hours=24)
+
     def discovery_cutoff(
         self,
         stream: DiscoveryStream,
@@ -586,7 +649,10 @@ class MarketCatalogService:
 
     def _index_fingerprint(self) -> str:
         digest = hashlib.sha256()
-        for pointer_path in (self.history_pointer_path, self.discovery_pointer_path):
+        pointer_paths = [self.history_pointer_path, self.discovery_pointer_path]
+        if self.known_key_basis() == "current_snapshot":
+            pointer_paths.append(self.current_pointer_path)
+        for pointer_path in pointer_paths:
             if pointer_path.is_file():
                 digest.update(pointer_path.name.encode("utf-8"))
                 digest.update(bytes.fromhex(sha256_file(pointer_path)))
@@ -625,7 +691,11 @@ class MarketCatalogService:
         temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
         if temporary.exists():
             temporary.unlink()
-        _history_path, history_manifest = self._history_manifest()
+        from_history = self.known_key_basis() == "history"
+        if from_history:
+            _history_path, history_manifest = self._history_manifest()
+            pm_path = self._history_artifact_path(history_manifest, "polymarket")
+            kx_path = self._history_artifact_path(history_manifest, "kalshi")
         with duckdb.connect(str(temporary)) as connection:
             connection.execute(
                 "CREATE TABLE catalog_meta(key VARCHAR PRIMARY KEY, value VARCHAR NOT NULL)"
@@ -635,30 +705,28 @@ class MarketCatalogService:
                 "payload_hash VARCHAR, updated_at_utc TIMESTAMPTZ, native_family VARCHAR, "
                 "PRIMARY KEY(venue, market_key))"
             )
-            pm_path = self._history_artifact_path(history_manifest, "polymarket")
-            kx_path = self._history_artifact_path(history_manifest, "kalshi")
-            connection.execute(
-                f"""
-                INSERT INTO known_keys
-                SELECT 'polymarket', CAST(market_id AS VARCHAR), raw_json_sha256,
-                       try_cast(coalesce(
-                           json_extract_string(raw_json, '$.updatedAt'),
-                           json_extract_string(raw_json, '$.updated_at')
-                       ) AS TIMESTAMPTZ), 'polymarket'
-                FROM {_parquet_sql(pm_path)}
-                WHERE market_id IS NOT NULL
-                """
-            )
-            connection.execute(
-                f"""
-                INSERT INTO known_keys
-                SELECT 'kalshi', CAST(market_key AS VARCHAR), raw_json_sha256,
-                       try_cast(updated_time AS TIMESTAMPTZ),
-                       {_kalshi_family_sql("market_key", filename_sql="filename")}
-                FROM {_parquet_sql(kx_path, filename=True)}
-                WHERE market_key IS NOT NULL
-                """
-            )
+            if from_history:
+                connection.execute(
+                    f"""
+                    INSERT INTO known_keys
+                    SELECT 'polymarket', CAST(market_id AS VARCHAR), raw_json_sha256,
+                           {_polymarket_updated_at_sql("raw_json")}, 'polymarket'
+                    FROM {_parquet_sql(pm_path)}
+                    WHERE market_id IS NOT NULL
+                    """
+                )
+                connection.execute(
+                    f"""
+                    INSERT INTO known_keys
+                    SELECT 'kalshi', CAST(market_key AS VARCHAR), raw_json_sha256,
+                           try_cast(updated_time AS TIMESTAMPTZ),
+                           {_kalshi_family_sql("market_key", filename_sql="filename")}
+                    FROM {_parquet_sql(kx_path, filename=True)}
+                    WHERE market_key IS NOT NULL
+                    """
+                )
+            else:
+                self._insert_current_known_keys(connection)
             for stream in ("polymarket", "kalshi-conventional", "kalshi-mve"):
                 for _manifest_path, manifest in self.reachable_discovery_manifests(
                     stream
@@ -683,17 +751,25 @@ class MarketCatalogService:
                             "market_id" if venue == "polymarket" else "market_key"
                         )
                         updated_sql = (
-                            "try_cast(json_extract_string(raw_json, '$.updatedAt') AS TIMESTAMPTZ)"
+                            _polymarket_updated_at_sql("raw_json")
                             if venue == "polymarket"
                             else "try_cast(updated_time AS TIMESTAMPTZ)"
                         )
+                        # Newest observation wins: a discovery release can be
+                        # older than the census or history row it overlaps.
                         connection.execute(
                             f"""
-                            INSERT OR REPLACE INTO known_keys
+                            INSERT INTO known_keys
                             SELECT {_quote_sql(venue)}, CAST({key_column} AS VARCHAR),
                                    raw_json_sha256, {updated_sql}, {_quote_sql(family)}
                             FROM {_parquet_sql(path)}
                             WHERE {key_column} IS NOT NULL
+                            ON CONFLICT (venue, market_key) DO UPDATE SET
+                                payload_hash = excluded.payload_hash,
+                                updated_at_utc = excluded.updated_at_utc,
+                                native_family = excluded.native_family
+                            WHERE known_keys.updated_at_utc IS NULL
+                               OR excluded.updated_at_utc >= known_keys.updated_at_utc
                             """
                         )
             connection.execute(
@@ -702,6 +778,95 @@ class MarketCatalogService:
             )
         os.replace(temporary, target)
         return target
+
+    def _current_known_key_sources(self) -> list[tuple[str, str, Path]]:
+        """Return (venue, artifact name, path) for current-only known keys.
+
+        These are the latest census lists plus every lifecycle artifact on the
+        current release chain: a refresh replaces the pointer's lifecycle
+        artifact, so terminal corrections from earlier refreshes are reachable
+        only through their manifests. A referenced artifact that is missing or
+        hash-invalid fails closed.
+        """
+        pointer = _read_json(self.current_pointer_path)
+        sources: list[tuple[str, str, Path]] = []
+        for venue, name in _CURRENT_KNOWN_KEY_ARTIFACTS:
+            if name not in pointer:
+                continue
+            path = self._pointer_artifact_path(pointer, name)
+            if path is None:
+                raise CatalogError(f"current artifact {name} is missing or empty")
+            sources.append((venue, name, path))
+        for _manifest_path, manifest in self.reachable_current_manifests():
+            for venue, name in (
+                ("polymarket", "polymarket_lifecycle_upserts"),
+                ("kalshi", "kalshi_lifecycle_upserts"),
+            ):
+                artifact = manifest["artifacts"][name]
+                sources.append(
+                    (
+                        venue,
+                        name,
+                        _resolve_stored_path(
+                            str(artifact["path"]),
+                            repository_root=self.repository_root,
+                        ),
+                    )
+                )
+        unique: dict[Path, tuple[str, str, Path]] = {}
+        for source in sources:
+            unique.setdefault(source[2].resolve(), source)
+        if not unique:
+            raise CatalogError(
+                "the current snapshot has no market artifacts to seed discovery"
+            )
+        return list(unique.values())
+
+    def _insert_current_known_keys(self, connection: Any) -> None:
+        """Seed known keys from the current catalog when history is absent.
+
+        A market that closed before the first census and never appears in it
+        is unknown here, so a later discovery reports it as new; history is the
+        only complete record of terminal markets.
+        """
+        selects: list[str] = []
+        for venue, name, path in self._current_known_key_sources():
+            if parquet_row_count(path) == 0:
+                continue
+            if venue == "polymarket":
+                selects.append(
+                    "SELECT 'polymarket' AS venue, CAST(market_id AS VARCHAR) AS market_key, "
+                    "raw_json_sha256 AS payload_hash, "
+                    f"{_polymarket_updated_at_sql('raw_json')} AS updated_at_utc, "
+                    "'polymarket' AS native_family "
+                    f"FROM {_parquet_sql(path)} WHERE market_id IS NOT NULL"
+                )
+            else:
+                # Census lists are collected per family; lifecycle upserts mix
+                # conventional and MVE rows, so classify those by ticker.
+                if name == "kalshi_mve_current_markets":
+                    family_sql = _quote_sql("kalshi_mve")
+                elif name == "kalshi_lifecycle_upserts":
+                    family_sql = _kalshi_family_sql("market_key")
+                else:
+                    family_sql = _quote_sql("kalshi_conventional")
+                selects.append(
+                    "SELECT 'kalshi' AS venue, CAST(market_key AS VARCHAR) AS market_key, "
+                    "raw_json_sha256 AS payload_hash, "
+                    "try_cast(updated_time AS TIMESTAMPTZ) AS updated_at_utc, "
+                    f"{family_sql} AS native_family "
+                    f"FROM {_parquet_sql(path)} WHERE market_key IS NOT NULL"
+                )
+        if not selects:
+            return
+        # A key can sit in several census and lifecycle artifacts; keep the newest.
+        connection.execute(
+            "INSERT INTO known_keys "
+            "SELECT venue, market_key, payload_hash, updated_at_utc, native_family "
+            f"FROM ({' UNION ALL '.join(selects)}) "
+            "QUALIFY row_number() OVER (PARTITION BY venue, market_key "
+            "ORDER BY updated_at_utc DESC NULLS LAST, payload_hash) = 1"
+        )
 
     def _split_new_and_upserts(
         self,
@@ -796,6 +961,13 @@ class MarketCatalogService:
             overlap_seconds=overlap,
             bootstrap_cutoff=bootstrap_cutoff,
         )
+        known_key_basis = self.known_key_basis()
+        if predecessor is not None:
+            cutoff_source = "discovery_watermark"
+        elif bootstrap_cutoff is not None:
+            cutoff_source = "explicit_bootstrap"
+        else:
+            cutoff_source = f"{known_key_basis}_bootstrap"
         started = utc_now()
         if stream == "polymarket":
             active_client = client
@@ -838,6 +1010,8 @@ class MarketCatalogService:
                             stream=stream,
                             started=started,
                             cutoff=cutoff,
+                            cutoff_source=cutoff_source,
+                            known_key_basis=known_key_basis,
                             report=exc.report,
                         )
                     raise
@@ -866,6 +1040,8 @@ class MarketCatalogService:
         summary = {
             "stream": stream,
             "cutoff_utc": iso_utc(cutoff),
+            "cutoff_source": cutoff_source,
+            "known_key_basis": known_key_basis,
             "resulting_high_watermark_utc": iso_utc(result.high_watermark),
             "counts": {
                 "raw": result.details.get("raw_rows", len(result.rows)),
@@ -911,6 +1087,8 @@ class MarketCatalogService:
             "started_at_utc": iso_utc(started),
             "observed_at_utc": iso_utc(utc_now()),
             "previous_cutoff_utc": iso_utc(cutoff),
+            "cutoff_source": cutoff_source,
+            "known_key_basis": known_key_basis,
             "resulting_high_watermark_utc": iso_utc(result.high_watermark),
             "overlap_seconds": overlap,
             "predecessor_manifest": predecessor,
@@ -1593,9 +1771,16 @@ class MarketCatalogService:
 
     def status(self, *, deep: bool = False) -> dict[str, Any]:
         pointer = self.read_discovery_pointer()
-        _history_path, _history_manifest, history_integrity = self._history_state(
-            deep=deep
-        )
+        history_integrity: dict[str, Any] | None = None
+        current_integrity: dict[str, Any] | None = None
+        if self.known_key_basis() == "history":
+            _history_path, _history_manifest, history_integrity = self._history_state(
+                deep=deep
+            )
+        else:
+            # Validates every referenced census and lifecycle artifact.
+            sources = self._current_known_key_sources()
+            current_integrity = {"status": "valid", "artifacts": len(sources)}
         index_state = "absent"
         if self.index_path.is_file():
             try:
@@ -1618,6 +1803,8 @@ class MarketCatalogService:
             "current_pointer_present": self.current_pointer_path.is_file(),
             "history_pointer_present": self.history_pointer_path.is_file(),
             "history_integrity": history_integrity,
+            "known_key_basis": self.known_key_basis(),
+            "current_integrity": current_integrity,
             "known_key_cache": {"path": str(self.index_path), "state": index_state},
             "scheduling_enabled": False,
             "execution_authority": False,
