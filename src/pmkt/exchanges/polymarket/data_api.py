@@ -143,6 +143,71 @@ class PolymarketWalletTrade:
 
 
 @dataclass(frozen=True)
+class PolymarketHolder:
+    wallet: str
+    token_id: str
+    outcome_index: int
+    amount: Decimal
+    avg_price: Decimal | None
+    entry_cost_usdc: Decimal | None
+    current_price: Decimal | None
+    current_value: Decimal | None
+    realized_pnl: Decimal | None
+    unrealized_pnl: Decimal | None
+    total_pnl: Decimal | None
+    request_id: str
+
+
+@dataclass(frozen=True)
+class PolymarketHolderGroup:
+    token_id: str
+    holders: tuple[PolymarketHolder, ...]
+
+
+@dataclass(frozen=True)
+class PolymarketHoldersPage:
+    condition_id: str
+    balance_basis: str  # NET by default; GROSS when include_pnl=true.
+    groups: tuple[PolymarketHolderGroup, ...]
+    next_cursor: str | None
+    observation: RequestObservation
+
+
+@dataclass(frozen=True)
+class PolymarketMarketTradesPage:
+    condition_id: str
+    trades: tuple[PolymarketWalletTrade, ...]
+    next_cursor: str | None
+    observation: RequestObservation
+    source_window: str = "fixed_three_years"
+    minimum_size_shares: Decimal = Decimal("0.01")
+
+
+@dataclass(frozen=True)
+class PolymarketWalletActivity:
+    wallet: str
+    condition_id: str
+    token_id: str
+    event_type: str
+    side: str
+    size: Decimal
+    usdc_size: Decimal
+    price: Decimal
+    timestamp_s: int
+    transaction_hash: str
+    outcome: str | None
+    request_id: str
+
+
+@dataclass(frozen=True)
+class PolymarketActivityPage:
+    wallet: str
+    activities: tuple[PolymarketWalletActivity, ...]
+    next_cursor: str | None
+    observation: RequestObservation
+
+
+@dataclass(frozen=True)
 class PolymarketParticipant:
     wallet: str
     current_positions: tuple[PolymarketPosition, ...]
@@ -281,8 +346,8 @@ def _position(
         raise InvalidDataError("Data API v2 current_size must be nonnegative")
     if total_size is not None and total_size < 0:
         raise InvalidDataError("Data API v2 total_size must be nonnegative")
-    if avg_price is not None and not 0 <= avg_price <= 1:
-        raise InvalidDataError("Data API v2 avg_price must be between 0 and 1")
+    if avg_price is not None and avg_price < 0:
+        raise InvalidDataError("Data API v2 avg_price must be nonnegative")
     return PolymarketPosition(
         wallet=found_wallet,
         condition_id=found_condition,
@@ -299,10 +364,16 @@ def _position(
     )
 
 
-def _trade(row: Mapping[str, Any], *, wallet: str, request_id: str) -> PolymarketWalletTrade:
+def _trade(
+    row: Mapping[str, Any], *, wallet: str | None, condition_id: str | None,
+    request_id: str,
+) -> PolymarketWalletTrade:
     found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
-    if found_wallet != wallet:
+    if wallet is not None and found_wallet != wallet:
         raise InvalidDataError("Data API v2 trade wallet differs from the request")
+    found_condition = _row_identifier(row, "condition_id", _CONDITION_RE)
+    if condition_id is not None and found_condition != condition_id:
+        raise InvalidDataError("Data API v2 trade condition differs from the request")
     size = _decimal(row, "size", required=True)
     price = _decimal(row, "price", required=True)
     assert size is not None and price is not None
@@ -313,10 +384,75 @@ def _trade(row: Mapping[str, Any], *, wallet: str, request_id: str) -> Polymarke
         raise InvalidDataError("Data API v2 trade timestamp must be epoch seconds")
     return PolymarketWalletTrade(
         wallet=found_wallet,
-        condition_id=_row_identifier(row, "condition_id", _CONDITION_RE),
+        condition_id=found_condition,
         token_id=_text(row, "token_id"),
         side=_text(row, "side"),
         size=size,
+        price=price,
+        timestamp_s=timestamp,
+        transaction_hash=_text(row, "transaction_hash"),
+        outcome=_optional_text(row, "outcome"),
+        request_id=request_id,
+    )
+
+
+def _holder(row: Mapping[str, Any], *, token_id: str, request_id: str) -> PolymarketHolder:
+    found_token = _text(row, "token_id")
+    if found_token != token_id:
+        raise InvalidDataError("Data API v2 holder token differs from its group")
+    amount = _decimal(row, "amount", required=True)
+    assert amount is not None
+    if amount < 0:
+        raise InvalidDataError("Data API v2 holder amount must be nonnegative")
+    outcome_index = row.get("outcome_index")
+    if isinstance(outcome_index, bool) or not isinstance(outcome_index, int) or outcome_index < 0:
+        raise InvalidDataError("Data API v2 holder outcome_index must be nonnegative integer")
+    return PolymarketHolder(
+        wallet=_row_identifier(row, "proxy_wallet", _WALLET_RE),
+        token_id=found_token,
+        outcome_index=outcome_index,
+        amount=amount,
+        avg_price=_decimal(row, "avg_price"),
+        entry_cost_usdc=_decimal(row, "entry_cost_usdc"),
+        current_price=_decimal(row, "current_price"),
+        current_value=_decimal(row, "current_value"),
+        realized_pnl=_decimal(row, "realized_pnl"),
+        unrealized_pnl=_decimal(row, "unrealized_pnl"),
+        total_pnl=_decimal(row, "total_pnl"),
+        request_id=request_id,
+    )
+
+
+def _activity(
+    row: Mapping[str, Any], *, wallet: str, condition_id: str | None,
+    request_id: str,
+) -> PolymarketWalletActivity:
+    found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
+    found_condition = _row_identifier(row, "condition_id", _CONDITION_RE)
+    if found_wallet != wallet:
+        raise InvalidDataError("Data API v2 activity wallet differs from the request")
+    if condition_id is not None and found_condition != condition_id:
+        raise InvalidDataError("Data API v2 activity condition differs from the request")
+    timestamp = row.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, int) or timestamp < 0:
+        raise InvalidDataError("Data API v2 activity timestamp must be epoch seconds")
+    size = _decimal(row, "size", required=True)
+    usdc_size = _decimal(row, "usdc_size", required=True)
+    price = _decimal(row, "price", required=True)
+    assert size is not None and usdc_size is not None and price is not None
+    if size < 0 or usdc_size < 0:
+        raise InvalidDataError("Data API v2 activity size must be nonnegative")
+    token_id = row.get("token_id")
+    if not isinstance(token_id, str):
+        raise InvalidDataError("Data API v2 activity token_id must be a string")
+    return PolymarketWalletActivity(
+        wallet=found_wallet,
+        condition_id=found_condition,
+        token_id=token_id,
+        event_type=_text(row, "type"),
+        side=_optional_text(row, "side") or "",
+        size=size,
+        usdc_size=usdc_size,
         price=price,
         timestamp_s=timestamp,
         transaction_hash=_text(row, "transaction_hash"),
@@ -509,12 +645,125 @@ class AsyncPolymarketDataClient:
             expiry=expiry,
         )
         trades = tuple(
-            _trade(row, wallet=user, request_id=page.observation.request_id)
+            _trade(row, wallet=user, condition_id=None, request_id=page.observation.request_id)
             for row in page.rows
         )
         if expiry is not None:
             expiry.checkpoint()
         return _DataPage(trades, page.next_cursor, page.observation)
+
+    async def holders_page(
+        self,
+        *,
+        condition_id: str,
+        include_pnl: bool = False,
+        page_size: int = 100,
+        cursor: str | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketHoldersPage:
+        """Read one per-token holder page; amounts are NET or per-side GROSS.
+
+        The cursor walks a current API observation, not a historical holder list.
+        """
+        condition = _identifier(condition_id, name="condition_id", pattern=_CONDITION_RE)
+        if not isinstance(include_pnl, bool):
+            raise ValueError("include_pnl must be boolean")
+        _positive_int(page_size, name="page_size", maximum=100 if include_pnl else 1000)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a nonempty string or None")
+        page = await self._v2_page(
+            "/v2/holders",
+            {
+                "condition": condition,
+                "include_pnl": include_pnl,
+                "min_balance": 0,
+                "limit": page_size,
+                "cursor": cursor,
+            },
+            expiry=expiry,
+        )
+        groups: list[PolymarketHolderGroup] = []
+        for row in page.rows:
+            token_id = _text(row, "token_id")
+            rows = row.get("holders")
+            if not isinstance(rows, list) or any(not isinstance(holder, dict) for holder in rows):
+                raise InvalidDataError("Data API v2 holders must be a list of objects")
+            groups.append(PolymarketHolderGroup(
+                token_id,
+                tuple(_holder(holder, token_id=token_id, request_id=page.observation.request_id)
+                      for holder in rows),
+            ))
+        if expiry is not None:
+            expiry.checkpoint()
+        return PolymarketHoldersPage(
+            condition, "GROSS" if include_pnl else "NET", tuple(groups),
+            page.next_cursor, page.observation,
+        )
+
+    async def market_trades_page(
+        self,
+        *,
+        condition_id: str,
+        page_size: int = 1000,
+        cursor: str | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketMarketTradesPage:
+        """Read maker-inclusive condition trades in the source's fixed three-year window."""
+        condition = _identifier(condition_id, name="condition_id", pattern=_CONDITION_RE)
+        _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a nonempty string or None")
+        page = await self._v2_page(
+            "/v2/trades",
+            {"condition": condition, "taker_only": False, "limit": page_size, "cursor": cursor},
+            expiry=expiry,
+        )
+        trades = tuple(
+            _trade(row, wallet=None, condition_id=condition, request_id=page.observation.request_id)
+            for row in page.rows
+        )
+        if expiry is not None:
+            expiry.checkpoint()
+        return PolymarketMarketTradesPage(
+            condition, trades, page.next_cursor, page.observation,
+        )
+
+    async def activity_page(
+        self,
+        *,
+        wallet: str,
+        condition_id: str | None = None,
+        page_size: int = 1000,
+        cursor: str | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketActivityPage:
+        """Read full-history wallet activity, including TRADE and lifecycle types.
+
+        TRADE rows overlap /v2/trades and must not be added to those fills.
+        Unknown activity types are preserved rather than interpreted as balance changes.
+        """
+        user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
+        condition = (
+            _identifier(condition_id, name="condition_id", pattern=_CONDITION_RE)
+            if condition_id is not None else None
+        )
+        _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a nonempty string or None")
+        page = await self._v2_page(
+            "/v2/activity",
+            {"user": user, "condition": condition, "start": 1,
+             "limit": page_size, "cursor": cursor},
+            expiry=expiry,
+        )
+        activities = tuple(
+            _activity(row, wallet=user, condition_id=condition,
+                      request_id=page.observation.request_id)
+            for row in page.rows
+        )
+        if expiry is not None:
+            expiry.checkpoint()
+        return PolymarketActivityPage(user, activities, page.next_cursor, page.observation)
 
     async def _scan_positions(
         self,
@@ -666,11 +915,17 @@ __all__ = [
     "DEFAULT_DATA_API_PERIOD_SECONDS",
     "MAX_OPEN_INTEREST_MARKETS",
     "MAX_V2_PAGE_SIZE",
+    "PolymarketActivityPage",
+    "PolymarketHolder",
+    "PolymarketHolderGroup",
+    "PolymarketHoldersPage",
     "PolymarketMarketParticipants",
+    "PolymarketMarketTradesPage",
     "PolymarketOpenInterestBatch",
     "PolymarketParticipant",
     "PolymarketPosition",
     "PolymarketWalletHistory",
+    "PolymarketWalletActivity",
     "PolymarketWalletTrade",
     "normalize_condition_ids",
     "normalize_polymarket_open_interest",

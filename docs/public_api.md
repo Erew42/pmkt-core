@@ -438,6 +438,35 @@ are not atomic. These feeds are insufficient to reconstruct historical balances.
 This feature adds no participant fields to
 the existing public trade recording or canonical `trade.v1` schema.
 
+### Holder, market trade, and wallet activity pages
+
+`holders_page(condition_id=...)` returns `PolymarketHoldersPage` with outcome
+token groups, an opaque continuation cursor, and the request observation.
+The default `balance_basis="NET"` is the venue's cross-outcome net amount.
+`include_pnl=True` changes the page to per-side gross amounts and position
+economics, with at most 100 rows per token page. `min_balance=0` is sent so
+zero-net rows remain visible. A cursor walk is a sequence of live observations,
+not an atomic snapshot or a list of historical holders. Each holder has a
+`request_id` linking it to the page observation.
+
+`market_trades_page(condition_id=...)` returns wallet-attributed trades from
+one condition. It sends `taker_only=false` to include maker fills. The source
+fixes condition-scoped queries to a three-year window and applies a minimum
+size of 0.01 shares even when a caller asks for zero. Those limits remain
+explicit on `PolymarketMarketTradesPage`; exhausting its cursor does not make
+the result a lifetime trade ledger. The existing `trades_page(wallet=...)`
+keeps its full-history `start=1` behavior and `(rows, cursor)` return shape.
+
+`activity_page(wallet=..., condition_id=...)` requests `start=1` wallet
+history and returns typed events, a cursor, and an observation. It retains
+unknown event types, empty outcome token IDs on events such as `MERGE`, and
+source timestamps. `TRADE` activity overlaps the trade feed: consumers must
+choose one trade source before adding lifecycle changes. Transaction hash alone
+does not uniquely identify a fill. The default activity type set excludes
+opt-in `TIP` events, so the page is not a complete token-transfer ledger.
+Position `avg_price` is preserved when the source reports a value above one;
+it is a cost-basis field, not a bounded execution price.
+
 ## Kalshi discovery, detail, and current books
 
 The supported Kalshi facade exports `AsyncKalshiClient`, `KalshiFilter`,

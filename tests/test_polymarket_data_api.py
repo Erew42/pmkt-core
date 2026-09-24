@@ -218,6 +218,107 @@ async def test_wallet_history_reads_full_trades_and_both_position_statuses() -> 
         assert observation.started_at_utc <= observation.received_at_utc <= result.completed_at_utc
 
 
+async def test_holders_page_preserves_groups_basis_cursor_and_observation() -> None:
+    seen: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/holders"
+        seen.append(dict(request.url.params))
+        return httpx.Response(200, json={
+            "data": [{"token_id": "123", "holders": [{
+                "proxy_wallet": WALLET_A, "token_id": "123", "outcome_index": 0,
+                "amount": 4, "avg_price": 0.25, "entry_cost_usdc": 1,
+            }]}, {"token_id": "456", "holders": []}],
+            "pagination": {"has_more": True, "next_cursor": "next-holders"},
+        })
+
+    async with AsyncPolymarketDataClient(
+        base_url="https://data.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.holders_page(
+            condition_id=CONDITION, include_pnl=True, page_size=100,
+        )
+
+    assert result.balance_basis == "GROSS"
+    assert result.next_cursor == "next-holders"
+    assert [group.token_id for group in result.groups] == ["123", "456"]
+    assert result.groups[0].holders[0].amount == Decimal("4")
+    assert result.groups[0].holders[0].request_id == result.observation.request_id
+    assert seen == [{"condition": CONDITION, "include_pnl": "true",
+                     "min_balance": "0", "limit": "100"}]
+
+
+async def test_market_trades_page_is_maker_inclusive_and_condition_scoped() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/trades"
+        assert dict(request.url.params) == {
+            "condition": CONDITION, "taker_only": "false", "limit": "10",
+        }
+        return httpx.Response(200, json={
+            "data": [_trade(WALLET_A), _trade(WALLET_B)],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        base_url="https://data.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.market_trades_page(condition_id=CONDITION, page_size=10)
+
+    assert {trade.wallet for trade in result.trades} == {WALLET_A, WALLET_B}
+    assert all(trade.request_id == result.observation.request_id for trade in result.trades)
+    assert result.source_window == "fixed_three_years"
+    assert result.minimum_size_shares == Decimal("0.01")
+
+
+async def test_activity_page_requests_full_history_and_preserves_unknown_type() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/activity"
+        assert dict(request.url.params) == {
+            "user": WALLET_A, "condition": CONDITION, "start": "1", "limit": "20",
+        }
+        return httpx.Response(200, json={
+            "data": [{
+                "proxy_wallet": WALLET_A, "condition_id": CONDITION,
+                "token_id": "123", "type": "NEW_EVENT", "side": "", "size": 2,
+                "usdc_size": 0, "price": 0, "timestamp": 1782752879,
+                "transaction_hash": "0x" + "f" * 64,
+            }],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        base_url="https://data.example", transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.activity_page(
+            wallet=WALLET_A, condition_id=CONDITION, page_size=20,
+        )
+
+    assert result.activities[0].event_type == "NEW_EVENT"
+    assert result.activities[0].size == Decimal("2")
+    assert result.activities[0].request_id == result.observation.request_id
+
+
+async def test_activity_page_allows_empty_token_for_merge() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "data": [{
+                "proxy_wallet": WALLET_A, "condition_id": CONDITION,
+                "token_id": "", "type": "MERGE", "side": "", "size": 2,
+                "usdc_size": 2, "price": 0, "timestamp": 1782752879,
+                "transaction_hash": "0x" + "f" * 64,
+            }],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        result = await client.activity_page(wallet=WALLET_A)
+
+    assert result.activities[0].token_id == ""
+    assert result.activities[0].event_type == "MERGE"
+
+
 async def test_market_participants_reports_page_cap_and_cursor() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.params["status"] == "OPEN":
@@ -323,7 +424,6 @@ async def test_v2_bad_json_raises_invalid_data_with_cause(content) -> None:
     ("positions", {"current_size": None}),
     ("positions", {"total_size": -1}),
     ("positions", {"avg_price": -0.1}),
-    ("positions", {"avg_price": 1.1}),
     ("positions", {"avg_price": "nan"}),
     ("positions", {"outcome": []}),
     ("trades", {"proxy_wallet": "bad"}),
@@ -371,6 +471,23 @@ async def test_caller_validation_is_not_remote_invalid_data() -> None:
             with pytest.raises(ValueError) as caught:
                 await client.positions_page(**kwargs)
             assert not isinstance(caught.value, InvalidDataError)
+
+
+async def test_positions_preserves_source_avg_price_above_one() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        row = _position(WALLET_A, status="OPEN")
+        row["avg_price"] = 1.0089
+        return httpx.Response(200, json={
+            "data": [row], "pagination": {"has_more": False},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        positions, cursor = await client.positions_page(wallet=WALLET_A)
+
+    assert cursor is None
+    assert positions[0].avg_price == Decimal("1.0089")
 
 
 async def test_wallet_history_preserves_nontrade_position_and_empty_page_provenance() -> None:
