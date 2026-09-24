@@ -193,6 +193,16 @@ def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
     )
 
 
+def _polymarket_updated_at_sql(raw_json_sql: str) -> str:
+    """Read the first parseable _PM_UPDATED_KEYS alias, as discovery observes it."""
+    parts = ", ".join(
+        f"try_cast(json_extract_string({raw_json_sql}, {_quote_sql('$.' + key)}) "
+        "AS TIMESTAMPTZ)"
+        for key in _PM_UPDATED_KEYS
+    )
+    return f"coalesce({parts})"
+
+
 class MarketCatalogService:
     """Own catalog lineage, collection, publication, and reader registration."""
 
@@ -805,10 +815,7 @@ class MarketCatalogService:
                     f"""
                     INSERT INTO known_keys
                     SELECT 'polymarket', CAST(market_id AS VARCHAR), raw_json_sha256,
-                           try_cast(coalesce(
-                               json_extract_string(raw_json, '$.updatedAt'),
-                               json_extract_string(raw_json, '$.updated_at')
-                           ) AS TIMESTAMPTZ), 'polymarket',
+                           {_polymarket_updated_at_sql("raw_json")}, 'polymarket',
                            {_polymarket_contract_hash_sql("raw_json")}
                     FROM {_parquet_sql(pm_path)}
                     WHERE market_id IS NOT NULL
@@ -851,7 +858,7 @@ class MarketCatalogService:
                             "market_id" if venue == "polymarket" else "market_key"
                         )
                         updated_sql = (
-                            "try_cast(json_extract_string(raw_json, '$.updatedAt') AS TIMESTAMPTZ)"
+                            _polymarket_updated_at_sql("raw_json")
                             if venue == "polymarket"
                             else "try_cast(updated_time AS TIMESTAMPTZ)"
                         )
@@ -943,10 +950,9 @@ class MarketCatalogService:
             if venue == "polymarket":
                 selects.append(
                     "SELECT 'polymarket' AS venue, CAST(market_id AS VARCHAR) AS market_key, "
-                    "raw_json_sha256 AS payload_hash, try_cast(coalesce("
-                    "json_extract_string(raw_json, '$.updatedAt'), "
-                    "json_extract_string(raw_json, '$.updated_at')) AS TIMESTAMPTZ) "
-                    "AS updated_at_utc, 'polymarket' AS native_family, "
+                    "raw_json_sha256 AS payload_hash, "
+                    f"{_polymarket_updated_at_sql('raw_json')} AS updated_at_utc, "
+                    "'polymarket' AS native_family, "
                     f"{_polymarket_contract_hash_sql('raw_json')} AS contract_hash "
                     f"FROM {_parquet_sql(path)} WHERE market_id IS NOT NULL"
                 )
