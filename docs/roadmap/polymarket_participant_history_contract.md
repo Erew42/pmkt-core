@@ -94,8 +94,8 @@ absence can mean zero only for an asset and address with a known opening state
 and uninterrupted transfer coverage through the queried block. Never convert
 unknown coverage to zero.
 
-For an observed-at query at UTC time `T`, choose only a scan whose completion
-time is at or before `T`, and return the full scan interval plus the receipt
+For an observed-at query at UTC time `T`, choose the scan with the latest
+completion time at or before `T`, and return its full interval plus the receipt
 time of each contributing page. The answer is "reported during this interval,"
 not "held at exactly T." Differences between scans bound changes in reported
 state only; they do not date the underlying transfer.
