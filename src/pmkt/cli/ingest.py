@@ -5,6 +5,7 @@ from pmkt.config import PmktConfig
 import asyncio
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from typing import Annotated, Any
 from uuid import uuid4
 
 import httpx
+import pandas as pd
 import typer
 
 from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
@@ -49,6 +51,36 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(
         json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
     )
+
+
+def _utc_timestamp(value: object, label: str) -> pd.Timestamp:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{label} is missing")
+    try:
+        timestamp = pd.Timestamp(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} is invalid: {value}") from exc
+    if pd.isna(timestamp) or timestamp.tzinfo is None:
+        raise ValueError(f"{label} must be a timezone-aware timestamp")
+    return timestamp.tz_convert("UTC")
+
+
+def _market_settled_cutoff(payload: object) -> str:
+    if not isinstance(payload, Mapping):
+        raise ValueError("Kalshi historical cutoff response is invalid")
+    value = payload.get("market_settled_ts")
+    _utc_timestamp(value, "historical cutoff market_settled_ts")
+    assert isinstance(value, str)
+    return value
+
+
+def _comma_tickers(value: str | None) -> str | None:
+    if value is None:
+        return None
+    parts = [part.strip() for part in value.split(",")]
+    if not parts or any(not part for part in parts):
+        raise ValueError("tickers must be a nonempty comma-separated list")
+    return ",".join(parts)
 
 
 def _distinct_parquet_json_hash(
@@ -94,6 +126,7 @@ class _StreamingContractEvidenceBundle:
         payload_scope: str,
         observed_at_utc: str,
         bounded_memory: bool = False,
+        request_parameters: Mapping[str, object] | None = None,
     ) -> None:
         self.out = out
         self.venue = venue
@@ -101,6 +134,7 @@ class _StreamingContractEvidenceBundle:
         self.payload_scope = payload_scope
         self.observed_at_utc = observed_at_utc
         self.bounded_memory = bounded_memory
+        self.request_parameters = dict(request_parameters) if request_parameters is not None else None
         self.derived_at_utc = _utc_now_iso()
         self.destination = contract_evidence_bundle_path(out)
         self.destination.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +265,8 @@ class _StreamingContractEvidenceBundle:
                 "continuation_cursor": normalized_cursor,
                 "collection_errors": normalized_errors,
             }
+            if self.request_parameters is not None:
+                source_manifest["request_parameters"] = self.request_parameters
             source_path = self.staging / "source_collection_manifest.json"
             source_path.write_text(
                 json.dumps(source_manifest, indent=2, sort_keys=True) + "\n",
@@ -787,46 +823,131 @@ async def _ingest_kalshi_historical_markets_async(
     tickers: str | None,
     manifest_out: Path | None,
     contract_evidence_out: Path | None,
+    mve_filter: str | None = None,
+    resume_from: Path | None = None,
 ) -> None:
-    if sum(value is not None for value in (event_ticker, series_ticker, tickers)) > 1:
+    if manifest_out is None:
+        raise ValueError("manifest_out is required for historical market ingestion")
+    if resume_from is not None and any(
+        value is not None for value in (event_ticker, series_ticker, tickers, mve_filter)
+    ):
+        raise ValueError("historical market filters cannot be combined with resume_from")
+    tickers = _comma_tickers(tickers)
+    if sum(value is not None for value in (event_ticker, series_ticker, tickers, mve_filter)) > 1:
         raise ValueError("historical market filters are mutually exclusive")
+    if mve_filter is not None and mve_filter != "exclude":
+        raise ValueError("historical mve_filter must be 'exclude'")
     if max_pages < 1:
         raise ValueError("max_pages must be positive")
+    if limit < 1 or limit > 1000:
+        raise ValueError("limit must be between 1 and 1000")
+    start_cursor: str | None = None
+    previous_manifest_sha256: str | None = None
+    chain_id = uuid4().hex
+    segment_index = 0
+    as_of: str | None = None
+    if resume_from is not None:
+        previous = json.loads(resume_from.read_text(encoding="utf-8"))
+        if not isinstance(previous, dict) or (
+            previous.get("endpoint") != "/historical/markets"
+            or previous.get("mode") not in {
+                "kalshi_historical_markets_cursor_bounded",
+                "kalshi_historical_markets_cursor_complete",
+            }
+        ):
+            raise ValueError("resume_from is not a historical market collection manifest")
+        start_cursor = previous.get("final_cursor")
+        if not isinstance(start_cursor, str) or not start_cursor.strip():
+            raise ValueError("resume_from has no continuation cursor")
+        filters = previous.get("filters")
+        cutoff = previous.get("historical_cutoff")
+        if not isinstance(filters, dict) or not isinstance(cutoff, dict):
+            raise ValueError("resume_from is missing filters or historical cutoff")
+        event_ticker = filters.get("event_ticker")
+        series_ticker = filters.get("series_ticker")
+        tickers = filters.get("tickers")
+        mve_filter = filters.get("mve_filter")
+        if any(
+            value is not None and (
+                not isinstance(value, str) or not value.strip()
+            )
+            for value in (event_ticker, series_ticker, tickers, mve_filter)
+        ) or sum(
+            value is not None for value in (event_ticker, series_ticker, tickers, mve_filter)
+        ) > 1 or (mve_filter is not None and mve_filter != "exclude"):
+            raise ValueError("resume_from has invalid historical market filters")
+        as_of = cutoff.get("as_of_market_settled_ts")
+        _utc_timestamp(as_of, "resume_from historical cutoff")
+        prior_chain_id = previous.get("chain_id")
+        prior_index = previous.get("segment_index")
+        if not isinstance(prior_chain_id, str) or not prior_chain_id or (
+            not isinstance(prior_index, int) or isinstance(prior_index, bool) or prior_index < 0
+        ):
+            raise ValueError("resume_from has invalid chain linkage")
+        chain_id = prior_chain_id
+        segment_index = prior_index + 1
+        previous_manifest_sha256 = file_sha256(resume_from)
     if out.exists():
         raise FileExistsError(f"refusing to overwrite historical markets: {out}")
-    if manifest_out is not None:
-        if manifest_out.resolve() == out.resolve():
-            raise ValueError("manifest_out must differ from out")
-        if manifest_out.exists():
-            raise FileExistsError(f"refusing to overwrite historical manifest: {manifest_out}")
+    if manifest_out.resolve() == out.resolve():
+        raise ValueError("manifest_out must differ from out")
+    if manifest_out.exists():
+        raise FileExistsError(f"refusing to overwrite historical manifest: {manifest_out}")
     started_at = _utc_now_iso()
     staging = out.with_name(f".{out.name}.{uuid4().hex}.staged.parquet")
     writer = AtomicParquetWriter(
         staging, schema_version=KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION
     )
-    try:
-        evidence_writer = (
-            _StreamingContractEvidenceBundle(
-                out=contract_evidence_out,
-                venue="kalshi",
-                source_endpoint="kalshi:/historical/markets",
-                payload_scope="cursor_list",
-                observed_at_utc=started_at,
-                bounded_memory=True,
-            )
-            if contract_evidence_out is not None
-            else None
-        )
-    except BaseException:
-        writer.abort()
-        raise
+    manifest_staging = manifest_out.with_name(
+        f".{manifest_out.name}.{uuid4().hex}.staged.json"
+    )
+    evidence_writer: _StreamingContractEvidenceBundle | None = None
     page_count = 0
-    cursor: str | None = None
-    seen_cursors: set[str] = set()
+    cursor = start_cursor
+    seen_cursors: set[str] = {cursor} if cursor else set()
     stop_reason = "not_started"
     published = False
+    evidence_published = False
+    manifest_published = False
+    rows_dropped = 0
+    filters = {
+        "event_ticker": event_ticker,
+        "series_ticker": series_ticker,
+        "tickers": tickers,
+        "mve_filter": mve_filter,
+    }
     try:
         async with AsyncKalshiClient(config=PmktConfig.from_env()) as kalshi:
+            observed_start = _market_settled_cutoff(await kalshi.historical_cutoff())
+            if as_of is None:
+                as_of = observed_start
+            as_of_timestamp = _utc_timestamp(as_of, "historical as_of cutoff")
+            if _utc_timestamp(observed_start, "historical start cutoff") < as_of_timestamp:
+                raise RuntimeError("Kalshi historical cutoff moved backwards")
+            cutoff_metadata = {
+                "as_of_market_settled_ts": as_of,
+                "observed_start": observed_start,
+                "observed_end": None,
+            }
+            request_parameters: dict[str, object] = {
+                **filters,
+                "limit": limit,
+                "chain_id": chain_id,
+                "segment_index": segment_index,
+                "start_cursor": start_cursor,
+                "previous_manifest_sha256": previous_manifest_sha256,
+                "historical_cutoff": cutoff_metadata,
+            }
+            if contract_evidence_out is not None:
+                evidence_writer = _StreamingContractEvidenceBundle(
+                    out=contract_evidence_out,
+                    venue="kalshi",
+                    source_endpoint="kalshi:/historical/markets",
+                    payload_scope="cursor_list",
+                    observed_at_utc=started_at,
+                    bounded_memory=True,
+                    request_parameters=request_parameters,
+                )
             while True:
                 if not complete and page_count >= max_pages:
                     stop_reason = "max_pages_reached"
@@ -837,6 +958,7 @@ async def _ingest_kalshi_historical_markets_async(
                     event_ticker=event_ticker,
                     series_ticker=series_ticker,
                     tickers=tickers,
+                    mve_filter=mve_filter,
                 )
                 page_count += 1
                 markets = page.get("markets")
@@ -844,10 +966,19 @@ async def _ingest_kalshi_historical_markets_async(
                     not isinstance(market, dict) for market in markets
                 ):
                     raise TypeError("Kalshi historical response has invalid markets")
-                if markets:
-                    writer.append(kalshi_markets_dataframe(markets))
+                retained = []
+                for market in markets:
+                    settled = _utc_timestamp(
+                        market.get("settlement_ts"), "historical market settlement_ts"
+                    )
+                    if settled < as_of_timestamp:
+                        retained.append(market)
+                    else:
+                        rows_dropped += 1
+                if retained:
+                    writer.append(kalshi_markets_dataframe(retained))
                     if evidence_writer is not None:
-                        evidence_writer.append(markets)
+                        evidence_writer.append(retained)
                 next_cursor = str(page.get("cursor") or "").strip() or None
                 cursor = next_cursor
                 if next_cursor is None:
@@ -856,72 +987,88 @@ async def _ingest_kalshi_historical_markets_async(
                 if next_cursor in seen_cursors:
                     raise RuntimeError("Kalshi historical markets cursor repeated")
                 seen_cursors.add(next_cursor)
+                if page_count % 10 == 0:
+                    print(f"Historical Kalshi pages={page_count} rows={writer.row_count} cursor={cursor}")
+            observed_end = _market_settled_cutoff(await kalshi.historical_cutoff())
+            if _utc_timestamp(observed_end, "historical end cutoff") < as_of_timestamp:
+                raise RuntimeError("Kalshi historical cutoff moved backwards")
+            cutoff_metadata["observed_end"] = observed_end
         writer.finish()
         _validate_historical_market_keys(staging)
-        staging.replace(out)
+        os.link(staging, out)
         published = True
+        staging.unlink()
         evidence_path: Path | None = None
         evidence_manifest_path: Path | None = None
         evidence_count = 0
+        collection_complete = segment_index == 0 and stop_reason == "cursor_exhausted"
         if evidence_writer is not None:
+            evidence_writer.request_parameters = request_parameters
             evidence_path, evidence_count, evidence_manifest_path = evidence_writer.finish(
-                collection_complete=stop_reason == "cursor_exhausted",
+                collection_complete=collection_complete,
                 stop_reason=stop_reason,
                 continuation_cursor=cursor,
                 collection_errors=(),
                 page_count=page_count,
             )
-        if manifest_out is not None:
-            dataset_paths = {"output": str(out)}
-            schema_versions = {"output": KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION}
-            row_counts = {"output": writer.row_count}
-            if evidence_path is not None and evidence_manifest_path is not None:
-                dataset_paths["contract_evidence"] = str(evidence_path)
-                dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path)
-                schema_versions["contract_evidence"] = CONTRACT_EVIDENCE_SCHEMA_VERSION
-                schema_versions["contract_evidence_manifest"] = (
-                    CONTRACT_EVIDENCE_MANIFEST_VERSION
-                )
-                row_counts["contract_evidence"] = evidence_count
-            _write_json(
-                manifest_out,
-                {
-                    "endpoint": "/historical/markets",
-                    "mode": (
-                        "kalshi_historical_markets_cursor_complete"
-                        if complete
-                        else "kalshi_historical_markets_cursor_bounded"
-                    ),
-                    "filters": {
-                        "event_ticker": event_ticker,
-                        "series_ticker": series_ticker,
-                        "tickers": tickers,
-                    },
-                    "started_at_utc": started_at,
-                    "finished_at_utc": _utc_now_iso(),
-                    "page_count": page_count,
-                    "row_count": writer.row_count,
-                    "unique_market_count": writer.row_count,
-                    "final_cursor": cursor,
-                    "stop_reason": stop_reason,
-                    "collection_complete": stop_reason == "cursor_exhausted",
-                    "errors": [],
-                    "output_path": str(out),
-                    "dataset_paths": dataset_paths,
-                    "schema_versions": schema_versions,
-                    "row_counts": row_counts,
-                },
+            evidence_published = True
+        dataset_paths = {"output": str(out)}
+        schema_versions = {"output": KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION}
+        row_counts = {"output": writer.row_count}
+        if evidence_path is not None and evidence_manifest_path is not None:
+            dataset_paths["contract_evidence"] = str(evidence_path)
+            dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path)
+            schema_versions["contract_evidence"] = CONTRACT_EVIDENCE_SCHEMA_VERSION
+            schema_versions["contract_evidence_manifest"] = (
+                CONTRACT_EVIDENCE_MANIFEST_VERSION
             )
+            row_counts["contract_evidence"] = evidence_count
+        _write_json(
+            manifest_staging,
+            {
+                "endpoint": "/historical/markets",
+                "mode": (
+                    "kalshi_historical_markets_cursor_complete"
+                    if complete
+                    else "kalshi_historical_markets_cursor_bounded"
+                ),
+                "filters": filters,
+                "chain_id": chain_id,
+                "segment_index": segment_index,
+                "start_cursor": start_cursor,
+                "previous_manifest_sha256": previous_manifest_sha256,
+                "historical_cutoff": cutoff_metadata,
+                "rows_dropped_settled_at_or_after_as_of": rows_dropped,
+                "started_at_utc": started_at,
+                "finished_at_utc": _utc_now_iso(),
+                "page_count": page_count,
+                "row_count": writer.row_count,
+                "unique_market_count": writer.row_count,
+                "final_cursor": cursor,
+                "stop_reason": stop_reason,
+                "collection_complete": collection_complete,
+                "errors": [],
+                "output_path": str(out),
+                "output_sha256": file_sha256(out),
+                "dataset_paths": dataset_paths,
+                "schema_versions": schema_versions,
+                "row_counts": row_counts,
+            },
+        )
+        os.link(manifest_staging, manifest_out)
+        manifest_published = True
+        manifest_staging.unlink()
     except BaseException:
         writer.abort()
         if evidence_writer is not None:
             evidence_writer.abort()
-            if evidence_writer.destination.exists():
+            if evidence_published:
                 shutil.rmtree(evidence_writer.destination, ignore_errors=True)
         staging.unlink(missing_ok=True)
+        manifest_staging.unlink(missing_ok=True)
         if published:
             out.unlink(missing_ok=True)
-        if manifest_out is not None:
+        if manifest_published:
             manifest_out.unlink(missing_ok=True)
         raise
     print(f"Wrote {writer.row_count} historical Kalshi markets to {out}")
@@ -1029,7 +1176,8 @@ def ingest_kalshi_markets(
 
 def ingest_kalshi_historical_markets(
     out: Annotated[Path, typer.Option(help="New Parquet output path.")],
-    limit: Annotated[int, typer.Option(help="Markets per page, up to 1000.")] = 100,
+    manifest_out: Annotated[Path, typer.Option(help="Required collection manifest JSON path.")],
+    limit: Annotated[int, typer.Option(help="Markets per page, up to 1000.")] = 1000,
     max_pages: Annotated[int, typer.Option(help="Maximum pages in bounded mode.")] = 1,
     complete: Annotated[
         bool,
@@ -1044,8 +1192,11 @@ def ingest_kalshi_historical_markets(
     tickers: Annotated[
         str | None, typer.Option(help="Filter by comma-separated market tickers.")
     ] = None,
-    manifest_out: Annotated[
-        Path | None, typer.Option(help="Optional collection manifest JSON path.")
+    mve_filter: Annotated[
+        str | None, typer.Option(help="Use 'exclude' for conventional markets only.")
+    ] = None,
+    resume_from: Annotated[
+        Path | None, typer.Option(help="Continue from a prior segment manifest.")
     ] = None,
     contract_evidence_out: Annotated[
         Path | None,
@@ -1064,5 +1215,7 @@ def ingest_kalshi_historical_markets(
             tickers=tickers,
             manifest_out=manifest_out,
             contract_evidence_out=contract_evidence_out,
+            mve_filter=mve_filter,
+            resume_from=resume_from,
         )
     )

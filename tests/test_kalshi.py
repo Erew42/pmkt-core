@@ -214,6 +214,7 @@ async def test_kalshi_historical_markets_page_serializes_one_selector() -> None:
         )
         await client.historical_markets_page(event_ticker="KXEVENT")
         await client.historical_markets_page(tickers=["KXONE", "KXTWO"])
+        await client.historical_markets_page(mve_filter="exclude")
 
     assert seen == [
         (
@@ -227,6 +228,10 @@ async def test_kalshi_historical_markets_page_serializes_one_selector() -> None:
         (
             "/trade-api/v2/historical/markets",
             {"limit": "100", "tickers": "KXONE,KXTWO"},
+        ),
+        (
+            "/trade-api/v2/historical/markets",
+            {"limit": "100", "mve_filter": "exclude"},
         ),
     ]
 
@@ -245,15 +250,26 @@ async def test_kalshi_historical_markets_rejects_mixed_filters() -> None:
             )
         with pytest.raises(ValueError, match="must not be empty"):
             await client.historical_markets_page(tickers=[])
+        for selector in (
+            {"event_ticker": "KXEVENT"},
+            {"series_ticker": "KXSERIES"},
+            {"tickers": "KXONE"},
+        ):
+            with pytest.raises(ValueError, match="mutually exclusive"):
+                await client.historical_markets_page(mve_filter="exclude", **selector)
+        with pytest.raises(ValueError, match="must be 'exclude'"):
+            await client.historical_markets_page(mve_filter="only")
 
 
 @pytest.mark.asyncio
 async def test_kalshi_iter_historical_markets_follows_empty_cursor_page() -> None:
     cursors: list[str | None] = []
+    filters: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         cursor = request.url.params.get("cursor")
         cursors.append(cursor)
+        filters.append(request.url.params.get("mve_filter"))
         if cursor is None:
             return httpx.Response(200, json={"markets": [], "cursor": "next"})
         return httpx.Response(
@@ -264,9 +280,10 @@ async def test_kalshi_iter_historical_markets_follows_empty_cursor_page() -> Non
         base_url="https://example.com/trade-api/v2",
         transport=httpx.MockTransport(handler),
     ) as client:
-        rows = [row async for row in client.iter_historical_markets()]
+        rows = [row async for row in client.iter_historical_markets(mve_filter="exclude")]
 
     assert cursors == [None, "next"]
+    assert filters == ["exclude", "exclude"]
     assert rows == [{"ticker": "KXOLD"}]
 
 

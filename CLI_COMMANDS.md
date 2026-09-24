@@ -30,12 +30,34 @@ installed version.
 - `ingest-markets-keyset`: fetch Polymarket markets by keyset pagination.
 - `ingest-kalshi-markets`: fetch normalized Kalshi market snapshots.
 - `ingest-kalshi-historical-markets`: fetch archived Kalshi market snapshots from
-  `/historical/markets`. Use one of `--event-ticker`, `--series-ticker`, or
-  `--tickers`, or omit filters to scan the archive. The default fetches one page;
-  `--complete` follows the cursor to exhaustion. The command writes the existing
-  `kalshi_market_snapshot.v1` schema, refuses to overwrite the output, and checks
-  duplicate market tickers on disk before publishing. Optional manifest and
-  contract evidence outputs identify the historical endpoint and completion state.
+  `/historical/markets`. Use one of `--event-ticker`, `--series-ticker`,
+  `--tickers`, or `--mve-filter exclude`; omit filters to scan the whole archive.
+  Kalshi does not support `mve_filter=only` on this endpoint. The default fetches
+  one page of up to 1000 rows; `--complete` follows the cursor to exhaustion.
+  `--manifest-out` is required. The command writes the existing
+  `kalshi_market_snapshot.v1` schema, refuses to overwrite the output or
+  manifest, and checks duplicate market tickers on disk before publishing.
+  Each segment contains archived markets settled **before** its recorded
+  `as_of_market_settled_ts`; rows settled on or after it belong to the live
+  `/markets` side. The endpoints can overlap by days, so consumers combining
+  them must deduplicate by ticker. A missing or invalid settlement timestamp
+  fails the segment. The manifest and optional contract evidence record filters,
+  cutoff observations, cursor, counts, and completion state. Progress prints
+  every 10 pages.
+
+  For a large conventional-market scan, run bounded segments and continue from
+  each preceding manifest (use different output paths):
+
+  ```shell
+  pmkt ingest-kalshi-historical-markets --out seg0.parquet --manifest-out seg0.json --max-pages 200 --limit 1000 --mve-filter exclude
+  pmkt ingest-kalshi-historical-markets --out seg1.parquet --manifest-out seg1.json --max-pages 200 --limit 1000 --resume-from seg0.json
+  ```
+
+  Repeat with the latest segment manifest until `stop_reason` is
+  `cursor_exhausted`. Re-run a failed segment with the same `--resume-from`;
+  failed segments publish nothing. A resumed segment is not individually
+  authoritative even when it exhausts the cursor. Stitching and chain
+  verification are part of the catalog-import follow-up.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.

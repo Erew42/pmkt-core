@@ -21,8 +21,15 @@ candle-history workflows on 2026-09-11, and archived market listing on
 ## Kalshi
 
 - `/historical/markets` lists archived market metadata and settlement fields with
-  cursor pagination. Market, event, and series filters are mutually exclusive;
-  this is a market listing, not historical order-book evidence. Source:
+  cursor pagination. Market, event, series, and `mve_filter=exclude` filters are
+  mutually exclusive. Kalshi does not accept `mve_filter=only` here. The ingest
+  command pins a snapshot to the starting `market_settled_ts` cutoff and keeps
+  only rows settled before it, even if the cutoff advances during pagination.
+  Resumed segments carry that same cutoff. The live and archive listings can
+  overlap, so combined listings require ticker deduplication. Kalshi market
+  objects omit `series_ticker`; for a filtered snapshot, read that scope from
+  the collection manifest rather than the normalized row. This is a market
+  listing, not historical order-book evidence. Source:
   <https://docs.kalshi.com/api-reference/historical/get-historical-markets>
 - `/series/{series_ticker}/markets/{ticker}/candlesticks` provides live-dataset market candlesticks with price, yes-bid, yes-ask, volume, and open-interest context. `start_ts`/`end_ts` are inclusive end-labels. Source: <https://docs.kalshi.com/api-reference/market/get-market-candlesticks>
 - `/markets/candlesticks` provides batched live-dataset candlesticks for up to 100 market tickers and up to 10,000 candles total. Source: <https://docs.kalshi.com/api-reference/market/batch-get-market-candlesticks>

@@ -1030,6 +1030,7 @@ class AsyncKalshiClient:
         event_ticker: str | None = None,
         series_ticker: str | None = None,
         tickers: str | Iterable[str] | None = None,
+        mve_filter: str | None = None,
         expiry: OperationExpiry | None = None,
     ) -> dict[str, Any]:
         """Fetch one page of markets from Kalshi's historical archive."""
@@ -1037,9 +1038,11 @@ class AsyncKalshiClient:
         normalized_tickers = _normalize_tickers(tickers)
         if tickers is not None and normalized_tickers is None:
             raise ValueError("tickers must not be empty")
-        selectors = (event_ticker, series_ticker, normalized_tickers)
+        selectors = (event_ticker, series_ticker, normalized_tickers, mve_filter)
         if sum(value is not None for value in selectors) > 1:
             raise ValueError("historical market filters are mutually exclusive")
+        if mve_filter is not None and mve_filter != "exclude":
+            raise ValueError("historical mve_filter must be 'exclude'")
         for name, value in (
             ("event_ticker", event_ticker),
             ("series_ticker", series_ticker),
@@ -1056,6 +1059,7 @@ class AsyncKalshiClient:
                 "event_ticker": event_ticker,
                 "series_ticker": series_ticker,
                 "tickers": normalized_tickers,
+                "mve_filter": mve_filter,
             },
             expiry=expiry,
         )
@@ -1071,6 +1075,7 @@ class AsyncKalshiClient:
         event_ticker: str | None = None,
         series_ticker: str | None = None,
         tickers: str | Iterable[str] | None = None,
+        mve_filter: str | None = None,
         max_pages: int | None = None,
         expiry: OperationExpiry | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
@@ -1084,6 +1089,7 @@ class AsyncKalshiClient:
                 event_ticker=event_ticker,
                 series_ticker=series_ticker,
                 tickers=tickers,
+                mve_filter=mve_filter,
                 expiry=expiry,
             )
             pages += 1
