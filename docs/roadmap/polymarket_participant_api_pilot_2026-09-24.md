@@ -7,7 +7,7 @@ held each outcome on a chosen date, including wallets no longer holding it?**
 
 ## Sample and method
 
-The pilot read the official Data API v2 OpenAPI document, then used public
+The pilot read the [official Data API v2 OpenAPI document](https://data-api.polymarket.com/v2/openapi.json), then used public
 `/v2/positions` (`OPEN`, `CLOSED`), `/v2/holders?include_pnl=true`,
 `/v2/trades?condition=...&taker_only=false`, and wallet
 `/v2/activity?start=1&condition=...`. Wallet `/v2/trades?start=1` was also
@@ -75,6 +75,13 @@ Observed examples:
   activity replay differed by 91.62 shares from its reported position; its
   global wallet trade feed also remained capped. These are gaps to diagnose,
   not evidence that a particular API row is wrong.
+- One negative-risk wallet's global trade page contained a 62-hex-digit
+  `condition_id` rather than a canonical 64-digit ID. The prior strict parser
+  rejected the entire wallet page. Wallet-scoped reads now preserve that
+  source hex ID; condition-scoped reads still require a match to the requested
+  canonical ID. After the fix, this wallet's single market activity trade
+  reproduced its five-share current position, while its global wallet trade
+  walk still had a cursor after five pages.
 
 The negative-risk position sample contained a source `avg_price` of 1.0089.
 The prior client rejected it as if cost basis were a bounded trade price;
