@@ -424,14 +424,20 @@ class AsyncPolymarketDataClient:
         cursor: str | None = None,
         expiry: OperationExpiry | None = None,
     ) -> tuple[tuple[PolymarketWalletTrade, ...], str | None]:
-        """Read one wallet trade page from the full-history feed."""
+        """Read one wallet trade page, maker and taker fills, from the full-history feed."""
         user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
         _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
         if cursor is not None and (not isinstance(cursor, str) or not cursor):
             raise ValueError("cursor must be a nonempty string or None")
         page = await self._v2_page(
             "/v2/trades",
-            {"user": user, "full_history": True, "limit": page_size, "cursor": cursor},
+            {
+                "user": user,
+                "full_history": True,
+                "taker_only": False,
+                "limit": page_size,
+                "cursor": cursor,
+            },
             expiry=expiry,
         )
         trades = tuple(_trade(row, wallet=user) for row in page.rows)

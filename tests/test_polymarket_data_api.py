@@ -151,6 +151,7 @@ async def test_wallet_history_reads_full_trades_and_both_position_statuses() -> 
         assert params["user"] == WALLET_A
         if request.url.path == "/v2/trades":
             assert params["full_history"] == "true"
+            assert params["taker_only"] == "false"
             return httpx.Response(200, content=(
                 '{"data":[{"proxy_wallet":"' + WALLET_A + '","condition_id":"'
                 + CONDITION + '","token_id":"123","side":"BUY","size":1.25,'
