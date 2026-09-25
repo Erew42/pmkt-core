@@ -157,7 +157,10 @@ visibility that excludes inactive markets even when archived positions are
 requested. Trade reads also default to `taker_only=true`, which omits maker
 fills; market discovery and wallet reconstruction must request
 `taker_only=false`. Record those limits, the exact query sent, and any future
-source changes before a completeness claim.
+source changes before a completeness claim. The core activity read explicitly
+uses `exclude_deposits_withdrawals=true`: `start=1` extends the time range but
+does not include those cash movements. The default activity type set also
+omits opt-in `TIP` rows.
 
 If the available wallet feed omits historical executions or prices, either
 backfill them before promising full trading history or publish an explicitly

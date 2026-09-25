@@ -442,9 +442,11 @@ def _activity(
     request_id: str,
 ) -> PolymarketWalletActivity:
     found_wallet = _row_identifier(row, "proxy_wallet", _WALLET_RE)
+    event_type = _text(row, "type")
     # REWARD, YIELD and rebate rows are wallet cash flows with no market.
     found_condition = (
-        "" if condition_id is None and row.get("condition_id") == ""
+        "" if event_type != "TRADE" and condition_id is None
+        and row.get("condition_id") == ""
         else _source_condition_id(row, requested=condition_id, feed="activity")
     )
     if found_wallet != wallet:
@@ -461,6 +463,10 @@ def _activity(
     token_id = row.get("token_id")
     if not isinstance(token_id, str):
         raise InvalidDataError("Data API v2 activity token_id must be a string")
+    side = _optional_text(row, "side") or ""
+    if event_type == "TRADE":
+        if not token_id or side not in ("BUY", "SELL") or size <= 0 or not 0 <= price <= 1:
+            raise InvalidDataError("Data API v2 activity TRADE fields are invalid")
     is_combo = row.get("is_combo")
     if is_combo is not None and not isinstance(is_combo, bool):
         raise InvalidDataError("Data API v2 activity is_combo must be boolean or null")
@@ -468,8 +474,8 @@ def _activity(
         wallet=found_wallet,
         condition_id=found_condition,
         token_id=token_id,
-        event_type=_text(row, "type"),
-        side=_optional_text(row, "side") or "",
+        event_type=event_type,
+        side=side,
         size=size,
         usdc_size=usdc_size,
         price=price,
@@ -764,10 +770,11 @@ class AsyncPolymarketDataClient:
         cursor: str | None = None,
         expiry: OperationExpiry | None = None,
     ) -> PolymarketActivityPage:
-        """Read full-history wallet activity, including TRADE and lifecycle types.
+        """Read full-time-range wallet activity, including TRADE and lifecycle types.
 
         TRADE rows overlap /v2/trades and must not be added to those fills.
         Unknown activity types are preserved rather than interpreted as balance changes.
+        Deposits and withdrawals are excluded from this outcome-token feed.
         """
         user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
         condition = (
@@ -780,6 +787,7 @@ class AsyncPolymarketDataClient:
         page = await self._v2_page(
             "/v2/activity",
             {"user": user, "condition": condition, "start": 1,
+             "exclude_deposits_withdrawals": True,
              "limit": page_size, "cursor": cursor},
             expiry=expiry,
         )

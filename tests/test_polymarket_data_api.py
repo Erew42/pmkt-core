@@ -50,6 +50,10 @@ def _trade(wallet: str) -> dict:
     }
 
 
+def _activity_trade(wallet: str) -> dict:
+    return {**_trade(wallet), "type": "TRADE", "usdc_size": 1}
+
+
 async def test_open_interest_page_preserves_raw_payload_and_comma_encoding() -> None:
     seen: dict[str, str | None] = {}
 
@@ -296,7 +300,8 @@ async def test_activity_page_requests_full_history_and_preserves_unknown_type() 
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v2/activity"
         assert dict(request.url.params) == {
-            "user": WALLET_A, "condition": CONDITION, "start": "1", "limit": "20",
+            "user": WALLET_A, "condition": CONDITION, "start": "1",
+            "exclude_deposits_withdrawals": "true", "limit": "20",
         }
         return httpx.Response(200, json={
             "data": [{
@@ -318,6 +323,77 @@ async def test_activity_page_requests_full_history_and_preserves_unknown_type() 
     assert result.activities[0].event_type == "NEW_EVENT"
     assert result.activities[0].size == Decimal("2")
     assert result.activities[0].request_id == result.observation.request_id
+
+
+@pytest.mark.parametrize("updates", [
+    {"condition_id": ""}, {"token_id": ""}, {"side": ""},
+    {"side": None}, {"side": "HOLD"}, {"size": 0},
+    {"price": -0.1}, {"price": 1.1},
+])
+async def test_activity_trade_rejects_malformed_fill_fields(updates) -> None:
+    row = _activity_trade(WALLET_A)
+    row.update(updates)
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={
+            "data": [row], "pagination": {"has_more": False},
+        }))
+    ) as client:
+        with pytest.raises(InvalidDataError):
+            await client.activity_page(wallet=WALLET_A)
+
+
+@pytest.mark.parametrize("feed", ["holders", "trades", "activity"])
+async def test_participant_page_reads_resume_opaque_cursor(feed) -> None:
+    seen: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        seen.append(cursor)
+        assert request.url.path == f"/v2/{feed}"
+        assert request.url.params["limit"] == "2"
+        if cursor is None:
+            return httpx.Response(200, json={
+                "data": [], "pagination": {"has_more": True, "next_cursor": "opaque+token"},
+            })
+        assert cursor == "opaque+token"
+        row = (
+            {"token_id": "123", "holders": [{
+                "proxy_wallet": WALLET_A, "token_id": "123",
+                "outcome_index": 0, "amount": 1,
+            }]}
+            if feed == "holders" else
+            _trade(WALLET_A) if feed == "trades" else _activity_trade(WALLET_A)
+        )
+        return httpx.Response(200, json={
+            "data": [row], "pagination": {"has_more": False},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        if feed == "holders":
+            first = await client.holders_page(condition_id=CONDITION, page_size=2)
+            second = await client.holders_page(
+                condition_id=CONDITION, page_size=2, cursor=first.next_cursor,
+            )
+            assert second.groups[0].holders[0].wallet == WALLET_A
+        elif feed == "trades":
+            first = await client.market_trades_page(condition_id=CONDITION, page_size=2)
+            second = await client.market_trades_page(
+                condition_id=CONDITION, page_size=2, cursor=first.next_cursor,
+            )
+            assert second.trades[0].wallet == WALLET_A
+        else:
+            first = await client.activity_page(wallet=WALLET_A, page_size=2)
+            second = await client.activity_page(
+                wallet=WALLET_A, page_size=2, cursor=first.next_cursor,
+            )
+            assert second.activities[0].wallet == WALLET_A
+
+    assert seen == [None, "opaque+token"]
+    assert first.next_cursor == "opaque+token"
+    assert second.next_cursor is None
+    assert dict(second.observation.effective_parameters)["cursor"] == "opaque+token"
 
 
 async def test_activity_page_allows_empty_token_for_merge() -> None:
