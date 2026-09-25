@@ -15,7 +15,10 @@ walked up to five 1,000-row pages per sampled wallet. The market scans used
 one 100-row page per feed. The market-page sample finished near 21:10 UTC and
 the wallet replay near 21:30 UTC. The exact replay wallets are listed below.
 All source reads were live and non-atomic; page caps and cursor exhaustion
-are reported separately.
+are reported separately. Exact request and receipt times, response hashes,
+query strings, and original RPC identifiers were not retained for the
+2026-09-24 run, so its quantitative observations cannot be independently
+reproduced from an original capture.
 
 | Case | Gamma market ID and condition | OPEN / CLOSED position page | Gross holder page | Condition trade page |
 | --- | --- | --- | --- | --- |
@@ -124,6 +127,24 @@ minting, and a final transfer into the wallet; a transaction hash alone is
 not a transfer-item key. Replay needs block, transaction, log, and batch-item
 ordering plus the from/to addresses, including the zero address.
 
+On 2026-09-25, a separate read-only recheck through
+`https://polygon-bor-rpc.publicnode.com` independently returned the same two
+activity trade hashes and 509 CTF logs across the two blocks. The exact
+request windows, query parameters, response hashes, pagination states, RPC
+methods, and block identifiers are in the [follow-up evidence manifest](polymarket_participant_pilot_evidence_2026-09-25.json).
+The recheck is not a recovered capture of the original run. Its market trade
+and `CLOSED` position pages still had continuation cursors; the wallet's
+condition activity page had two TRADE rows and an exhausted cursor. Holder
+`row_count` in the manifest counts token groups, not wallet holders.
+
+| Activity transaction | Block | Canonical block hash | CTF logs in block |
+| --- | ---: | --- | ---: |
+| `0x88c3c85ae34b28c9b73fe1da42311dd8b277bb8bc085c763c916d5a9b0496527` | 94,377,135 | `0x9104e14b26e332d78c8f84151ee84dde088d03c26b60bb033b2ae48265906adc` | 165 |
+| `0x0abbd5cc533e4290db40984d152e81f8d5155e36e4d44dd983b964219ad12e2d` | 94,377,099 | `0x79f39f8769671fa773ca55094ef626a5341dc1f7baf7074058d4a12ce73ba38f` | 344 |
+
+The follow-up confirms the two-block log count, not the original transfer
+item classification or a full historical balance reconstruction.
+
 The public RPC supported current `eth_call` and bounded historical logs, but
 rejected `eth_call` at the sampled historical blocks because it lacked the
 required state. A second public endpoint gave inconsistent historical-state
@@ -214,11 +235,19 @@ alone cannot distinguish the sampled combo trade from an outcome-token trade.
 | Consumer answer | Decision | Evidence boundary |
 | --- | --- | --- |
 | Current observed holders | Supported with gaps | Gross holder pages include small positive balances classified `CLOSED` by positions. `OPEN` alone misses them; scans are not atomic and capped pages must be resumed. |
-| Known-wallet API-derived dated timeline | Supported with gaps | Trades and lifecycle activity explain some sampled balances; blank-token lifecycle rows, direct transfers, older coverage, source floors, combo classification, and unavailable historical checks prevent exactness. Dates without covered opening/events must be `uncovered`, never zero. |
+| Known-wallet API event timeline and diagnostic balance replay | Supported with gaps | Trades and lifecycle activity explain some sampled current balances. Trade/activity overlap must be deduplicated, while blank-token lifecycle rows, direct transfers, older coverage, source floors, and combo classification remain unresolved. |
+| Known-wallet dated balances | Unqualified | A final-position match does not establish a zero opening balance or complete events before a date. No sampled intermediate date was checked against historical state; queries without a known opening state and uninterrupted event coverage must return `uncovered`, never zero. |
 | Exact market-wide dated holder history | Unsupported by API-only evidence | The old market has an on-chain holder whose API trade/activity feeds contain no event, and market-wide transfer recipients cannot be proven from these feeds. |
 
-**Go/no-go:** build only a clearly labelled, source-limited API timeline if a
-consumer accepts the gaps. The original exact market-wide question remains
+At a replay boundary, a source condition ID must be mapped to a canonical
+market and outcome token before changing a balance. A trade row without a
+combo marker cannot by itself establish that it is an ordinary outcome-token
+trade; unresolved combo or shortened source IDs remain event evidence only.
+
+**Go/no-go:** build only a clearly labelled API event timeline and diagnostic
+replay if a consumer accepts the gaps. Do not publish dated balances until a
+known opening state and event coverage are established. The original exact
+market-wide question remains
 unanswered. The two-block chain extraction demonstrates a plausible path but
 does not justify a production indexer. Before that commitment, obtain an
 archival Polygon RPC and run a one-market, token-creation-to-head transfer
