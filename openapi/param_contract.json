@@ -103,7 +103,7 @@
     "/v2/activity": {
       "get": {
         "params": {
-          "user": {"required": false},
+          "user": {"required": true},
           "limit": {"required": false},
           "cursor": {"required": false},
           "type": {"required": false},
