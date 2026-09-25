@@ -368,6 +368,80 @@ async def test_wallet_activity_keeps_cash_flow_rows_without_market() -> None:
     assert result.activities[0].usdc_size == Decimal("30.29")
 
 
+async def test_activity_page_preserves_optional_combo_flag() -> None:
+    trade = {
+        "proxy_wallet": WALLET_A, "condition_id": CONDITION,
+        "token_id": "123", "type": "TRADE", "side": "BUY", "size": 2,
+        "usdc_size": 1, "price": 0.5, "timestamp": 1782752879,
+        "transaction_hash": "0x" + "f" * 64,
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "data": [
+                {**trade, "is_combo": True},
+                {**trade, "is_combo": False},
+                trade,
+            ],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        page = await client.activity_page(wallet=WALLET_A)
+
+    assert tuple(row.is_combo for row in page.activities) == (True, False, None)
+
+
+async def test_activity_page_rejects_non_boolean_combo_flag() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={
+            "data": [{
+                "proxy_wallet": WALLET_A, "condition_id": CONDITION,
+                "token_id": "123", "type": "TRADE", "side": "BUY", "size": 2,
+                "usdc_size": 1, "price": 0.5, "timestamp": 1782752879,
+                "transaction_hash": "0x" + "f" * 64, "is_combo": "true",
+            }],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        with pytest.raises(InvalidDataError, match="is_combo"):
+            await client.activity_page(wallet=WALLET_A)
+
+
+async def test_activity_page_accepts_combo_condition_id() -> None:
+    combo_condition = (
+        "0x0358aedb06b9a9095ab2b216cf8ae8961f0000000000000000000000000000"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["condition"] == combo_condition
+        return httpx.Response(200, json={
+            "data": [{
+                "proxy_wallet": WALLET_A, "condition_id": combo_condition,
+                "token_id": "123", "type": "TRADE", "side": "BUY", "size": 2,
+                "usdc_size": 1, "price": 0.5, "timestamp": 1782752879,
+                "transaction_hash": "0x" + "f" * 64, "is_combo": True,
+            }],
+            "pagination": {"has_more": False, "next_cursor": None},
+        })
+
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(handler)
+    ) as client:
+        page = await client.activity_page(
+            wallet=WALLET_A, condition_id=combo_condition,
+        )
+
+    assert len(page.activities) == 1
+    assert page.activities[0].is_combo is True
+    assert page.activities[0].condition_id == combo_condition
+
+
 async def test_market_participants_reports_page_cap_and_cursor() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.params["status"] == "OPEN":

@@ -198,6 +198,7 @@ class PolymarketWalletActivity:
     transaction_hash: str
     outcome: str | None
     request_id: str
+    is_combo: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -460,6 +461,9 @@ def _activity(
     token_id = row.get("token_id")
     if not isinstance(token_id, str):
         raise InvalidDataError("Data API v2 activity token_id must be a string")
+    is_combo = row.get("is_combo")
+    if is_combo is not None and not isinstance(is_combo, bool):
+        raise InvalidDataError("Data API v2 activity is_combo must be boolean or null")
     return PolymarketWalletActivity(
         wallet=found_wallet,
         condition_id=found_condition,
@@ -473,6 +477,7 @@ def _activity(
         transaction_hash=_text(row, "transaction_hash"),
         outcome=_optional_text(row, "outcome"),
         request_id=request_id,
+        is_combo=is_combo,
     )
 
 
@@ -766,7 +771,7 @@ class AsyncPolymarketDataClient:
         """
         user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
         condition = (
-            _identifier(condition_id, name="condition_id", pattern=_CONDITION_RE)
+            _identifier(condition_id, name="condition_id", pattern=_SOURCE_CONDITION_RE)
             if condition_id is not None else None
         )
         _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)

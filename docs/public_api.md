@@ -470,11 +470,18 @@ history and returns typed events, a cursor, and an observation. It retains
 unknown event types, empty outcome token IDs on events such as `MERGE`, and
 source timestamps. Wallet-wide pages also return cash-flow rows such as
 `REWARD`, `YIELD`, `MAKER_REBATE`, and `TAKER_REBATE` with empty
-`condition_id` and `token_id`; condition-scoped pages never accept them. `TRADE` activity overlaps the trade feed: consumers must
-choose one trade source before adding lifecycle changes. Transaction hash alone
-does not uniquely identify a fill. The default activity type set excludes
-opt-in `TIP` pUSD transfers. This activity feed does not establish a complete
-ERC-1155 outcome-token transfer ledger.
+`condition_id` and `token_id`; condition-scoped pages never accept them.
+Activity rows also preserve the optional source `is_combo` flag: `true` marks
+a combo trade, while `None` means the source omitted or nullified the flag.
+Combo trades must not be replayed as direct outcome-token trades. The trades
+feed does not carry this flag, even for combo trades; consumers using that feed
+need separate classification. Condition-filtered activity accepts source combo
+condition IDs as well as ordinary market condition IDs. `TRADE` activity
+overlaps the trade feed; consumers must choose one trade source before adding
+lifecycle changes.
+Transaction hash alone does not uniquely identify a fill. The default activity
+type set excludes opt-in `TIP` pUSD transfers. This activity feed does not
+establish a complete ERC-1155 outcome-token transfer ledger.
 Position `avg_price` is preserved when the source reports a value above one;
 it is a cost-basis field, not a bounded execution price.
 
