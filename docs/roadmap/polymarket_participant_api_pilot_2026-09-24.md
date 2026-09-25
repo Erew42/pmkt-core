@@ -161,12 +161,60 @@ maker-side fill appeared in both the wallet trade and condition activity
 feeds. This verifies the need for `taker_only=false` in market discovery and
 shows that overlapping activity TRADE rows must not be added again.
 
+## Follow-up conversion and combo probes
+
+On 2026-09-25 UTC, a bounded `eth_getLogs` query through
+`https://polygon-bor-rpc.publicnode.com` against the Polygon negative-risk
+adapter (`0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296`)
+`PositionsConverted` event found 555 logs in blocks
+94,421,763 through 94,424,763, across seven indexed stakeholder addresses.
+The adapter address is in [Polymarket's contract guide](https://github.com/Polymarket/agent-skills/blob/main/ctf-operations.md),
+and the event is in its [contract source](https://github.com/Polymarket/neg-risk-ctf-adapter/blob/main/src/NegRiskAdapter.sol).
+One stakeholder, `0xada2005600dec949baf300f4c6120000bdb6eaab`, accounted
+for 535 logs and returned HTTP 400 `user is a protocol contract address` from
+`/v2/activity`. For each of the six other stakeholders, the probe requested
+one 120-second window around a sampled on-chain conversion, with
+`limit=1000`, both with default activity types and with `type=CONVERSION`.
+Every query returned a row matching the sampled transaction hash and an
+exhausted cursor. For example, wallet
+`0x0629ad7753ba6a7bf22dc816df228e92364c501d` had a matching
+`CONVERSION` row for transaction
+`0x3798cad831e39542b9a2f62eba39abbde59d4537e08aff3bf005af84ec2ae953`
+in both queries. This shows that the default activity feed **can** include
+negative-risk conversions. It does not establish that every conversion is
+covered: only one event per accessible wallet was matched, and the windows
+were narrow. The returned conversion rows had an empty `token_id` and
+`outcome_index=999`; they identify the conversion but do not assign its
+per-outcome balance changes.
+
+The [official Polygon V2 contract registry](https://github.com/Polymarket/contract-security)
+identifies the Position Manager at
+`0x006F54F7f9A22e0000CC2AB60031000000ae9fEF`. Its `TransferSingle`
+logs in blocks 94,423,815 through 94,424,815 yielded 691 transfers and 144
+recipient addresses. Two sampled recipients,
+`0xee88371850f0e1332c526e1b8e6f43a7e3ef2826` and
+`0x583582716cc49794789cacdf7aeffbdbd0b79404`, had populated
+`/v2/positions/combos` and `/v2/activity/combos` pages. For
+`0xee88371850f0e1332c526e1b8e6f43a7e3ef2826`, the first 100 combo
+position rows and first 100 combo lifecycle rows both had continuation
+cursors. Its first 1,000 ordinary activity rows were all flagged
+`is_combo=true`, also with a cursor. A condition-scoped activity query for
+`0x0358aedb06b9a9095ab2b216cf8ae8961f0000000000000000000000000000`
+returned one flagged combo trade and exhausted its cursor. The same trade
+appeared in `/v2/trades`, but that row had no `is_combo` field, consistent with
+the [official v2 schema](https://data-api.polymarket.com/v2/openapi.json). A separate
+`/v2/activity/combos` row in the transaction described a combo `SPLIT` with
+legs. The combo condition ID has 62 hex digits; the core activity filter now
+accepts this source ID. These first-page checks establish accessible combo
+sources, not complete combo history or a balance replay. Ordinary trade rows
+alone cannot distinguish the sampled combo trade from an outcome-token trade.
+
 ## Decision
 
 | Consumer answer | Decision | Evidence boundary |
 | --- | --- | --- |
 | Current observed holders | Supported with gaps | Gross holder pages include small positive balances classified `CLOSED` by positions. `OPEN` alone misses them; scans are not atomic and capped pages must be resumed. |
-| Known-wallet API-derived dated timeline | Supported with gaps | Trades and lifecycle activity explain some sampled balances; blank-token lifecycle rows, direct transfers, older coverage, source floors, and unavailable historical checks prevent exactness. Dates without covered opening/events must be `uncovered`, never zero. |
+| Known-wallet API-derived dated timeline | Supported with gaps | Trades and lifecycle activity explain some sampled balances; blank-token lifecycle rows, direct transfers, older coverage, source floors, combo classification, and unavailable historical checks prevent exactness. Dates without covered opening/events must be `uncovered`, never zero. |
 | Exact market-wide dated holder history | Unsupported by API-only evidence | The old market has an on-chain holder whose API trade/activity feeds contain no event, and market-wide transfer recipients cannot be proven from these feeds. |
 
 **Go/no-go:** build only a clearly labelled, source-limited API timeline if a
