@@ -1080,6 +1080,10 @@ class AsyncKalshiClient:
         expiry: OperationExpiry | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         """Yield archived markets until the cursor ends or max_pages is reached."""
+        if tickers is not None:
+            tickers = _normalize_tickers(tickers)
+            if tickers is None:
+                raise ValueError("tickers must not be empty")
         seen_cursors = {cursor} if cursor else set()
         pages = 0
         while max_pages is None or pages < max_pages:
