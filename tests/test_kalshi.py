@@ -166,6 +166,37 @@ async def test_kalshi_iter_markets_stops_on_terminal_empty_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kalshi_iter_markets_reuses_generator_tickers() -> None:
+    seen: list[tuple[str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        seen.append((cursor, request.url.params.get("tickers")))
+        if cursor is None:
+            return httpx.Response(
+                200, json={"markets": [{"ticker": "KXONE"}], "cursor": "next"}
+            )
+        return httpx.Response(
+            200, json={"markets": [{"ticker": "KXTWO"}], "cursor": ""}
+        )
+
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        tickers = (ticker for ticker in ("KXONE", "KXTWO"))
+        rows = [
+            row
+            async for row in client.iter_markets(
+                status=None, tickers=tickers, limit=1
+            )
+        ]
+
+    assert seen == [(None, "KXONE,KXTWO"), ("next", "KXONE,KXTWO")]
+    assert rows == [{"ticker": "KXONE"}, {"ticker": "KXTWO"}]
+
+
+@pytest.mark.asyncio
 async def test_kalshi_iter_markets_rejects_repeated_cursor() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"markets": [], "cursor": "same"})
