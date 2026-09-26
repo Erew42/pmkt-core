@@ -1121,6 +1121,9 @@ class AsyncKalshiClient:
         **params: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         cursor = params.pop("cursor", None)
+        if "tickers" in params:
+            # Normalize once so a one-shot iterable filters every page.
+            params["tickers"] = _normalize_tickers(params["tickers"])
         seen_cursors = {cursor} if cursor else set()
         pages = 0
         while True:
