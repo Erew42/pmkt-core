@@ -198,6 +198,155 @@ async def test_kalshi_iter_markets_preserves_page_limit() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kalshi_historical_markets_page_serializes_one_selector() -> None:
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={"markets": [], "cursor": ""})
+
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        await client.historical_markets_page(
+            limit=1000, cursor="next", series_ticker="KXSERIES"
+        )
+        await client.historical_markets_page(event_ticker="KXEVENT")
+        await client.historical_markets_page(tickers=["KXONE", "KXTWO"])
+        await client.historical_markets_page(mve_filter="exclude")
+
+    assert seen == [
+        (
+            "/trade-api/v2/historical/markets",
+            {"limit": "1000", "cursor": "next", "series_ticker": "KXSERIES"},
+        ),
+        (
+            "/trade-api/v2/historical/markets",
+            {"limit": "100", "event_ticker": "KXEVENT"},
+        ),
+        (
+            "/trade-api/v2/historical/markets",
+            {"limit": "100", "tickers": "KXONE,KXTWO"},
+        ),
+        (
+            "/trade-api/v2/historical/markets",
+            {"limit": "100", "mve_filter": "exclude"},
+        ),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_kalshi_historical_markets_rejects_mixed_filters() -> None:
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"markets": [], "cursor": ""})
+        ),
+    ) as client:
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            await client.historical_markets_page(
+                event_ticker="KXEVENT", series_ticker="KXSERIES"
+            )
+        with pytest.raises(ValueError, match="must not be empty"):
+            await client.historical_markets_page(tickers=[])
+        for selector in (
+            {"event_ticker": "KXEVENT"},
+            {"series_ticker": "KXSERIES"},
+            {"tickers": "KXONE"},
+        ):
+            with pytest.raises(ValueError, match="mutually exclusive"):
+                await client.historical_markets_page(mve_filter="exclude", **selector)
+        with pytest.raises(ValueError, match="must be 'exclude'"):
+            await client.historical_markets_page(mve_filter="only")
+
+
+@pytest.mark.asyncio
+async def test_kalshi_iter_historical_markets_reuses_generator_tickers() -> None:
+    seen: list[tuple[str | None, str | None]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        seen.append((cursor, request.url.params.get("tickers")))
+        if cursor is None:
+            return httpx.Response(
+                200, json={"markets": [{"ticker": "KXONE"}], "cursor": "next"}
+            )
+        return httpx.Response(
+            200, json={"markets": [{"ticker": "KXTWO"}], "cursor": ""}
+        )
+
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        tickers = (ticker for ticker in ("KXONE", "KXTWO"))
+        rows = [
+            row async for row in client.iter_historical_markets(tickers=tickers, limit=1)
+        ]
+
+    assert seen == [(None, "KXONE,KXTWO"), ("next", "KXONE,KXTWO")]
+    assert rows == [{"ticker": "KXONE"}, {"ticker": "KXTWO"}]
+
+
+@pytest.mark.asyncio
+async def test_kalshi_iter_historical_markets_follows_empty_cursor_page() -> None:
+    cursors: list[str | None] = []
+    filters: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        cursors.append(cursor)
+        filters.append(request.url.params.get("mve_filter"))
+        if cursor is None:
+            return httpx.Response(200, json={"markets": [], "cursor": "next"})
+        return httpx.Response(
+            200, json={"markets": [{"ticker": "KXOLD"}], "cursor": ""}
+        )
+
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        rows = [row async for row in client.iter_historical_markets(mve_filter="exclude")]
+
+    assert cursors == [None, "next"]
+    assert filters == ["exclude", "exclude"]
+    assert rows == [{"ticker": "KXOLD"}]
+
+
+@pytest.mark.asyncio
+async def test_kalshi_iter_historical_markets_rejects_repeated_cursor() -> None:
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(200, json={"markets": [], "cursor": "same"})
+        ),
+    ) as client:
+        with pytest.raises(RuntimeError, match="cursor repeated"):
+            _ = [row async for row in client.iter_historical_markets()]
+
+
+@pytest.mark.asyncio
+async def test_kalshi_iter_historical_markets_preserves_page_limit() -> None:
+    calls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(200, json={"markets": [], "cursor": str(calls)})
+
+    async with AsyncKalshiClient(
+        base_url="https://example.com/trade-api/v2",
+        transport=httpx.MockTransport(handler),
+    ) as client:
+        rows = [row async for row in client.iter_historical_markets(max_pages=2)]
+
+    assert rows == []
+    assert calls == 2
+
+
+@pytest.mark.asyncio
 async def test_kalshi_events_page_serializes_params() -> None:
     seen: list[tuple[str, dict[str, str]]] = []
 

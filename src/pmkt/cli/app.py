@@ -4,7 +4,12 @@ import typer
 
 from pmkt.cli.features import compute_features_cmd
 from pmkt.cli.history import backfill_venue_history_cmd, record_topbooks_cmd
-from pmkt.cli.ingest import ingest_kalshi_markets, ingest_markets, ingest_markets_keyset
+from pmkt.cli.ingest import (
+    ingest_kalshi_historical_markets,
+    ingest_kalshi_markets,
+    ingest_markets,
+    ingest_markets_keyset,
+)
 from pmkt.cli.market_catalog import markets_app
 from pmkt.cli.query import query_cmd
 from pmkt.cli.reconstruction import reconstruct_book_tape_cmd
@@ -27,6 +32,7 @@ app.add_typer(markets_app, name="markets")
 app.command("ingest-markets")(ingest_markets)
 app.command("ingest-markets-keyset")(ingest_markets_keyset)
 app.command("ingest-kalshi-markets")(ingest_kalshi_markets)
+app.command("ingest-kalshi-historical-markets")(ingest_kalshi_historical_markets)
 app.command("query")(query_cmd)
 app.command("collect-books")(collect_books)
 app.command("collect-kalshi-books")(collect_kalshi_books)

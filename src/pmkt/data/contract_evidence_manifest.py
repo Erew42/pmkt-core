@@ -204,6 +204,8 @@ def build_contract_evidence_manifest_from_summary(
     evidence_ids: list[str] | set[str] | tuple[str, ...],
     payload_hashes: list[str] | set[str] | tuple[str, ...],
     payload_authority_valid: bool,
+    evidence_ids_sha256: str | None = None,
+    payload_hashes_sha256: str | None = None,
 ) -> dict[str, Any]:
     artifact = Path(artifact_path)
     if not artifact.is_file():
@@ -240,14 +242,14 @@ def build_contract_evidence_manifest_from_summary(
         "continuation_cursor": _text(continuation_cursor) or None,
         "collection_errors": normalized_errors,
         "source_manifest_sha256": source_manifest_hash,
-        "payload_hashes_sha256": _sha256_json(normalized_payload_hashes),
+        "payload_hashes_sha256": payload_hashes_sha256 or _sha256_json(normalized_payload_hashes),
         "authoritative_complete": authoritative_complete,
         "row_count": int(row_count),
         "observation_min_utc": _text(observation_min_utc) or None,
         "observation_max_utc": _text(observation_max_utc) or None,
         "artifact_path": artifact.name,
         "artifact_sha256": file_sha256(artifact),
-        "evidence_ids_sha256": _sha256_json(normalized_evidence_ids),
+        "evidence_ids_sha256": evidence_ids_sha256 or _sha256_json(normalized_evidence_ids),
     }
 
 

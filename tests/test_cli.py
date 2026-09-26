@@ -12,6 +12,7 @@ PUBLIC_COMMANDS = {
     "compute-features",
     "dataset",
     "ingest-kalshi-markets",
+    "ingest-kalshi-historical-markets",
     "ingest-markets",
     "ingest-markets-keyset",
     "markets",
