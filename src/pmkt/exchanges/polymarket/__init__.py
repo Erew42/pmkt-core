@@ -5,10 +5,16 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pmkt.exchanges.polymarket.data_api import (
+        PolymarketActivityPage as PolymarketActivityPage,
+        PolymarketHolder as PolymarketHolder,
+        PolymarketHolderGroup as PolymarketHolderGroup,
+        PolymarketHoldersPage as PolymarketHoldersPage,
         PolymarketMarketParticipants as PolymarketMarketParticipants,
+        PolymarketMarketTradesPage as PolymarketMarketTradesPage,
         PolymarketParticipant as PolymarketParticipant,
         PolymarketPosition as PolymarketPosition,
         PolymarketWalletHistory as PolymarketWalletHistory,
+        PolymarketWalletActivity as PolymarketWalletActivity,
         PolymarketWalletTrade as PolymarketWalletTrade,
     )
     from pmkt.exchanges.polymarket.clob import (
@@ -36,6 +42,12 @@ _LAZY_MODULES: dict[str, str] = {
 }
 
 _LAZY_ATTRS: dict[str, tuple[str, str]] = {
+    "PolymarketActivityPage": ("pmkt.exchanges.polymarket.data_api", "PolymarketActivityPage"),
+    "PolymarketHolder": ("pmkt.exchanges.polymarket.data_api", "PolymarketHolder"),
+    "PolymarketHolderGroup": ("pmkt.exchanges.polymarket.data_api", "PolymarketHolderGroup"),
+    "PolymarketHoldersPage": ("pmkt.exchanges.polymarket.data_api", "PolymarketHoldersPage"),
+    "PolymarketMarketTradesPage": ("pmkt.exchanges.polymarket.data_api", "PolymarketMarketTradesPage"),
+    "PolymarketWalletActivity": ("pmkt.exchanges.polymarket.data_api", "PolymarketWalletActivity"),
     "AsyncClobClient": ("pmkt.exchanges.polymarket.clob", "AsyncClobClient"),
     "AsyncPolymarketDataClient": (
         "pmkt.exchanges.polymarket.data_api",

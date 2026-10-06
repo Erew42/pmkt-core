@@ -357,9 +357,10 @@ remains reusable. Malformed or contradictory upstream workflow data raises
 
 `AsyncPolymarketDataClient.market_participants(condition_id)` reads Data API v2
 `/positions` for `OPEN` and `CLOSED` positions anchored on one condition ID. It
-groups the returned proxy wallets and keeps current and past position rows
-separate. `OPEN` is the venue's held-position superset, including unredeemed
-resolved positions; `CLOSED` means exited positions. The query status selects
+groups the returned proxy wallets and keeps the two query partitions
+separate. `OPEN` is the venue's active lifecycle bucket, including unredeemed
+resolved positions. `CLOSED` includes exited positions but can retain a small
+positive `current_size`; it is not proof of zero balance. The query status selects
 the feed, while `PolymarketPosition.status` preserves the row's own lifecycle
 status: an `OPEN` query can return `REDEEMABLE` rows in `current_positions`.
 The upstream API also has `REDEEMABLE`, user-required `REDEEMABLE_LOST`, and
@@ -437,6 +438,52 @@ Trade rows carry no maker/taker role, and the separate position and trade reads
 are not atomic. These feeds are insufficient to reconstruct historical balances.
 This feature adds no participant fields to
 the existing public trade recording or canonical `trade.v1` schema.
+
+### Holder, market trade, and wallet activity pages
+
+`holders_page(condition_id=...)` returns `PolymarketHoldersPage` with outcome
+token groups, an opaque continuation cursor, and the request observation.
+The default `balance_basis="NET"` is the venue's cross-outcome net amount.
+`include_pnl=True` changes the page to per-side gross amounts and position
+economics, with at most 100 rows per token page. `min_balance=0` is sent so
+zero-net rows remain visible. Gross holders can include positive residual
+balances absent from the `OPEN` position query; use them for observed current
+holder discovery. A cursor walk is a sequence of live observations, not an
+atomic snapshot or a list of historical holders. Each holder has a
+`request_id` linking it to the page observation.
+
+`market_trades_page(condition_id=...)` returns wallet-attributed trades from
+one condition. It sends `taker_only=false` to include maker fills and explicitly
+requests the `TOKENS` filter with a 0.01-share minimum. The source
+fixes condition-scoped queries to a three-year window and applies a minimum
+size of 0.01 shares even when a caller asks for zero. Those limits remain
+explicit on `PolymarketMarketTradesPage`; exhausting its cursor does not make
+the result a lifetime trade ledger. The existing `trades_page(wallet=...)`
+keeps its full-history `start=1` behavior and `(rows, cursor)` return shape.
+Wallet-scoped trade rows preserve a source hex condition ID even when the
+source shortens it; condition-scoped reads still reject rows that do not match
+the requested canonical ID. Consumers should validate a source ID before
+using it as a canonical market key.
+
+`activity_page(wallet=..., condition_id=...)` requests `start=1` wallet
+history and returns typed events, a cursor, and an observation. It retains
+unknown event types, empty outcome token IDs on events such as `MERGE`, and
+source timestamps. Wallet-wide pages also return cash-flow rows such as
+`REWARD`, `YIELD`, `MAKER_REBATE`, and `TAKER_REBATE` with empty
+`condition_id` and `token_id`; condition-scoped pages never accept them.
+Activity rows also preserve the optional source `is_combo` flag: `true` marks
+a combo trade, while `None` means the source omitted or nullified the flag.
+Combo trades must not be replayed as direct outcome-token trades. The trades
+feed does not carry this flag, even for combo trades; consumers using that feed
+need separate classification. Condition-filtered activity accepts source combo
+condition IDs as well as ordinary market condition IDs. `TRADE` activity
+overlaps the trade feed; consumers must choose one trade source before adding
+lifecycle changes.
+Transaction hash alone does not uniquely identify a fill. The default activity
+type set excludes opt-in `TIP` pUSD transfers. This activity feed does not
+establish a complete ERC-1155 outcome-token transfer ledger.
+Position `avg_price` is preserved when the source reports a value above one;
+it is a cost-basis field, not a bounded execution price.
 
 ## Kalshi discovery, detail, and current books
 
