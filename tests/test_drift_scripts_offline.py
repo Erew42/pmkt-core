@@ -69,6 +69,7 @@ async def test_contract_check_validates_v2_open_interest_offline(payload, ok) ->
     ) as client:
         result = await contract_check.check_open_interest(client, "0xa")
     assert result.ok is ok
+    assert result.url == "https://data.test/v2/oi"
 
 
 @pytest.mark.asyncio

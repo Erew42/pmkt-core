@@ -1,0 +1,275 @@
+{
+  "sample_wallet": "0x04c2f84c8a94637144f694be9ed45921dfd943c4",
+  "sample_condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+  "data_origin": "https://data-api.polymarket.com",
+  "rpc_origin": "https://polygon-bor-rpc.publicnode.com",
+  "api_pages": [
+    {
+      "path": "/v2/activity",
+      "query": {
+        "user": "0x04c2f84c8a94637144f694be9ed45921dfd943c4",
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "start": 1,
+        "exclude_deposits_withdrawals": "true",
+        "limit": 1000
+      },
+      "started_at_utc": "2026-09-25T19:29:07.831946Z",
+      "received_at_utc": "2026-09-25T19:29:08.103052Z",
+      "status": 200,
+      "body_sha256": "79d28111d58e42e9f28922b80800e8363f4c2327653bafa1b59e7f5d117adc01",
+      "row_count": 2,
+      "pagination": {
+        "limit": 1000,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      },
+      "event_types": [
+        "TRADE",
+        "TRADE"
+      ],
+      "trade_tx_hashes": [
+        "0x88c3c85ae34b28c9b73fe1da42311dd8b277bb8bc085c763c916d5a9b0496527",
+        "0x0abbd5cc533e4290db40984d152e81f8d5155e36e4d44dd983b964219ad12e2d"
+      ]
+    },
+    {
+      "path": "/v2/trades",
+      "query": {
+        "user": "0x04c2f84c8a94637144f694be9ed45921dfd943c4",
+        "start": 1,
+        "taker_only": "false",
+        "filter_type": "TOKENS",
+        "filter_amount": "0.01",
+        "limit": 1000
+      },
+      "started_at_utc": "2026-09-25T19:29:08.103052Z",
+      "received_at_utc": "2026-09-25T19:29:08.450983Z",
+      "status": 200,
+      "body_sha256": "87e1aefc660a894aecb3db509a9ba9f631bc95f4438d1a0d4511d0402a18f84a",
+      "row_count": 503,
+      "pagination": {
+        "limit": 1000,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      }
+    },
+    {
+      "path": "/v2/trades",
+      "query": {
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "taker_only": "false",
+        "filter_type": "TOKENS",
+        "filter_amount": "0.01",
+        "limit": 100
+      },
+      "started_at_utc": "2026-09-25T19:29:08.457015Z",
+      "received_at_utc": "2026-09-25T19:29:08.597885Z",
+      "status": 200,
+      "body_sha256": "cc02e96d074430dfc3a885114761cf6647c7385e04c6fd453a69d34fb7d9cfe3",
+      "row_count": 100,
+      "pagination": {
+        "limit": 100,
+        "offset": 0,
+        "has_more": true,
+        "next_cursor": "eyJkYXRhIjp7InR5cGUiOiJ0cmFkZXMiLCJwYXJhbXMiOnsibCI6MTAwLCJ0cyI6MTc5MDI3NTE3Miwic3EiOiI5NDM4MDAyMTAwMDE5MDE0MDAiLCJkIjoxMDB9fSwic2lnIjoiYzc0ZmViNGVlYjljZTgwYTI1Njc2MTk5YTdmNjZkMDYifQ"
+      }
+    },
+    {
+      "path": "/v2/holders",
+      "query": {
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "include_pnl": "true",
+        "min_balance": "0",
+        "limit": 100
+      },
+      "started_at_utc": "2026-09-25T19:29:08.603510Z",
+      "received_at_utc": "2026-09-25T19:29:08.705276Z",
+      "status": 200,
+      "body_sha256": "c39ee1c7bd7064b52d9dc4d9c833563d54f77c25f67ae06b484df7336ce823c6",
+      "row_count": 2,
+      "pagination": {
+        "limit": 100,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      }
+    },
+    {
+      "path": "/v2/positions",
+      "query": {
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "status": "OPEN",
+        "filter_type": "TOKENS",
+        "filter_amount": "0",
+        "include_archived": "true",
+        "limit": 100
+      },
+      "started_at_utc": "2026-09-25T19:29:08.705276Z",
+      "received_at_utc": "2026-09-25T19:29:08.806026Z",
+      "status": 200,
+      "body_sha256": "d03c4c64bc79ab1a947dc1593e44d5cd77c0fb05ee81f3881b40a52ce59636cd",
+      "row_count": 21,
+      "pagination": {
+        "limit": 100,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      }
+    },
+    {
+      "path": "/v2/positions",
+      "query": {
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "status": "CLOSED",
+        "filter_type": "TOKENS",
+        "filter_amount": "0",
+        "limit": 100
+      },
+      "started_at_utc": "2026-09-25T19:29:08.809328Z",
+      "received_at_utc": "2026-09-25T19:29:09.009702Z",
+      "status": 200,
+      "body_sha256": "9eb1b808d7b1f83d121165e68ef085929927eeab31e5648703afffafce50a628",
+      "row_count": 100,
+      "pagination": {
+        "limit": 100,
+        "offset": 0,
+        "has_more": true,
+        "next_cursor": "eyJkYXRhIjp7InR5cGUiOiJwb3NpdGlvbnMiLCJwYXJhbXMiOnsibCI6MTAwLCJkIjoxMDAsImsiOiIwLjAwMDAiLCJ0IjoiMHhmMTAyOTljZjFmZmY1MDdjZmY0NWUxYTkwNjgwMGU1YjQ0YmYxMzQ4fDkzNjEzNTAyNjkzMzczOTQ3MDEwMDYyMjg0NTY4Mjk3MTg0NzI5NTM1MjE1NTE5OTAzNTcyNTE3Mzg1NTY4MjU1Nzk3ODk3NDEwNjY5IiwiYSI6Im0iLCJhdiI6IjB4NzU5MGJiMzkxMDRlZjdjYTgwZjZkNDI5NDRmMGYzYzIzNDY0YTM2ZTBmMjZmZDMyNTRiMDQyMDg1ZDY3ZmU0OSIsInN0IjoiQ0xPU0VEIiwicyI6IlJFQUxJWkVEX1BOTCIsImRpciI6IkRFU0MifX0sInNpZyI6IjUyNmQxNDI0YjQ1ZjlmZGVmYWZhMzlhOWFkNGIyOTc4In0"
+      }
+    },
+    {
+      "path": "/v2/positions",
+      "query": {
+        "user": "0x04c2f84c8a94637144f694be9ed45921dfd943c4",
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "status": "OPEN",
+        "filter_type": "TOKENS",
+        "filter_amount": "0",
+        "include_archived": "true",
+        "limit": 1000
+      },
+      "started_at_utc": "2026-09-25T19:29:09.012238Z",
+      "received_at_utc": "2026-09-25T19:29:09.114311Z",
+      "status": 200,
+      "body_sha256": "281d0587441376ac4c7f70df0e76b74de99e7b7ab2dce0e66fe005d4b7d1753c",
+      "row_count": 1,
+      "pagination": {
+        "limit": 1000,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      }
+    },
+    {
+      "path": "/v2/positions",
+      "query": {
+        "user": "0x04c2f84c8a94637144f694be9ed45921dfd943c4",
+        "condition": "0x7590bb39104ef7ca80f6d42944f0f3c23464a36e0f26fd3254b042085d67fe49",
+        "status": "CLOSED",
+        "filter_type": "TOKENS",
+        "filter_amount": "0",
+        "limit": 1000
+      },
+      "started_at_utc": "2026-09-25T19:29:09.114311Z",
+      "received_at_utc": "2026-09-25T19:29:09.211367Z",
+      "status": 200,
+      "body_sha256": "c9a05b8163613ddab3ca18d556c75feee61709ba88c2c6653ae1e772933a2f68",
+      "row_count": 0,
+      "pagination": {
+        "limit": 1000,
+        "offset": 0,
+        "has_more": false,
+        "next_cursor": null
+      }
+    }
+  ],
+  "rpc_calls": [
+    {
+      "method": "eth_chainId",
+      "params": [],
+      "started_at_utc": "2026-09-25T19:29:09.211367Z",
+      "received_at_utc": "2026-09-25T19:29:09.317739Z",
+      "result": "0x89"
+    },
+    {
+      "method": "eth_getTransactionReceipt",
+      "params": [
+        "0x88c3c85ae34b28c9b73fe1da42311dd8b277bb8bc085c763c916d5a9b0496527"
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.317739Z",
+      "received_at_utc": "2026-09-25T19:29:09.382296Z",
+      "block_number": "0x5a014af",
+      "block_hash": "0x9104e14b26e332d78c8f84151ee84dde088d03c26b60bb033b2ae48265906adc",
+      "transaction_index": "0x10",
+      "ctf_log_count": 5
+    },
+    {
+      "method": "eth_getBlockByNumber",
+      "params": [
+        "0x5a014af",
+        false
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.382296Z",
+      "received_at_utc": "2026-09-25T19:29:09.463277Z",
+      "block_hash": "0x9104e14b26e332d78c8f84151ee84dde088d03c26b60bb033b2ae48265906adc",
+      "timestamp_hex": "0x6ab55d7b"
+    },
+    {
+      "method": "eth_getLogs",
+      "params": [
+        {
+          "address": "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+          "fromBlock": "0x5a014af",
+          "toBlock": "0x5a014af"
+        }
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.463277Z",
+      "received_at_utc": "2026-09-25T19:29:09.517459Z",
+      "log_count": 165,
+      "block_hashes": [
+        "0x9104e14b26e332d78c8f84151ee84dde088d03c26b60bb033b2ae48265906adc"
+      ]
+    },
+    {
+      "method": "eth_getTransactionReceipt",
+      "params": [
+        "0x0abbd5cc533e4290db40984d152e81f8d5155e36e4d44dd983b964219ad12e2d"
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.518499Z",
+      "received_at_utc": "2026-09-25T19:29:09.558801Z",
+      "block_number": "0x5a0148b",
+      "block_hash": "0x79f39f8769671fa773ca55094ef626a5341dc1f7baf7074058d4a12ce73ba38f",
+      "transaction_index": "0x31",
+      "ctf_log_count": 9
+    },
+    {
+      "method": "eth_getBlockByNumber",
+      "params": [
+        "0x5a0148b",
+        false
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.558801Z",
+      "received_at_utc": "2026-09-25T19:29:09.608217Z",
+      "block_hash": "0x79f39f8769671fa773ca55094ef626a5341dc1f7baf7074058d4a12ce73ba38f",
+      "timestamp_hex": "0x6ab55d45"
+    },
+    {
+      "method": "eth_getLogs",
+      "params": [
+        {
+          "address": "0x4d97dcd97ec945f40cf65f87097ace5ea0476045",
+          "fromBlock": "0x5a0148b",
+          "toBlock": "0x5a0148b"
+        }
+      ],
+      "started_at_utc": "2026-09-25T19:29:09.608217Z",
+      "received_at_utc": "2026-09-25T19:29:09.681515Z",
+      "log_count": 344,
+      "block_hashes": [
+        "0x79f39f8769671fa773ca55094ef626a5341dc1f7baf7074058d4a12ce73ba38f"
+      ]
+    }
+  ]
+}

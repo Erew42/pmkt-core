@@ -219,7 +219,7 @@ async def run_check(
 
 async def check_open_interest(client: HttpClient, condition_id: str) -> CheckResult:
     path = "/v2/oi"
-    url = format_url(client.base_url, path)
+    url = format_url(httpx.URL(client.base_url), path)
     response = None
     try:
         response = await client.request_response(
