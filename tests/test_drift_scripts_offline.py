@@ -45,6 +45,33 @@ async def test_contract_check_selects_later_token_with_orderbook_offline() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload,ok",
+    [
+        ({"data": [{"condition_id": "0xa", "value": 0}]}, True),
+        ({"data": []}, True),
+        ([{"market": "0xa", "value": 1}], False),
+        ({"data": [{"market": "0xa", "value": 1}]}, False),
+        ({"data": [{"condition_id": "0xa", "value": -1}]}, False),
+        ({"data": [{"condition_id": "0xb", "value": 1}]}, False),
+        ({"data": [{"condition_id": "0xa", "value": 1}] * 2}, False),
+    ],
+)
+async def test_contract_check_validates_v2_open_interest_offline(payload, ok) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v2/oi"
+        assert dict(request.url.params) == {"condition": "0xa"}
+        return httpx.Response(200, json=payload)
+
+    async with HttpClient(
+        base_url="https://data.test", transport=httpx.MockTransport(handler),
+        request_policy=RequestPolicy(max_attempts=1),
+    ) as client:
+        result = await contract_check.check_open_interest(client, "0xa")
+    assert result.ok is ok
+
+
+@pytest.mark.asyncio
 async def test_update_openapi_examples_finds_later_clob_token_offline() -> None:
     def gamma_handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/markets"

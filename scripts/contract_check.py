@@ -21,9 +21,11 @@ from sync_upstream_docs import format_timestamp, utc_now  # noqa: E402
 from pmkt._http import HttpClient, format_url  # noqa: E402
 from pmkt.runtime import RequestPolicy  # noqa: E402
 from pmkt.tokens import extract_token_ids  # noqa: E402
+from pmkt.exchanges.polymarket.data_api import normalize_polymarket_open_interest  # noqa: E402
 
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
+DEFAULT_DATA_BASE = "https://data-api.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MAX_ATTEMPTS = 4
 DEFAULT_MAX_PAGES = 3
@@ -48,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Polymarket API contract checks")
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
+    parser.add_argument("--data-base-url", default=DEFAULT_DATA_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
@@ -214,6 +217,30 @@ async def run_check(
     return CheckResult(name=name, url=url, status_code=response.status_code, ok=True)
 
 
+async def check_open_interest(client: HttpClient, condition_id: str) -> CheckResult:
+    path = "/v2/oi"
+    url = format_url(client.base_url, path)
+    response = None
+    try:
+        response = await client.request_response(
+            "GET", path, params={"condition": condition_id}
+        )
+        response.raise_for_status()
+        payload = json_or_error(response, "open-interest")
+        if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
+            raise CheckError("/v2/oi must return a data array envelope")
+        if any(not isinstance(row, dict) or "condition_id" not in row for row in payload["data"]):
+            raise CheckError("/v2/oi rows must use condition_id")
+        normalize_polymarket_open_interest([condition_id], payload)
+    except (httpx.HTTPError, CheckError, TypeError, ValueError) as exc:
+        return CheckResult(
+            name="open-interest", url=url,
+            status_code=response.status_code if response is not None else None,
+            ok=False, error=str(exc),
+        )
+    return CheckResult(name="open-interest", url=url, status_code=response.status_code, ok=True)
+
+
 async def run() -> int:
     args = parse_args()
     timestamp = format_timestamp(utc_now())
@@ -234,6 +261,13 @@ async def run() -> int:
             headers=headers,
             follow_redirects=True,
         ) as clob_client,
+        HttpClient(
+            base_url=args.data_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as data_client,
     ):
         results: list[CheckResult] = []
         try:
@@ -285,6 +319,16 @@ async def run() -> int:
             print(message, file=sys.stderr)
             return 1
         results.append(book_result)
+
+        condition_id = next((
+            market.get("conditionId") or market.get("condition_id")
+            for market in markets
+            if isinstance(market, dict) and token_id in extract_token_ids(market)
+        ), None)
+        if not isinstance(condition_id, str) or not condition_id:
+            print("Selected Gamma market lacks a condition ID for /v2/oi", file=sys.stderr)
+            return 1
+        results.append(await check_open_interest(data_client, condition_id))
 
         results.append(
             await run_check(

@@ -22,6 +22,7 @@ DEFAULT_MANIFEST_NAME = "manifest.json"
 
 DEFAULT_GAMMA_BASE = "https://gamma-api.polymarket.com"
 DEFAULT_CLOB_BASE = "https://clob.polymarket.com"
+DEFAULT_DATA_BASE = "https://data-api.polymarket.com"
 DEFAULT_TIMEOUT_S = 20.0
 DEFAULT_MAX_ATTEMPTS = 4
 USER_AGENT = "pmkt-openapi-examples/0.1"
@@ -35,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Refresh OpenAPI examples")
     parser.add_argument("--gamma-base-url", default=DEFAULT_GAMMA_BASE)
     parser.add_argument("--clob-base-url", default=DEFAULT_CLOB_BASE)
+    parser.add_argument("--data-base-url", default=DEFAULT_DATA_BASE)
     parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_S)
     parser.add_argument("--max-attempts", type=int, default=DEFAULT_MAX_ATTEMPTS)
     parser.add_argument(
@@ -157,6 +159,13 @@ async def run() -> int:
             headers=headers,
             follow_redirects=True,
         ) as clob_client,
+        HttpClient(
+            base_url=args.data_base_url.rstrip("/"),
+            timeout_s=args.timeout,
+            request_policy=RequestPolicy(max_attempts=args.max_attempts),
+            headers=headers,
+            follow_redirects=True,
+        ) as data_client,
     ):
         token_id = args.token_id
         if not token_id:
@@ -197,6 +206,13 @@ async def run() -> int:
             params=book_params,
         )
         record_example("/book", book, book_params)
+
+        condition_id = book.get("market") if isinstance(book, dict) else None
+        if not isinstance(condition_id, str) or not condition_id:
+            raise UpdateError("CLOB /book lacks its market condition ID")
+        oi_params = {"condition": condition_id}
+        oi = await fetch_json(data_client, "/v2/oi", params=oi_params)
+        record_example("/v2/oi", oi, oi_params)
 
         price_params = {"token_id": token_id, "side": "BUY"}
         price = await fetch_json(
@@ -249,6 +265,7 @@ async def run() -> int:
         "token_id": token_id,
         "gamma_base_url": args.gamma_base_url,
         "clob_base_url": args.clob_base_url,
+        "data_base_url": args.data_base_url,
         "examples": manifest_examples,
     }
     write_manifest(manifest_path, manifest)

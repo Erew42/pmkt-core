@@ -21,7 +21,7 @@ from pmkt.exchanges._requests import VenueRequests
 from pmkt.records import RequestObservation, ResultProvenance
 
 
-MAX_OPEN_INTEREST_MARKETS = 25
+MAX_OPEN_INTEREST_MARKETS = 20
 DEFAULT_DATA_API_MAX_RATE = 10
 DEFAULT_DATA_API_PERIOD_SECONDS = 1
 MAX_V2_PAGE_SIZE = 1000
@@ -43,7 +43,7 @@ def normalize_condition_ids(condition_ids: Sequence[object]) -> tuple[str, ...]:
         raise ValueError("At least one Polymarket condition ID is required.")
     if len(requested) > MAX_OPEN_INTEREST_MARKETS:
         raise ValueError(
-            f"Polymarket /oi accepts at most {MAX_OPEN_INTEREST_MARKETS} markets per request."
+            f"Polymarket /v2/oi accepts at most {MAX_OPEN_INTEREST_MARKETS} conditions per request."
         )
     return tuple(requested)
 
@@ -68,34 +68,43 @@ def normalize_polymarket_open_interest(
     requested_condition_ids: Sequence[object],
     payload: object,
 ) -> PolymarketOpenInterestBatch:
+    """Normalize v2 rows or an envelope, retaining support for saved v1 rows.
+
+    Missing conditions stay omitted; a served zero is an observed value.
+    Values are priced gross open interest in USD, not outcome-token shares.
+    """
     requested = normalize_condition_ids(requested_condition_ids)
+    if isinstance(payload, Mapping):
+        payload = payload.get("data")
     if not isinstance(payload, list):
-        raise TypeError("Polymarket /oi response must be a list.")
+        raise TypeError("Polymarket open-interest data must be a list.")
 
     requested_set = set(requested)
     values: dict[str, Decimal] = {}
     response_keys: list[str] = []
     for row in payload:
         if not isinstance(row, Mapping):
-            raise TypeError("Polymarket /oi response rows must be objects.")
-        market = str(row.get("market") or "").strip()
+            raise TypeError("Polymarket open-interest rows must be objects.")
+        market = str(row.get("condition_id", row.get("market")) or "").strip()
         if not market:
-            raise ValueError("Polymarket /oi response row lacks market.")
+            raise ValueError("Polymarket open-interest row lacks condition_id.")
+        if "condition_id" in row and "market" in row and row["market"] != row["condition_id"]:
+            raise ValueError("Conflicting Polymarket open-interest condition identifiers.")
         if market not in requested_set:
-            raise ValueError(f"Unexpected Polymarket /oi market: {market}")
+            raise ValueError(f"Unexpected Polymarket open-interest condition: {market}")
         if market in values:
-            raise ValueError(f"Duplicate Polymarket /oi market: {market}")
+            raise ValueError(f"Duplicate Polymarket open-interest condition: {market}")
         raw_value = row.get("value")
         if isinstance(raw_value, bool):
-            raise ValueError(f"Invalid Polymarket /oi value for {market}: {raw_value}")
+            raise ValueError(f"Invalid Polymarket open-interest value for {market}: {raw_value}")
         try:
             value = Decimal(str(raw_value))
         except (InvalidOperation, ValueError) as exc:
             raise ValueError(
-                f"Invalid Polymarket /oi value for {market}: {raw_value}"
+                f"Invalid Polymarket open-interest value for {market}: {raw_value}"
             ) from exc
         if not value.is_finite() or value < 0:
-            raise ValueError(f"Invalid Polymarket /oi value for {market}: {raw_value}")
+            raise ValueError(f"Invalid Polymarket open-interest value for {market}: {raw_value}")
         values[market] = value
         response_keys.append(market)
 
@@ -371,15 +380,23 @@ class AsyncPolymarketDataClient:
     async def open_interest_page(
         self, condition_ids: Sequence[object], *, expiry: OperationExpiry | None = None
     ) -> list[dict[str, Any]]:
+        """Read up to 20 conditions from /v2/oi and return its condition_id rows.
+
+        This aggregate has no cursor. Omitted conditions did not resolve to a
+        servable market and must not be filled with invented zero values.
+        """
         requested = normalize_condition_ids(condition_ids)
         payload = await self._http.request_json(
-            "GET", "/oi", params={"market": ",".join(requested)}, expiry=expiry
+            "GET", "/v2/oi", params={"condition": ",".join(requested)}, expiry=expiry
         )
-        if not isinstance(payload, list) or any(
-            not isinstance(row, dict) for row in payload
+        if not isinstance(payload, dict):
+            raise TypeError("Polymarket /v2/oi response must be an object.")
+        rows = payload.get("data")
+        if not isinstance(rows, list) or any(
+            not isinstance(row, dict) for row in rows
         ):
-            raise TypeError("Polymarket /oi response must be list[dict].")
-        return payload
+            raise TypeError("Polymarket /v2/oi data must be list[dict].")
+        return rows
 
     async def _v2_page(
         self, path: str, params: dict[str, Any], *, expiry: OperationExpiry | None

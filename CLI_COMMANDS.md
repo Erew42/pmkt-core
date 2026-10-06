@@ -121,3 +121,8 @@ result to core clients. Python client construction alone uses deterministic
 defaults. Repository API-check/example scripts now use `--max-attempts` for the
 total request budget; `--max-retries` is removed. Existing `pmkt` command names
 remain; live recording has the deliberate format migration described above.
+
+Repository `scripts/contract_check.py` and `scripts/update_openapi_examples.py`
+also accept `--data-base-url` (default `https://data-api.polymarket.com`) for
+their public Data API `/v2/oi` check and example. This does not add a `pmkt`
+command or require account credentials.
