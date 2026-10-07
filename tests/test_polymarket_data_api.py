@@ -55,22 +55,22 @@ def _activity_trade(wallet: str) -> dict:
 
 
 async def test_open_interest_page_preserves_raw_payload_and_comma_encoding() -> None:
-    seen: dict[str, str | None] = {}
+    seen: list[tuple[str, dict[str, str]]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        seen["market"] = request.url.params.get("market")
-        return httpx.Response(200, json=[{"market": "0xa", "value": 12.5}])
+        seen.append((request.url.path, dict(request.url.params)))
+        return httpx.Response(200, json={"data": [{"condition_id": "0xa", "value": 12.5}]})
 
     async with AsyncPolymarketDataClient(
         base_url="https://example.com", transport=httpx.MockTransport(handler)
     ) as client:
         payload = await client.open_interest_page(["0xa", "0xb"])
 
-    assert seen["market"] == "0xa,0xb"
-    assert payload == [{"market": "0xa", "value": 12.5}]
+    assert seen == [("/v2/oi", {"condition": "0xa,0xb"})]
+    assert payload == [{"condition_id": "0xa", "value": 12.5}]
 
 
-async def test_open_interest_normalizer_retains_source_omissions() -> None:
+async def test_open_interest_normalizer_retains_saved_v1_source_omissions() -> None:
     result = normalize_polymarket_open_interest(
         ["0xa", "0xb"], [{"market": "0xa", "value": "12.50"}]
     )
@@ -78,6 +78,65 @@ async def test_open_interest_normalizer_retains_source_omissions() -> None:
     assert result.omitted_keys == ("0xb",)
     assert result.coverage_rate == 0.5
     assert result.value_coverage_complete is False
+
+
+@pytest.mark.parametrize("count", range(21, 26))
+async def test_open_interest_normalizer_accepts_saved_v1_batches(count: int) -> None:
+    ids = [f"0x{index}" for index in range(count)]
+    rows = [{"market": key, "value": str(index)} for index, key in enumerate(ids[:-1])]
+    result = normalize_polymarket_open_interest(ids + ids, rows)
+    assert result.requested_keys == tuple(ids)
+    assert result.values == {key: Decimal(index) for index, key in enumerate(ids[:-1])}
+    assert result.omitted_keys == (ids[-1],)
+
+
+@pytest.mark.parametrize("envelope", [False, True])
+async def test_open_interest_v2_distinguishes_zero_from_omitted_conditions(envelope) -> None:
+    rows = [{"condition_id": "0xa", "value": 0}, {"condition_id": "0xb", "value": "12.50"}]
+    result = normalize_polymarket_open_interest(
+        ["0xa", "0xb", "0xc"], {"data": rows} if envelope else rows
+    )
+    assert result.values == {"0xa": Decimal("0"), "0xb": Decimal("12.50")}
+    assert result.omitted_keys == ("0xc",)
+    assert result.response_keys == ("0xa", "0xb")
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"data": None}, {"data": {}}, {"data": [None]}])
+async def test_open_interest_client_rejects_malformed_v2_envelopes(payload) -> None:
+    async with AsyncPolymarketDataClient(
+        base_url="https://example.com",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload)),
+    ) as client:
+        with pytest.raises(TypeError, match="/v2/oi"):
+            await client.open_interest_page(["0xa"])
+
+
+async def test_open_interest_empty_v2_data_preserves_all_omissions() -> None:
+    async with AsyncPolymarketDataClient(
+        base_url="https://example.com",
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"data": []})),
+    ) as client:
+        rows = await client.open_interest_page(["0xa"])
+    result = normalize_polymarket_open_interest(["0xa"], rows)
+    assert result.values == {}
+    assert result.omitted_keys == ("0xa",)
+
+
+@pytest.mark.parametrize(
+    "row,match",
+    [
+        ({"condition_id": "0xa", "market": "0xb", "value": 1}, "Conflicting"),
+        ({"condition_id": "0xa", "value": None}, "Invalid"),
+        ({"condition_id": "0xa", "value": True}, "Invalid"),
+        ({"condition_id": "0xa", "value": "Infinity"}, "Invalid"),
+        ({"condition_id": "0xa", "value": -1}, "Invalid"),
+        ({"condition_id": "0xb", "value": 1}, "Unexpected"),
+        ({"value": 1}, "lacks condition_id"),
+    ],
+)
+async def test_open_interest_normalizer_rejects_invalid_v2_rows(row, match) -> None:
+    with pytest.raises(ValueError, match=match):
+        normalize_polymarket_open_interest(["0xa"], {"data": [row]})
 
 
 @pytest.mark.parametrize(
@@ -95,13 +154,23 @@ async def test_open_interest_normalizer_rejects_invalid_rows(payload, match) -> 
         normalize_polymarket_open_interest(["0xa"], payload)
 
 
-async def test_open_interest_client_enforces_25_key_limit() -> None:
+async def test_open_interest_client_enforces_20_distinct_key_limit_before_io() -> None:
+    requests = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"data": []})
+
     client = AsyncPolymarketDataClient(
         base_url="https://example.com",
-        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=[])),
+        transport=httpx.MockTransport(handler),
     )
-    with pytest.raises(ValueError, match="at most 25"):
-        await client.open_interest_page([f"0x{index}" for index in range(26)])
+    with pytest.raises(ValueError, match="at most 20"):
+        await client.open_interest_page([f"0x{index}" for index in range(21)])
+    assert requests == []
+    ids = [f"0x{index}" for index in range(20)]
+    await client.open_interest_page(ids + ids)
+    assert requests[0].url.params["condition"] == ",".join(ids)
     await client.close()
 
 

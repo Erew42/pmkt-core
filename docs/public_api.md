@@ -353,6 +353,27 @@ covers transport, decoding, and normalization. Expiry raises
 remains reusable. Malformed or contradictory upstream workflow data raises
 `InvalidDataError`.
 
+## Polymarket open interest
+
+`AsyncPolymarketDataClient.open_interest_page(condition_ids)` calls public
+Data API `/v2/oi` with the `condition` query parameter, accepts at most 20
+distinct conditions, and returns the envelope's `data` rows unchanged. Each
+row has `condition_id` and `value`; the value is priced gross open interest
+in USD, not outcome-token shares. This bounded aggregate has no cursor.
+
+`normalize_polymarket_open_interest(condition_ids, payload)` accepts those
+rows or the complete v2 envelope. It retains Decimal values, rejects duplicate,
+unexpected, or conflicting identifiers and invalid values, and records omitted
+conditions separately from served zero values. Saved v1 rows with `market`
+remain readable; network requests always use v2. An omitted condition did not
+resolve to a servable market, so consumers must not invent a zero for it.
+
+Data API v1 retires on October 24, 2026. Consumers of the raw page must replace
+`row["market"]` with `row["condition_id"]` and split batches at 20 conditions.
+The normalized batch fields and canonical stored schemas are unchanged.
+See the [upstream migration guide](https://docs.polymarket.com/migrate/data-api-v1-to-v2)
+and [open-interest contract](https://docs.polymarket.com/api-reference/markets/get-open-interest).
+
 ## Polymarket participants and wallet history
 
 `AsyncPolymarketDataClient.market_participants(condition_id)` reads Data API v2

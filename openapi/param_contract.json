@@ -124,6 +124,15 @@
           "fidelity": {"required": false}
         }
       }
+    },
+    "/v2/oi": {
+      "get": {
+        "params": {
+          "condition": {
+            "required": false
+          }
+        }
+      }
     }
   }
 }

@@ -50,6 +50,16 @@ def test_public_clob_read_endpoints_are_in_openapi_contract() -> None:
         assert path in paths
 
 
+def test_open_interest_contract_uses_data_api_v2_envelope() -> None:
+    operation = load_json(SPEC_PATH)["paths"]["/v2/oi"]["get"]
+    assert operation["servers"][0]["url"] == "https://data-api.polymarket.com"
+    assert [parameter["name"] for parameter in operation["parameters"]] == ["condition"]
+    schema = operation["responses"]["200"]["content"]["application/json"]["schema"]
+    assert schema["required"] == ["data"]
+    assert schema["properties"]["data"]["items"]["required"] == ["condition_id", "value"]
+    assert "pagination" not in schema["properties"]
+
+
 def test_gamma_keyset_contract_uses_qualified_arrays_and_envelope() -> None:
     spec = load_json(SPEC_PATH)
     operation = spec["paths"]["/markets/keyset"]["get"]

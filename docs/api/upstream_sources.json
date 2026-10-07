@@ -49,6 +49,18 @@
     {
       "name": "rate-limits",
       "url": "https://docs.polymarket.com/api-reference/rate-limits"
+    },
+    {
+      "name": "data-api-v2-migration",
+      "url": "https://docs.polymarket.com/migrate/data-api-v1-to-v2"
+    },
+    {
+      "name": "data-api-v2-overview",
+      "url": "https://docs.polymarket.com/api-reference/data-api/overview"
+    },
+    {
+      "name": "data-api-v2-open-interest",
+      "url": "https://docs.polymarket.com/api-reference/markets/get-open-interest"
     }
   ]
 }

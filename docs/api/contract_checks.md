@@ -1,13 +1,13 @@
 # Contract checks
 
 `scripts/contract_check.py` performs a minimal contract check against the public
-Gamma and CLOB APIs to catch breaking drift. It is a live network check, so it
+Gamma, CLOB, and Data APIs to catch breaking drift. It is a live network check, so it
 can fail because of upstream API changes, temporary network failures, rate
 limits, or a lack of currently active order books in the scanned markets.
-It does not exercise Data API v2 endpoints. The curated v2 activity contract
-marks `user` required because the live endpoint rejects requests without it;
-the upstream v2 OpenAPI document currently marks the parameter optional while
-describing the feed as user-anchored.
+It does not exercise Data API v2 wallet or feed endpoints. The curated v2
+activity contract marks `user` required because the live endpoint rejects
+requests without it; the upstream v2 OpenAPI document currently marks the
+parameter optional while describing the feed as user-anchored.
 
 What it checks:
 - Gamma `/markets` returns JSON and yields a CLOB token id.
@@ -15,6 +15,9 @@ What it checks:
   stable keys; `/prices-history` is queried with
   `market=<token_id>&interval=1d`, requires a `history` key, and is skipped only
   on 404.
+- Data API `/v2/oi` uses the selected market's condition ID and returns a `data`
+  envelope with `condition_id` rows and finite, nonnegative USD values. Omitted
+  conditions are allowed and stay distinct from observed zeros.
 
 By default it scans up to 3 pages of Gamma `/markets` to find a token with an
 active order book; override with `--max-pages`.
@@ -31,8 +34,10 @@ Options:
   `https://gamma-api.polymarket.com`.
 - `--clob-base-url`: CLOB API base URL. Default:
   `https://clob.polymarket.com`.
+- `--data-base-url`: public Data API base URL. Default:
+  `https://data-api.polymarket.com`.
 - `--timeout`: per-request timeout in seconds. Default: `20.0`.
-- `--max-retries`: maximum total request attempts for transient failures,
+- `--max-attempts`: maximum total request attempts for transient failures,
   including the initial attempt. Default: `4`.
 - `--max-pages`: Gamma `/markets` pages to scan for a token with an active order
   book. Default: `3`.
@@ -42,3 +47,7 @@ Expected output is a timestamped summary, the token id used for CLOB checks, and
 one line per checked endpoint. A skipped `/prices-history` check with 404 is not
 treated as failure because not every active token has historical data available
 through that endpoint.
+
+`scripts/update_openapi_examples.py` also captures `/v2/oi` for the condition
+returned by `/book`. Its `--data-base-url` override and generated manifest
+record the Data API host. Examples remain ignored under `generated/`.
