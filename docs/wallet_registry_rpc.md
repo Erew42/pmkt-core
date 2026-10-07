@@ -12,11 +12,11 @@ collector script. An existing running interpreter needs a controlled restart
 to adopt these changes; editing the source does not update that process.
 
 The default is the public `https://polygon.gateway.tenderly.co` endpoint, with
-one request at most every second (`--request-delay 1`). This is a client pacing
-limit; it does not establish the provider's effective quota. No account
-credentials, signing key, authenticated venue endpoint, or paid service is used.
-The RPC transport accepts
-only `eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`, and `eth_getLogs`.
+one request at most every second (`--request-delay 1`), including startup checks
+and each retry. This is a client pacing limit; it does not establish the
+provider's effective quota. No account credentials, signing key, authenticated
+venue endpoint, or paid service is used. The RPC transport accepts only
+`eth_chainId`, `eth_blockNumber`, `eth_getBlockByNumber`, and `eth_getLogs`.
 It verifies Polygon mainnet (137), freezes an inclusive end at latest minus 256
 blocks, and checks the end-block hash on resume and completion.
 
@@ -43,6 +43,9 @@ identity or cross-wallet linkage is inferred.
 
 Factory and AMM scans advance together, with factory discovery always committed
 before an AMM range. Unrelated contracts emitting the same AMM topics are ignored.
+Their RPC log envelopes still undergo validation; their payloads are not decoded
+using the discovered pools' ABI. Malformed events from a discovered pool fail
+without advancing its range.
 The factory is permissionless: this attributes trades to a contract family, and
 does not independently establish that each pool was listed on the website.
 
@@ -57,8 +60,10 @@ Keep output under an ignored directory such as `data/`. Outputs include:
   or independent `--export-only` invocation from using the same output.
 - `status.json`: atomically updated committed counts and next blocks after each
   productive collection iteration, together with export health and freshness.
-  SQLite checkpoints commit after every accepted range and are authoritative
-  after a crash.
+  Stream checkpoints commit after every accepted range and are authoritative
+  after a crash. `rpc_wait` records the cooldown reason, remaining duration at
+  publication and not-before deadline; `phase_timings_s` separates RPC, status
+  and validation/commit time. `wal_maintenance` reports reclamation or deferral.
 - `wallets.csv`: one `(chain_id, wallet_address)` row, observed first/last blocks,
   observed roles, and a witness transaction hash and log index.
 - `wallet-evidence.jsonl`: one earliest observed raw trade log per wallet,
@@ -76,28 +81,85 @@ Keep output under an ignored directory such as `data/`. Outputs include:
   not overwrite the collector's live `status.json`. The publisher retains the
   newest and immediately preceding completed generations.
 
+Collection requires SQLite to confirm WAL mode rather than silently fall back to
+a rollback journal. Status totals are initialized when opening a registry and
+updated after committed changes, avoiding full table scans after every range.
+These invocation caches do not replace the database as the resume authority.
+Evidence exports preload the earliest request-provenance records up to a 32 MiB
+estimate, including Python object overhead, and use a separate 4,096-entry
+lookup cache. The manifest records preload size, lookup misses, cache statistics
+and serialization time to
+help measure the benefit; witness contents and product hashes retain their
+existing meaning.
+
+The writer sets `journal_size_limit` to 64 MiB to reclaim oversized retained WAL
+allocation when the WAL resets. This is not a hard cap while a snapshot reader
+still needs old pages. Writer maintenance at startup and after worker release
+attempts to reclaim a larger WAL with no lock wait; a busy reader defers it.
+Maintenance also runs before launching snapshots, including replacing an older
+worker for the final export. Collection shutdown leaves reclamation for the next
+startup instead of adding checkpoint I/O to the stop path. Checkpoint transfer
+still performs disk I/O. This SQLite WAL maintenance is separate from committing
+an application's stream checkpoint after an accepted range. See
+[SQLite's WAL description](https://www.sqlite.org/wal.html) and
+[journal-size setting](https://www.sqlite.org/pragma.html#pragma_journal_size_limit).
+
 Full RPC responses and every fill are not retained; their hashes cannot by
 themselves reconstruct omitted bytes. Witnesses can be independently checked
 against public transaction or block receipts. Some RPCs prune historical
 transaction-hash lookup while retaining block receipts. Accepted-range counts describe returned
 logs, not economic executions. A transaction may contain several different fills.
 Within each range, identical logs are deduplicated by block hash and log index;
-conflicting duplicates, malformed ABI data, removed logs, unexpected addresses,
-and logs outside the requested range fail without advancing the checkpoint.
+conflicting duplicates, malformed ABI data from in-scope contracts, removed
+logs, unexpected addresses, and logs outside the requested range fail without
+advancing the checkpoint.
 
-Throttling and transient transport/server failures retain the requested range
-and retry with bounded exponential backoff, honoring `Retry-After` when supplied.
+Throttling and recognized transient transport/server failures retry with bounded
+exponential backoff. HTTP 429, compute throughput errors and any `Retry-After`
+header take priority over range reduction, including on a timeout response.
 The same retry handling applies to startup identity and anchor checks. Retry
 exhaustion leaves checkpoints in place. The remaining provider cooldown is
-retained across restarts, including request-budget exits and interrupted retry waits. The
-request error record includes HTTP status, RPC code and parsed `Retry-After`.
-Only recognized provider range/result limits, or responses reaching `--log-cap`
-(default 5,000), shrink the range.
+retained across restarts, including request-budget exits and interrupted retry
+waits. The request error record includes HTTP status, RPC code and parsed
+`Retry-After`.
+
+A provider cooldown longer than 900 seconds stops the invocation with an error
+without shortening the delay. The full not-before deadline remains saved.
+A restart with more than 900 seconds remaining also fails before an RPC call;
+once the remainder is within that bound, collection
+waits it out before requesting again. This limit bounds a single wait, not the
+provider's cooldown.
+
+Recognized provider range/result limits, or responses reaching `--log-cap`
+(default 5,000), shrink the range immediately. Two consecutive capacity failures
+on the same `eth_getLogs` range also trigger reduction: read timeouts, recognized
+RPC timeout errors, or HTTP 502/504 without throttling or a `Retry-After` header.
+A single such failure retries the original range. This is a collector recovery
+heuristic; it does not prove that the provider failure was caused by range size.
+The reduced window is saved without advancing the stream's next block. Explicit
+invalid-request, unknown-method and invalid-params errors fail immediately unless
+recognized as a provider range limit or throttling response. Any supplied
+cooldown is still saved before exit. Malformed responses also fail without range
+reduction.
 A single block reaching that cap fails explicitly. Successful small responses
 allow growth up to `--max-blocks` (default 100,000). Empty responses advance only
 as provider observations. Public RPC can silently omit data, and the cap does
 not prove absence of truncation below the threshold. All configured ranges
 being scanned is distinct from independently verified lifetime coverage.
+
+Provider limits checked on 2026-10-07: [Tenderly's public endpoint
+documentation](https://docs.tenderly.co/node-rpc/overview#public-endpoint-limits)
+lists a 3,000-result limit per `eth_getLogs` call and the oversized-query error
+`-32602`; its network table lists no daily response-byte limit for Polygon.
+Those public-endpoint docs give no numeric requests-per-second guarantee or
+timeout policy. The collector's configured log cap is a separate truncation
+safeguard and is pinned for an existing dataset; it does not override a
+provider's lower limit.
+[Alchemy's throughput documentation](https://www.alchemy.com/docs/reference/throughput)
+distinguishes compute-unit capacity throttling from query size. Its
+[error reference](https://www.alchemy.com/docs/reference/error-reference)
+also documents gateway timeouts and internal errors. These sources inform error
+classification; they do not establish a Tenderly rate guarantee.
 
 ## Bounded runs and resume
 
@@ -137,7 +199,8 @@ complete. No holes are jumped over after errors. A request-budget exit, Ctrl+C,
 SIGTERM or startup failure retains committed checkpoints without initiating a
 full export. Normal collection completion retains a final export. Use
 `--export-only` after collection stops to export committed rows without RPC
-access. Other failures exit nonzero.
+access. Export-only requires an initialized registry; a missing or empty one
+fails without creating or initializing a database. Other failures exit nonzero.
 
 ## Export scheduling and concurrent snapshots
 

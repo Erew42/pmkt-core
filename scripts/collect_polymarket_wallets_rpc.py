@@ -70,6 +70,7 @@ SOURCES = [
 ]
 ROLES = {1: "clob_order_maker", 2: "clob_fill_counterparty", 4: "amm_buyer", 8: "amm_seller"}
 READ_METHODS = {"eth_chainId", "eth_blockNumber", "eth_getBlockByNumber", "eth_getLogs"}
+MAX_RETRY_AFTER_S = 900.0
 COLLECTOR_SHA256 = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 
 
@@ -189,12 +190,12 @@ def decode_traders(log: dict[str, Any], pool: dict[str, Any] | None = None) -> l
             return []
         traders = [(address_word(log["topics"][2]), 1), (address_word(log["topics"][3]), 2)]
     elif topic in (BUY, SELL):
+        if pool is None:
+            return []  # Unrelated contracts do not share the factory pool ABI.
         if len(log["topics"]) != 3:
             raise ValueError("Invalid AMM event topics")
         trader = address_word(log["topics"][1])
         data = words(log["data"], 3)
-        if pool is None:
-            return []  # Identical events on unrelated factories are not evidence.
         if quantity(log["blockNumber"]) < pool["creation_block"]:
             raise ValueError("AMM trade predates pool creation")
         traders = [(trader, 4 if topic == BUY else 8)] if data[2] > 0 else []
@@ -206,15 +207,23 @@ def decode_traders(log: dict[str, Any], pool: dict[str, Any] | None = None) -> l
 class Store:
     def __init__(self, path: Path, *, readonly: bool = False):
         self.path = path
+        self.readonly = readonly
         if readonly:
             self.db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
             self.db.execute("PRAGMA query_only=ON")
             self.db.execute("PRAGMA cache_size=-65536")
+            self._seed_status_totals()
             return
         self.db = sqlite3.connect(path)
-        self.db.execute("PRAGMA journal_mode=WAL")
+        if self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
+            self.db.close()
+            raise ValueError("Wallet collection requires SQLite WAL mode")
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA cache_size=-65536")
+        # Reclaim allocated WAL capacity at the next ordinary reset. A snapshot
+        # reader can grow the WAL past its budget; keeping that capacity forever
+        # would otherwise reject every later snapshot even after it is released.
+        self.db.execute("PRAGMA journal_size_limit=67108864")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS requests (
@@ -232,6 +241,69 @@ class Store:
                 address TEXT PRIMARY KEY, first_block INTEGER, last_block INTEGER,
                 roles INTEGER, evidence TEXT NOT NULL);
         """)
+        self.maintain_wal()
+        self._seed_status_totals()
+
+    def maintain_wal(self, max_bytes: int = 64 * 1024**2) -> dict[str, Any]:
+        """Reclaim large retained WAL capacity without waiting on reader locks.
+
+        Only the collector writer calls this at startup or after worker release.
+        A busy reader defers reclamation; ordinary writes still reset the WAL
+        under journal_size_limit later. Checkpoint transfer I/O can take time,
+        but busy_timeout=0 prevents an unbounded lock wait behind an exporter.
+        """
+        if self.readonly:
+            return {"state": "readonly"}
+        wal = Path(str(self.path) + "-wal")
+        try:
+            before = wal.stat().st_size
+        except FileNotFoundError:
+            before = 0
+        result = {"state": "not_needed", "wal_before_bytes": before, "wal_after_bytes": before}
+        if before <= max_bytes:
+            return result
+        if self.db.in_transaction:
+            return {**result, "state": "deferred", "reason": "Active writer transaction"}
+        previous_timeout = self.db.execute("PRAGMA busy_timeout").fetchone()[0]
+        try:
+            self.db.execute("PRAGMA busy_timeout=0")
+            busy, frames, checkpointed = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            try:
+                after = wal.stat().st_size
+            except FileNotFoundError:
+                after = 0
+            return {"state": "reclaimed" if not busy and after <= max_bytes else "deferred",
+                    "wal_before_bytes": before, "wal_after_bytes": after,
+                    "checkpoint_busy": busy, "log_frames": frames, "checkpointed_frames": checkpointed}
+        except sqlite3.OperationalError as exc:
+            return {**result, "state": "deferred", "reason": str(exc)}
+        finally:
+            self.db.execute(f"PRAGMA busy_timeout={previous_timeout}")
+
+    def _seed_status_totals(self) -> None:
+        # This Store owns all production mutations. Resume (and immutable export
+        # copies) pay the full scans once, rather than after every accepted range.
+        self._counts = {table: self.db.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                        for table in ("wallets", "pools", "requests")}
+        self._range_totals = {row[0]: row[1:] for row in self.db.execute(
+            "SELECT stream,COUNT(*),COALESCE(SUM(unique_logs),0),COALESCE(SUM(qualified_logs),0) "
+            "FROM ranges GROUP BY stream")}
+        self._status_totals_valid = True
+
+    def _ensure_status_totals(self) -> None:
+        if not self._status_totals_valid:
+            self._seed_status_totals()
+
+    def record_request(self, rpc: str, method: str, params: list[Any], started_at: str) -> int:
+        self._ensure_status_totals()
+        self._status_totals_valid = False
+        with self.db:
+            cursor = self.db.execute("INSERT INTO requests (rpc,method,params,started_at) VALUES (?,?,?,?)",
+                                     (rpc, method, dumps(params), started_at))
+            request_id = int(cursor.lastrowid or 0)
+        self._counts["requests"] += 1
+        self._status_totals_valid = True
+        return request_id
 
     def get(self, key: str) -> Any:
         row = self.db.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
@@ -290,6 +362,9 @@ class Store:
                 else:
                     observations[wallet]["last"] = max(observations[wallet]["last"], block)
                     observations[wallet]["roles"] |= role
+        self._ensure_status_totals()
+        self._status_totals_valid = False
+        new_wallets = new_pools = 0
         with self.db:
             row = self.db.execute("SELECT next_block FROM streams WHERE name=?", (stream,)).fetchone()
             if row is None or row[0] != start:
@@ -302,35 +377,50 @@ class Store:
                 old = self.db.execute("SELECT payload FROM pools WHERE address=?", (pool["address"],)).fetchone()
                 if old and json.loads(old[0])["creation_log"] != pool["creation_log"]:
                     raise ValueError("Conflicting pool creation")
-                self.db.execute("INSERT OR IGNORE INTO pools VALUES (?,?)", (pool["address"], dumps(pool)))
-            self.db.executemany("""
-                INSERT INTO wallets VALUES (?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET
-                  evidence=CASE WHEN excluded.first_block < wallets.first_block
-                                THEN excluded.evidence ELSE wallets.evidence END,
-                  first_block=MIN(wallets.first_block, excluded.first_block),
-                  last_block=MAX(wallets.last_block, excluded.last_block),
-                  roles=wallets.roles | excluded.roles
-                """, [(w, o["first"], o["last"], o["roles"], dumps(o["evidence"])) for w, o in observations.items()])
+                inserted = self.db.execute("INSERT OR IGNORE INTO pools VALUES (?,?)", (pool["address"], dumps(pool)))
+                new_pools += inserted.rowcount
+            entries = [(wallet, item["first"], item["last"], item["roles"], dumps(item["evidence"]))
+                       for wallet, item in observations.items()]
+            for offset in range(0, len(entries), 500):
+                batch = entries[offset:offset + 500]
+                # Covered primary-key lookups count genuinely new wallets while
+                # preserving the original UPSERT and its witness/role semantics.
+                placeholders = ",".join("?" for _ in batch)
+                existing = len(self.db.execute(
+                    f"SELECT address FROM wallets WHERE address IN ({placeholders})",
+                    [item[0] for item in batch]).fetchall())
+                new_wallets += len(batch) - existing
+                self.db.executemany("""
+                    INSERT INTO wallets VALUES (?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET
+                      evidence=CASE WHEN excluded.first_block < wallets.first_block
+                                    THEN excluded.evidence ELSE wallets.evidence END,
+                      first_block=MIN(wallets.first_block, excluded.first_block),
+                      last_block=MAX(wallets.last_block, excluded.last_block),
+                      roles=wallets.roles | excluded.roles
+                    """, batch)
             self.db.execute("INSERT INTO ranges VALUES (?,?,?,?,?,?,?)",
                             (stream, start, end, request_id, returned, len(logs), qualified))
             self.db.execute("UPDATE streams SET next_block=?, window=? WHERE name=?", (end + 1, window, stream))
+        # Only update invocation counters after SQLite has durably committed.
+        self._counts["wallets"] += new_wallets
+        self._counts["pools"] += new_pools
+        ranges, unique, qualified_total = self._range_totals.get(stream, (0, 0, 0))
+        self._range_totals[stream] = (ranges + 1, unique + len(logs), qualified_total + qualified)
+        self._status_totals_valid = True
 
     def status(self, state: str, error: str | None = None) -> dict[str, Any]:
+        self._ensure_status_totals()
         config = self.get("config")
         streams = []
-        totals_by_stream = {row[0]: row[1:] for row in self.db.execute(
-            "SELECT stream,COUNT(*),COALESCE(SUM(unique_logs),0),COALESCE(SUM(qualified_logs),0) "
-            "FROM ranges GROUP BY stream")}
         for name, start, next_block, window in self.db.execute("SELECT * FROM streams ORDER BY name"):
-            totals = totals_by_stream.get(name, (0, 0, 0))
+            totals = self._range_totals.get(name, (0, 0, 0))
             streams.append({"name": name, "start_block": start, "next_block": next_block,
                             "last_scanned_block": next_block - 1 if next_block > start else None,
                             "window_blocks": window, "accepted_ranges": totals[0],
                             "unique_logs_observed": totals[1], "qualified_logs_observed": totals[2]})
         return {"state": state, "updated_at": utc_now(), "error": error,
-                "wallets": self.db.execute("SELECT COUNT(*) FROM wallets").fetchone()[0],
-                "pools": self.db.execute("SELECT COUNT(*) FROM pools").fetchone()[0],
-                "requests": self.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0],
+                "wallets": self._counts["wallets"], "pools": self._counts["pools"],
+                "requests": self._counts["requests"],
                 "streams": streams, "config": config, "anchor": self.get("anchor"),
                 "configured_ranges_scanned": bool(config) and all(s["next_block"] > config["end_block"] for s in streams),
                 "lifetime_coverage_proven": False}
@@ -339,10 +429,16 @@ class Store:
 class RpcError(RuntimeError):
     def __init__(self, message: str, *, http_status: int | None = None,
                  code: int | None = None, retry_after: float | None = None,
-                 retryable: bool = False, range_limit: bool = False):
+                 retryable: bool = False, range_limit: bool = False,
+                 capacity_failure: bool = False):
         super().__init__(message)
         self.http_status, self.code = http_status, code
         self.retry_after, self.retryable, self.range_limit = retry_after, retryable, range_limit
+        self.capacity_failure = capacity_failure
+
+
+class RpcCooldownExceeded(RpcError):
+    """Stop without making an early request or sleeping for an excessive header."""
 
 
 class RequestBudgetReached(RuntimeError):
@@ -354,7 +450,10 @@ def retry_after_seconds(value: str | None) -> float | None:
         return None
     try:
         if value.strip().isdigit():
-            return float(value)
+            result = float(value)
+            if not math.isfinite(result):
+                raise RpcCooldownExceeded("Retry-After exceeds the supported duration")
+            return result
         parsed = parsedate_to_datetime(value)
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
@@ -366,11 +465,18 @@ def retry_after_seconds(value: str | None) -> float | None:
 def is_range_limit(message: str) -> bool:
     text = message.lower()
     # Generic rate/compute limits must not turn into repeated range bisections.
-    if any(s in text for s in ("rate limit", "too many requests", "requests per")):
+    if is_throttle(message):
         return False
     return (any(s in text for s in ("query returned more than", "too many results", "response size")) or
             ("range" in text and any(s in text for s in ("limit", "exceed", "too large", "maximum"))) or
             ("result" in text and any(s in text for s in ("limit exceeded", "maximum", "too large"))))
+
+
+def is_throttle(message: str, code: int | None = None) -> bool:
+    text = message.lower()
+    return code == 429 or any(s in text for s in (
+        "rate limit", "too many requests", "requests per", "compute units per second",
+        "compute units/s", "throughput limit"))
 
 
 class Rpc:
@@ -391,31 +497,52 @@ class Rpc:
         cooldown = store.get("rpc_retry_after_until")
         self.resume_wait_s = (max(0.0, cooldown - datetime.now(timezone.utc).timestamp())
                               if isinstance(cooldown, (int, float)) else 0.0)
+        self.wait_state: dict[str, Any] = {}
+        self.on_wait: Any = None
         self.timings = {"limiter_wait_s": 0.0, "network_s": 0.0, "retry_wait_s": 0.0,
                         "retries": 0}
 
     def call(self, method: str, params: list[Any]) -> tuple[Any, int]:
         if method not in READ_METHODS:
             raise ValueError("RPC method is outside the public read allowlist")
+        capacity_failures = 0
         for attempt in range(self.retry_attempts):
             try:
                 return self._call_once(method, params)
             except RpcError as exc:
-                if not exc.retryable:
+                if isinstance(exc, RpcCooldownExceeded):
+                    raise  # A saved deadline must not be extended on resume.
+                if not exc.retryable and exc.retry_after is None:
                     raise
+                capacity_failures = capacity_failures + 1 if exc.capacity_failure else 0
                 wait = exc.retry_after if exc.retry_after is not None else min(60.0, 2.0 ** attempt)
                 # Persist cooldown before a budget exit, interruption, or service
                 # restart; a new invocation must not bypass the last 429 header.
                 self.store.put("rpc_retry_after_until", datetime.now(timezone.utc).timestamp() + wait)
                 self.resume_wait_s = wait
+                self.wait_state = {"reason": "provider_cooldown" if exc.retry_after is not None else "backoff",
+                                   "remaining_s": wait, "not_before": self.store.get("rpc_retry_after_until")}
+                if wait > MAX_RETRY_AFTER_S:
+                    raise RpcCooldownExceeded(
+                        f"Provider Retry-After {wait:g}s exceeds the {MAX_RETRY_AFTER_S:g}s wait limit; "
+                        "full cooldown retained, no early retry", http_status=exc.http_status,
+                        code=exc.code, retry_after=wait) from exc
+                if not exc.retryable:
+                    raise
+                if method == "eth_getLogs" and capacity_failures >= 2:
+                    exc.range_limit = True
+                    raise
                 if attempt + 1 >= self.retry_attempts:
                     raise
                 # An invocation budget includes every attempt; don't wait if exhausted.
                 if self.budget is not None and self.calls >= self.budget:
                     raise RequestBudgetReached("Invocation request budget reached") from exc
                 started = time.monotonic()
+                if self.on_wait:
+                    self.on_wait()
                 time.sleep(wait)
                 self.resume_wait_s = 0.0
+                self.wait_state = {}
                 self.timings["retry_wait_s"] += time.monotonic() - started
                 self.timings["retries"] += 1
         raise ValueError("RPC retry attempts must be positive")
@@ -425,14 +552,20 @@ class Rpc:
             raise RequestBudgetReached("Invocation request budget reached")
         waited = time.monotonic()
         if self.resume_wait_s:
+            self.wait_state = {"reason": "resumed_cooldown", "remaining_s": self.resume_wait_s,
+                               "not_before": self.store.get("rpc_retry_after_until")}
+            if self.resume_wait_s > MAX_RETRY_AFTER_S:
+                raise RpcCooldownExceeded(
+                    f"Remaining provider cooldown {self.resume_wait_s:g}s exceeds the {MAX_RETRY_AFTER_S:g}s wait limit; "
+                    "no RPC request made", retry_after=self.resume_wait_s)
+            if self.on_wait:
+                self.on_wait()
             time.sleep(self.resume_wait_s)
             self.resume_wait_s = 0.0
+            self.wait_state = {}
         time.sleep(max(0, self.delay - (time.monotonic() - self.last_call)))
         self.timings["limiter_wait_s"] += time.monotonic() - waited
-        with self.store.db:
-            cursor = self.store.db.execute("INSERT INTO requests (rpc,method,params,started_at) VALUES (?,?,?,?)",
-                                           (self.url, method, dumps(params), utc_now()))
-            request_id = int(cursor.lastrowid or 0)
+        request_id = self.store.record_request(self.url, method, params, utc_now())
         self.calls += 1
         self.last_call = time.monotonic()
         status, digest, length, error = None, None, None, None
@@ -453,12 +586,17 @@ class Rpc:
                     pass
                 message = str(detail.get("message", "")) if isinstance(detail, dict) else ""
                 code = detail.get("code") if isinstance(detail, dict) else None
-                transient = status in (408, 425, 429, 500, 502, 503, 504)
+                header_present = "retry-after" in response.headers
+                throttle = status == 429 or is_throttle(message, code)
+                transient = status in (408, 425, 429, 500, 502, 503, 504) or throttle or header_present
+                invalid_request = code in (-32600, -32601, -32602) and not is_range_limit(message) and not throttle
                 raise RpcError(f"RPC HTTP {status}: {message[:500]}" if message else f"RPC HTTP {status}",
                                http_status=status, code=code if isinstance(code, int) else None,
                                retry_after=retry_after_seconds(response.headers.get("retry-after")),
-                               retryable=transient,
-                               range_limit=not transient and method == "eth_getLogs" and is_range_limit(message))
+                               retryable=transient and not invalid_request,
+                               range_limit=not transient and method == "eth_getLogs" and is_range_limit(message),
+                               capacity_failure=method == "eth_getLogs" and status in (502, 504)
+                               and not throttle and not header_present)
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or payload.get("id") != request_id:
                 raise RpcError(f"Invalid RPC response (HTTP {status})")
@@ -467,26 +605,33 @@ class Rpc:
                 message = str(detail.get("message", "")) if isinstance(detail, dict) else ""
                 code = detail.get("code") if isinstance(detail, dict) else None
                 text = message.lower()
-                range_limit = method == "eth_getLogs" and is_range_limit(message)
-                retryable = not range_limit and any(s in text for s in (
+                header_present = "retry-after" in response.headers
+                throttle = is_throttle(message, code) or (code == -32005 and not is_range_limit(message))
+                timeout = any(s in text for s in ("timeout", "timed out"))
+                range_limit = method == "eth_getLogs" and is_range_limit(message) and not header_present and not throttle
+                invalid_request = code in (-32600, -32601, -32602) and not is_range_limit(message) and not throttle
+                retryable = not range_limit and not invalid_request and (header_present or throttle or code == -32603 or any(s in text for s in (
                     "rate limit", "too many requests", "requests per", "temporarily unavailable",
-                    "timeout", "timed out", "server busy", "try again"))
+                    "timeout", "timed out", "server busy", "try again")))
                 raise RpcError(f"RPC error: {dumps(detail)[:500]}", http_status=status,
                                code=code if isinstance(code, int) else None,
                                retry_after=retry_after_seconds(response.headers.get("retry-after")),
-                               retryable=retryable, range_limit=range_limit)
+                               retryable=retryable, range_limit=range_limit,
+                               capacity_failure=method == "eth_getLogs" and timeout and not header_present and not throttle)
             return payload["result"], request_id
         except RpcError as exc:
             error = dumps({"message": str(exc)[:600], "http_status": exc.http_status,
                            "rpc_code": exc.code, "retry_after_s": exc.retry_after,
-                           "retryable": exc.retryable, "range_limit": exc.range_limit})
+                           "retryable": exc.retryable, "range_limit": exc.range_limit,
+                           "capacity_failure": exc.capacity_failure})
             raise
         except KeyboardInterrupt:
             error = "Interrupted during RPC request"
             raise
         except (httpx.HTTPError, ValueError) as exc:
             error = str(exc)[:600]
-            raise RpcError(error, http_status=status, retryable=isinstance(exc, httpx.TransportError)) from exc
+            raise RpcError(error, http_status=status, retryable=isinstance(exc, httpx.TransportError),
+                           capacity_failure=method == "eth_getLogs" and isinstance(exc, httpx.ReadTimeout)) from exc
         finally:
             self.timings["network_s"] += time.monotonic() - network_started
             with self.store.db:
@@ -524,9 +669,11 @@ class Collector:
             try:
                 result, request_id = self.rpc.call("eth_getLogs", [query])
             except RpcError as exc:
-                if not exc.range_limit or window == 1:
+                if not exc.range_limit or end == start:
                     raise
                 window = max(1, (end - start + 1) // 2)
+                with self.store.db:
+                    self.store.db.execute("UPDATE streams SET window=? WHERE name=? AND next_block=?", (window, stream, start))
                 continue
             if not isinstance(result, list):
                 raise ValueError("eth_getLogs did not return a list")
@@ -534,6 +681,8 @@ class Collector:
                 if end == start:
                     raise ValueError("Single block reached the log cap; cannot rule out truncation")
                 window = max(1, (end - start + 1) // 2)
+                with self.store.db:
+                    self.store.db.execute("UPDATE streams SET window=? WHERE name=? AND next_block=?", (window, stream, start))
                 continue
             processing_started = time.monotonic()
             logs = validate_logs(result, start, end, topics, addresses)
@@ -567,22 +716,63 @@ class HashingTextWriter:
 
 
 def export(store: Store, directory: Path, state: str, error: str | None = None,
-           *, publish_status: bool = True) -> dict[str, Any]:
+           *, publish_status: bool = True, provenance_preload_bytes: int = 32 * 1024**2) -> dict[str, Any]:
     # The caller owns the writer lock or supplies an immutable snapshot copy.
     export_started = time.monotonic()
     status = store.status(state, error)
     hashes = {}
     csv_path, evidence_path = directory / "wallets.csv", directory / "wallet-evidence.jsonl"
 
+    def decode_provenance(row: tuple[Any, ...]) -> dict[str, Any]:
+        request = dict(zip(("rpc", "method", "params", "started_at", "completed_at", "response_sha256"), row))
+        request["params"] = json.loads(request["params"])
+        return request
+
+    def estimated_size(value: Any) -> int:
+        size = sys.getsizeof(value)
+        if isinstance(value, dict):
+            size += sum(estimated_size(key) + estimated_size(item) for key, item in value.items())
+        elif isinstance(value, (list, tuple)):
+            size += sum(estimated_size(item) for item in value)
+        return size
+
+    # Wallet addresses randomize witness IDs: a small LRU alone repeatedly seeks
+    # the same old requests. One sequential pass preloads a bounded prefix, with
+    # conservative Python object/container overhead included in the 32 MiB cap.
+    if provenance_preload_bytes < 0:
+        raise ValueError("Provenance preload budget cannot be negative")
+    preload_budget = provenance_preload_bytes
+    preloaded: dict[int, dict[str, Any]] = {}
+    preload_bytes = database_lookup_misses = 0
+    if preload_budget and status["wallets"]:
+        provenance_rows = store.db.execute("SELECT id,rpc,method,params,started_at,completed_at,response_sha256 FROM requests ORDER BY id")
+        try:
+            for row in provenance_rows:
+                try:
+                    request = decode_provenance(row[1:])
+                except (ValueError, TypeError):
+                    # Unused incomplete request records do not invalidate witnesses.
+                    # A witness referencing one still fails in the lookup below.
+                    continue
+                size = estimated_size(request) + sys.getsizeof(row[0]) + 96
+                if preload_bytes + size > preload_budget:
+                    break
+                preloaded[row[0]] = request
+                preload_bytes += size
+        finally:
+            provenance_rows.close()
+
     @lru_cache(maxsize=4096)
     def request_provenance(request_id: int) -> dict[str, Any]:
+        nonlocal database_lookup_misses
+        if request_id in preloaded:
+            return preloaded[request_id]
         row = store.db.execute("SELECT rpc,method,params,started_at,completed_at,response_sha256 FROM requests WHERE id=?",
                                (request_id,)).fetchone()
         if row is None:
             raise ValueError(f"Missing witness request {request_id}")
-        request = dict(zip(("rpc", "method", "params", "started_at", "completed_at", "response_sha256"), row))
-        request["params"] = json.loads(request["params"])
-        return request
+        database_lookup_misses += 1
+        return decode_provenance(row)
 
     with csv_path.with_suffix(".csv.tmp").open("wb") as csv_raw, evidence_path.with_suffix(".jsonl.tmp").open("wb") as evidence_raw:
         csv_file, evidence_file = HashingTextWriter(csv_raw), HashingTextWriter(evidence_raw)
@@ -616,7 +806,10 @@ def export(store: Store, directory: Path, state: str, error: str | None = None,
                                              "Fill counterparties may be operators/contracts; observed roles distinguish them from signed-order makers.",
                                              "Wallet identity is not resolved to controlling EOAs or linked accounts."]},
                 "export_timings_s": {"status_and_serialization_s": time.monotonic() - export_started},
-                "request_provenance_cache": request_provenance.cache_info()._asdict()}
+                "request_provenance_cache": request_provenance.cache_info()._asdict(),
+                "request_provenance_preload": {"entries": len(preloaded), "estimated_bytes": preload_bytes,
+                                               "budget_bytes": preload_budget,
+                                               "database_lookup_misses": database_lookup_misses}}
     atomic_json(directory / "manifest.json", manifest)
     if publish_status:
         atomic_json(directory / "status.json", status)
@@ -678,6 +871,33 @@ def main(argv: list[str] | None = None) -> int:
                         "snapshot_max_wal_bytes": args.snapshot_max_wal_bytes,
                         "snapshot_min_free_bytes": args.snapshot_min_free_bytes,
                         "snapshot_pause_s": args.snapshot_pause_s}
+    if args.export_only and not args._export_worker:
+        database = args.output / "registry.sqlite3"
+        initialized = False
+        if database.is_file():
+            probe = None
+            try:
+                wal = database.with_name(database.name + "-wal")
+                # SQLite's ordinary read-only WAL connections may create sidecars.
+                # With no pending WAL frames the immutable main file is enough;
+                # otherwise retain normal WAL visibility for an active writer.
+                pending_wal = wal.is_file() and wal.stat().st_size > 0
+                uri = database.resolve().as_uri() + ("?mode=ro" if pending_wal else "?mode=ro&immutable=1")
+                probe = sqlite3.connect(uri, uri=True)
+                probe.execute("PRAGMA query_only=ON")
+                tables = {row[0] for row in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if {"metadata", "requests", "streams", "ranges", "pools", "wallets"} <= tables:
+                    row = probe.execute("SELECT value FROM metadata WHERE key='config'").fetchone()
+                    config = json.loads(row[0]) if row is not None else None
+                    initialized = isinstance(config, dict) and bool(config)
+            except (sqlite3.DatabaseError, ValueError):
+                pass
+            finally:
+                if probe is not None:
+                    probe.close()
+        if not initialized:
+            print("No initialized registry to export; collection must initialize it first", file=sys.stderr)
+            return 1
     args.output.mkdir(parents=True, exist_ok=True)
     if args._export_worker:
         return worker_main(args.output, args.export_scratch_dir, args.worker_state,
@@ -698,6 +918,8 @@ def main(argv: list[str] | None = None) -> int:
         status_time = 0.0
         sync_export = {"mode": "sync", "stage": "idle", "snapshot_updated_at": None}
         previous_export: dict[str, Any] = {}
+        wal_maintenance: dict[str, Any] = {"state": "not_requested"}
+        previous_worker_running = False
         try:
             previous_export = json.loads((args.output / "latest-export.json").read_text())
             sync_export.update(snapshot_updated_at=previous_export["snapshot"]["started_at"],
@@ -706,10 +928,16 @@ def main(argv: list[str] | None = None) -> int:
             previous_export = {}
 
         def publish_live() -> dict[str, Any]:
-            nonlocal status_time
+            nonlocal status_time, wal_maintenance, previous_worker_running
             started = time.monotonic()
             live = store.status(state, error)
             live["export"] = manager.poll() if manager else sync_export.copy()
+            worker_running = bool(live["export"].get("worker_running"))
+            if previous_worker_running and not worker_running and state == "running":
+                wal_maintenance = store.maintain_wal()
+            previous_worker_running = worker_running
+            live["wal_maintenance"] = wal_maintenance
+            live["rpc_wait"] = rpc.wait_state.copy() if rpc else {}
             if not manager and sync_export["snapshot_updated_at"]:
                 try:
                     live["export"]["snapshot_age_s"] = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(
@@ -758,12 +986,15 @@ def main(argv: list[str] | None = None) -> int:
                         pass  # Retain rather than delete a potentially published bundle.
 
         def full_export() -> None:
+            nonlocal wal_maintenance
             if manager:
                 # An older snapshot must not stand in for the final checkpoint.
                 manager.cancel()
+                wal_maintenance = store.maintain_wal()
                 if not manager.start(state, error):
                     raise RuntimeError("Could not start final snapshot export")
                 result = manager.wait()
+                wal_maintenance = store.maintain_wal()
                 if result.get("stage") != "succeeded" or result.get("worker_exit_code") != 0:
                     raise RuntimeError(result.get("error") or "Final snapshot export failed")
             else:
@@ -782,6 +1013,7 @@ def main(argv: list[str] | None = None) -> int:
                 full_export()
                 return 0
             rpc = Rpc(store, args.rpc_url, delay=args.request_delay, budget=args.max_requests)
+            rpc.on_wait = publish_live
             chain, _ = rpc.call("eth_chainId", [])
             if quantity(chain) != CHAIN_ID:
                 raise ValueError("RPC is not Polygon mainnet")
@@ -826,6 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
                     "SELECT name,next_block FROM streams") if name in streams)
                 if selected_pending and time.monotonic() - last_export >= args.export_interval_s:
                     if manager:
+                        if not manager.poll().get("worker_running"):
+                            wal_maintenance = store.maintain_wal()
                         if manager.start("running") or not manager.poll().get("worker_running"):
                             last_export = time.monotonic()
                     else:

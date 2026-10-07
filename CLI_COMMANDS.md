@@ -133,8 +133,13 @@ command or require account credentials.
 collects a wallet registry from public Polygon RPC trade events. It runs on
 Linux, requires only core dependencies, and never loads account profiles or
 keys. Requests default to a one-second minimum interval (`--request-delay 1`);
-throttling/transient retries preserve the requested range and honor
-`Retry-After`. This pacing does not guarantee a provider quota.
+startup checks and retries use the same limiter. Throttling and `Retry-After`
+preserve the range. Recognized range limits and two consecutive capacity
+timeouts or HTTP 502/504 responses on the same range can reduce its window
+without advancing the checkpoint. A cooldown over 900 seconds fails with its
+full deadline saved rather than retrying early. This pacing does not guarantee
+a provider quota; Tenderly currently documents a 3,000-result public query limit
+and no numeric public requests-per-second guarantee.
 
 Full exports default to a 12-hour schedule (`--export-interval-s 43200`).
 `--export-mode sync` is the default and pauses collection during exports.
@@ -144,15 +149,24 @@ are `--snapshot-timeout-s 900`, `--snapshot-max-wal-bytes 2147483648`,
 `--snapshot-min-free-bytes 10737418240` and `--snapshot-pause-s 0.01`.
 Resource limits can defer exports; live status reports export health/freshness.
 
-SQLite checkpoints remain current after every accepted range, and status is
+Stream checkpoints commit after every accepted range, and status is
 updated after each productive collection iteration. Ctrl+C, SIGTERM, startup
 errors and request-budget exits do not initiate a full export. Normal completion
 and offline `--export-only` retain final exports; export-only makes no RPC calls.
+It rejects a missing or uninitialized registry without creating a database.
 `latest-export.json` selects a matching immutable CSV/evidence/manifest bundle.
 Root symlinks remain compatibility views and can span generations across reads;
 the snapshot manifest does not overwrite live status. Export controls are
 invocation metadata and may change on resume without changing the dataset's
 anchor, schemas, grain or provenance.
+
+Collection verifies SQLite WAL mode. Committed status totals are cached to avoid
+repeated full-table scans. The writer reclaims oversized retained WAL allocation
+at startup, before snapshot launches and after worker release while collection
+continues; a busy reader defers reclamation. The 64 MiB retained-size target does
+not cap growth during an active snapshot. Status includes RPC cooldowns, phase
+timings and WAL maintenance; export manifests report bounded provenance-cache
+statistics. Workers inherit the collector's CPU and I/O priority.
 
 For example, after factory and AMM scans are complete:
 

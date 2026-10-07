@@ -82,6 +82,8 @@ jobs:
               tests/test_wallet_registry_export.py
               tests/test_wallet_registry_lifecycle.py
               tests/test_wallet_registry_rpc.py
+              tests/test_wallet_registry_review.py
+              tests/test_wallet_registry_storage.py
               tests/test_recorder.py
               tests/test_resolution.py
               tests/test_resolution_batch.py
