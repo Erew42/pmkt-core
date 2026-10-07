@@ -4,10 +4,10 @@
 Gamma, CLOB, and Data APIs to catch breaking drift. It is a live network check, so it
 can fail because of upstream API changes, temporary network failures, rate
 limits, or a lack of currently active order books in the scanned markets.
-It does not exercise Data API v2 endpoints. The curated v2 activity contract
-marks `user` required because the live endpoint rejects requests without it;
-the upstream v2 OpenAPI document currently marks the parameter optional while
-describing the feed as user-anchored.
+It does not exercise Data API v2 wallet or feed endpoints. The curated v2
+activity contract marks `user` required because the live endpoint rejects
+requests without it; the upstream v2 OpenAPI document currently marks the
+parameter optional while describing the feed as user-anchored.
 
 What it checks:
 - Gamma `/markets` returns JSON and yields a CLOB token id.
@@ -37,7 +37,7 @@ Options:
 - `--data-base-url`: public Data API base URL. Default:
   `https://data-api.polymarket.com`.
 - `--timeout`: per-request timeout in seconds. Default: `20.0`.
-- `--max-retries`: maximum total request attempts for transient failures,
+- `--max-attempts`: maximum total request attempts for transient failures,
   including the initial attempt. Default: `4`.
 - `--max-pages`: Gamma `/markets` pages to scan for a token with an active order
   book. Default: `3`.
