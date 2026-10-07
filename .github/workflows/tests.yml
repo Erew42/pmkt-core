@@ -79,6 +79,9 @@ jobs:
               tests/test_normalize.py
               tests/test_openapi_params.py
               tests/test_polymarket_data_api.py
+              tests/test_wallet_registry_export.py
+              tests/test_wallet_registry_lifecycle.py
+              tests/test_wallet_registry_rpc.py
               tests/test_recorder.py
               tests/test_resolution.py
               tests/test_resolution_batch.py

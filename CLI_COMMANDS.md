@@ -126,3 +126,44 @@ Repository `scripts/contract_check.py` and `scripts/update_openapi_examples.py`
 also accept `--data-base-url` (default `https://data-api.polymarket.com`) for
 their public Data API `/v2/oi` check and example. This does not add a `pmkt`
 command or require account credentials.
+
+## Research scripts
+
+`python scripts/collect_polymarket_wallets_rpc.py --output data/wallet-registry`
+collects a wallet registry from public Polygon RPC trade events. It runs on
+Linux, requires only core dependencies, and never loads account profiles or
+keys. Requests default to a one-second minimum interval (`--request-delay 1`);
+throttling/transient retries preserve the requested range and honor
+`Retry-After`. This pacing does not guarantee a provider quota.
+
+Full exports default to a 12-hour schedule (`--export-interval-s 43200`).
+`--export-mode sync` is the default and pauses collection during exports.
+`--export-mode snapshot` uses one bounded worker while collection continues and
+requires `--export-scratch-dir` on an SSD outside the checkout. Copy defaults
+are `--snapshot-timeout-s 900`, `--snapshot-max-wal-bytes 2147483648`,
+`--snapshot-min-free-bytes 10737418240` and `--snapshot-pause-s 0.01`.
+Resource limits can defer exports; live status reports export health/freshness.
+
+SQLite checkpoints remain current after every accepted range, and status is
+updated after each productive collection iteration. Ctrl+C, SIGTERM, startup
+errors and request-budget exits do not initiate a full export. Normal completion
+and offline `--export-only` retain final exports; export-only makes no RPC calls.
+`latest-export.json` selects a matching immutable CSV/evidence/manifest bundle.
+Root symlinks remain compatibility views and can span generations across reads;
+the snapshot manifest does not overwrite live status. Export controls are
+invocation metadata and may change on resume without changing the dataset's
+anchor, schemas, grain or provenance.
+
+For example, after factory and AMM scans are complete:
+
+```shell
+python scripts/collect_polymarket_wallets_rpc.py \
+  --output data/wallet-registry-example --streams exchange \
+  --request-delay 1 --export-interval-s 43200 \
+  --export-mode snapshot \
+  --export-scratch-dir /path/to/ssd/wallet-registry-export-scratch
+```
+
+Replace the scratch placeholder with an SSD directory outside the checkout.
+See [the collection and evidence contract](docs/wallet_registry_rpc.md) for
+source scope, resumability, copy limits, bounded pilots and coverage limitations.
