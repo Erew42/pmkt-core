@@ -134,6 +134,22 @@ def _read_json(path: Path) -> dict[str, Any]:
     return result if isinstance(result, dict) else {}
 
 
+def pointer_may_select(output: Path, generation: str) -> bool:
+    """Return False only if the pointer is absent or readably selects another generation.
+
+    Cleanup may delete an unpublished generation only on False: a pointer that
+    exists but cannot be read may already direct consumers to ``generation``.
+    """
+    try:
+        pointer = json.loads((output / "latest-export.json").read_text())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    selected = pointer.get("generation") if isinstance(pointer, dict) else None
+    return not isinstance(selected, str) or selected == generation
+
+
 def _publish_aliases(output: Path, generation: str) -> None:
     # Each root path is a compatibility view. Only reading latest-export.json
     # once, followed by paths in that immutable generation, gives a bundle.
@@ -261,7 +277,7 @@ def worker_main(output: Path, scratch: Path, state: str, error: str | None,
         finally:
             for signum, handler in old_handlers.items():
                 signal.signal(signum, handler)
-            if not published:
+            if not published and not pointer_may_select(output, generation):
                 shutil.rmtree(generation_path, ignore_errors=True)
             for path in (snapshot, Path(str(snapshot) + "-wal"), Path(str(snapshot) + "-shm")):
                 path.unlink(missing_ok=True)
@@ -372,15 +388,8 @@ class ExportManager:
                 pass
         progress = _read_json(self.output / "export-progress.json")
         generation = progress.get("generation")
-        pointer_path = self.output / "latest-export.json"
-        try:
-            pointer = _read_json(pointer_path)
-            if pointer_path.exists() and not isinstance(pointer.get("generation"), str):
-                return  # Unreadable pointer: retain rather than risk its bundle.
-        except OSError:
-            return
         if (progress.get("pid") == self.process.pid and isinstance(generation, str)
                 and len(Path(generation).parts) == 2 and Path(generation).parts[0] == "export-generations"
                 and Path(generation).name.startswith("generation-")
-                and pointer.get("generation") != generation):
+                and not pointer_may_select(self.output, generation)):
             shutil.rmtree(self.output / generation, ignore_errors=True)

@@ -972,7 +972,7 @@ def main(argv: list[str] | None = None) -> int:
         checkout = Path(__file__).resolve().parents[1]
         if args.export_scratch_dir.resolve().is_relative_to(checkout):
             parser.error("Snapshot scratch must be outside the checkout")
-    from wallet_registry_export import ExportManager, publish_generation, worker_main
+    from wallet_registry_export import ExportManager, pointer_may_select, publish_generation, worker_main
 
     snapshot_options = {"snapshot_timeout_s": args.snapshot_timeout_s,
                         "snapshot_max_wal_bytes": args.snapshot_max_wal_bytes,
@@ -1084,14 +1084,8 @@ def main(argv: list[str] | None = None) -> int:
                 finally:
                     # A signal just after atomic publication must not delete the
                     # generation that readers have already been told to open.
-                    try:
-                        published = json.loads((args.output / "latest-export.json").read_text()).get("generation")
-                        if published != str(generation.relative_to(args.output)):
-                            shutil.rmtree(generation, ignore_errors=True)
-                    except FileNotFoundError:
+                    if not pointer_may_select(args.output, str(generation.relative_to(args.output))):
                         shutil.rmtree(generation, ignore_errors=True)
-                    except (OSError, ValueError):
-                        pass  # Retain rather than delete a potentially published bundle.
 
         def full_export() -> None:
             nonlocal wal_maintenance

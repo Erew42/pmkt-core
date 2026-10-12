@@ -407,6 +407,47 @@ def test_cancel_immediately_after_pointer_commit_retains_visible_generation(regi
     assert all((output / path).is_file() for path in pointer["files"].values())
 
 
+def test_cancel_after_pointer_commit_retains_generation_when_pointer_is_unreadable(registry, tmp_path, monkeypatch):
+    output, _ = registry
+    original_atomic, original_read_text = exporter._atomic_json, Path.read_text
+    committed = []
+
+    def cancel_after_rename(path, payload):
+        original_atomic(path, payload)
+        if path.name == "latest-export.json":
+            committed.append(payload["generation"])
+            signal.raise_signal(signal.SIGTERM)
+
+    def unreadable_committed_pointer(path, *args, **kwargs):
+        if committed and path.name == "latest-export.json":
+            raise OSError("transient pointer read failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(exporter, "_atomic_json", cancel_after_rename)
+    monkeypatch.setattr(Path, "read_text", unreadable_committed_pointer)
+    assert exporter.worker_main(output, tmp_path / "scratch", "running", None,
+                                callback, **worker_options()) == 130
+    monkeypatch.setattr(Path, "read_text", original_read_text)
+    pointer = json.loads((output / "latest-export.json").read_text())
+    assert pointer["generation"] == committed[0]
+    assert all((output / path).is_file() for path in pointer["files"].values())
+
+
+@pytest.mark.parametrize("pointer,expected", [
+    (None, False),
+    ({"generation": "export-generations/generation-other"}, False),
+    ({"generation": "export-generations/generation-mine"}, True),
+    ({"previous_generation": "export-generations/generation-other"}, True),
+    (["export-generations/generation-other"], True),
+    ("truncated {", True),
+])
+def test_pointer_may_select_deletes_only_when_another_generation_is_proven(tmp_path, pointer, expected):
+    if pointer is not None:
+        (tmp_path / "latest-export.json").write_text(
+            pointer if isinstance(pointer, str) else json.dumps(pointer))
+    assert exporter.pointer_may_select(tmp_path, "export-generations/generation-mine") is expected
+
+
 @pytest.mark.parametrize("code,stage", [(75, "failed"), (1, "failed"), (-9, "cancelled"), (0, "failed")])
 @pytest.mark.parametrize("progress_pid", [999, 123])
 def test_manager_never_claims_success_from_old_or_nonzero_worker_progress(tmp_path, code, stage, progress_pid):
