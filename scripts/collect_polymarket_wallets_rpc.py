@@ -480,6 +480,19 @@ def is_throttle(message: str, code: int | None = None) -> bool:
         "compute units/s", "throughput limit"))
 
 
+def rpc_error_text(detail: Any) -> str:
+    """Return the JSON-RPC message plus any string ``data`` detail for classification.
+
+    Tenderly reports oversized ``eth_getLogs`` queries as ``-32602 invalid params``
+    and puts "Query returned more than N results" only in ``data``.
+    """
+    if not isinstance(detail, dict):
+        return ""
+    data = detail.get("data")
+    parts = [str(detail.get("message", "")), data if isinstance(data, str) else ""]
+    return " ".join(part for part in parts if part)
+
+
 class Rpc:
     def __init__(self, store: Store, url: str, *, delay: float = 1.0,
                  budget: int | None = None, transport: httpx.BaseTransport | None = None,
@@ -675,7 +688,7 @@ class Rpc:
                     detail = body.get("error") if isinstance(body, dict) else None
                 except ValueError:
                     pass
-                message = str(detail.get("message", "")) if isinstance(detail, dict) else ""
+                message = rpc_error_text(detail)
                 code = detail.get("code") if isinstance(detail, dict) else None
                 header_present = "retry-after" in response.headers
                 throttle = status == 429 or is_throttle(message, code)
@@ -693,7 +706,7 @@ class Rpc:
                 raise RpcError(f"Invalid RPC response (HTTP {status})")
             if payload.get("error") is not None or "result" not in payload:
                 detail = payload.get("error")
-                message = str(detail.get("message", "")) if isinstance(detail, dict) else ""
+                message = rpc_error_text(detail)
                 code = detail.get("code") if isinstance(detail, dict) else None
                 text = message.lower()
                 header_present = "retry-after" in response.headers

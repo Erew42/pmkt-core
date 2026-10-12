@@ -420,6 +420,50 @@ def test_only_recognized_range_limit_bisects(store, monkeypatch, status):
         rpc.client.close()
 
 
+@pytest.mark.parametrize("status", [200, 400])
+def test_range_limit_reported_only_in_error_data_bisects(store, monkeypatch, status):
+    # Tenderly's shape: a generic -32602 message with the result limit in data.
+    clock, spans = Clock(), []
+    monkeypatch.setattr(census, "time", clock)
+
+    def transport(request):
+        payload = json.loads(request.content)
+        query = payload["params"][0]
+        span = int(query["toBlock"], 16) - int(query["fromBlock"], 16) + 1
+        spans.append(span)
+        if span > 4:
+            return httpx.Response(status, json={"jsonrpc": "2.0", "id": payload["id"], "error": {
+                "code": -32602, "message": "invalid params",
+                "data": "Query returned more than 20000 results. "
+                        "Try with this block range [0x4c782fb, 0x4c788fa]."}})
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "result": [event()]})
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=1, transport=httpx.MockTransport(transport))
+    try:
+        assert census.Collector(store, rpc).step("exchange")
+        assert spans == [8, 4]
+        assert store.db.execute("SELECT end_block FROM ranges WHERE stream='exchange'").fetchone()[0] == census.EXCHANGE_START + 3
+    finally:
+        rpc.client.close()
+
+
+def test_invalid_params_with_unrelated_error_data_still_fails(store):
+    def transport(request):
+        payload = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], "error": {
+            "code": -32602, "message": "invalid params", "data": "invalid argument 0: hex string has odd length"}})
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=0, transport=httpx.MockTransport(transport))
+    try:
+        with pytest.raises(census.RpcError) as exc:
+            census.Collector(store, rpc).step("exchange")
+        assert exc.value.code == -32602 and not exc.value.retryable and not exc.value.range_limit
+        assert rpc.calls == 1
+        assert store.db.execute("SELECT COUNT(*) FROM ranges").fetchone()[0] == 0
+    finally:
+        rpc.client.close()
+
+
 @pytest.mark.parametrize("message", ["rate limit exceeded", "too many requests"])
 def test_rpc_rate_limit_code_does_not_bisect(store, monkeypatch, message):
     clock, params = Clock(), []

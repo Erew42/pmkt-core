@@ -173,6 +173,9 @@ Provider limits checked on 2026-10-08: [Tenderly's public endpoint
 documentation](https://docs.tenderly.co/node-rpc/overview#public-endpoint-limits)
 lists a 3,000-result limit per `eth_getLogs` call and the oversized-query error
 `-32602`; its network table lists no daily response-byte limit for Polygon.
+Tenderly's response carries the generic message `invalid params` and puts the
+result-limit text (observed on 2026-10-12: more than 20,000 results) in the
+error's `data` string, so classification reads both `message` and `data`.
 Those public-endpoint docs give no numeric requests-per-second guarantee or
 timeout policy. The collector's configured log cap is a separate truncation
 safeguard and is pinned for an existing dataset; it does not override a
