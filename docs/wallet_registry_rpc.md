@@ -86,9 +86,20 @@ Keep output under an ignored directory such as `data/`. Outputs include:
 - `wallets.csv`: one `(chain_id, wallet_address)` row, observed first/last blocks,
   observed roles, and a witness transaction hash and log index.
 - `wallet-evidence.jsonl`: one earliest observed raw trade log per wallet,
-  linked to request provenance. AMM witnesses also retain the factory creation
-  event, collateral and condition IDs. Raw logs include block hash, transaction
-  hash, log index, topics and data.
+  linked to request provenance. "Earliest" is chain order, `(block number, log
+  index)`, independent of which stream committed a block first. AMM witnesses
+  also retain the factory creation event, collateral and condition IDs. Raw logs
+  include block hash, transaction hash, log index, topics and data.
+
+  Collectors before 2026-10-12 compared only block numbers, so a wallet with AMM
+  and exchange logs in its first block kept whichever stream committed that
+  block first. On its first run, a newer collector records the blocks both
+  streams had already scanned in `witness_order_repair` metadata and rereads them
+  alongside collection: AMM logs across that span, then exchange logs for each
+  block whose witness is an AMM log. Replaced witnesses cite the repair's own
+  requests; first/last blocks and roles are unchanged. Progress survives
+  restarts. `status.json` and the manifest report the repair phase, request count
+  and replaced witnesses; a new registry records `not_needed`.
 - `manifest.json`: source inventory, event signatures, collector hashes, product
   hashes, coverage and limitations. `lifetime_coverage_proven` is always false.
 - `latest-export.json`: an atomic pointer to a completed immutable export

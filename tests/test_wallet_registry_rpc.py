@@ -168,6 +168,114 @@ def test_reject_credential_urls(store, url):
         census.Rpc(store, url)
 
 
+def anchor_store(path, block):
+    db = census.Store(path)
+    config = {"end_block": block + 7, "max_blocks": 8,
+              "starts": {"factory": block, "amm": block, "exchange": block}}
+    db.initialize(config, {"number": block + 7, "hash": "0x" + word(9), "timestamp_s": 1})
+    request_id = db.record_request("https://rpc.test", "eth_getLogs", [], "2026-10-01T00:00:00Z")
+    db.commit_range("factory", block, block + 7, 8, request_id, 1, [event(census.CREATION, block=block)])
+    return db, request_id
+
+
+@pytest.mark.parametrize("order", [("exchange", "amm"), ("amm", "exchange")])
+def test_same_block_witness_follows_log_index_not_commit_order(tmp_path, order):
+    block = census.EXCHANGE_START
+    db, request_id = anchor_store(tmp_path / "registry.sqlite3", block)
+    try:
+        for stream in order:
+            log = event(census.BUY if stream == "amm" else census.FILLED_V1,
+                        block=block, index=1 if stream == "amm" else 5)
+            db.commit_range(stream, block, block + 7, 8, request_id, 1, [log])
+        first, roles, evidence = db.db.execute(
+            "SELECT first_block,roles,evidence FROM wallets WHERE address=?", (ALICE,)).fetchone()
+        witness = json.loads(evidence)
+        assert (first, roles) == (block, 1 | 4)
+        assert int(witness["log"]["logIndex"], 16) == 1 and witness["role"] == "amm_buyer"
+    finally:
+        db.db.close()
+
+
+def test_witness_repair_rereads_blocks_scanned_with_commit_order_witnesses(tmp_path):
+    dave = "0x" + "44" * 20
+    block = census.EXCHANGE_START
+    db, request_id = anchor_store(tmp_path / "registry.sqlite3", block)
+
+    def amm(index, at, trader=ALICE):
+        log = event(census.BUY, block=at, index=index)
+        log["topics"][1] = addr_topic(trader)
+        return log
+
+    def fill(index, at, maker=ALICE):
+        log = event(census.FILLED_V1, block=at, index=index)
+        log["topics"][2] = addr_topic(maker)
+        return log
+
+    amm_logs = [amm(1, block + 1), amm(7, block + 2, dave)]
+    exchange_logs = [fill(5, block + 1), fill(3, block + 2, dave)]
+    try:
+        db.commit_range("exchange", block, block + 7, 8, request_id, 2, exchange_logs)
+        db.commit_range("amm", block, block + 7, 8, request_id, 2, amm_logs)
+        pool = json.loads(db.db.execute("SELECT payload FROM pools").fetchone()[0])
+        # Witnesses as an older collector could leave them: by stream commit order.
+        stale = {ALICE: {"wallet_address": ALICE, "role": "clob_order_maker", "chain_id": census.CHAIN_ID,
+                         "request_id": request_id, "log": exchange_logs[0]},
+                 dave: {"wallet_address": dave, "role": "amm_buyer", "chain_id": census.CHAIN_ID,
+                        "request_id": request_id, "log": amm_logs[1], "pool": pool}}
+        with db.db:
+            for wallet, evidence in stale.items():
+                db.db.execute("UPDATE wallets SET evidence=? WHERE address=?", (census.dumps(evidence), wallet))
+        before = dict(db.db.execute("SELECT address, first_block || ':' || last_block || ':' || roles FROM wallets"))
+        bob_evidence = db.db.execute("SELECT evidence FROM wallets WHERE address=?", (BOB,)).fetchone()[0]
+
+        queries = []
+
+        def handler(payload):
+            query = payload["params"][0]
+            queries.append(query)
+            low, high = int(query["fromBlock"], 16), int(query["toBlock"], 16)
+            logs = exchange_logs if "address" in query else amm_logs
+            return [log for log in logs if low <= int(log["blockNumber"], 16) <= high]
+
+        rpc = rpc_for(db, handler)
+        try:
+            repair = census.WitnessOrderRepair(db, rpc)
+            while repair.step():
+                pass
+        finally:
+            rpc.client.close()
+
+        assert [("address" in q, q["fromBlock"], q["toBlock"]) for q in queries] == [
+            (False, hex(block), hex(block + 7)), (True, hex(block + 1), hex(block + 1)),
+            (True, hex(block + 2), hex(block + 2))]
+        witnesses = {wallet: json.loads(evidence) for wallet, evidence in db.db.execute(
+            "SELECT address,evidence FROM wallets")}
+        assert witnesses[ALICE]["log"] == amm_logs[0] and witnesses[ALICE]["role"] == "amm_buyer"
+        assert witnesses[ALICE]["pool"] == pool
+        assert witnesses[dave]["log"] == exchange_logs[1] and witnesses[dave]["role"] == "clob_order_maker"
+        assert "pool" not in witnesses[dave]
+        repair_requests = {row[0] for row in db.db.execute("SELECT id FROM requests WHERE id > ?", (request_id,))}
+        assert {witnesses[ALICE]["request_id"], witnesses[dave]["request_id"]} <= repair_requests
+        assert db.db.execute("SELECT evidence FROM wallets WHERE address=?", (BOB,)).fetchone()[0] == bob_evidence
+        assert dict(db.db.execute("SELECT address, first_block || ':' || last_block || ':' || roles FROM wallets")) == before
+        status = repair.status()
+        assert status["phase"] == "complete" and status["wallets_updated"] == 2
+        assert status["requests"] == 3 and status["exchange_blocks_total"] == 2
+        assert (status["lower_block"], status["upper_block"]) == (block, block + 7)
+    finally:
+        db.db.close()
+
+
+def test_witness_repair_is_not_needed_for_a_new_registry(store):
+    rpc = rpc_for(store, lambda payload: pytest.fail("no repair request expected"))
+    try:
+        repair = census.WitnessOrderRepair(store, rpc)
+        assert not repair.step()
+        assert repair.status()["phase"] == "not_needed"
+    finally:
+        rpc.client.close()
+
+
 def test_adaptive_range_split_and_durable_resume(store, tmp_path):
     seen = []
     def handler(payload):

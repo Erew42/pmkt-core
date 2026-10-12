@@ -204,6 +204,10 @@ def decode_traders(log: dict[str, Any], pool: dict[str, Any] | None = None) -> l
     return [(wallet, role) for wallet, role in traders if wallet != ZERO and wallet not in INFRASTRUCTURE]
 
 
+def witness_log_index(evidence: str) -> int:
+    return quantity(json.loads(evidence)["log"]["logIndex"])
+
+
 class Store:
     def __init__(self, path: Path, *, readonly: bool = False):
         self.path = path
@@ -219,6 +223,7 @@ class Store:
             self.db.close()
             raise ValueError("Wallet collection requires SQLite WAL mode")
         self.db.execute("PRAGMA synchronous=FULL")
+        self.db.create_function("witness_log_index", 1, witness_log_index, deterministic=True)
         self.db.execute("PRAGMA cache_size=-65536")
         # Reclaim allocated WAL capacity at the next ordinary reset. A snapshot
         # reader can grow the WAL past its budget; keeping that capacity forever
@@ -393,6 +398,9 @@ class Store:
                 self.db.executemany("""
                     INSERT INTO wallets VALUES (?,?,?,?,?) ON CONFLICT(address) DO UPDATE SET
                       evidence=CASE WHEN excluded.first_block < wallets.first_block
+                                      OR (excluded.first_block = wallets.first_block
+                                          AND witness_log_index(excluded.evidence)
+                                              < witness_log_index(wallets.evidence))
                                     THEN excluded.evidence ELSE wallets.evidence END,
                       first_block=MIN(wallets.first_block, excluded.first_block),
                       last_block=MAX(wallets.last_block, excluded.last_block),
@@ -797,6 +805,152 @@ class Collector:
             return True
 
 
+WITNESS_REPAIR_KEY = "witness_order_repair"
+
+
+class WitnessOrderRepair:
+    """Recompute same-block witnesses that older collectors chose by commit order.
+
+    Before 2026-10-12 a stored witness was replaced only by a smaller block. When
+    one block held a wallet's AMM and exchange logs, the witness came from
+    whichever stream committed that block first instead of the smaller log index.
+    Blocks both streams had scanned when this version first ran are reread once:
+    AMM logs over the whole span, then exchange logs for each block whose witness
+    is an AMM log. Progress is kept in metadata, so a restart resumes the repair.
+    """
+
+    def __init__(self, store: Store, rpc: Rpc, *, log_cap: int = 5000):
+        self.store, self.rpc, self.log_cap = store, rpc, log_cap
+        if store.get(WITNESS_REPAIR_KEY) is None:
+            store.put(WITNESS_REPAIR_KEY, self._initial_state())
+
+    def _initial_state(self) -> dict[str, Any]:
+        config = self.store.get("config")
+        next_blocks = dict(self.store.db.execute("SELECT name,next_block FROM streams").fetchall())
+        lower = config["starts"]["exchange"]
+        upper = min(next_blocks.get("amm", 0), next_blocks.get("exchange", 0)) - 1
+        state = {"started_at": utc_now(), "collector_sha256": COLLECTOR_SHA256,
+                 "lower_block": lower, "upper_block": upper, "requests": 0, "wallets_updated": 0}
+        if upper < lower or self.store.db.execute("SELECT 1 FROM wallets LIMIT 1").fetchone() is None:
+            return {**state, "phase": "not_needed", "completed_at": utc_now()}
+        return {**state, "phase": "amm", "next_block": lower, "window": config["max_blocks"]}
+
+    def status(self) -> dict[str, Any]:
+        state = self.store.get(WITNESS_REPAIR_KEY) or {}
+        status = {key: value for key, value in state.items() if key != "exchange_blocks"}
+        if "exchange_blocks" in state:
+            status["exchange_blocks_total"] = len(state["exchange_blocks"])
+        return status
+
+    def step(self) -> bool:
+        state = self.store.get(WITNESS_REPAIR_KEY)
+        if state["phase"] == "amm":
+            self._amm_step(state)
+        elif state["phase"] == "exchange":
+            self._exchange_step(state)
+        else:
+            return False
+        return True
+
+    def _amm_step(self, state: dict[str, Any]) -> None:
+        start, upper, window = state["next_block"], state["upper_block"], state["window"]
+        end = min(start + window - 1, upper)
+        topics = {BUY, SELL}
+        state["requests"] += 1
+        try:
+            result, request_id = self.rpc.call(
+                "eth_getLogs", [{"fromBlock": hex(start), "toBlock": hex(end), "topics": [sorted(topics)]}])
+        except RpcError as exc:
+            if not exc.range_limit or end == start:
+                raise
+            self.store.put(WITNESS_REPAIR_KEY, {**state, "window": max(1, (end - start + 1) // 2)})
+            return
+        if not isinstance(result, list):
+            raise ValueError("eth_getLogs did not return a list")
+        if len(result) >= self.log_cap:
+            if end == start:
+                raise ValueError("Single block reached the log cap; cannot rule out truncation")
+            self.store.put(WITNESS_REPAIR_KEY, {**state, "window": max(1, (end - start + 1) // 2)})
+            return
+        logs = validate_logs(result, start, end, topics, None)
+        if end < upper:
+            next_window = min(self.store.get("config")["max_blocks"], window * 2) if len(logs) < self.log_cap // 4 else window
+            next_state = {**state, "next_block": end + 1, "window": next_window}
+        else:
+            next_state = {key: value for key, value in state.items() if key not in ("next_block", "window")}
+            next_state["phase"] = "exchange"
+        self._apply(logs, request_id, next_state)
+
+    def _amm_witness_blocks(self, state: dict[str, Any]) -> list[int]:
+        blocks = set()
+        for first_block, evidence in self.store.db.execute(
+                "SELECT first_block,evidence FROM wallets WHERE first_block BETWEEN ? AND ?",
+                (state["lower_block"], state["upper_block"])):
+            if json.loads(evidence)["log"]["address"].lower() not in EXCHANGES:
+                blocks.add(first_block)
+        return sorted(blocks)
+
+    def _exchange_step(self, state: dict[str, Any]) -> None:
+        if "exchange_blocks" not in state:
+            # Listed only after every AMM update is committed: those can create AMM witnesses.
+            self.store.put(WITNESS_REPAIR_KEY, {**state, "next_index": 0,
+                                                "exchange_blocks": self._amm_witness_blocks(state)})
+            return
+        blocks, index = state["exchange_blocks"], state["next_index"]
+        if index >= len(blocks):
+            self.store.put(WITNESS_REPAIR_KEY, {**state, "phase": "complete", "completed_at": utc_now()})
+            return
+        block, topics, addresses = blocks[index], {FILLED_V1, FILLED_V2}, set(EXCHANGES)
+        state["requests"] += 1
+        result, request_id = self.rpc.call("eth_getLogs", [{
+            "fromBlock": hex(block), "toBlock": hex(block), "topics": [sorted(topics)],
+            "address": sorted(addresses)}])
+        if not isinstance(result, list):
+            raise ValueError("eth_getLogs did not return a list")
+        if len(result) >= self.log_cap:
+            raise ValueError("Single block reached the log cap; cannot rule out truncation")
+        next_state = {**state, "next_index": index + 1}
+        if index + 1 == len(blocks):
+            next_state.update(phase="complete", completed_at=utc_now())
+        self._apply(validate_logs(result, block, block, topics, addresses), request_id, next_state)
+
+    def _apply(self, logs: list[dict[str, Any]], request_id: int, next_state: dict[str, Any]) -> None:
+        # Same witness construction as commit_range: the first log and role per wallet.
+        candidates: dict[str, tuple[int, int, dict[str, Any]]] = {}
+        pool_cache: dict[str, Any] = {}
+        for log in logs:
+            pool = None
+            if log["topics"][0].lower() in (BUY, SELL):
+                address = log["address"].lower()
+                if address not in pool_cache:
+                    row = self.store.db.execute("SELECT payload FROM pools WHERE address=?", (address,)).fetchone()
+                    pool_cache[address] = json.loads(row[0]) if row else None
+                pool = pool_cache[address]
+            for wallet, role in decode_traders(log, pool):
+                if wallet not in candidates:
+                    evidence = {"wallet_address": wallet, "role": ROLES[role], "chain_id": CHAIN_ID,
+                                "request_id": request_id, "log": log}
+                    if pool:
+                        evidence["pool"] = pool
+                    candidates[wallet] = (quantity(log["blockNumber"]), quantity(log["logIndex"]), evidence)
+        updates = []
+        items = list(candidates.items())
+        for offset in range(0, len(items), 500):
+            batch = items[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            current = {address: (first_block, evidence) for address, first_block, evidence in self.store.db.execute(
+                f"SELECT address,first_block,evidence FROM wallets WHERE address IN ({placeholders})",
+                [wallet for wallet, _ in batch])}
+            for wallet, (block, index, evidence) in batch:
+                if wallet in current and current[wallet][0] == block and index < witness_log_index(current[wallet][1]):
+                    updates.append((dumps(evidence), wallet))
+        next_state["wallets_updated"] += len(updates)
+        with self.store.db:
+            self.store.db.executemany("UPDATE wallets SET evidence=? WHERE address=?", updates)
+            self.store.db.execute("INSERT OR REPLACE INTO metadata VALUES (?,?)",
+                                  (WITNESS_REPAIR_KEY, dumps(next_state)))
+
+
 def atomic_json(path: Path, payload: Any) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8") as handle:
@@ -901,8 +1055,10 @@ def export(store: Store, directory: Path, state: str, error: str | None = None,
                 "contracts": {"exchanges": EXCHANGES, "factory": FACTORY, "conditional_tokens": CTF},
                 "sources": SOURCES, "source_inventory_checked_at": "2026-10-01",
                 "collector_versions": store.get("collector_versions"),
+                "witness_order_repair": {key: value for key, value in (store.get(WITNESS_REPAIR_KEY) or {}).items()
+                                         if key != "exchange_blocks"},
                 "grain": "One observed trading-contract wallet address per chain; not a person or signer",
-                "evidence": "One earliest observed raw trade log per wallet; AMM witnesses include factory creation logs. Request bodies and response hashes are retained in registry.sqlite3; full RPC responses are not retained.",
+                "evidence": "One earliest observed raw trade log per wallet, ordered by (block number, log index); AMM witnesses include factory creation logs. Request bodies and response hashes are retained in registry.sqlite3; full RPC responses are not retained.",
                 "coverage": {"lifetime_coverage_proven": False, "assurance": "provider_observed",
                              "limitations": ["RPC providers may silently omit logs; independent full-history coverage is not proven.",
                                              "Only the listed contract inventory and event ABIs are covered.",
@@ -1019,6 +1175,7 @@ def main(argv: list[str] | None = None) -> int:
         store = Store(args.output / "registry.sqlite3")
         rpc = None
         collector = None
+        repair: WitnessOrderRepair | None = None
         manager = (ExportManager(args.output, args.export_scratch_dir, Path(__file__), **snapshot_options)
                    if args.export_mode == "snapshot" else None)
         state, error = "partial", None
@@ -1046,6 +1203,7 @@ def main(argv: list[str] | None = None) -> int:
             live["wal_maintenance"] = wal_maintenance
             live["rpc_wait"] = rpc.wait_state.copy() if rpc else {}
             live["rpc_pacing"] = rpc.pacing_status() if rpc else {}
+            live["witness_order_repair"] = repair.status() if repair else {}
             if not manager and sync_export["snapshot_updated_at"]:
                 try:
                     live["export"]["snapshot_age_s"] = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(
@@ -1138,6 +1296,7 @@ def main(argv: list[str] | None = None) -> int:
                              "snapshot_options": snapshot_options if manager else None})
             store.put("collector_versions", versions)
             collector = Collector(store, rpc, log_cap=args.log_cap)
+            repair = WitnessOrderRepair(store, rpc, log_cap=args.log_cap)
             last_export = time.monotonic()
             previous_time = (previous_export.get("snapshot", {}).get("started_at") if manager else
                              previous_export.get("published_at"))
@@ -1152,6 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
                 progressed = False
                 for stream in streams:
                     progressed |= collector.step(stream)
+                progressed |= repair.step()
                 if not progressed:
                     if rpc.block(end) != store.get("anchor"):
                         raise ValueError("End-block anchor changed during collection")
