@@ -141,6 +141,15 @@ full deadline saved rather than retrying early. This pacing does not guarantee
 a provider quota; Tenderly currently documents a 3,000-result public query limit
 and no numeric public requests-per-second guarantee.
 
+For unattended backfills, `--adaptive-rpc-pacing --request-delay 5` enables
+persistent pacing and in-process throttle recovery. On throttling, the effective
+interval doubles up to 60 seconds; cooldowns grow from one minute to 15 minutes,
+respecting any longer `Retry-After`. A restart preserves the interval and
+deadline. Each 100 successful requests reduce the interval by 10% toward the
+configured minimum. Throttle recovery continues until success, interruption or
+the request budget; ordinary transient failures retain bounded retries. These
+client settings do not establish a guaranteed public quota.
+
 Full exports default to a 12-hour schedule (`--export-interval-s 43200`).
 `--export-mode sync` is the default and pauses collection during exports.
 `--export-mode snapshot` uses one bounded worker while collection continues and

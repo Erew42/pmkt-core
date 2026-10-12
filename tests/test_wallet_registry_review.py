@@ -71,6 +71,234 @@ def rpc_result(request, result):
     )
 
 
+def test_adaptive_throttling_waits_in_process_past_retry_limit_without_advancing(store, clock):
+    starts, queries, waits = [], [], []
+
+    def transport(request):
+        starts.append(clock.now)
+        queries.append(json.loads(request.content)["params"])
+        if len(starts) <= 8:
+            return httpx.Response(429, json={"error": {"code": -32005, "message": "rate limit exceeded"}})
+        return rpc_result(request, [fixtures.event()])
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=5, retry_attempts=2,
+                     adaptive_pacing=True, transport=httpx.MockTransport(transport))
+    rpc.on_wait = lambda: waits.append((rpc.wait_state.copy(), stream_checkpoint(store)))
+    try:
+        assert census.Collector(store, rpc).step("exchange")
+        assert len(queries) == 9 and all(query == queries[0] for query in queries)
+        assert [b - a for a, b in zip(starts, starts[1:])] == [60, 120, 240, 480, 900, 900, 900, 900]
+        assert all(checkpoint == (census.EXCHANGE_START, 8) for _, checkpoint in waits)
+        assert all(wait["reason"] == "throttled" for wait, _ in waits)
+        assert all(seconds <= 30 for seconds in clock.sleeps)
+        assert rpc.effective_delay == 60 and rpc.throttle_streak == 0
+        assert rpc.timings["retries"] == 8
+        assert stream_checkpoint(store)[0] == census.EXCHANGE_START + 8
+        assert store.db.execute("SELECT COUNT(*) FROM ranges").fetchone()[0] == 1
+    finally:
+        rpc.client.close()
+
+
+def test_adaptive_pacing_and_cooldown_survive_budget_exit_and_reopen(store, clock):
+    rpc = census.Rpc(store, "https://rpc.test", delay=5, budget=1, adaptive_pacing=True,
+                     transport=httpx.MockTransport(lambda _: httpx.Response(429)))
+    try:
+        with pytest.raises(census.RequestBudgetReached):
+            census.Collector(store, rpc).step("exchange")
+        assert rpc.calls == 1 and clock.now == 5
+        assert stream_checkpoint(store) == (census.EXCHANGE_START, 8)
+        assert store.get("rpc_retry_after_until") == 1704067200 + 65
+    finally:
+        rpc.client.close()
+    reopened = census.Store(store.path)
+    starts = []
+
+    def transport(request):
+        starts.append(clock.now)
+        return rpc_result(request, "0x89")
+
+    resumed = census.Rpc(reopened, "https://rpc.test", delay=5, adaptive_pacing=True,
+                         transport=httpx.MockTransport(transport))
+    try:
+        assert resumed.effective_delay == 10
+        resumed.call("eth_chainId", [])
+        resumed.call("eth_chainId", [])
+        assert starts == [65, 75]
+        assert reopened.get("rpc_pacing")["effective_delay_s"] == 10
+        assert reopened.get("rpc_pacing")["throttle_streak"] == 0
+    finally:
+        resumed.client.close()
+        reopened.db.close()
+
+
+def test_adaptive_long_retry_after_can_be_interrupted_and_resumed_without_early_request(store, clock):
+    normal_sleep = clock.sleep
+
+    def interrupt_wait(seconds):
+        if seconds:
+            clock.now += 10
+            raise KeyboardInterrupt
+        normal_sleep(seconds)
+
+    clock.sleep = interrupt_wait
+    rpc = census.Rpc(store, "https://rpc.test", delay=0, adaptive_pacing=True,
+                     transport=httpx.MockTransport(lambda _: httpx.Response(429, headers={"Retry-After": "3600"})))
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            rpc.call("eth_chainId", [])
+        assert rpc.calls == 1 and clock.now == 10
+        assert store.get("rpc_retry_after_until") == 1704067200 + 3600
+    finally:
+        rpc.client.close()
+    clock.sleep = normal_sleep
+    starts = []
+
+    def transport(request):
+        starts.append(clock.now)
+        return rpc_result(request, "0x89")
+
+    resumed = census.Rpc(store, "https://rpc.test", delay=0, adaptive_pacing=True,
+                         transport=httpx.MockTransport(transport))
+    try:
+        resumed.call("eth_chainId", [])
+        assert starts == [3600]
+        assert store.get("rpc_retry_after_until") == 1704067200 + 3600
+        assert max(clock.sleeps) <= 30
+    finally:
+        resumed.client.close()
+
+
+@pytest.mark.parametrize("starting_interval,next_interval", [(20, 18), (5.1, 5)])
+def test_adaptive_pacing_reduces_slowly_after_success_and_respects_minimum(
+    store, clock, starting_interval, next_interval,
+):
+    store.put("rpc_pacing", {"rpc": "https://rpc.test", "effective_delay_s": starting_interval, "throttle_streak": 0})
+    rpc = census.Rpc(store, "https://rpc.test", delay=5, adaptive_pacing=True,
+                     transport=httpx.MockTransport(lambda request: rpc_result(request, "0x89")))
+    try:
+        for _ in range(99):
+            rpc.call("eth_chainId", [])
+        assert rpc.effective_delay == starting_interval
+        rpc.call("eth_chainId", [])
+        assert rpc.effective_delay == next_interval
+        assert store.get("rpc_pacing")["effective_delay_s"] == next_interval
+    finally:
+        rpc.client.close()
+
+
+@pytest.mark.parametrize("status,code,message", [
+    (429, -32005, "rate limit exceeded"),
+    (200, 429, "compute units per second capacity exceeded"),
+    (200, -32005, "resource quota exceeded"),
+])
+def test_adaptive_pacing_handles_http_and_rpc_throttles(store, clock, status, code, message):
+    calls = []
+
+    def transport(request):
+        calls.append(clock.now)
+        if len(calls) == 1:
+            payload = json.loads(request.content)
+            return httpx.Response(status, json={"jsonrpc": "2.0", "id": payload["id"],
+                                                "error": {"code": code, "message": message}})
+        return rpc_result(request, "0x89")
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=5, adaptive_pacing=True,
+                     transport=httpx.MockTransport(transport))
+    try:
+        rpc.call("eth_chainId", [])
+        assert calls == [5, 65]
+        assert rpc.effective_delay == 10
+        error = json.loads(store.db.execute("SELECT error FROM requests WHERE error IS NOT NULL").fetchone()[0])
+        assert error["throttled"] and not error["range_limit"]
+    finally:
+        rpc.client.close()
+
+
+def test_adaptive_mode_keeps_transient_failures_bounded_and_range_errors_immediate(store, clock):
+    rpc = census.Rpc(store, "https://rpc.test", delay=0, retry_attempts=2, adaptive_pacing=True,
+                     transport=httpx.MockTransport(lambda _: httpx.Response(503)))
+    try:
+        with pytest.raises(census.RpcError):
+            rpc.call("eth_chainId", [])
+        assert rpc.calls == 2
+        assert rpc.effective_delay == 0
+    finally:
+        rpc.client.close()
+
+    def transport(request):
+        query = json.loads(request.content)["params"][0]
+        if int(query["toBlock"], 16) - int(query["fromBlock"], 16) + 1 > 4:
+            return httpx.Response(400, json={"error": {"code": -32602, "message": "Query returned more than 3000 results."}})
+        return rpc_result(request, [])
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=0, adaptive_pacing=True,
+                     transport=httpx.MockTransport(transport))
+    try:
+        assert census.Collector(store, rpc).step("exchange")
+        assert rpc.calls == 2 and rpc.effective_delay == 0
+        assert stream_checkpoint(store)[0] == census.EXCHANGE_START + 4
+    finally:
+        rpc.client.close()
+
+
+def test_adaptive_mode_waits_for_long_transient_retry_after_with_heartbeat(store, clock):
+    starts, waits = [], []
+
+    def transport(request):
+        starts.append(clock.now)
+        if len(starts) == 1:
+            return httpx.Response(503, headers={"Retry-After": "3600"})
+        return rpc_result(request, "0x89")
+
+    rpc = census.Rpc(store, "https://rpc.test", delay=0, adaptive_pacing=True,
+                     transport=httpx.MockTransport(transport))
+    rpc.on_wait = lambda: waits.append(rpc.wait_state.copy())
+    try:
+        rpc.call("eth_chainId", [])
+        assert starts == [0, 3600]
+        assert len(waits) == 120
+        assert max(clock.sleeps) <= 30
+        assert rpc.effective_delay == 0
+    finally:
+        rpc.client.close()
+
+
+def test_adaptive_cli_pacing_is_recorded_without_changing_pinned_config(tmp_path, clock, monkeypatch):
+    original_rpc = census.Rpc
+
+    def transport(request):
+        payload = json.loads(request.content)
+        if payload["id"] == 1:
+            return httpx.Response(429)
+        if payload["method"] == "eth_chainId":
+            result = "0x89"
+        elif payload["method"] == "eth_getBlockByNumber":
+            result = {"number": payload["params"][0], "hash": "0x" + fixtures.word(9), "timestamp": "0x1"}
+        else:
+            result = []
+        return rpc_result(request, result)
+
+    def build_rpc(store, url, **kwargs):
+        assert kwargs["adaptive_pacing"]
+        return original_rpc(store, url, transport=httpx.MockTransport(transport), **kwargs)
+
+    monkeypatch.setattr(census, "Rpc", build_rpc)
+    assert census.main(["--output", str(tmp_path), "--rpc-url", "https://rpc.test",
+                        "--streams", "factory", "--end-block", str(census.FACTORY_START),
+                        "--max-blocks", "1", "--request-delay", "5",
+                        "--adaptive-rpc-pacing", "--max-requests", "4"]) == 0
+    db = census.Store(tmp_path / "registry.sqlite3")
+    try:
+        version = db.get("collector_versions")[-1]
+        assert version["adaptive_rpc_pacing"] and version["request_delay_s"] == 5
+        assert "adaptive_rpc_pacing" not in db.get("config")
+        assert "request_delay_s" not in db.get("config")
+        assert db.get("rpc_pacing")["effective_delay_s"] == 10
+        assert db.db.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 4
+    finally:
+        db.db.close()
+
+
 @pytest.mark.parametrize("malformation", ["data", "topics", "padding"])
 @pytest.mark.parametrize("known_pool", [False, True])
 def test_amm_abi_validation_applies_only_to_attributed_pools(

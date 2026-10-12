@@ -430,11 +430,12 @@ class RpcError(RuntimeError):
     def __init__(self, message: str, *, http_status: int | None = None,
                  code: int | None = None, retry_after: float | None = None,
                  retryable: bool = False, range_limit: bool = False,
-                 capacity_failure: bool = False):
+                 capacity_failure: bool = False, throttled: bool = False):
         super().__init__(message)
         self.http_status, self.code = http_status, code
         self.retry_after, self.retryable, self.range_limit = retry_after, retryable, range_limit
         self.capacity_failure = capacity_failure
+        self.throttled = throttled
 
 
 class RpcCooldownExceeded(RpcError):
@@ -482,13 +483,26 @@ def is_throttle(message: str, code: int | None = None) -> bool:
 class Rpc:
     def __init__(self, store: Store, url: str, *, delay: float = 1.0,
                  budget: int | None = None, transport: httpx.BaseTransport | None = None,
-                 retry_attempts: int = 6):
+                 retry_attempts: int = 6, adaptive_pacing: bool = False):
         parsed = urlsplit(url)
         if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
             raise ValueError("Use a public HTTPS RPC URL without credentials/query/fragment")
         if not math.isfinite(delay) or delay < 0 or retry_attempts < 1:
             raise ValueError("Invalid RPC pacing/retry bounds")
         self.store, self.url, self.delay, self.budget = store, url, delay, budget
+        self.adaptive_pacing = adaptive_pacing
+        self.effective_delay = delay
+        self.max_delay = max(60.0, delay)
+        self.throttle_streak = self.successes = 0
+        saved = store.get("rpc_pacing") if adaptive_pacing else None
+        if isinstance(saved, dict) and saved.get("rpc") == url:
+            previous_delay = saved.get("effective_delay_s", delay)
+            streak = saved.get("throttle_streak", 0)
+            if (not isinstance(previous_delay, (int, float)) or not math.isfinite(previous_delay)
+                    or previous_delay < 0 or not isinstance(streak, int) or streak < 0):
+                raise ValueError("Invalid saved RPC pacing state")
+            self.effective_delay = min(self.max_delay, max(delay, previous_delay))
+            self.throttle_streak = streak
         # No environment profiles, proxy credentials, cookies or auth providers.
         self.client = httpx.Client(timeout=45, transport=transport, trust_env=False, follow_redirects=False)
         self.calls = 0
@@ -502,18 +516,88 @@ class Rpc:
         self.timings = {"limiter_wait_s": 0.0, "network_s": 0.0, "retry_wait_s": 0.0,
                         "retries": 0}
 
+    def pacing_status(self) -> dict[str, Any]:
+        return {"enabled": self.adaptive_pacing, "minimum_delay_s": self.delay,
+                "effective_delay_s": self.effective_delay, "maximum_delay_s": self.max_delay,
+                "throttle_streak": self.throttle_streak,
+                "successes_since_reduction": self.successes}
+
+    def _save_pacing(self) -> None:
+        self.store.put("rpc_pacing", {"rpc": self.url, "effective_delay_s": self.effective_delay,
+                                      "throttle_streak": self.throttle_streak})
+
+    def _successful_call(self) -> None:
+        if not self.adaptive_pacing:
+            return
+        recovered = self.throttle_streak > 0
+        self.throttle_streak = 0
+        self.successes += 1
+        if self.successes >= 100:
+            self.successes = 0
+            if self.effective_delay > self.delay:
+                self.effective_delay = max(self.delay, self.effective_delay * 0.9)
+                self._save_pacing()
+                return
+        if recovered:
+            self._save_pacing()
+
+    def _wait_adaptive_cooldown(self, reason: str) -> None:
+        # Keep the original provider deadline across interruption/restart. Short
+        # sleeps publish progress and allow signals even for multi-hour cooldowns.
+        deadline = self.store.get("rpc_retry_after_until")
+        remaining = max(0.0, deadline - datetime.now(timezone.utc).timestamp())
+        end = time.monotonic() + remaining
+        while remaining > 0:
+            self.wait_state = {"reason": reason, "remaining_s": remaining,
+                               "not_before": self.store.get("rpc_retry_after_until")}
+            if self.on_wait:
+                self.on_wait()
+            time.sleep(min(30.0, remaining))
+            remaining = max(0.0, end - time.monotonic(), deadline - datetime.now(timezone.utc).timestamp())
+        self.resume_wait_s = 0.0
+        self.wait_state = {}
+
+    def _throttle(self, exc: RpcError) -> None:
+        self.throttle_streak += 1
+        self.successes = 0
+        self.effective_delay = min(self.max_delay, max(1.0, self.delay, self.effective_delay * 2))
+        # At most four probes/hour during a prolonged outage, instead of six
+        # quick probes plus repeated interpreter restarts. Retry-After is a floor.
+        wait = max(exc.retry_after or 0.0, min(900.0, 60.0 * 2 ** min(self.throttle_streak - 1, 4)))
+        deadline = datetime.now(timezone.utc).timestamp() + wait
+        with self.store.db:
+            self.store.db.executemany("INSERT OR REPLACE INTO metadata VALUES (?,?)", [
+                ("rpc_retry_after_until", dumps(deadline)),
+                ("rpc_pacing", dumps({"rpc": self.url, "effective_delay_s": self.effective_delay,
+                                       "throttle_streak": self.throttle_streak})),
+            ])
+        self.resume_wait_s = wait
+        if self.budget is not None and self.calls >= self.budget:
+            raise RequestBudgetReached("Invocation request budget reached") from exc
+        started = time.monotonic()
+        self._wait_adaptive_cooldown("throttled")
+        self.timings["retry_wait_s"] += time.monotonic() - started
+        self.timings["retries"] += 1
+
     def call(self, method: str, params: list[Any]) -> tuple[Any, int]:
         if method not in READ_METHODS:
             raise ValueError("RPC method is outside the public read allowlist")
         capacity_failures = 0
-        for attempt in range(self.retry_attempts):
+        attempt = 0
+        while attempt < self.retry_attempts:
             try:
-                return self._call_once(method, params)
+                result = self._call_once(method, params)
+                self._successful_call()
+                return result
             except RpcError as exc:
                 if isinstance(exc, RpcCooldownExceeded):
                     raise  # A saved deadline must not be extended on resume.
                 if not exc.retryable and exc.retry_after is None:
                     raise
+                if self.adaptive_pacing and exc.retryable and exc.throttled:
+                    capacity_failures = 0
+                    self._throttle(exc)
+                    continue
                 capacity_failures = capacity_failures + 1 if exc.capacity_failure else 0
                 wait = exc.retry_after if exc.retry_after is not None else min(60.0, 2.0 ** attempt)
                 # Persist cooldown before a budget exit, interruption, or service
@@ -522,7 +606,7 @@ class Rpc:
                 self.resume_wait_s = wait
                 self.wait_state = {"reason": "provider_cooldown" if exc.retry_after is not None else "backoff",
                                    "remaining_s": wait, "not_before": self.store.get("rpc_retry_after_until")}
-                if wait > MAX_RETRY_AFTER_S:
+                if wait > MAX_RETRY_AFTER_S and not (self.adaptive_pacing and exc.retryable):
                     raise RpcCooldownExceeded(
                         f"Provider Retry-After {wait:g}s exceeds the {MAX_RETRY_AFTER_S:g}s wait limit; "
                         "full cooldown retained, no early retry", http_status=exc.http_status,
@@ -538,13 +622,17 @@ class Rpc:
                 if self.budget is not None and self.calls >= self.budget:
                     raise RequestBudgetReached("Invocation request budget reached") from exc
                 started = time.monotonic()
-                if self.on_wait:
-                    self.on_wait()
-                time.sleep(wait)
+                if self.adaptive_pacing:
+                    self._wait_adaptive_cooldown(str(self.wait_state["reason"]))
+                else:
+                    if self.on_wait:
+                        self.on_wait()
+                    time.sleep(wait)
                 self.resume_wait_s = 0.0
                 self.wait_state = {}
                 self.timings["retry_wait_s"] += time.monotonic() - started
                 self.timings["retries"] += 1
+                attempt += 1
         raise ValueError("RPC retry attempts must be positive")
 
     def _call_once(self, method: str, params: list[Any]) -> tuple[Any, int]:
@@ -554,16 +642,19 @@ class Rpc:
         if self.resume_wait_s:
             self.wait_state = {"reason": "resumed_cooldown", "remaining_s": self.resume_wait_s,
                                "not_before": self.store.get("rpc_retry_after_until")}
-            if self.resume_wait_s > MAX_RETRY_AFTER_S:
+            if self.adaptive_pacing:
+                self._wait_adaptive_cooldown("resumed_cooldown")
+            elif self.resume_wait_s > MAX_RETRY_AFTER_S:
                 raise RpcCooldownExceeded(
                     f"Remaining provider cooldown {self.resume_wait_s:g}s exceeds the {MAX_RETRY_AFTER_S:g}s wait limit; "
                     "no RPC request made", retry_after=self.resume_wait_s)
-            if self.on_wait:
-                self.on_wait()
-            time.sleep(self.resume_wait_s)
+            if not self.adaptive_pacing:
+                if self.on_wait:
+                    self.on_wait()
+                time.sleep(self.resume_wait_s)
             self.resume_wait_s = 0.0
             self.wait_state = {}
-        time.sleep(max(0, self.delay - (time.monotonic() - self.last_call)))
+        time.sleep(max(0, self.effective_delay - (time.monotonic() - self.last_call)))
         self.timings["limiter_wait_s"] += time.monotonic() - waited
         request_id = self.store.record_request(self.url, method, params, utc_now())
         self.calls += 1
@@ -596,7 +687,7 @@ class Rpc:
                                retryable=transient and not invalid_request,
                                range_limit=not transient and method == "eth_getLogs" and is_range_limit(message),
                                capacity_failure=method == "eth_getLogs" and status in (502, 504)
-                               and not throttle and not header_present)
+                               and not throttle and not header_present, throttled=throttle)
             payload = response.json()
             if not isinstance(payload, dict) or payload.get("jsonrpc") != "2.0" or payload.get("id") != request_id:
                 raise RpcError(f"Invalid RPC response (HTTP {status})")
@@ -617,13 +708,14 @@ class Rpc:
                                code=code if isinstance(code, int) else None,
                                retry_after=retry_after_seconds(response.headers.get("retry-after")),
                                retryable=retryable, range_limit=range_limit,
-                               capacity_failure=method == "eth_getLogs" and timeout and not header_present and not throttle)
+                               capacity_failure=method == "eth_getLogs" and timeout and not header_present and not throttle,
+                               throttled=throttle)
             return payload["result"], request_id
         except RpcError as exc:
             error = dumps({"message": str(exc)[:600], "http_status": exc.http_status,
                            "rpc_code": exc.code, "retry_after_s": exc.retry_after,
                            "retryable": exc.retryable, "range_limit": exc.range_limit,
-                           "capacity_failure": exc.capacity_failure})
+                           "capacity_failure": exc.capacity_failure, "throttled": exc.throttled})
             raise
         except KeyboardInterrupt:
             error = "Interrupted during RPC request"
@@ -834,6 +926,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--max-blocks", type=int, default=100_000)
     parser.add_argument("--log-cap", type=int, default=5000, help="Split responses at/above this suspected truncation threshold")
     parser.add_argument("--request-delay", type=float, default=1.0, help="Minimum seconds between request starts (default: 1)")
+    parser.add_argument("--adaptive-rpc-pacing", action="store_true",
+                        help="Persist slower pacing after throttling and wait in-process until the provider recovers")
     parser.add_argument("--export-interval-s", type=int, default=43200, help="Full export interval in seconds (default: 43200 / 12 hours)")
     parser.add_argument("--export-mode", choices=("sync", "snapshot"), default="sync")
     parser.add_argument("--export-scratch-dir", type=Path, help="Snapshot scratch directory on SSD outside this checkout")
@@ -938,6 +1032,7 @@ def main(argv: list[str] | None = None) -> int:
             previous_worker_running = worker_running
             live["wal_maintenance"] = wal_maintenance
             live["rpc_wait"] = rpc.wait_state.copy() if rpc else {}
+            live["rpc_pacing"] = rpc.pacing_status() if rpc else {}
             if not manager and sync_export["snapshot_updated_at"]:
                 try:
                     live["export"]["snapshot_age_s"] = max(0.0, (datetime.now(timezone.utc) - datetime.fromisoformat(
@@ -1012,7 +1107,8 @@ def main(argv: list[str] | None = None) -> int:
                 state = "exported"
                 full_export()
                 return 0
-            rpc = Rpc(store, args.rpc_url, delay=args.request_delay, budget=args.max_requests)
+            rpc = Rpc(store, args.rpc_url, delay=args.request_delay, budget=args.max_requests,
+                      adaptive_pacing=args.adaptive_rpc_pacing)
             rpc.on_wait = publish_live
             chain, _ = rpc.call("eth_chainId", [])
             if quantity(chain) != CHAIN_ID:
@@ -1031,6 +1127,7 @@ def main(argv: list[str] | None = None) -> int:
                              "exporter_sha256": hashlib.sha256(Path(__file__).with_name("wallet_registry_export.py").read_bytes()).hexdigest(),
                              "export_interval_s": args.export_interval_s, "export_mode": args.export_mode,
                              "request_delay_s": args.request_delay,
+                             "adaptive_rpc_pacing": args.adaptive_rpc_pacing,
                              "snapshot_options": snapshot_options if manager else None})
             store.put("collector_versions", versions)
             collector = Collector(store, rpc, log_cap=args.log_cap)

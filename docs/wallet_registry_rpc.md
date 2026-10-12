@@ -20,6 +20,25 @@ venue endpoint, or paid service is used. The RPC transport accepts only
 It verifies Polygon mainnet (137), freezes an inclusive end at latest minus 256
 blocks, and checks the end-block hash on resume and completion.
 
+For an unattended public-RPC backfill, enable `--adaptive-rpc-pacing` and use
+`--request-delay 5` to smooth short request bursts. Five seconds is a conservative
+client setting, not a documented provider allowance. On a recognized HTTP or
+JSON-RPC throttle, adaptive mode doubles the effective request interval up to
+60 seconds, then waits in-process for 60, 120, 240, 480 and at most 900 seconds
+between probes. A longer `Retry-After` remains authoritative. Throttling does
+not consume the ordinary transient-error retry limit or reduce the block range.
+Collection retries the same request until recovery, an invocation request budget,
+or interruption. Every attempt still counts toward `--max-requests`.
+
+The effective interval and throttle streak are persisted in `rpc_pacing`
+metadata. After recovery, each 100 successful RPC calls reduce the interval by
+10%, down to the configured minimum. A restart preserves the slower interval and
+any unexpired cooldown instead of resetting to the fastest setting. Cooldowns
+publish status in chunks of at most 30 seconds; `rpc_pacing` in live status shows
+the current interval and recovery counters. These operational settings are
+recorded in collector versions and do not change the pinned dataset inventory.
+An unpublished shared-IP quota can still throttle the collector.
+
 The first research dataset is a registry, not each wallet's full trade history.
 The script scans these public settlement events:
 
@@ -123,12 +142,15 @@ retained across restarts, including request-budget exits and interrupted retry
 waits. The request error record includes HTTP status, RPC code and parsed
 `Retry-After`.
 
-A provider cooldown longer than 900 seconds stops the invocation with an error
+A provider cooldown longer than 900 seconds in the default, non-adaptive mode stops the invocation with an error
 without shortening the delay. The full not-before deadline remains saved.
 A restart with more than 900 seconds remaining also fails before an RPC call;
 once the remainder is within that bound, collection
 waits it out before requesting again. This limit bounds a single wait, not the
 provider's cooldown.
+Adaptive mode waits out longer saved deadlines with interruptible status updates
+and no requests before the deadline. Ordinary transport/server failures still
+have bounded retries, and permanent errors still fail immediately.
 
 Recognized provider range/result limits, or responses reaching `--log-cap`
 (default 5,000), shrink the range immediately. Two consecutive capacity failures
@@ -147,7 +169,7 @@ as provider observations. Public RPC can silently omit data, and the cap does
 not prove absence of truncation below the threshold. All configured ranges
 being scanned is distinct from independently verified lifetime coverage.
 
-Provider limits checked on 2026-10-07: [Tenderly's public endpoint
+Provider limits checked on 2026-10-08: [Tenderly's public endpoint
 documentation](https://docs.tenderly.co/node-rpc/overview#public-endpoint-limits)
 lists a 3,000-result limit per `eth_getLogs` call and the oversized-query error
 `-32602`; its network table lists no daily response-byte limit for Polygon.
