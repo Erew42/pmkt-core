@@ -33,7 +33,36 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
+
+
+class WebSocketMessagePump:
+    """Keep one receive alive across timer wakes; cancel it before iterator close."""
+
+    def __init__(self, iterator: AsyncIterator[dict[str, Any]]) -> None:
+        self.iterator = iterator
+        self.pending: asyncio.Future[dict[str, Any]] | None = None
+
+    async def wait(self, timeout: float) -> bool:
+        if self.pending is None:
+            self.pending = asyncio.ensure_future(anext(self.iterator))
+        done, _ = await asyncio.wait({self.pending}, timeout=max(0.0, timeout))
+        return self.pending in done
+
+    def pop(self) -> dict[str, Any]:
+        if self.pending is None:
+            raise RuntimeError("no pending receive")
+        pending, self.pending = self.pending, None
+        return pending.result()
+
+    async def close(self) -> None:
+        if self.pending is not None:
+            self.pending.cancel()
+            await asyncio.gather(self.pending, return_exceptions=True)
+            self.pending = None
+        close = getattr(self.iterator, "aclose", None)
+        if close is not None:
+            await close()
 
 
 class WebSocketDeadlineExceeded(ConnectionError):
@@ -44,14 +73,16 @@ class WebSocketRetryBudget:
     """One attempt counter shared by startup, receive, and requested recovery.
 
     The initial connection is free; each replacement attempt consumes one retry.
-    Successful connections don't reset the capture's budget.
+    Successful connections don't reset the capture's budget. ``None`` permits
+    ongoing managed feeds to retry indefinitely, with an optional delay cap.
     """
 
     def __init__(
         self,
-        max_reconnects: int = 3,
+        max_reconnects: int | None = 3,
         *,
         backoff: float = 0.5,
+        max_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         on_retry: Callable[[dict[str, Any]], None] | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -60,6 +91,7 @@ class WebSocketRetryBudget:
     ) -> None:
         self.max_reconnects = max_reconnects
         self.backoff = backoff
+        self.max_backoff = max_backoff
         self.on_retry = on_retry
         self.retry_context: dict[str, Any] = {}
         self.on_reconnect = on_reconnect
@@ -71,7 +103,7 @@ class WebSocketRetryBudget:
 
     @property
     def available(self) -> bool:
-        return self.used < self.max_reconnects
+        return self.max_reconnects is None or self.used < self.max_reconnects
 
     def check_deadline(self) -> None:
         if self.deadline is not None and self.clock() >= self.deadline:
@@ -143,7 +175,10 @@ class WebSocketRetryBudget:
                 if self.on_reconnect is not None:
                     self.on_reconnect()
                 if not immediate_first:
-                    await self._bounded(lambda: self.sleep(self.backoff * self.used))
+                    delay = self.backoff * self.used
+                    if self.max_backoff is not None:
+                        delay = min(delay, self.max_backoff)
+                    await self._bounded(lambda: self.sleep(delay))
                 immediate_first = False
                 self.check_deadline()
             try:

@@ -423,6 +423,9 @@
         "FeedRecoveryAction",
         "FeedShardHealth",
         "LiveFeedSupervisor",
+        "ManagedBookFeed",
+        "PublicBook",
+        "PublicBookHealth",
         "RecordingOptions",
         "RuntimeFeedProjectionRecorder",
         "StreamDatasetSpec",
@@ -437,7 +440,11 @@
         "run_fake_websocket_load_replay",
         "validate_parquet_rotation_config"
       ],
-      "tier_overrides": {}
+      "tier_overrides": {
+        "ManagedBookFeed": "supported",
+        "PublicBook": "supported",
+        "PublicBookHealth": "supported"
+      }
     },
     "pmkt.text": {
       "default_tier": "advanced",

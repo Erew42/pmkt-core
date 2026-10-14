@@ -101,6 +101,7 @@ jobs:
               tests/test_kalshi_integration.py
               tests/test_kalshi_ws.py
               tests/test_live_feed_supervisor.py
+              tests/test_managed_feed.py
               tests/test_recording.py
               tests/test_recording_cli.py
               tests/test_streaming_collector.py

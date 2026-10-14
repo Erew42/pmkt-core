@@ -29,6 +29,7 @@ from pmkt.exchanges.polymarket.ws import (
 from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
 from pmkt.exchanges.ws_transport import (
     WebSocketDeadlineExceeded,
+    WebSocketMessagePump,
     WebSocketRetryBudget,
     WebSocketTransportSettings,
 )
@@ -123,8 +124,8 @@ class VenueBooks:
                 views.append(
                     BookView(
                         state.asset_id,
-                        state.bids,
-                        state.asks,
+                        {float(p): float(q) for p, q in state.bids.items()},
+                        {float(p): float(q) for p, q in state.asks.items()},
                         state.initial_snapshot_received,
                         state.book_integrity_valid,
                         state.valid_state,
@@ -167,8 +168,8 @@ class VenueBooks:
             views.append(
                 BookView(
                     key + ":YES",
-                    state_k.yes_bids,
-                    state_k.no_bids,
+                    {float(p): float(q) for p, q in state_k.yes_bids.items()},
+                    {float(p): float(q) for p, q in state_k.no_bids.items()},
                     state_k.initial_snapshot_received,
                     state_k.book_integrity_valid,
                     state_k.valid_state,
@@ -303,7 +304,7 @@ async def record_feed(
             **shared,
         )
     iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
-    pending: asyncio.Task[Any] | None = None
+    pump = WebSocketMessagePump(iterator)
     error: BaseException | None = None
     reason, normal = "interrupted", False
     try:
@@ -311,8 +312,6 @@ async def record_feed(
             if deadline is not None and time.monotonic() >= deadline:
                 reason, normal = "duration", True
                 break
-            if pending is None:
-                pending = asyncio.create_task(anext(iterator))
             # Keep one receive task alive across timer checks. Cancelling an async
             # generator on every timer would lose its connection and queued data.
             wake = min(
@@ -324,31 +323,26 @@ async def record_feed(
             complement = books.complementary.next_deadline_ns
             if complement is not None:
                 wake = min(wake, complement / 1_000_000_000)
-            done, _ = await asyncio.wait(
-                {pending}, timeout=max(0.0, wake - time.monotonic())
-            )
+            received = await pump.wait(wake - time.monotonic())
             # Enforce the grace bound before a late corrective message can
             # erase the evidence that this connection needs a fresh snapshot.
             if books.complementary.recovery_due(
-                message_count=recorder.source_sequence + int(pending in done),
+                message_count=recorder.source_sequence + int(received),
                 now_ns=time.monotonic_ns(),
             ):
-                pending.cancel()
-                await asyncio.gather(pending, return_exceptions=True)
-                pending = None
-                await iterator.aclose()
+                await pump.close()
                 await budget.run(
                     client.reconnect, retry_first=True, immediate_first=True
                 )
                 iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
+                pump = WebSocketMessagePump(iterator)
                 continue
-            if pending in done:
+            if received:
                 try:
-                    message = pending.result()
+                    message = pump.pop()
                 except StopAsyncIteration:
                     reason = "feed_ended"
                     break
-                pending = None
                 source = recorder.message(message)
                 recorder.observe_books(
                     books.apply(message, recorder.source_sequence), source=source
@@ -406,15 +400,12 @@ async def record_feed(
                 # A single bounded policy: obtain fresh subscriptions for the
                 # connection. The existing Polymarket corrective-delta grace
                 # avoids reconnecting between complementary updates.
-                if pending is not None:
-                    pending.cancel()
-                    await asyncio.gather(pending, return_exceptions=True)
-                    pending = None
-                await iterator.aclose()
+                await pump.close()
                 await budget.run(
                     client.reconnect, retry_first=True, immediate_first=True
                 )
                 iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
+                pump = WebSocketMessagePump(iterator)
     except WebSocketDeadlineExceeded:
         reason, normal = "duration", True
     except BaseException as exc:
@@ -425,11 +416,8 @@ async def record_feed(
         if not recorder.store.failed:
             recorder.invalidate("feed_interrupted")
     finally:
-        if pending is not None:
-            pending.cancel()
-            await asyncio.gather(pending, return_exceptions=True)
         with contextlib.suppress(Exception):
-            await iterator.aclose()
+            await pump.close()
         # Take any terminal sample before our own socket teardown. A cancellation
         # during teardown is still recorded as cancellation and propagated.
         try:

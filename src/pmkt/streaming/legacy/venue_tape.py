@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any, Iterable, Mapping
+
+from pmkt.exchanges.book_integrity import finite_decimal
 
 from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.exchanges.polymarket.ws import MarketBookState
@@ -29,7 +32,7 @@ def polymarket_delta_levels(
             continue
         raw_side = str(change.get("side") or "").upper()
         side = "bid" if raw_side in {"BUY", "BID", "BIDS"} else "ask" if raw_side in {"SELL", "ASK", "ASKS"} else None
-        price = _float_or_none(change.get("price"))
+        price = finite_decimal(change.get("price"))
         if side is None or price is None:
             continue
         ladder = state.bids if side == "bid" else state.asks
@@ -37,7 +40,7 @@ def polymarket_delta_levels(
             NativeBookLevel(
                 source_side=side,
                 price=price,
-                size_after_contracts=ladder.get(price, 0.0),
+                size_after_contracts=ladder.get(price, Decimal(0)),
                 size_delta_contracts=None,
                 level_ordinal=ordinal,
             )
@@ -58,7 +61,7 @@ def kalshi_delta_levels(
     side = str(payload.get("side") or "").lower()
     if side not in {"yes", "no"}:
         return ()
-    price = _first_float(payload.get("price_dollars"), payload.get("price"))
+    price = finite_decimal(payload.get("price_dollars", payload.get("price")))
     delta = _first_float(
         payload.get("delta_fp"), payload.get("delta"), payload.get("size_delta")
     )
@@ -69,7 +72,7 @@ def kalshi_delta_levels(
         NativeBookLevel(
             source_side=side,
             price=price,
-            size_after_contracts=ladder.get(price, 0.0),
+            size_after_contracts=ladder.get(price, Decimal(0)),
             size_delta_contracts=delta,
             level_ordinal=0,
         ),
@@ -77,7 +80,7 @@ def kalshi_delta_levels(
 
 
 def _ordered_full_levels(
-    *sides: tuple[str, Mapping[float, float]],
+    *sides: tuple[str, Mapping[Decimal, Decimal]],
 ) -> tuple[NativeBookLevel, ...]:
     rows: list[NativeBookLevel] = []
     ordinal = 0

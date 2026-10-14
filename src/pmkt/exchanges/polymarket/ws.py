@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from decimal import Decimal
 import inspect
 import json
 import logging
@@ -20,8 +21,9 @@ from typing import (
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
-from pmkt.exchanges.book_integrity import finite_number, well_formed_levels
+from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
@@ -135,7 +137,7 @@ def application_heartbeat_token(raw: Any) -> str | None:
     return None
 
 
-def decode_market_messages(raw: Any) -> list[dict[str, Any]]:
+def decode_market_messages(raw: Any, *, strict: bool = False) -> list[dict[str, Any]]:
     """Decode a raw websocket frame into market message dictionaries."""
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
@@ -144,8 +146,10 @@ def decode_market_messages(raw: Any) -> list[dict[str, Any]]:
         if not frame or frame.upper() in {"PING", "PONG"}:
             return []
         try:
-            decoded = json.loads(frame)
+            decoded = json.loads(frame, parse_float=Decimal if strict else float)
         except json.JSONDecodeError:
+            if strict:
+                raise WebSocketProtocolError("invalid market JSON") from None
             logger.warning("Failed to parse websocket message: %s", raw)
             return []
     else:
@@ -154,27 +158,13 @@ def decode_market_messages(raw: Any) -> list[dict[str, Any]]:
     if isinstance(decoded, dict):
         return [decoded]
     if isinstance(decoded, list):
+        if strict and any(not isinstance(item, dict) for item in decoded):
+            raise WebSocketProtocolError("non-object market message")
         return [item for item in decoded if isinstance(item, dict)]
+    if strict:
+        raise WebSocketProtocolError("non-object market frame")
     return []
 
-
-def _levels_to_map(levels: Any) -> dict[float, float]:
-    parsed: dict[float, float] = {}
-    if not isinstance(levels, list):
-        return parsed
-    for level in levels:
-        if isinstance(level, dict):
-            price = _parse_float(level.get("price"))
-            size = _parse_float(level.get("size"))
-        elif isinstance(level, (list, tuple)) and len(level) >= 2:
-            price = _parse_float(level[0])
-            size = _parse_float(level[1])
-        else:
-            continue
-        if price is None or size is None or size <= 0:
-            continue
-        parsed[price] = size
-    return parsed
 
 
 def _previous_hash(change: dict[str, Any], parent: dict[str, Any]) -> str | None:
@@ -268,10 +258,10 @@ class MarketBookState:
 
     asset_id: str
     market: str | None = None
-    bids: dict[float, float] = field(default_factory=dict)
-    asks: dict[float, float] = field(default_factory=dict)
-    best_bid: float | None = None
-    best_ask: float | None = None
+    bids: dict[Decimal, Decimal] = field(default_factory=dict)
+    asks: dict[Decimal, Decimal] = field(default_factory=dict)
+    best_bid: Decimal | None = None
+    best_ask: Decimal | None = None
     last_trade_price: float | None = None
     last_trade_size: float | None = None
     last_trade_side: str | None = None
@@ -302,13 +292,13 @@ class MarketBookState:
             market=self.market,
             event_type=event_type or self.last_event_type,
             timestamp=self.timestamp,
-            best_bid=self.best_bid,
-            best_ask=self.best_ask,
+            best_bid=float(self.best_bid) if self.best_bid is not None else None,
+            best_ask=float(self.best_ask) if self.best_ask is not None else None,
             best_bid_size=(
-                self.bids.get(self.best_bid) if self.best_bid is not None else None
+                float(self.bids[self.best_bid]) if self.best_bid in self.bids else None
             ),
             best_ask_size=(
-                self.asks.get(self.best_ask) if self.best_ask is not None else None
+                float(self.asks[self.best_ask]) if self.best_ask in self.asks else None
             ),
             bid_depth=len(self.bids),
             ask_depth=len(self.asks),
@@ -327,8 +317,8 @@ class MarketBookState:
 
     def apply_book(self, message: dict[str, Any]) -> MarketStreamSnapshot:
         self.market = str(message.get("market") or self.market or "")
-        self.bids = _levels_to_map(message.get("bids"))
-        self.asks = _levels_to_map(message.get("asks"))
+        self.bids = decimal_levels(message.get("bids"))
+        self.asks = decimal_levels(message.get("asks"))
         self.timestamp = message.get("timestamp")
         self.last_hash = (
             str(message["hash"]) if message.get("hash") is not None else self.last_hash
@@ -358,11 +348,11 @@ class MarketBookState:
             self.valid_state = False
             self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
         side = str(change.get("side") or "").upper()
-        price = finite_number(change.get("price"))
-        size = finite_number(change.get("size"))
+        price = finite_decimal(change.get("price"))
+        size = finite_decimal(change.get("size"))
         if (side not in {"BUY", "BID", "BIDS", "SELL", "ASK", "ASKS"}
                 or price is None or size is None
-                or finite_number(price) is None or finite_number(size) is None
+                or finite_decimal(price) is None or finite_decimal(size) is None
                 or not 0 <= price <= 1 or size < 0):
             self.quality_flags.add("malformed_book")
         else:
@@ -438,7 +428,7 @@ class MarketBookState:
         self.last_hash = None
         self.last_book_hash = None
 
-    def _set_level(self, side: str, price: float, size: float) -> None:
+    def _set_level(self, side: str, price: Decimal, size: Decimal) -> None:
         if side in {"BUY", "BID", "BIDS"}:
             book_side = self.bids
         elif side in {"SELL", "ASK", "ASKS"}:
@@ -452,8 +442,8 @@ class MarketBookState:
         self._recompute_best_prices()
 
     def _apply_best_fields(self, payload: dict[str, Any]) -> None:
-        best_bid = _parse_float(payload.get("best_bid"))
-        best_ask = _parse_float(payload.get("best_ask"))
+        best_bid = finite_decimal(payload.get("best_bid"))
+        best_ask = finite_decimal(payload.get("best_ask"))
         if best_bid is not None:
             self.best_bid = best_bid
         if best_ask is not None:
@@ -630,6 +620,8 @@ class AsyncMarketWebSocketClient:
     @property
     def is_connected(self) -> bool:
         if self._ws is None:
+            return False
+        if getattr(self._ws, "state", None) in {State.CLOSING, State.CLOSED}:
             return False
         return not bool(getattr(self._ws, "closed", False))
 
@@ -836,6 +828,7 @@ class AsyncMarketWebSocketClient:
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
+        strict_decode: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
         # A capture supplies one budget for startup and all iterator generations.
         budget = self._retry_budget or WebSocketRetryBudget(
@@ -869,7 +862,7 @@ class AsyncMarketWebSocketClient:
                     )
                     self.last_frame_received_monotonic_ns = time.monotonic_ns()
                     self.last_frame_sequence += 1
-                    for index, message in enumerate(decode_market_messages(raw)):
+                    for index, message in enumerate(decode_market_messages(raw, strict=strict_decode)):
                         self.last_message_index_in_frame = index
                         yield message
                 if self._heartbeat_error is not None:
