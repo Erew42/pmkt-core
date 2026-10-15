@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from pmkt.exchanges.book_integrity import finite_number
+from pmkt.exchanges.book_integrity import finite_decimal
 from pmkt.exchanges.polymarket.ws import MarketBookState
 
 
@@ -104,12 +104,12 @@ class ComplementaryDeltaRecovery:
             if asset not in previously_intact or asset in self.pending or state is None:
                 continue
             bid, ask = (
-                finite_number(change.get("best_bid")),
-                finite_number(change.get("best_ask")),
+                finite_decimal(change.get("best_bid")),
+                finite_decimal(change.get("best_ask")),
             )
             size, price = (
-                finite_number(change.get("size")),
-                finite_number(change.get("price")),
+                finite_decimal(change.get("size")),
+                finite_decimal(change.get("price")),
             )
             timestamp, book_hash = (
                 str(message.get("timestamp") or ""),

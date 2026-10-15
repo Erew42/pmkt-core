@@ -306,7 +306,7 @@ def test_kalshi_orderbook_delta_removes_depleted_level() -> None:
 
     assert snapshot.yes_bid == pytest.approx(0.3)
     assert snapshot.yes_bid_depth == 1
-    assert states["KXTEST"].yes_bids == {0.3: 1.0}
+    assert states["KXTEST"].yes_bids == {Decimal("0.3"): Decimal("1.0")}
 
 
 def test_kalshi_orderbook_preserves_explicit_zero_price_fields() -> None:
@@ -856,3 +856,38 @@ async def test_kalshi_iter_messages_surfaces_unrelated_attribute_error() -> None
     ) as client:
         with pytest.raises(AttributeError, match="application bug"):
             await client.iter_messages(max_reconnects=1).__anext__()
+
+
+def test_kalshi_decimal_deltas_cancel_exactly_and_snapshots_remain_float():
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+        "msg": {"market_ticker": "KXTEST", "yes_dollars_fp": [["0.3", "0.10"]],
+                "no_dollars_fp": [["0.6", "1.23"]]}})
+    for seq, delta in enumerate(["0.01"] * 20 + ["-0.30"], start=2):
+        state.apply_delta({"type": "orderbook_delta", "sid": 7, "seq": seq,
+            "msg": {"market_ticker": "KXTEST", "side": "yes", "price_dollars": "0.3",
+                    "delta_fp": delta}})
+    assert state.yes_bids == {}
+    assert state.no_bids == {Decimal("0.6"): Decimal("1.23")}
+    assert state.book_integrity_valid
+    legacy = state.snapshot().as_dict()
+    assert isinstance(legacy["yes_ask"], float)
+    assert isinstance(legacy["yes_ask_size"], float)
+
+
+def test_kalshi_snapshot_size_overflowing_float_is_malformed():
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+        "msg": {"market_ticker": "KXTEST", "yes_dollars_fp": [["0.3", "1e999"]]}})
+    assert not state.book_integrity_valid
+    assert state.yes_bids == {}
+
+
+def test_kalshi_negative_exact_size_is_integrity_failure():
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot({"type": "orderbook_snapshot", "sid": 7, "seq": 1,
+        "msg": {"yes_dollars_fp": [["0.3", "0.10"]]}})
+    state.apply_delta({"type": "orderbook_delta", "sid": 7, "seq": 2,
+        "msg": {"side": "yes", "price_dollars": "0.3", "delta_fp": "-0.1000000001"}})
+    assert not state.book_integrity_valid
+    assert "malformed_book" in state.quality_flags

@@ -838,6 +838,15 @@ The following `pmkt.data` conveniences are inherited rather than promoted:
 remains absent. Keep the import for compatibility, but do not use that name in
 new quickstarts.
 
+## Managed public books
+
+`pmkt.streaming.ManagedBookFeed`, `PublicBook`, and `PublicBookHealth` are supported
+in-memory public order-book interfaces for both venues. See
+[managed book feeds](managed-book-feeds.md) for lifecycle, exact decimal ladders,
+connection generations, liveness and consumer adoption. Existing mutable state
+ladder keys and sizes now use `Decimal`; legacy snapshot projections and canonical
+storage schemas retain floats at their explicit boundaries.
+
 ## Inherited advanced surfaces
 
 The complete inherited facade membership is recorded in the machine-readable
@@ -851,7 +860,7 @@ separate `pmkt.catalog` facade.
 
 `MarketCatalogService` remains the mutable maintenance service and the CLI
 `query` command exposes an unmanaged DuckDB connection. Use `pmkt.catalog` for
-the pinned reader and bounded managed query result. WebSocket clients retain their transport and book-state behavior. The two
+the pinned reader and bounded managed query result. WebSocket clients retain their transport behavior; the decimal state-map change is documented above. The two
 `stream_*_order_book_data` recording entrypoints now implement
 [the simplified recording contract](stream_recording_contract.md). Historical
 storage-profile arguments are removed; use `mode`, `depth_check_interval_s`,

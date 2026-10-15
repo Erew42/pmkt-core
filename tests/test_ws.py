@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from decimal import Decimal
 from collections import deque
 from copy import deepcopy
 from typing import Any
@@ -913,10 +914,10 @@ def test_apply_market_message_keeps_independent_asset_state() -> None:
     )
 
     assert [snapshot.asset_id for snapshot in snapshots] == ["a1", "a2"]
-    assert states["a1"].best_bid == 0.2
+    assert states["a1"].best_bid == Decimal("0.2")
     assert states["a1"].best_ask is None
     assert states["a2"].best_bid is None
-    assert states["a2"].best_ask == 0.8
+    assert states["a2"].best_ask == Decimal("0.8")
 
 
 def test_apply_market_message_does_not_allocate_unowned_asset_state() -> None:
@@ -987,7 +988,7 @@ def test_apply_market_message_recomputes_levels_and_ignores_tick_observation() -
     assert zero_size.bid_depth == 1
     assert tick_snapshots == []
     assert states["a1"] == before_tick
-    assert states["a1"].best_ask == pytest.approx(0.6)
+    assert states["a1"].best_ask == Decimal("0.6")
 
 
 def test_market_price_change_before_book_is_invalid() -> None:
