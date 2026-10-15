@@ -64,6 +64,8 @@ class _Recovery:
     reason: str
     deadline: float
     phase: Literal["grace", "pending", "sending", "waiting", "cooldown"]
+    # A valid snapshot arrived while the request was still being sent.
+    answered: bool = False
 
 
 @dataclass
@@ -83,6 +85,11 @@ class _Shard:
     last_error: str | None = None
     sid: int | None = None
     command_id: int | None = None
+    # Resolution is terminal: kept across snapshots, recoveries and generations.
+    resolved: set[str] = field(default_factory=set)
+    # Native market identity first seen per instrument, kept across book resets so
+    # market-scoped lifecycle events still find instruments under recovery.
+    market_ids: dict[str, str] = field(default_factory=dict)
 
 
 class ManagedBookFeed:
@@ -129,6 +136,9 @@ class ManagedBookFeed:
                 raise ValueError(f"{name} must be finite and positive")
         if probe_interval >= liveness_timeout:
             raise ValueError("probe_interval must be less than liveness_timeout")
+        if venue == "kalshi" and auth is None:
+            # Not a transport fault: retrying would only hide the misconfiguration.
+            raise ValueError("a Kalshi feed needs a read-auth provider (auth=...)")
         self.venue = venue
         ids = (
             _normalize_asset_ids(instruments)
@@ -270,7 +280,7 @@ class ManagedBookFeed:
             shard.books.polymarket if self.venue == "polymarket" else shard.books.kalshi
         )
         for instrument, state in states.items():
-            if "market_resolved" in state.quality_flags:
+            if instrument in shard.resolved or "market_resolved" in state.quality_flags:
                 continue
             recovery = shard.recovery.get(instrument)
             if recovery is None:
@@ -319,8 +329,12 @@ class ManagedBookFeed:
                     for instrument, recovery in pending.items():
                         if shard.recovery.get(instrument) is not recovery:
                             continue
-                        # Ignore depth received during unsubscribe/subscribe. A
-                        # subsequent snapshot must establish a complete ladder.
+                        if recovery.answered:
+                            # A complete, valid snapshot already arrived during the send.
+                            shard.recovery.pop(instrument)
+                            continue
+                        # Ignore partial depth received during unsubscribe/subscribe.
+                        # A subsequent snapshot must establish a complete ladder.
                         self._reset_book(shard, instrument)
                         recovery.phase = "waiting"
                         recovery.deadline = time.monotonic() + self.snapshot_timeout
@@ -350,9 +364,8 @@ class ManagedBookFeed:
             if self.venue == "polymarket"
             else shard.books.kalshi[instrument]
         )
-        intact = (
-            state.book_integrity_valid and "market_resolved" not in state.quality_flags
-        )
+        resolved = instrument in shard.resolved or "market_resolved" in state.quality_flags
+        intact = state.book_integrity_valid and not resolved
         usable = (
             shard.health.connection_state == "connected"
             and not shard.restart
@@ -372,8 +385,8 @@ class ManagedBookFeed:
             if usable
             else (
                 shard.reason if shard.restart else
+                "market_resolved" if resolved else
                 shard.recovery[instrument].reason if instrument in shard.recovery else
-                "market_resolved" if "market_resolved" in state.quality_flags else
                 "no_initial_snapshot" if not state.initial_snapshot_received else
                 "book_integrity_failed"
             ),
@@ -510,17 +523,32 @@ class ManagedBookFeed:
                 shard,
                 "closed" if self._closed else (shard.last_error or "disconnected"),
             )
-            if probe is not None:
-                probe.cancel()
-                await asyncio.gather(probe, return_exceptions=True)
-            if recovery_task is not None:
-                recovery_task.cancel()
-                await asyncio.gather(recovery_task, return_exceptions=True)
-            if pump is not None:
-                with contextlib.suppress(Exception):
-                    await pump.close()
+            teardown = asyncio.ensure_future(
+                self._teardown(client, pump, probe, recovery_task)
+            )
+            try:
+                await asyncio.shield(teardown)
+            except asyncio.CancelledError:
+                # close() may cancel while the socket is closing: finish closing it.
+                await teardown
+                raise
+
+    async def _teardown(
+        self,
+        client: Any,
+        pump: WebSocketMessagePump | None,
+        probe: asyncio.Task[None] | None,
+        recovery_task: asyncio.Task[None] | None,
+    ) -> None:
+        for task in (probe, recovery_task):
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        if pump is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(client.close(), self.connect_timeout)
+                await pump.close()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(client.close(), self.connect_timeout)
 
     async def _probe(self, shard: _Shard) -> None:
         # Waiting for a pong must not suspend receipt/application of book deltas.
@@ -592,6 +620,15 @@ class ManagedBookFeed:
                     for change in changes
                 ):
                     raise ConnectionError("malformed_price_changes")
+        if self.venue == "polymarket" and kind == "market_resolved":
+            # Market-scoped: reach instruments whose state was reset for recovery.
+            market = str(message.get("market") or "")
+            assets = message.get("assets_ids") or message.get("asset_ids") or ()
+            for instrument in shard.health.subscribed_instruments:
+                if (market and shard.market_ids.get(instrument) == market) or instrument in assets \
+                        or instrument == message.get("asset_id"):
+                    shard.resolved.add(instrument)
+                    shard.recovery.pop(instrument, None)
         views = shard.books.apply(message, count)
         now = time.monotonic()
         shard.health.record_message(now_monotonic_ns=time.monotonic_ns())
@@ -611,9 +648,31 @@ class ManagedBookFeed:
                 quality_flags=view.quality_flags,
                 now_monotonic_ns=time.monotonic_ns(),
             )
+            if self.venue == "polymarket":
+                market = str(shard.books.polymarket[instrument].market or "")
+            else:
+                market = str(shard.books.kalshi[instrument].market_id or "")
+            known = shard.market_ids.get(instrument)
+            if market and known and market != known:
+                # A message for another market merged into this book: drop the
+                # mixed ladder and require a fresh snapshot.
+                shard.market_ids[instrument] = market
+                self._reset_book(shard, instrument)
+                shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
+                continue
+            if market and not known:
+                shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
-            if "market_resolved" in view.quality_flags:
+            if "market_resolved" in view.quality_flags or instrument in shard.resolved:
+                shard.resolved.add(instrument)
                 shard.recovery.pop(instrument, None)
+            elif (
+                recovery is not None
+                and recovery.phase == "sending"
+                and view.integrity_valid
+                and kind in {"book", "orderbook_snapshot"}
+            ):
+                recovery.answered = True
             elif not view.integrity_valid and recovery is None:
                 grace = (
                     self.venue == "polymarket"

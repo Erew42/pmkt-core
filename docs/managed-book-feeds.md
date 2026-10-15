@@ -19,7 +19,8 @@ async def consume(tokens):
             # Apply the consumer's identity and trading policy here.
 ```
 
-For Kalshi, use `venue="kalshi"` and inject `auth`, an existing
+For Kalshi, use `venue="kalshi"` and inject `auth` (required: construction raises
+`ValueError` without it, because the handshake cannot succeed), an existing
 `ReadAuthHeaderProvider`. Core only requests headers for the public WebSocket
 GET handshake; it loads no keys or credentials. These are public order-book
 subscriptions, not authenticated account/user channels. `connect_factory` and
@@ -102,7 +103,8 @@ Fault scope is explicit:
 | Crossed ladder (Polymarket also treats locked depth as invalid) | Instrument; bounded corrective-delta grace | Instrument; replacement snapshot required |
 | Malformed ladder/quantity, delta before snapshot | Instrument when identity is known | Instrument when ticker and subscription identity are valid |
 | Supplied previous-hash mismatch | Instrument; replacement snapshot required | Not applicable |
-| Resolution event | Affected instrument(s); `market_resolved` | Not part of this book-channel contract |
+| Book or delta naming another market than the instrument's known one | Instrument; the mixed ladder is dropped (`market_identity_changed`) and a replacement snapshot required | Instrument; same rule for `market_id` |
+| Resolution event (token- or market-scoped) | Affected instrument(s); `market_resolved` is terminal: later snapshots, recoveries and reconnects do not make the book usable again | Not part of this book-channel contract |
 | Decode failure, unscoped malformed envelope/missing identity, subscription error | Shard | Shard |
 | Missing/invalid acknowledgement, wrong SID/ticker, missing/noncontiguous subscription sequence | Not applicable; foreign token IDs are ignored | Shard; acknowledgement deadline is `snapshot_timeout` |
 | Disconnect, expired liveness, failed heartbeat/probe, failed/timed-out recovery send | Shard | Shard |

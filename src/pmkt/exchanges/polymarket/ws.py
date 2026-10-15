@@ -676,7 +676,9 @@ class AsyncMarketWebSocketClient:
         self._pending_ping_since = None
         ws, self._ws = self._ws, None
         if ws is not None:
-            await ws.close()
+            # The reference is already detached: a cancelled caller must not
+            # abandon the closing handshake, or the socket stays open unowned.
+            await asyncio.shield(ws.close())
 
     async def reconnect(self) -> None:
         await self.close()

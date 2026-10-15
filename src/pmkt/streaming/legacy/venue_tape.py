@@ -40,7 +40,7 @@ def polymarket_delta_levels(
             NativeBookLevel(
                 source_side=side,
                 price=price,
-                size_after_contracts=ladder.get(price, Decimal(0)),
+                size_after_contracts=float(ladder.get(price, Decimal(0))),
                 size_delta_contracts=None,
                 level_ordinal=ordinal,
             )
@@ -72,7 +72,7 @@ def kalshi_delta_levels(
         NativeBookLevel(
             source_side=side,
             price=price,
-            size_after_contracts=ladder.get(price, Decimal(0)),
+            size_after_contracts=float(ladder.get(price, Decimal(0))),
             size_delta_contracts=delta,
             level_ordinal=0,
         ),
@@ -86,7 +86,8 @@ def _ordered_full_levels(
     ordinal = 0
     for side, ladder in sides:
         for price, size in sorted(ladder.items(), key=lambda item: canonical_decimal(item[0])):
-            rows.append(NativeBookLevel(side, price, size, level_ordinal=ordinal))
+            # The legacy tape stores and hashes float sizes; project exact state here.
+            rows.append(NativeBookLevel(side, price, float(size), level_ordinal=ordinal))
             ordinal += 1
     return tuple(rows)
 

@@ -2571,3 +2571,42 @@ def test_mixed_journal_files_and_records_fail_closed(tmp_path: Path) -> None:
     assert any(
         "mixed journal versions" in item for item in mixed_records.journal_errors
     )
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_tape_hashes_reproduce_for_sizes_beyond_float_precision(venue: str) -> None:
+    # Book state keeps exact Decimal sizes; the legacy tape stores floats and must
+    # hash exactly what it stores, or capture commits and reconstruction reject it.
+    from pmkt.streaming.legacy.tape import (
+        NativeBookLevel,
+        post_book_hash,
+        recompute_tape_event_payload_hash,
+    )
+    from pmkt.streaming.legacy.tape_producers import KalshiTapeProducer, PolymarketTapeProducer
+
+    size = "1.234567890123456789"
+    if venue == "polymarket":
+        state = MarketBookState("a")
+        message = {"event_type": "book", "asset_id": "a",
+                   "bids": [["0.4", size]], "asks": [["0.6", "3"]]}
+        state.apply_book(message)
+        producer = PolymarketTapeProducer(collector_run_id="r", shard_id="s", integrity_evidence=True)
+        states, book_id = {"a": state}, "a"
+    else:
+        kalshi_state = KalshiOrderBookState("KX-1")
+        message = {"type": "orderbook_snapshot", "sid": 1, "seq": 1,
+                   "msg": {"market_ticker": "KX-1", "yes_dollars": [["0.4", size]],
+                           "no_dollars": [["0.6", "3"]]}}
+        kalshi_state.apply_snapshot(message)
+        producer = KalshiTapeProducer(collector_run_id="r", shard_id="s", use_yes_price=True)
+        states, book_id = {"KX-1": kalshi_state}, "KX-1"
+    batch = producer.observe(message=message, states=states, received_at_utc=_UTC,
+                             received_at_monotonic_ns=1, local_sequence=1).batches[0]
+    assert all(isinstance(row["size_after_contracts"], float) for row in batch.levels)
+    assert recompute_tape_event_payload_hash(batch.event, batch.levels) == batch.event["event_payload_hash"]
+    if batch.event.get("post_book_hash"):
+        levels = [NativeBookLevel(row["source_side"], row["price_key"], row["size_after_contracts"])
+                  for row in batch.levels]
+        settings = producer._adapter_settings() if venue == "kalshi" else None
+        assert post_book_hash(venue=venue, venue_book_id=batch.event.get("venue_book_id", book_id),
+                              levels=levels, adapter_settings=settings) == batch.event["post_book_hash"]

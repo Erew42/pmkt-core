@@ -844,3 +844,126 @@ async def test_concurrent_close_waits_for_socket_cleanup(venue):
         release.set()
         await asyncio.gather(first, second)
     assert socket.closed
+
+
+def test_kalshi_feed_without_read_auth_is_refused_at_construction():
+    with pytest.raises(ValueError, match="read-auth provider"):
+        ManagedBookFeed(["a"], venue="kalshi")
+
+
+@pytest.mark.asyncio
+async def test_resolution_is_terminal_across_later_snapshots():
+    connections = Connections()
+    async with feed("polymarket", connections) as f:
+        socket = await ready(f, connections, "polymarket")
+        socket.put({"event_type": "market_resolved", "asset_id": "a", "market": "condition"})
+        await until(lambda: f.health("a").reason == "market_resolved")
+        later = snapshot("polymarket")
+        later["hash"] = "h9"
+        socket.put(later)
+        socket.put(delta("polymarket"))  # processing barrier for the snapshot
+        await asyncio.sleep(0.05)
+        assert f.book("a") is None and f.health("a").reason == "market_resolved"
+
+
+@pytest.mark.asyncio
+async def test_market_scoped_resolution_reaches_an_instrument_under_recovery():
+    connections = Connections()
+    entered, release = asyncio.Event(), asyncio.Event()
+    async with feed("polymarket", connections) as f:
+        socket = await ready(f, connections, "polymarket")
+
+        async def blocked(shard, instruments):
+            entered.set()
+            await release.wait()
+
+        f._request_snapshots = blocked
+        bad = delta("polymarket")
+        bad["price_changes"][0]["size"] = "NaN"
+        socket.put(bad)
+        await entered.wait()  # the book was reset for recovery and lost its market id
+        socket.put({"event_type": "market_resolved", "market": "condition"})
+        await until(lambda: f.health("a").reason == "market_resolved")
+        release.set()
+        socket.put(snapshot("polymarket"))
+        await asyncio.sleep(0.05)
+        assert f.book("a") is None and f.health("a").reason == "market_resolved"
+
+
+@pytest.mark.asyncio
+async def test_a_different_condition_never_merges_into_existing_depth():
+    connections = Connections()
+    async with feed("polymarket", connections) as f:
+        socket = await ready(f, connections, "polymarket")
+        foreign = delta("polymarket")
+        foreign["market"] = "other-condition"
+        foreign["price_changes"][0]["price"] = "0.5"
+        socket.put(foreign)
+        await until(lambda: f.book("a") is None)
+        assert f.health("a").reason == "market_identity_changed"
+        await until(lambda: recovery_commands(socket, "polymarket"))
+        clean = snapshot("polymarket")
+        clean["market"] = "other-condition"
+        clean["hash"] = "h5"
+        socket.put(clean)
+        await until(lambda: f.book("a") is not None)
+        book = f.book("a")
+        assert book.market_id == "other-condition"
+        assert (Decimal("0.5"), Decimal("0.30")) not in book.bids  # no mixed ladder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_recovery_snapshot_received_during_the_send_is_kept(venue):
+    connections = Connections()
+    entered, release = asyncio.Event(), asyncio.Event()
+    async with feed(venue, connections, ("a", "b")) as f:
+        socket = await ready(f, connections, venue)
+        socket.put(snapshot(venue, "b", seq=2))
+        await until(lambda: f.book("b"))
+
+        async def slow_send(shard, instruments):
+            entered.set()
+            await release.wait()
+
+        f._request_snapshots = slow_send
+        bad = delta(venue, "b", seq=3)
+        if venue == "polymarket":
+            bad["price_changes"][0]["size"] = "NaN"
+        else:
+            bad["msg"]["delta_fp"] = "NaN"
+        socket.put(bad)
+        await entered.wait()
+        socket.put(snapshot(venue, "b", seq=4))  # the venue answers before the send returns
+        socket.put(delta(venue, "a", seq=5))  # processing barrier
+        await until(lambda: f.book("a").bids[0][1] == Decimal("0.30"))
+        assert f.book("b") is None  # not published while the send is outstanding
+        release.set()
+        await until(lambda: f.book("b") is not None)
+        assert f.health("b").reconnect_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_close_during_session_teardown_still_closes_the_socket(venue):
+    connections = Connections()
+    f = feed(venue, connections)
+    await f.start()
+    socket = await ready(f, connections, venue)
+    closing, release = asyncio.Event(), asyncio.Event()
+    original_close = socket.close
+
+    async def slow_close():
+        closing.set()
+        await release.wait()
+        await original_close()
+
+    socket.close = slow_close
+    socket.queue.put_nowait("{not json")  # decode failure: the session starts tearing down
+    await closing.wait()
+    closer = asyncio.create_task(f.close())
+    for _ in range(10):
+        await asyncio.sleep(0)
+    release.set()
+    await asyncio.wait_for(closer, 3)
+    assert socket.closed
