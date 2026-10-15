@@ -46,6 +46,14 @@ change does not require reviewing every package contract.
 - Keep Kalshi authentication behind the narrow read-auth protocol. Core must
   reject write methods before invoking an authenticator or network transport.
 
+## Pull request attribution
+
+When creating a PR, end its description with
+`Created with <model name> (<reasoning effort> reasoning)`. Use the exact model
+identity provided by the runtime when available; otherwise use the known model
+family, such as GPT, Gemini, or Claude. Omit reasoning effort if unavailable.
+Never guess either value.
+
 ## Verification
 
 Run focused tests while working. Before a commit, PR, or readiness claim run:
