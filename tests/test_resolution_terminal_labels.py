@@ -70,6 +70,55 @@ def test_polymarket_canonical_binary_labels_are_training_eligible() -> None:
     assert no_label.exclusion_reason is None
 
 
+def _mapping(source: str, *outcomes: str) -> dict[str, object]:
+    return {
+        "source": source,
+        "confidence": "metadata_only",
+        "evidence": {
+            "outcome_labels": [
+                {"outcome_index": index, "outcome": outcome}
+                for index, outcome in enumerate(outcomes)
+            ],
+            "status": "success",
+        },
+    }
+
+
+def test_default_binary_label_mapping_is_excluded_unless_a_verified_mapping_agrees() -> None:
+    ctf = {"source": "polygon_ctf", "confidence": "canonical", "evidence": {"numerators": [1, 0]}}
+    assumed = _mapping("polymarket_default_binary_labels", "yes", "no")
+    verified = _mapping("polymarket_snapshot", "Yes", "No")
+    contradicting = _mapping("polymarket_gamma", "seahawks", "broncos")
+
+    excluded = _record(source_observations_json=[assumed, ctf])
+    label = resolution_training_label(excluded)
+    assert label.exclusion_reason == "outcome_mapping_assumed"
+    assert label.quality == "unavailable"
+    assert label.terminal_label == "yes"
+    assert not is_authoritative_final_resolution(excluded)
+
+    # A cache merge can carry a verified mapping alongside a later default one.
+    merged = _record(source_observations_json=[verified, ctf, assumed])
+    assert resolution_training_label(merged).quality == "canonical_binary"
+    assert resolution_training_label(
+        _record(source_observations_json=json.dumps([assumed, verified, ctf]))
+    ).exclusion_reason is None
+    assert resolution_training_label(
+        _record(source_observations_json=[contradicting, assumed, ctf])
+    ).exclusion_reason == "outcome_mapping_assumed"
+
+    # Records without mapping observations, or from other platforms, are unchanged.
+    assert resolution_training_label(_record(source_observations_json=[ctf])).exclusion_reason is None
+    kalshi = _record(
+        platform="kalshi",
+        canonical_source="kalshi_rest",
+        result="yes",
+        raw_status="finalized",
+        source_observations_json=[assumed],
+    )
+    assert resolution_training_label(kalshi).exclusion_reason != "outcome_mapping_assumed"
+
+
 def test_default_training_policy_accepts_retained_v2_canonical_rows() -> None:
     retained = _record(resolver_version="market_resolution_resolver.v2")
 

@@ -796,7 +796,12 @@ class, and status summaries rather than RPC URLs, request secrets, or raw remote
 error bodies.
 
 New records use `market_resolution_resolver.v3`. The default terminal-label
-policy accepts eligible v2 and v3 canonical finals. Separately, the resolution
+policy accepts eligible v2 and v3 canonical finals. It excludes a Polymarket
+final as `outcome_mapping_assumed` when the resolver named the payout outcomes
+only through its yes/no default, because neither a snapshot nor Gamma supplied
+labels: index order is then arbitrary for Over/Under or named-side markets. A
+retained snapshot or Gamma mapping that names the payout outcomes in order keeps
+the record eligible. The resolver output itself is unchanged. Separately, the resolution
 cache preserves eligible retained v2 canonical finals and v2 conflicts without
 relabeling them; conflicts remain ineligible for terminal labels. A refresh with
 weaker evidence carries forward the original payout and resolver version, while
