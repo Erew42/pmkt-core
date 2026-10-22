@@ -817,3 +817,217 @@ async def test_data_api_source_classification(transport_supplied, expected) -> N
     assert source.data_scope == expected
     assert source_after_response(source, "https://data-api.polymarket.com/v2/trades").data_scope == expected
     assert source_after_response(source, "https://data.example/v2/trades").data_scope == "unknown"
+
+
+def _pnl_point(**updates) -> dict:
+    point = {
+        "timestamp": 1792507701, "source_block": 95868222,
+        "realized_market_pnl": -52.561934, "realized_lp_pnl": 0.0,
+        "realized_combo_pnl": 0.0, "realized_pnl": -52.561934,
+        "unrealized_pnl": -0.002528, "fees": -0.713317, "fees_refunded": 0.69897,
+        "fees_paid": -0.014347, "deposits": None,
+        "volume": 5037.176366, "volume_usdc": 547.707853, "trade_count": 564,
+    }
+    point.update(updates)
+    return point
+
+
+def _json_transport(path: str, payload: object, seen: list[dict[str, str]] | None = None):
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == path
+        if seen is not None:
+            seen.append(dict(request.url.params))
+        return httpx.Response(200, json=payload)
+    return httpx.MockTransport(handler)
+
+
+async def test_user_pnl_keeps_block_label_and_null_atoms() -> None:
+    seen: list[dict[str, str]] = []
+    payload = {"data": {
+        "proxy_wallet": WALLET_A, "interval": "all", "fidelity": "1d",
+        "source_fidelity": "1d",
+        "points": [_pnl_point(), _pnl_point(timestamp=1792507701, source_block=95868223)],
+    }}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/user-pnl", payload, seen)) as client:
+        series = await client.user_pnl(WALLET_A)
+
+    assert seen == [{"user": WALLET_A, "interval": "all", "fidelity": "1d"}]
+    assert series is not None and series.source_fidelity == "1d"
+    first = series.points[0]
+    assert (first.timestamp_s, first.source_block, first.trade_count) == (1792507701, 95868222, 564)
+    assert first.realized_pnl == Decimal("-52.561934")
+    assert first.volume_shares == Decimal("5037.176366")
+    assert first.deposits is None and first.wallet_income is None
+    assert first.fees_paid == Decimal("-0.014347")
+    # Duplicate labels stay in source order; selection rules belong to consumers.
+    assert [point.source_block for point in series.points] == [95868222, 95868223]
+    assert series.observation.request_id
+
+
+async def test_user_pnl_null_data_is_unknown_wallet() -> None:
+    async with AsyncPolymarketDataClient(
+        transport=_json_transport("/v2/user-pnl", {"data": None})
+    ) as client:
+        assert await client.user_pnl(WALLET_A) is None
+
+
+@pytest.mark.parametrize("data", [
+    {"proxy_wallet": WALLET_B},
+    {"interval": "1m"},
+    {"fidelity": "1h"},
+    {"points": None},
+    {"points": [None]},
+    {"points": [_pnl_point(realized_pnl=None)]},
+    {"points": [_pnl_point(trade_count=-1)]},
+    {"points": [_pnl_point(source_block=True)]},
+    {"points": [_pnl_point(volume_usdc=-1)]},
+    {"points": [_pnl_point(fees="nan")]},
+    {"source_fidelity": ""},
+])
+async def test_user_pnl_rejects_contradictory_series(data) -> None:
+    series = {"proxy_wallet": WALLET_A, "interval": "all", "fidelity": "1d",
+              "source_fidelity": "1d", "points": [_pnl_point()], **data}
+    async with AsyncPolymarketDataClient(
+        transport=_json_transport("/v2/user-pnl", {"data": series})
+    ) as client:
+        with pytest.raises(InvalidDataError):
+            await client.user_pnl(WALLET_A)
+
+
+@pytest.mark.parametrize("payload", [[], {}, {"data": []}])
+async def test_unpaginated_reads_reject_malformed_envelopes(payload) -> None:
+    async with AsyncPolymarketDataClient(
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    ) as client:
+        for read in (client.user_pnl, client.user_stats, client.leaderboard_standing):
+            with pytest.raises(InvalidDataError):
+                await read(WALLET_A)
+
+
+async def test_user_stats_separates_unknown_wallet_from_zero_profile() -> None:
+    zeros = {"data": {"proxy_wallet": WALLET_A, "trades": 0, "biggest_win": 0,
+                      "views": 0, "join_date": None, "all_time_pnl": None}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/user-stats", zeros)) as client:
+        stats = await client.user_stats(WALLET_A)
+    assert stats is not None
+    assert (stats.markets_traded, stats.biggest_win_usdc, stats.join_date_s) == (0, Decimal("0"), None)
+    assert stats.all_time_pnl is None
+
+    async with AsyncPolymarketDataClient(
+        transport=_json_transport("/v2/user-stats", {"data": None})
+    ) as client:
+        assert await client.user_stats(WALLET_A) is None
+
+
+async def test_user_stats_parses_latest_pnl_point() -> None:
+    seen: list[dict[str, str]] = []
+    payload = {"data": {"proxy_wallet": WALLET_A, "trades": 158, "biggest_win": 12.5,
+                        "views": 3, "join_date": 1700000000, "all_time_pnl": _pnl_point()}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/user-stats", payload, seen)) as client:
+        stats = await client.user_stats(WALLET_A)
+    assert seen == [{"user": WALLET_A}]
+    assert stats is not None and stats.markets_traded == 158 and stats.join_date_s == 1700000000
+    assert stats.all_time_pnl is not None and stats.all_time_pnl.source_block == 95868222
+
+
+@pytest.mark.parametrize("updates", [
+    {"proxy_wallet": WALLET_B}, {"trades": 1.5}, {"views": -1}, {"biggest_win": None},
+    {"join_date": "2024"}, {"all_time_pnl": []},
+])
+async def test_user_stats_rejects_malformed_rows(updates) -> None:
+    data = {"proxy_wallet": WALLET_A, "trades": 1, "biggest_win": 0, "views": 0, **updates}
+    async with AsyncPolymarketDataClient(
+        transport=_json_transport("/v2/user-stats", {"data": data})
+    ) as client:
+        with pytest.raises(InvalidDataError):
+            await client.user_stats(WALLET_A)
+
+
+async def test_leaderboard_page_keeps_ties_basis_and_cursor() -> None:
+    seen: list[dict[str, str]] = []
+    payload = {
+        "data": [
+            {"rank": 1, "user_id": WALLET_A, "pnl": 10.5, "volume": 100, "user_name": "a",
+             "profile_image": "", "x_username": "", "verified": False},
+            {"rank": 1, "user_id": WALLET_B, "pnl": 10.5, "volume": 50, "user_name": "b",
+             "profile_image": "", "x_username": "", "verified": True},
+        ],
+        "pagination": {"limit": 2, "offset": 0, "has_more": True, "next_cursor": "board-2"},
+    }
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/leaderboard", payload, seen)) as client:
+        page = await client.leaderboard_page(page_size=2)
+
+    assert seen == [{"time_period": "all", "category": "overall", "sort_by": "PNL", "limit": "2"}]
+    assert [entry.rank for entry in page.entries] == [1, 1]
+    assert page.entries[1].wallet == WALLET_B and page.entries[1].volume_shares == Decimal("50")
+    assert page.entries[0].request_id == page.observation.request_id
+    assert page.next_cursor == "board-2" and page.pnl_basis == "realized_lifetime"
+
+
+async def test_leaderboard_finite_window_is_marked_basis() -> None:
+    payload = {"data": [], "pagination": {"limit": 0, "offset": 0, "has_more": False}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/leaderboard", payload)) as client:
+        page = await client.leaderboard_page(time_period="week", cursor="pinned")
+    assert page.entries == () and page.pnl_basis == "marked_equity_change_net_of_flows"
+
+
+@pytest.mark.parametrize("updates", [
+    {"user_id": "not-a-wallet"}, {"rank": -1}, {"pnl": None}, {"volume": -1},
+])
+async def test_leaderboard_page_rejects_malformed_rows(updates) -> None:
+    row = {"rank": 1, "user_id": WALLET_A, "pnl": 1, "volume": 1, **updates}
+    payload = {"data": [row], "pagination": {"has_more": False}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/leaderboard", payload)) as client:
+        with pytest.raises(InvalidDataError):
+            await client.leaderboard_page()
+
+
+@pytest.mark.parametrize("ranks,expected", [
+    ({"rank_pnl": 7, "rank_volume": None}, (7, None)),
+    ({"rank_pnl": 0, "rank_volume": 3}, (None, 3)),
+    ({}, (None, None)),
+])
+async def test_leaderboard_standing_treats_null_and_zero_as_unranked(ranks, expected) -> None:
+    seen: list[dict[str, str]] = []
+    payload = {"data": {"user_id": WALLET_A, "pnl": -4.5, "volume": 12, "user_name": "",
+                        "profile_image": "", "x_username": "", "verified": False, **ranks}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/leaderboard", payload, seen)) as client:
+        standing = await client.leaderboard_standing(WALLET_A)
+    assert seen == [{"user": WALLET_A, "time_period": "all", "category": "overall"}]
+    assert standing is not None
+    assert (standing.rank_pnl, standing.rank_volume) == expected
+    assert standing.pnl_usdc == Decimal("-4.5")
+
+
+async def test_leaderboard_standing_rejects_other_wallet_and_accepts_unknown() -> None:
+    other = {"data": {"user_id": WALLET_B, "pnl": 0, "volume": 0}}
+    async with AsyncPolymarketDataClient(transport=_json_transport("/v2/leaderboard", other)) as client:
+        with pytest.raises(InvalidDataError):
+            await client.leaderboard_standing(WALLET_A)
+    async with AsyncPolymarketDataClient(
+        transport=_json_transport("/v2/leaderboard", {"data": None})
+    ) as client:
+        assert await client.leaderboard_standing(WALLET_A) is None
+
+
+async def test_pnl_and_board_arguments_fail_before_io() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("invalid arguments must fail before I/O")
+
+    async with AsyncPolymarketDataClient(transport=httpx.MockTransport(handler)) as client:
+        calls = [
+            client.user_pnl("bad"),
+            client.user_pnl(WALLET_A, interval="1y"),
+            client.user_pnl(WALLET_A, fidelity="1m"),
+            client.user_stats("bad"),
+            client.leaderboard_page(time_period="year"),
+            client.leaderboard_page(sort_by="pnl"),
+            client.leaderboard_page(category=""),
+            client.leaderboard_page(page_size=1001),
+            client.leaderboard_page(cursor=""),
+            client.leaderboard_standing(WALLET_A, time_period="year"),
+        ]
+        for call in calls:
+            with pytest.raises(ValueError) as caught:
+                await call
+            assert not isinstance(caught.value, InvalidDataError)

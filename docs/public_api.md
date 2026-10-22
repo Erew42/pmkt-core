@@ -506,6 +506,41 @@ establish a complete ERC-1155 outcome-token transfer ledger.
 Position `avg_price` is preserved when the source reports a value above one;
 it is a cost-basis field, not a bounded execution price.
 
+### Provider P/L, profile statistics, and leaderboards
+
+`user_pnl(wallet, interval="all", fidelity="1d")` reads `/v2/user-pnl` and
+returns `PolymarketPnlSeries`, or `None` when the source returns `data: null`
+for an unknown wallet. Each `PolymarketPnlPoint` holds cumulative USDC amounts
+through its chart `timestamp_s`. `source_block` is the provider's observation
+block, a separate clock from the chart label. The client keeps both. Daily
+points can repeat an earlier block when the provider carries state forward.
+The realized market, LP, and combo components, `realized_pnl`, volume, and
+trade count are required. Every other atom is `None` when the source marks it
+uncovered; consumers must not treat `None` as zero. `volume_shares`,
+`volume_usdc`, and `trade_count` are cumulative maker-attributed canonical
+fills, not archive owner records. Points keep source order. The client does not
+select a point for a cutoff, check the component identity, or reconcile points
+with trades. The series is the provider's current computation. A later read can
+differ for the same past timestamp, so the request observation records the
+vintage.
+
+`user_stats(wallet)` reads `/v2/user-stats` and returns `PolymarketUserStats`,
+or `None` for an unknown wallet. A known wallet with no activity has zeros.
+`markets_traded` counts distinct markets, not trades. `all_time_pnl` is the
+newest persisted P/L point, or `None` when nothing has been published yet.
+
+`leaderboard_page(time_period="all", category="overall", sort_by="PNL")` reads
+one `/v2/leaderboard` page. The `all` board is realized lifetime P/L. Day, week,
+and month boards are marked equity changes net of flows, so they also move with
+unrealized marks. `pnl_basis` names the basis. Ranks are competition ranks:
+tied wallets share a rank and the next rank skips. Board volume is in shares.
+The cursor pins its board but walks offsets, so pages read across a refresh can
+skip or repeat wallets. A finished walk is not an atomic snapshot of every
+wallet. `leaderboard_standing(wallet)` returns one wallet's P/L and both ranks.
+A `None` rank means unranked on that board. The source reports this as `null`
+or as `0`, and the client maps both to `None`. Profile names, images, and
+social handles are not retained.
+
 ## Kalshi discovery, detail, and current books
 
 The supported Kalshi facade exports `AsyncKalshiClient`, `KalshiFilter`,
