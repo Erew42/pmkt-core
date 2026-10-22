@@ -83,7 +83,10 @@ inputs also do not make unordered, random, or time-dependent SQL deterministic.
 
 Qualified catalog environments use DuckDB 1.5.5 on Windows and Linux with
 Python 3.10 through 3.12, and either PyArrow 14.0.0 with NumPy 1.26.4 or
-PyArrow 25.0.1 with NumPy 2.2.6.
+PyArrow 25.0.1 with NumPy 2.2.6. Data, storage, and test extras constrain DuckDB
+to `>=1.5.5,<2`; managed queries reject runtimes outside that range before
+opening a connection. DuckDB 2 changes statement classification and disables
+the catalog's arrow-lambda syntax by default, so it requires separate qualification.
 
 New publishers declare each artifact's canonical `schema`. Older descriptors
 with no `schema` key are accepted using the expected schema for that artifact
@@ -510,8 +513,8 @@ it is a cost-basis field, not a bounded execution price.
 
 `user_pnl(wallet, interval="all", fidelity="1d")` reads `/v2/user-pnl` and
 returns `PolymarketPnlSeries`, or `None` when the source returns `data: null`
-for an unknown wallet. Each `PolymarketPnlPoint` holds cumulative USDC amounts
-through its chart `timestamp_s`. `source_block` is the provider's observation
+for an unknown wallet. Each `PolymarketPnlPoint` keeps cumulative P/L atoms and
+a chart `timestamp_s` label. `source_block` is the provider's observation
 block, a separate clock from the chart label. The client keeps both. Daily
 points can repeat an earlier block when the provider carries state forward.
 The realized market, LP, and combo components, `realized_pnl`, volume, and
