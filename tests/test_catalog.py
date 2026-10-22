@@ -1090,7 +1090,7 @@ def test_catalog_open_reports_missing_arrow_as_optional_dependency(
         CatalogSnapshot.open_latest_history(market_root, path_base=path_base)
 
 
-@pytest.mark.parametrize("version", ["1.5.4", "development-build"])
+@pytest.mark.parametrize("version", ["1.5.4", "2.0.0", "3.0.0", "development-build"])
 def test_managed_query_rejects_unqualified_duckdb_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str
 ) -> None:
@@ -1101,7 +1101,11 @@ def test_managed_query_rejects_unqualified_duckdb_runtime(
     catalog = CatalogSnapshot.open_latest_history(market_root, path_base=path_base)
     monkeypatch.setattr(duckdb, "__version__", version)
 
-    with pytest.raises(OptionalDependencyError, match="duckdb>=1.5.5"):
+    def forbidden_connect(*args: Any, **kwargs: Any) -> Any:
+        pytest.fail("unqualified DuckDB runtime must fail before opening a connection")
+
+    monkeypatch.setattr(duckdb, "connect", forbidden_connect)
+    with pytest.raises(OptionalDependencyError, match=r"duckdb>=1\.5\.5,<2"):
         catalog.query("SELECT 1")
 
 

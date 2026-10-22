@@ -83,7 +83,9 @@ inputs also do not make unordered, random, or time-dependent SQL deterministic.
 
 Qualified catalog environments use DuckDB 1.5.5 on Windows and Linux with
 Python 3.10 through 3.12, and either PyArrow 14.0.0 with NumPy 1.26.4 or
-PyArrow 25.0.1 with NumPy 2.2.6.
+PyArrow 25.0.1 with NumPy 2.2.6. Data, storage, and test extras constrain DuckDB
+to `>=1.5.5,<2`; managed queries reject runtimes outside that range before
+opening a connection. DuckDB 2 requires separate compatibility qualification.
 
 New publishers declare each artifact's canonical `schema`. Older descriptors
 with no `schema` key are accepted using the expected schema for that artifact

@@ -5,6 +5,7 @@ from pmkt.records import PolymarketMarketRef, KalshiMarketRef
 import asyncio
 import json
 from collections import Counter
+from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -42,6 +43,7 @@ from pmkt.resolution.models import (
     error_record,
 )
 from pmkt.resolution.polymarket import PolymarketResolutionResolver
+from pmkt.resolution.terminal_labels import POLYMARKET_DEFAULT_LABEL_SOURCE, _ordered_outcomes
 
 POLYMARKET_RESOLUTION_COLUMNS = [
     "market_id",
@@ -328,6 +330,7 @@ def _decode_observations(value: Any) -> list[dict[str, Any]]:
 
 def _bounded_observations(
     *observation_groups: list[dict[str, Any]],
+    protected: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     observations: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -338,7 +341,11 @@ def _bounded_observations(
                 continue
             seen.add(key)
             observations.append(observation)
-    return observations[-_MAX_CARRIED_SOURCE_OBSERVATIONS:]
+    protected = protected or []
+    protected_keys = {_stable_json(item) for item in protected}
+    remaining = _MAX_CARRIED_SOURCE_OBSERVATIONS - len(protected)
+    diagnostics = [item for item in observations if _stable_json(item) not in protected_keys]
+    return protected + (diagnostics[-remaining:] if remaining else [])
 
 
 def _is_weaker_than_current_final(row: dict[str, Any]) -> bool:
@@ -472,9 +479,28 @@ def _carry_forward_final(
     carried = dict(existing_row)
     attempted_observations = _decode_observations(attempted_row.get("source_observations_json"))
     if attempted_observations:
+        existing_observations = _decode_observations(carried.get("source_observations_json"))
+        protected = []
+        if _is_canonical_final(carried) and carried.get("platform") == "polymarket":
+            # Preserve the two observations that determine the retained payout's
+            # mapping status. Keeping every timestamped mapping could otherwise
+            # fill the cap and permanently discard fresh failure diagnostics.
+            outcomes = _ordered_outcomes(carried.get("payouts_json"))
+            default = explicit = None
+            for item in [*existing_observations, *attempted_observations]:
+                evidence = item.get("evidence")
+                if not isinstance(evidence, Mapping) or "outcome_labels" not in evidence:
+                    continue
+                if str(item.get("source") or "").strip() == POLYMARKET_DEFAULT_LABEL_SOURCE:
+                    if default is None:
+                        default = item
+                elif explicit is None and _ordered_outcomes(evidence["outcome_labels"]) == outcomes:
+                    explicit = item
+            protected = [item for item in (default, explicit) if item is not None]
         carried["source_observations_json"] = _bounded_observations(
-            _decode_observations(carried.get("source_observations_json")),
+            existing_observations,
             attempted_observations,
+            protected=protected,
         )
     return carried
 
