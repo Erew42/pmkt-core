@@ -83,7 +83,9 @@ inputs also do not make unordered, random, or time-dependent SQL deterministic.
 
 Qualified catalog environments use DuckDB 1.5.5 on Windows and Linux with
 Python 3.10 through 3.12, and either PyArrow 14.0.0 with NumPy 1.26.4 or
-PyArrow 25.0.1 with NumPy 2.2.6.
+PyArrow 25.0.1 with NumPy 2.2.6. Data, storage, and test extras constrain DuckDB
+to `>=1.5.5,<2`; managed queries reject runtimes outside that range before
+opening a connection. DuckDB 2 requires separate compatibility qualification.
 
 New publishers declare each artifact's canonical `schema`. Older descriptors
 with no `schema` key are accepted using the expected schema for that artifact
@@ -744,6 +746,71 @@ canonical. Snapshot-only resolution is fully offline: it retains useful state
 and payout hints at its existing metadata-only ceiling. The offline ownership
 and typed-reference flow is executable in
 [`scripts/resolution_example.py`](../scripts/resolution_example.py).
+
+`PolygonCtfClient` also exposes these native, read-only
+[Ethereum JSON-RPC methods](https://ethereum.org/developers/docs/apis/json-rpc/):
+
+- `block_number()` returns the node's current height as an exact Python integer.
+- `block_by_number(block="latest")` requests `eth_getBlockByNumber` with
+  transaction hashes rather than full transaction objects. It returns the
+  native block dictionary, including `number`, `hash`, and `timestamp`, or
+  `None` when the node returns null.
+- `transaction_receipt(transaction_hash)` returns the native receipt dictionary
+  or `None` when the node has no mined receipt. Quantities, log data, and
+  identifiers keep their native hex representations.
+
+All three methods accept the existing keyword-only `expiry`. Nonobject RPC
+envelopes, missing `result` fields, and results of the wrong type raise
+`EvmRpcError`; a missing `result` is distinct from explicit null. Block and
+receipt objects otherwise retain the node's fields without
+schema normalization or a guarantee of completeness or canonicality. The RPC
+dispatcher permits only the specific read methods exposed by this client.
+
+`eth_call`, `payout_denominator`, `payout_numerator`, and `payout_vector` accept
+keyword-only `block=`, defaulting to `"latest"`. The payout return types remain
+integers and `(denominator, numerators)` respectively. A block can be a
+nonnegative Python integer, a canonical `0x` hex quantity without leading
+zeroes, or `"earliest"`, `"latest"`, `"pending"`, `"safe"`, or `"finalized"`.
+Calls also accept [EIP-1898](https://eips.ethereum.org/EIPS/eip-1898) objects:
+`{"blockNumber": number}` or `{"blockHash": hash, "requireCanonical": True}`.
+The latter flag is optional and must be a boolean; it is valid only with a hash.
+Hashes require exactly 32 bytes. Booleans used as numbers, malformed hex,
+negative values, mixed hash/number objects, and unknown keys fail before I/O.
+Condition IDs keep their existing short-hex padding convention; outcome indexes
+must be uint256 integers, and vector outcome counts must be positive integers.
+Empty or malformed payout return data raises `EvmRpcError`; an empty `"0x"`
+does not establish a zero denominator. Valid uint256 values remain exact integers.
+
+For a common state across a vector or multiple conditions, select a mined
+header once and reuse its hash. Tags can move between requests, including the
+individual reads within a vector. A fixed height can refer to a different hash
+after a reorganization. Hash selection avoids mixing those states, while
+`requireCanonical=True` asks the node to reject a noncanonical block:
+
+```python
+from datetime import datetime, timezone
+from pmkt.resolution import PolygonCtfClient
+
+async with PolygonCtfClient(rpc_url=rpc_url) as ctf:
+    await ctf.ensure_polygon()
+    header = await ctf.block_by_number("finalized")
+    header_observed_at = datetime.now(timezone.utc)
+    if header is None or header.get("number") is None or header.get("hash") is None:
+        raise RuntimeError("A mined block header is required")
+    common_block = {"blockHash": header["hash"], "requireCanonical": True}
+    denominator, numerators = await ctf.payout_vector("0xabc", 2, block=common_block)
+    payout_observed_at = datetime.now(timezone.utc)
+    # Reuse common_block for every other condition in the caller's batch.
+```
+
+Retain the header number/hash, the exact query selector, and local query
+observation times separately. The header's native `timestamp` describes the
+block; it is not the time the RPC evidence was observed. These native methods
+leave evidence persistence to the caller. Provider support for historical state,
+tags, and EIP-1898 can vary. JSON-RPC errors, missing historical state,
+unsupported selectors, and HTTP/transport failures propagate with no fallback to
+latest and no added retries. Resolver calls retain their existing latest-state
+behavior and stored resolution schemas.
 
 Both resolvers also expose an ordered typed batch:
 
