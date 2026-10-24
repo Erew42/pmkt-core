@@ -133,6 +133,34 @@
           }
         }
       }
+    },
+    "/v2/user-pnl": {
+      "get": {
+        "params": {
+          "user": {"required": true},
+          "interval": {"required": false},
+          "fidelity": {"required": false}
+        }
+      }
+    },
+    "/v2/user-stats": {
+      "get": {
+        "params": {
+          "user": {"required": true}
+        }
+      }
+    },
+    "/v2/leaderboard": {
+      "get": {
+        "params": {
+          "time_period": {"required": false},
+          "category": {"required": false},
+          "sort_by": {"required": false},
+          "user": {"required": false},
+          "limit": {"required": false},
+          "cursor": {"required": false}
+        }
+      }
     }
   }
 }

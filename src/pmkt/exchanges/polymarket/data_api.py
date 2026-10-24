@@ -25,6 +25,16 @@ MAX_OPEN_INTEREST_MARKETS = 20
 DEFAULT_DATA_API_MAX_RATE = 10
 DEFAULT_DATA_API_PERIOD_SECONDS = 1
 MAX_V2_PAGE_SIZE = 1000
+_USER_PNL_INTERVALS = ("max", "all", "1m", "1w", "1d", "12h", "6h")
+_USER_PNL_FIDELITIES = ("1d", "18h", "12h", "3h", "1h")
+_LEADERBOARD_PERIODS = ("day", "week", "month", "all")
+_LEADERBOARD_SORTS = ("PNL", "VOLUME")
+_PNL_OPTIONAL_FIELDS = (
+    "unrealized_pnl", "position_pnl", "wallet_income", "settled_pnl", "economic_pnl",
+    "trade_pnl", "fees", "fees_refunded", "fees_paid", "maker_rebate", "taker_rebate",
+    "reward_income", "yield_income", "referral_income", "sponsored_income",
+    "deposits", "withdrawals", "cashflow_net",
+)
 _WALLET_RE = re.compile(r"0x[0-9a-fA-F]{40}\Z")
 _CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{64}\Z")
 _SOURCE_CONDITION_RE = re.compile(r"0x[0-9a-fA-F]{1,64}\Z")
@@ -268,6 +278,116 @@ class PolymarketWalletHistory:
 
 
 @dataclass(frozen=True)
+class PolymarketPnlPoint:
+    """One cumulative provider P/L point in USDC; None means uncovered, not zero.
+
+    ``source_block`` is the provider's observation block and ``timestamp_s`` its
+    chart label. Volume and trade count are maker-attributed canonical fills.
+    """
+
+    timestamp_s: int
+    source_block: int
+    realized_market_pnl: Decimal
+    realized_lp_pnl: Decimal
+    realized_combo_pnl: Decimal
+    realized_pnl: Decimal
+    volume_shares: Decimal
+    volume_usdc: Decimal
+    trade_count: int
+    unrealized_pnl: Decimal | None = None
+    position_pnl: Decimal | None = None
+    wallet_income: Decimal | None = None
+    settled_pnl: Decimal | None = None
+    economic_pnl: Decimal | None = None
+    trade_pnl: Decimal | None = None
+    fees: Decimal | None = None
+    fees_refunded: Decimal | None = None
+    fees_paid: Decimal | None = None
+    maker_rebate: Decimal | None = None
+    taker_rebate: Decimal | None = None
+    reward_income: Decimal | None = None
+    yield_income: Decimal | None = None
+    referral_income: Decimal | None = None
+    sponsored_income: Decimal | None = None
+    deposits: Decimal | None = None
+    withdrawals: Decimal | None = None
+    cashflow_net: Decimal | None = None
+
+
+@dataclass(frozen=True)
+class PolymarketPnlSeries:
+    """The provider's current cumulative P/L series for one wallet.
+
+    Histories can be recomputed, so the observation time is the vintage.
+    """
+
+    wallet: str
+    interval: str
+    fidelity: str
+    source_fidelity: str
+    points: tuple[PolymarketPnlPoint, ...]
+    observation: RequestObservation
+
+
+@dataclass(frozen=True)
+class PolymarketUserStats:
+    """Profile statistics; ``markets_traded`` counts distinct markets, not trades."""
+
+    wallet: str
+    markets_traded: int
+    biggest_win_usdc: Decimal
+    views: int
+    join_date_s: int | None
+    all_time_pnl: PolymarketPnlPoint | None
+    observation: RequestObservation
+
+
+def _leaderboard_pnl_basis(time_period: str) -> str:
+    return "realized_lifetime" if time_period == "all" else "marked_equity_change_net_of_flows"
+
+
+@dataclass(frozen=True)
+class PolymarketLeaderboardEntry:
+    rank: int  # Competition rank: ties share a rank and the next one skips.
+    wallet: str
+    pnl_usdc: Decimal
+    volume_shares: Decimal
+    request_id: str
+
+
+@dataclass(frozen=True)
+class PolymarketLeaderboardPage:
+    time_period: str
+    category: str
+    sort_by: str
+    entries: tuple[PolymarketLeaderboardEntry, ...]
+    next_cursor: str | None
+    observation: RequestObservation
+
+    @property
+    def pnl_basis(self) -> str:
+        return _leaderboard_pnl_basis(self.time_period)
+
+
+@dataclass(frozen=True)
+class PolymarketLeaderboardStanding:
+    """One wallet's board standing; a None rank means unranked on that board."""
+
+    wallet: str
+    time_period: str
+    category: str
+    pnl_usdc: Decimal
+    volume_shares: Decimal
+    rank_pnl: int | None
+    rank_volume: int | None
+    observation: RequestObservation
+
+    @property
+    def pnl_basis(self) -> str:
+        return _leaderboard_pnl_basis(self.time_period)
+
+
+@dataclass(frozen=True)
 class _DataPage(Generic[_RowT]):
     rows: tuple[_RowT, ...]
     next_cursor: str | None
@@ -328,6 +448,19 @@ def _decimal(row: Mapping[str, Any], key: str, *, required: bool = False) -> Dec
     if not result.is_finite():
         raise InvalidDataError(f"Data API v2 {key} must be finite")
     return result
+
+
+def _required_decimal(row: Mapping[str, Any], key: str) -> Decimal:
+    value = _decimal(row, key, required=True)
+    assert value is not None
+    return value
+
+
+def _count(row: Mapping[str, Any], key: str) -> int:
+    value = row.get(key)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise InvalidDataError(f"Data API v2 {key} must be a nonnegative integer")
+    return value
 
 
 def _row_identifier(row: Mapping[str, Any], key: str, pattern: re.Pattern[str]) -> str:
@@ -492,6 +625,45 @@ def _activity(
     )
 
 
+def _pnl_point(row: Mapping[str, Any]) -> PolymarketPnlPoint:
+    volume = _required_decimal(row, "volume")
+    volume_usdc = _required_decimal(row, "volume_usdc")
+    if volume < 0 or volume_usdc < 0:
+        raise InvalidDataError("Data API v2 cumulative volume must be nonnegative")
+    return PolymarketPnlPoint(
+        timestamp_s=_count(row, "timestamp"),
+        source_block=_count(row, "source_block"),
+        realized_market_pnl=_required_decimal(row, "realized_market_pnl"),
+        realized_lp_pnl=_required_decimal(row, "realized_lp_pnl"),
+        realized_combo_pnl=_required_decimal(row, "realized_combo_pnl"),
+        realized_pnl=_required_decimal(row, "realized_pnl"),
+        volume_shares=volume,
+        volume_usdc=volume_usdc,
+        trade_count=_count(row, "trade_count"),
+        **{key: _decimal(row, key) for key in _PNL_OPTIONAL_FIELDS},
+    )
+
+
+def _leaderboard_entry(row: Mapping[str, Any], *, request_id: str) -> PolymarketLeaderboardEntry:
+    volume = _required_decimal(row, "volume")
+    if volume < 0:
+        raise InvalidDataError("Data API v2 leaderboard volume must be nonnegative")
+    return PolymarketLeaderboardEntry(
+        rank=_count(row, "rank"),
+        wallet=_row_identifier(row, "user_id", _WALLET_RE),
+        pnl_usdc=_required_decimal(row, "pnl"),
+        volume_shares=volume,
+        request_id=request_id,
+    )
+
+
+def _standing_rank(row: Mapping[str, Any], key: str) -> int | None:
+    # The schema uses null for unranked; the endpoint description uses zero.
+    if row.get(key) is None:
+        return None
+    return _count(row, key) or None
+
+
 class AsyncPolymarketDataClient:
     """Public Polymarket Data API client for activity endpoints."""
 
@@ -560,9 +732,9 @@ class AsyncPolymarketDataClient:
             raise TypeError("Polymarket /v2/oi data must be list[dict].")
         return rows
 
-    async def _v2_page(
+    async def _v2_request(
         self, path: str, params: dict[str, Any], *, expiry: OperationExpiry | None
-    ) -> _DataPage[dict[str, Any]]:
+    ) -> tuple[Any, RequestObservation]:
         try:
             payload, observation = await self._requests.request_json_observed(
                 "GET", path, params=params, expiry=expiry,
@@ -575,6 +747,24 @@ class AsyncPolymarketDataClient:
             raise InvalidDataError(f"{path} response must be valid JSON") from exc
         if expiry is not None:
             expiry.checkpoint()
+        return payload, observation
+
+    async def _v2_object(
+        self, path: str, params: dict[str, Any], *, expiry: OperationExpiry | None
+    ) -> tuple[dict[str, Any] | None, RequestObservation]:
+        """Read an unpaginated envelope; ``data: null`` is the documented miss."""
+        payload, observation = await self._v2_request(path, params, expiry=expiry)
+        if not isinstance(payload, dict) or "data" not in payload:
+            raise InvalidDataError(f"{path} response must be an object with data")
+        data = payload["data"]
+        if data is not None and not isinstance(data, dict):
+            raise InvalidDataError(f"{path} data must be an object or null")
+        return data, observation
+
+    async def _v2_page(
+        self, path: str, params: dict[str, Any], *, expiry: OperationExpiry | None
+    ) -> _DataPage[dict[str, Any]]:
+        payload, observation = await self._v2_request(path, params, expiry=expiry)
         if not isinstance(payload, dict):
             raise InvalidDataError(f"{path} response must be an object")
         rows = payload.get("data")
@@ -817,6 +1007,137 @@ class AsyncPolymarketDataClient:
             expiry.checkpoint()
         return PolymarketActivityPage(user, activities, page.next_cursor, page.observation)
 
+    async def user_pnl(
+        self,
+        wallet: str,
+        *,
+        interval: str = "all",
+        fidelity: str = "1d",
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketPnlSeries | None:
+        """Read the provider's cumulative P/L series, or None for an unknown wallet.
+
+        Points keep source order and are not reconciled with archive trades.
+        """
+        user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
+        if interval not in _USER_PNL_INTERVALS:
+            raise ValueError(f"interval must be one of {_USER_PNL_INTERVALS}")
+        if fidelity not in _USER_PNL_FIDELITIES:
+            raise ValueError(f"fidelity must be one of {_USER_PNL_FIDELITIES}")
+        data, observation = await self._v2_object(
+            "/v2/user-pnl", {"user": user, "interval": interval, "fidelity": fidelity},
+            expiry=expiry,
+        )
+        if data is None:
+            return None
+        if _row_identifier(data, "proxy_wallet", _WALLET_RE) != user:
+            raise InvalidDataError("Data API v2 user-pnl wallet differs from the request")
+        if data.get("interval") != interval or data.get("fidelity") != fidelity:
+            raise InvalidDataError("Data API v2 user-pnl window or grid differs from the request")
+        points = data.get("points")
+        if not isinstance(points, list) or any(not isinstance(point, dict) for point in points):
+            raise InvalidDataError("Data API v2 user-pnl points must be a list of objects")
+        return PolymarketPnlSeries(
+            user, interval, fidelity, _text(data, "source_fidelity"),
+            tuple(_pnl_point(point) for point in points), observation,
+        )
+
+    async def user_stats(
+        self, wallet: str, *, expiry: OperationExpiry | None = None,
+    ) -> PolymarketUserStats | None:
+        """Read profile statistics, or None when the wallet is not a known user."""
+        user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
+        data, observation = await self._v2_object(
+            "/v2/user-stats", {"user": user}, expiry=expiry,
+        )
+        if data is None:
+            return None
+        if _row_identifier(data, "proxy_wallet", _WALLET_RE) != user:
+            raise InvalidDataError("Data API v2 user-stats wallet differs from the request")
+        all_time_pnl = data.get("all_time_pnl")
+        if all_time_pnl is not None and not isinstance(all_time_pnl, dict):
+            raise InvalidDataError("Data API v2 all_time_pnl must be an object or null")
+        return PolymarketUserStats(
+            wallet=user,
+            markets_traded=_count(data, "trades"),
+            biggest_win_usdc=_required_decimal(data, "biggest_win"),
+            views=_count(data, "views"),
+            join_date_s=None if data.get("join_date") is None else _count(data, "join_date"),
+            all_time_pnl=None if all_time_pnl is None else _pnl_point(all_time_pnl),
+            observation=observation,
+        )
+
+    async def leaderboard_page(
+        self,
+        *,
+        time_period: str = "all",
+        category: str = "overall",
+        sort_by: str = "PNL",
+        page_size: int = 1000,
+        cursor: str | None = None,
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketLeaderboardPage:
+        """Read one ranked board page; ``all`` is realized lifetime P/L.
+
+        Day, week and month boards are marked equity changes net of flows.
+        The cursor walks an offset board, so a walk across a refresh can skip
+        or repeat rows. It is not an atomic snapshot of every wallet.
+        """
+        if time_period not in _LEADERBOARD_PERIODS:
+            raise ValueError(f"time_period must be one of {_LEADERBOARD_PERIODS}")
+        if sort_by not in _LEADERBOARD_SORTS:
+            raise ValueError(f"sort_by must be one of {_LEADERBOARD_SORTS}")
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("category must be a nonempty string")
+        _positive_int(page_size, name="page_size", maximum=MAX_V2_PAGE_SIZE)
+        if cursor is not None and (not isinstance(cursor, str) or not cursor):
+            raise ValueError("cursor must be a nonempty string or None")
+        page = await self._v2_page(
+            "/v2/leaderboard",
+            {"time_period": time_period, "category": category, "sort_by": sort_by,
+             "limit": page_size, "cursor": cursor},
+            expiry=expiry,
+        )
+        entries = tuple(
+            _leaderboard_entry(row, request_id=page.observation.request_id)
+            for row in page.rows
+        )
+        return PolymarketLeaderboardPage(
+            time_period, category, sort_by, entries, page.next_cursor, page.observation,
+        )
+
+    async def leaderboard_standing(
+        self,
+        wallet: str,
+        *,
+        time_period: str = "all",
+        category: str = "overall",
+        expiry: OperationExpiry | None = None,
+    ) -> PolymarketLeaderboardStanding | None:
+        """Read one wallet's P/L and volume board standing, or None when unknown."""
+        user = _identifier(wallet, name="wallet", pattern=_WALLET_RE)
+        if time_period not in _LEADERBOARD_PERIODS:
+            raise ValueError(f"time_period must be one of {_LEADERBOARD_PERIODS}")
+        if not isinstance(category, str) or not category.strip():
+            raise ValueError("category must be a nonempty string")
+        data, observation = await self._v2_object(
+            "/v2/leaderboard",
+            {"user": user, "time_period": time_period, "category": category},
+            expiry=expiry,
+        )
+        if data is None:
+            return None
+        if _row_identifier(data, "user_id", _WALLET_RE) != user:
+            raise InvalidDataError("Data API v2 leaderboard standing wallet differs from the request")
+        volume = _required_decimal(data, "volume")
+        if volume < 0:
+            raise InvalidDataError("Data API v2 leaderboard volume must be nonnegative")
+        return PolymarketLeaderboardStanding(
+            user, time_period, category, _required_decimal(data, "pnl"), volume,
+            _standing_rank(data, "rank_pnl"), _standing_rank(data, "rank_volume"),
+            observation,
+        )
+
     async def _scan_positions(
         self,
         *,
@@ -973,11 +1294,17 @@ __all__ = [
     "PolymarketHolder",
     "PolymarketHolderGroup",
     "PolymarketHoldersPage",
+    "PolymarketLeaderboardEntry",
+    "PolymarketLeaderboardPage",
+    "PolymarketLeaderboardStanding",
     "PolymarketMarketParticipants",
     "PolymarketMarketTradesPage",
     "PolymarketOpenInterestBatch",
     "PolymarketParticipant",
+    "PolymarketPnlPoint",
+    "PolymarketPnlSeries",
     "PolymarketPosition",
+    "PolymarketUserStats",
     "PolymarketWalletHistory",
     "PolymarketWalletActivity",
     "PolymarketWalletTrade",
