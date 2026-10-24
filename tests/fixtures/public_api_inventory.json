@@ -648,7 +648,18 @@
     },
     {
       "path": "pmkt.resolution.evm.PolygonCtfClient",
-      "tier": "supported"
+      "tier": "supported",
+      "methods": [
+        "chain_id",
+        "ensure_polygon",
+        "block_number",
+        "block_by_number",
+        "transaction_receipt",
+        "eth_call",
+        "payout_denominator",
+        "payout_numerator",
+        "payout_vector"
+      ]
     },
     {
       "path": "pmkt.resolution.evm.EvmRpcError",
