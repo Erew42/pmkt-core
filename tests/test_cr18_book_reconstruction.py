@@ -929,8 +929,8 @@ def test_kalshi_reconstruction_matches_each_transcript_wire_mode(
         )
     state = states["KXTRANSCRIPT"]
     native_book = {
-        **{("yes", str(price)): size for price, size in state.yes_bids.items()},
-        **{("no", str(price)): size for price, size in state.no_bids.items()},
+        **{("yes", str(price)): float(size) for price, size in state.yes_bids.items()},
+        **{("no", str(price)): float(size) for price, size in state.no_bids.items()},
     }
     event = {
         "venue": "kalshi",

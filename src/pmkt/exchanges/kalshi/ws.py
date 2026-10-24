@@ -22,8 +22,9 @@ from urllib.parse import urlparse
 
 import websockets
 from websockets.exceptions import ConnectionClosed
+from websockets.protocol import State
 
-from pmkt.exchanges.book_integrity import finite_number, well_formed_levels, snapshot_ladder
+from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels, snapshot_ladder
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
@@ -35,10 +36,8 @@ from pmkt.data.kalshi_quotes import (
     KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT,
     project_kalshi_quotes,
 )
-from pmkt.data.prices import complement_probability as _price_complement
 from pmkt.data.time import isoformat_source_timestamp
 from pmkt.data.time import timestamp_seconds as _timestamp_seconds
-from pmkt.data.types import parse_float as _parse_float
 from pmkt.data.types import parse_int as _parse_int
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
@@ -55,14 +54,6 @@ RawFrameCallback = Callable[[str | bytes], None | Awaitable[None]]
 
 DEFAULT_RECONNECT_ATTEMPTS = 3
 DEFAULT_RECONNECT_BACKOFF_SECONDS = 0.5
-
-
-def _first_parsed_float(*values: Any) -> float | None:
-    for value in values:
-        parsed = _parse_float(value)
-        if parsed is not None:
-            return parsed
-    return None
 
 
 def normalize_market_tickers(tickers: str | Iterable[str]) -> list[str]:
@@ -149,6 +140,7 @@ def decode_kalshi_messages(
     raw: Any,
     *,
     on_decode_error: DecodeErrorCallback | None = None,
+    decimal_numbers: bool = False,
 ) -> list[dict[str, Any]]:
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
@@ -157,7 +149,7 @@ def decode_kalshi_messages(
         if not frame or frame.upper() in {"PING", "PONG"}:
             return []
         try:
-            decoded = json.loads(frame)
+            decoded = json.loads(frame, parse_float=Decimal if decimal_numbers else float)
         except json.JSONDecodeError:
             logger.warning("Failed to parse Kalshi websocket message: %s", raw)
             if on_decode_error is not None:
@@ -340,26 +332,6 @@ def _message_payload(message: dict[str, Any]) -> dict[str, Any]:
     return msg if isinstance(msg, dict) else message
 
 
-def _levels_to_map(levels: Any) -> dict[float, float]:
-    parsed: dict[float, float] = {}
-    if not isinstance(levels, list):
-        return parsed
-    for level in levels:
-        if isinstance(level, dict):
-            price = _first_parsed_float(level.get("price"), level.get("price_dollars"))
-            size = _first_parsed_float(
-                level.get("size"), level.get("count"), level.get("count_fp")
-            )
-        elif isinstance(level, (list, tuple)) and len(level) >= 2:
-            price = _parse_float(level[0])
-            size = _parse_float(level[1])
-        else:
-            continue
-        if price is None or size is None or size <= 0:
-            continue
-        parsed[price] = size
-    return parsed
-
 
 @dataclass
 class KalshiBookSnapshot:
@@ -453,8 +425,8 @@ class KalshiOrderBookState:
     use_yes_price: bool = True
     quote_normalization_policy: str = KALSHI_QUOTE_NORMALIZATION_POLICY_CURRENT
     market_id: str | None = None
-    yes_bids: dict[float, float] = field(default_factory=dict)
-    no_bids: dict[float, float] = field(default_factory=dict)
+    yes_bids: dict[Decimal, Decimal] = field(default_factory=dict)
+    no_bids: dict[Decimal, Decimal] = field(default_factory=dict)
     last_event_type: str | None = None
     sid: int | None = None
     last_seq: int | None = None
@@ -490,10 +462,10 @@ class KalshiOrderBookState:
         yes_bid_size = self.yes_bids.get(yes_bid) if yes_bid is not None else None
         no_price_size = self.no_bids.get(no_price) if no_price is not None else None
         quotes = project_kalshi_quotes(
-            yes_bid=yes_bid,
-            no_ladder_price=no_price,
-            yes_bid_size=yes_bid_size,
-            no_ladder_size=no_price_size,
+            yes_bid=float(yes_bid) if yes_bid is not None else None,
+            no_ladder_price=float(no_price) if no_price is not None else None,
+            yes_bid_size=float(yes_bid_size) if yes_bid_size is not None else None,
+            no_ladder_size=float(no_price_size) if no_price_size is not None else None,
             use_yes_price=self.use_yes_price,
             policy_version=self.quote_normalization_policy,
         )
@@ -525,8 +497,8 @@ class KalshiOrderBookState:
         )
         yes = snapshot_ladder(msg, "yes_dollars_fp", "yes_dollars", "yes")
         no = snapshot_ladder(msg, "no_dollars_fp", "no_dollars", "no")
-        self.yes_bids = _levels_to_map(yes)
-        self.no_bids = _levels_to_map(no)
+        self.yes_bids = decimal_levels(yes)
+        self.no_bids = decimal_levels(no)
         self.initial_snapshot_received = True
         self.valid_state = True
         self.quality_flags.clear()
@@ -555,15 +527,15 @@ class KalshiOrderBookState:
             self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
         self._apply_sequence(message.get("sid"), message.get("seq"))
         side = str(msg.get("side") or "").lower()
-        price = finite_number(next((msg[key] for key in ("price_dollars", "price") if key in msg), None))
-        delta = finite_number(next((msg[key] for key in ("delta_fp", "delta", "size_delta") if key in msg), None))
-        if (side not in {"yes", "no"} or price is None or delta is None or finite_number(price) is None
-                or finite_number(delta) is None or not 0 <= price <= 1):
+        price = finite_decimal(next((msg[key] for key in ("price_dollars", "price") if key in msg), None))
+        delta = finite_decimal(next((msg[key] for key in ("delta_fp", "delta", "size_delta") if key in msg), None))
+        if (side not in {"yes", "no"} or price is None or delta is None or finite_decimal(price) is None
+                or finite_decimal(delta) is None or not 0 <= price <= 1):
             self.quality_flags.add("malformed_book")
         else:
             levels = self.yes_bids if side == "yes" else self.no_bids
-            next_size = levels.get(price, 0.0) + delta
-            if next_size < -1e-9:
+            next_size = levels.get(price, Decimal(0)) + delta
+            if next_size < 0:
                 self.quality_flags.add("malformed_book")
             if next_size <= 0:
                 levels.pop(price, None)
@@ -631,7 +603,7 @@ class KalshiOrderBookState:
         yes_ask = (
             min(self.no_bids)
             if self.use_yes_price and self.no_bids
-            else _price_complement(max(self.no_bids))
+            else Decimal(1) - max(self.no_bids)
             if self.no_bids
             else None
         )
@@ -749,6 +721,8 @@ class AsyncKalshiWebSocketClient:
     def is_connected(self) -> bool:
         if self._ws is None:
             return False
+        if getattr(self._ws, "state", None) in {State.CLOSING, State.CLOSED}:
+            return False
         return not bool(getattr(self._ws, "closed", False))
 
     def auth_headers(self) -> dict[str, str]:
@@ -783,7 +757,9 @@ class AsyncKalshiWebSocketClient:
     async def close(self) -> None:
         ws, self._ws = self._ws, None
         if ws is not None:
-            await ws.close()
+            # The reference is already detached: a cancelled caller must not
+            # abandon the closing handshake, or the socket stays open unowned.
+            await asyncio.shield(ws.close())
 
     async def reconnect(self) -> None:
         await self.close()
@@ -910,6 +886,7 @@ class AsyncKalshiWebSocketClient:
         reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
         on_reconnect: Callable[[], None] | None = None,
         on_decode_error: DecodeErrorCallback | None = None,
+        decimal_numbers: bool = False,
         on_raw_frame: RawFrameCallback | None = None,
         fail_on_clean_close_exhausted: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
@@ -932,7 +909,7 @@ class AsyncKalshiWebSocketClient:
                         if inspect.isawaitable(callback_result):
                             await callback_result
                     for message in decode_kalshi_messages(
-                        raw, on_decode_error=on_decode_error
+                        raw, on_decode_error=on_decode_error, decimal_numbers=decimal_numbers
                     ):
                         yield message
             except (ConnectionClosed, OSError, asyncio.TimeoutError, AttributeError) as exc:
