@@ -29,6 +29,10 @@ from pmkt.resolution.models import (
     STATE_UNAVAILABLE,
     ResolutionRecord,
 )
+from pmkt.resolution.terminal_labels import (
+    is_authoritative_final_resolution,
+    resolution_training_label,
+)
 
 
 class FakeGamma:
@@ -445,6 +449,102 @@ def test_cache_carry_forward_observations_are_deduped_and_bounded() -> None:
     assert observations[-1]["source"] == "new-source"
     assert "source-0" not in {observation["source"] for observation in observations}
     assert len({cache_module._stable_json(observation) for observation in observations}) == 32
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_weak_refreshes_preserve_retained_payout_label_mappings(verified: bool) -> None:
+    def mapping(source: str) -> dict[str, Any]:
+        return {
+            "source": source,
+            "confidence": CONFIDENCE_METADATA_ONLY,
+            "evidence": {
+                "outcome_labels": [
+                    {"outcome_index": 0, "outcome": "yes"},
+                    {"outcome_index": 1, "outcome": "no"},
+                ],
+                "status": "success",
+            },
+        }
+
+    mappings = [mapping("polymarket_default_binary_labels")]
+    if verified:
+        mappings.append(mapping("polymarket_snapshot"))
+    existing = _resolution_row(
+        platform="polymarket", market_key="pm-assumed", canonical_source="polygon_ctf",
+        payouts_json='[{"outcome":"yes","payout":"1"},{"outcome":"no","payout":"0"}]',
+    )
+    existing["source_observations_json"] = mappings
+    carried = existing
+    # Failed RPC refreshes do not repeat the canonical row's mapping evidence.
+    for index in range(64):
+        attempted = _unavailable_record("polymarket", "pm-assumed").to_row()
+        attempted["source_observations_json"] = [
+            {"source": "polygon_ctf", "confidence": CONFIDENCE_UNAVAILABLE,
+             "observed_at_utc": f"attempt-{index}", "error_type": "EvmRpcError"},
+        ]
+        carried = cache_module._carry_forward_final(carried, attempted)
+        observations = carried["source_observations_json"]
+        assert all(item in observations for item in mappings)
+        assert len(observations) <= 32
+        assert observations[-1] == attempted["source_observations_json"][0]
+        assert carried["payouts_json"] == existing["payouts_json"]
+        assert carried["resolver_version"] == existing["resolver_version"]
+
+        label = resolution_training_label(carried)
+        assert label.terminal_label == "yes"
+        assert label.binary_yes == 1
+        assert label.exclusion_reason == (None if verified else "outcome_mapping_assumed")
+        assert label.quality == ("canonical_binary" if verified else "unavailable")
+        assert is_authoritative_final_resolution(carried) is verified
+
+    assert len(observations) == 32
+    assert not any(item.get("observed_at_utc") == "attempt-0" for item in observations)
+
+
+@pytest.mark.parametrize("verified", [False, True])
+def test_overfull_final_preserves_policy_evidence_beyond_mapping_cap(verified: bool) -> None:
+    existing = _resolution_row(
+        platform="polymarket", market_key="pm-overfull", canonical_source="polygon_ctf",
+        payouts_json='[{"outcome":"yes","payout":"1"},{"outcome":"no","payout":"0"}]',
+    )
+    noise = [{"source": "polymarket_snapshot", "observed_at_utc": str(index),
+              "evidence": {"outcome_labels": [{"outcome": "over"}, {"outcome": "under"}]}}
+             for index in range(32)]
+    mapping = {"evidence": {"outcome_labels": [{"outcome": "yes"}, {"outcome": "no"}]}}
+    default = {**mapping, "source": "polymarket_default_binary_labels"}
+    explicit = {**mapping, "source": "polymarket_snapshot"}
+    existing["source_observations_json"] = [*noise, default, *([explicit] if verified else [])]
+    attempted = _unavailable_record("polymarket", "pm-overfull").to_row()
+    latest = {"source": "polygon_ctf", "error_type": "EvmRpcError", "observed_at_utc": "latest"}
+    attempted["source_observations_json"] = [latest]
+    carried = cache_module._carry_forward_final(existing, attempted)
+    assert default in carried["source_observations_json"]
+    if verified:
+        assert explicit in carried["source_observations_json"]
+    assert carried["source_observations_json"][-1] == latest
+    assert len(carried["source_observations_json"]) == 32
+    assert is_authoritative_final_resolution(carried) is verified
+
+
+def test_conflict_refresh_keeps_recent_diagnostics_with_many_timestamped_mappings() -> None:
+    existing = _resolution_row(platform="polymarket", market_key="pm-conflict")
+    existing.update(resolution_state=STATE_INCONSISTENT, confidence=CONFIDENCE_INCONSISTENT,
+                    error_type="MarketResolutionCacheConflict")
+    for index in range(64):
+        attempted = _resolution_row(platform="polymarket", market_key="pm-conflict")
+        attempted["source_observations_json"] = [
+            {"source": "polymarket_snapshot", "observed_at_utc": f"mapping-{index}",
+             "evidence": {"outcome_labels": [{"outcome": "yes"}, {"outcome": "no"}]}},
+            {"source": "polygon_ctf", "observed_at_utc": f"payout-{index}"},
+        ]
+        existing = cache_module._carry_forward_final(existing, attempted)
+        assert existing["source_observations_json"][-1] == attempted["source_observations_json"][-1]
+        assert len(existing["source_observations_json"]) <= 32
+    failed = _unavailable_record("polymarket", "pm-conflict").to_row()
+    failed["source_observations_json"] = [{"source": "polygon_ctf", "error_type": "EvmRpcError"}]
+    carried = cache_module._carry_forward_final(existing, failed)
+    assert carried["source_observations_json"][-1] == failed["source_observations_json"][0]
+    assert carried["resolution_state"] == STATE_INCONSISTENT
 
 
 @pytest.mark.asyncio
