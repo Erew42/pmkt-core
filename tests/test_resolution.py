@@ -37,6 +37,7 @@ from pmkt.resolution.kalshi import (
 )
 from pmkt.resolution.models import RESOLVER_VERSION, error_record
 from pmkt.resolution.polymarket import PolymarketResolutionResolver, _clob_tokens
+from pmkt.resolution.terminal_labels import resolution_training_label
 
 
 @pytest.mark.asyncio
@@ -785,6 +786,41 @@ async def test_polymarket_resolver_ctf_final_retains_snapshot_label_mapping() ->
         {"outcome_index": 1, "outcome": "no"},
     ]
     assert isinstance(mapping["payload_sha256"], str)
+
+
+@pytest.mark.asyncio
+async def test_default_binary_labels_after_gamma_failure_are_not_training_labels() -> None:
+    class FailingGamma:
+        async def market(self, market_key: str, *, expiry=None):
+            raise httpx.ConnectError("Gamma unavailable")
+
+    class FakeCtf:
+        async def ensure_polygon(self, *, expiry=None) -> None:
+            return None
+
+        async def payout_vector(self, condition_id: str, outcome_count: int, *, expiry=None):
+            return 1, [1, 0]
+
+    resolver = PolymarketResolutionResolver(gamma_client=FailingGamma(), ctf_client=FakeCtf())
+    # Only a condition ID, as a settlement lookup passes: the outcomes might be teams.
+    assumed = await resolver.resolve(PolymarketMarketRef("pm-1"), snapshot={"condition_id": "0xabc"})
+    named = await resolver.resolve(
+        PolymarketMarketRef("pm-1"),
+        snapshot={"condition_id": "0xabc", "outcome_labels_json": ["Seahawks", "Broncos"]},
+    )
+
+    assert assumed.winner == "yes" and assumed.canonical_source == "polygon_ctf"
+    assert "polymarket_default_binary_labels" in [o.source for o in assumed.source_observations]
+    stored = assumed.to_row()
+    stored["source_observations_json"] = json.dumps(stored["source_observations_json"])
+    for row in (assumed.to_row(), stored):
+        label = resolution_training_label(row)
+        assert label.terminal_label == "yes"
+        assert label.binary_yes == 1
+        assert label.exclusion_reason == "outcome_mapping_assumed"
+        assert label.quality == "unavailable"
+    assert named.winner == "seahawks"
+    assert resolution_training_label(named.to_row()).exclusion_reason == "terminal_label_unavailable"
 
 
 @pytest.mark.asyncio

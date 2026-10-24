@@ -457,12 +457,12 @@ class CatalogSnapshot:
         if match is None:
             raise OptionalDependencyError(
                 f"unsupported DuckDB version string {duckdb.__version__!r}; "
-                "managed catalog queries require duckdb>=1.5.5"
+                "managed catalog queries require duckdb>=1.5.5,<2"
             )
         duckdb_parts = tuple(int(part) for part in match.groups())
-        if duckdb_parts < (1, 5, 5):
+        if not (1, 5, 5) <= duckdb_parts < (2, 0, 0):
             raise OptionalDependencyError(
-                "managed catalog queries require duckdb>=1.5.5"
+                "managed catalog queries require duckdb>=1.5.5,<2"
             )
         arrow_major = int(pa.__version__.split(".", 1)[0])
         if arrow_major < 14:

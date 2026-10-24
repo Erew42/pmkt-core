@@ -35,15 +35,17 @@ dependencies = [
 pmkt = "pmkt.cli.entrypoint:main"
 
 [project.optional-dependencies]
+# DuckDB 2 changes SELECT classification and disables the catalog's arrow lambdas.
+# Qualify that major separately before allowing it in data, storage, or tests.
 data = [
   "pandas>=2.1,<3",
   "pyarrow>=14",
-  "duckdb>=1.5.5",
+  "duckdb>=1.5.5,<2",
 ]
 storage = [
   "pandas>=2.1,<3",
   "pyarrow>=14",
-  "duckdb>=1.5.5",
+  "duckdb>=1.5.5,<2",
 ]
 streaming = [
   "pandas>=2.1,<3",
@@ -54,7 +56,7 @@ test = [
   "pandas>=2.1,<3",
   "numpy>=1.26,<2.5",
   "pyarrow>=14",
-  "duckdb>=1.5.5",
+  "duckdb>=1.5.5,<2",
   "websockets>=12.0",
   "build>=1.2",
   "setuptools>=68",

@@ -16,6 +16,8 @@ from pmkt.resolution.models import (
 )
 
 KNOWN_TERMINAL_LABELS = frozenset({"yes", "no", "refund"})
+# Label-mapping source used when neither a snapshot nor Gamma named the outcomes.
+POLYMARKET_DEFAULT_LABEL_SOURCE = "polymarket_default_binary_labels"
 EXACT_PAYOUT_LABEL_PREFIX = "payout:"
 EXACT_SCALAR_LABEL_PREFIX = "scalar:"
 
@@ -418,7 +420,50 @@ def _eligibility_error(record: Mapping[str, Any], policy: ResolutionLabelPolicy)
         return "canonical_source_not_allowed"
     if _authoritative_terminal_label_from_resolution(record, policy) is None:
         return "terminal_label_unavailable"
+    if _polymarket_outcome_mapping_assumed(record):
+        return "outcome_mapping_assumed"
     return None
+
+
+def _polymarket_outcome_mapping_assumed(record: Mapping[str, Any]) -> bool:
+    """Return whether payout outcomes were named only by the resolver's yes/no default.
+
+    The resolver labels indices 0 and 1 as yes/no when no snapshot or Gamma
+    mapping is available, which is arbitrary for markets such as Over/Under or
+    team names. Cache merges can add a verified mapping to the same row; one that
+    names the payout outcomes in order keeps the record eligible. Records without
+    mapping observations are unaffected.
+    """
+    if _clean_text(record.get("platform")) != "polymarket":
+        return False
+    mappings: list[tuple[str | None, list[str]]] = []
+    for observation in json_array(record.get("source_observations_json")):
+        if not isinstance(observation, Mapping):
+            continue
+        evidence = observation.get("evidence")
+        if isinstance(evidence, Mapping) and "outcome_labels" in evidence:
+            mappings.append(
+                (_clean_text(observation.get("source")), _ordered_outcomes(evidence["outcome_labels"]))
+            )
+    if not any(source == POLYMARKET_DEFAULT_LABEL_SOURCE for source, _ in mappings):
+        return False
+    payout_outcomes = _ordered_outcomes(record.get("payouts_json"))
+    return not any(
+        source != POLYMARKET_DEFAULT_LABEL_SOURCE and outcomes == payout_outcomes
+        for source, outcomes in mappings
+    )
+
+
+def _ordered_outcomes(value: Any) -> list[str]:
+    items = [item for item in json_array(value) if isinstance(item, Mapping)]
+    indices = [
+        index
+        for index in (item.get("outcome_index") for item in items)
+        if isinstance(index, int) and not isinstance(index, bool)
+    ]
+    if len(indices) == len(items):
+        items = [items[position] for position in sorted(range(len(items)), key=indices.__getitem__)]
+    return [str(item.get("outcome") or "").strip().lower() for item in items]
 
 
 def _authoritative_terminal_label_from_resolution(
