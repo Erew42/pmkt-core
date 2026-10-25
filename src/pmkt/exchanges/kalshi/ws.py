@@ -562,7 +562,11 @@ class KalshiOrderBookState:
             self.quality_flags.add("malformed_book")
         else:
             levels = self.yes_bids if side == "yes" else self.no_bids
-            next_size = levels.get(price, 0.0) + delta
+            # Add decimal representations before exporting float quantities:
+            # binary addition can leave a positive residue at an exhausted level.
+            next_size = float(
+                Decimal(str(levels.get(price, 0.0))) + Decimal(str(delta))
+            )
             if next_size < -1e-9:
                 self.quality_flags.add("malformed_book")
             if next_size <= 0:
