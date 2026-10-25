@@ -9,7 +9,7 @@ the public repository by accident.
 
 The following paths are owned by `pmkt-core`:
 
-- `src/pmkt/{__init__,_http,_observations,_operation,catalog,config,errors,models,pagination,records,tokens}.py` and
+- `src/pmkt/{__init__,_http,_observations,catalog,config,errors,models,pagination,provenance,records,runtime,tokens}.py` and
   `src/pmkt/py.typed`.
 - `src/pmkt/data/**`, except semantic sports-corpus and matching-policy code.
 - `src/pmkt/exchanges/**`, except credential/private-key loaders, generic signed
@@ -20,8 +20,7 @@ The following paths are owned by `pmkt-core`:
   `src/pmkt/text/**` utilities and taxonomy data.
 - The core CLI modules and commands documented in `CLI_COMMANDS.md`.
 - `openapi/**`, `docs/api/**`, `docs/data_dictionary.md`,
-  `docs/public_api.md`, `docs/schema_lifecycle.{md,json}`, and
-  `docs/storage_profile_capture_runbook.md`.
+  `docs/public_api.md`, and `docs/schema_lifecycle.{md,json}`.
 - Read-only capture/contract/example scripts retained under `scripts/` and the
   tests for the public modules.
 - The two normalized Kalshi order-book fixtures under `tests/fixtures/`.

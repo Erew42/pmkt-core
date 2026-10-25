@@ -16,7 +16,9 @@ Schema versions, column constants, and typed schema objects live in
 `src/pmkt/data/schemas.py` provide row builders and registry-backed public
 import paths.
 
-Freshness pass: 2026-06-02.
+Sections marked "Producer: pmkt-trading" describe artifacts that only
+`pmkt-trading` writes; core may still register or validate their physical
+schema.
 
 ## Design principles
 
@@ -90,9 +92,10 @@ New history partitions carry immutable acquisition provenance in their path:
 `native_family=kalshi_mve`. Discovery deltas add a unique immutable
 `promotion_id=<history_release_id>` level between `source=discovery_delta` and
 `native_family`; Kalshi retains its stable bucket below that level. Repeated
-promotions therefore never reuse a parent delta path. `register_catalog_views()` injects that value,
-`family_provenance`, `operational_family`, and
-`family_classifier_version=operational_family.v1` at read time. Legacy Kalshi
+promotions therefore never reuse a parent delta path. `register_catalog_views()`
+injects `native_family`, `family_provenance`, `operational_family`, and
+`family_classifier_version=operational_family.v1` at read time; it does not
+expose `promotion_id`. Legacy Kalshi
 rows use the narrow `KXMVE` ticker compatibility rule; the catalog does not call
 the matching-oriented `infer_contract_family()` heuristic. Polymarket derived
 families recognize only the high-confidence 5-minute, 15-minute, and 4-hour
@@ -166,13 +169,18 @@ sections below or in the registry descriptions.
 | `convergence_summary.v1` | `convergence_summary` | Per-match convergence/divergence aggregates. |
 | `contract_evidence.v1` | `contract_evidence` | Venue contract-semantics evidence with endpoint provenance, distinct hashes, instrument mapping, and explicit completeness. |
 | `depth.v1` | `depth` | Canonical order-book depth levels. |
+| `depth.v2` | `depth` | `depth.v1` plus book-integrity evidence for profile-v3 captures. |
 | `event.v1` | `event` | Venue event metadata. |
 | `execution_sizing_plan.v1` | `execution_sizing_plan` | Versioned execution sizing decision with plan-derived exposure evidence. |
 | `feed_health.v1` | `feed_health` | Shard-level websocket feed supervision and instrument coverage state. |
+| `feed_health.v2` | `feed_health` | `feed_health.v1` plus book-integrity evidence for profile-v3 captures. |
 | `capture_instrument_evidence.v1` | `capture_instrument_evidence` | Per-instrument, per-subscription-attempt eligibility and initial valid-book evidence for profile-v2 captures. |
+| `capture_instrument_evidence.v2` | `capture_instrument_evidence` | `capture_instrument_evidence.v1` plus book-integrity evidence for profile-v3 captures. |
 | `book_tape_event.v1` | `book_tape_event` | Logical commit header for one venue-native book checkpoint or delta. |
+| `book_tape_event.v2` | `book_tape_event` | `book_tape_event.v1` plus book-integrity evidence for profile-v3 captures. |
 | `book_tape_level.v1` | `book_tape_level` | Absolute post-event venue-native price-level mutation. |
 | `book_tape_control.v1` | `book_tape_control` | Book validity, epoch, and stream-terminal transition. |
+| `book_tape_control.v2` | `book_tape_control` | `book_tape_control.v1` plus book-integrity evidence for profile-v3 captures. |
 | `stream_lifecycle.v1` | `stream_lifecycle` | Source market-lifecycle observation from a stream run. |
 | `historical_backfill_gap.v1` | `historical_backfill_gap` | Historical backfill unsupported capability, fetch error, or data-quality gap. |
 | `historical_price.v1` | `historical_price` | Historical price/candle context, not executable topbook/depth evidence. |
@@ -196,11 +204,17 @@ sections below or in the registry descriptions.
 | `passive_markout.v1` | `passive_markout` | Post-fill passive replay markout row for local analysis. |
 | `polymarket_market_snapshot.v1` | `polymarket_market_snapshot` | Legacy Polymarket Gamma market snapshot export used by matchers and stream selectors. |
 | `polymarket_market_snapshot.v2` | `polymarket_market_snapshot_v2` | Trimmed Polymarket Gamma market snapshot export without legacy resolution metadata. |
+| `recording_book_levels.v1` | `recording_book_levels` | `recording.v1` price level of one saved book snapshot. |
+| `recording_book_snapshots.v1` | `recording_book_snapshots` | `recording.v1` saved full-book snapshot header. |
+| `recording_events.v1` | `recording_events` | `recording.v1` connection, integrity, and market-lifecycle event. |
+| `recording_topbook.v1` | `recording_topbook` | `recording.v1` changed top-of-book observation. |
+| `recording_trades.v1` | `recording_trades` | `recording.v1` public trade report. |
 | `run_manifest.v1` | `run_manifest` | Auditable run metadata. |
 | `signal.v1` | `signal` | Price-aware cross-venue signal state before order intent. |
 | `soak_run_plan.v1` | `soak_run_plan` | Read-only long-duration soak evidence plan; does not start runtime processes. |
 | `soak_run_report.v1` | `soak_run_report` | Summary of recorded no-order soak evidence from runtime store and artifacts. |
 | `topbook.v1` | `topbook` | Canonical top-of-book snapshot. |
+| `topbook.v2` | `topbook` | `topbook.v1` plus book-integrity evidence for profile-v3 captures. |
 | `topbook_capture_gap.v1` | `topbook_capture_gap` | Continuous topbook recorder fetch and coverage gaps. |
 | `tracking_health.v1` | `tracking_health` | Match-level websocket tracking coverage, freshness, and book validity. |
 | `tracking_match.v1` | `tracking_match` | Candidate cross-venue match rows intended for websocket tracking. |
@@ -301,6 +315,8 @@ columns resume under the explicit `legacy_all_domains_checkpoint` policy.
 
 ### Authoritative relation binding
 
+Producer: pmkt-trading.
+
 `relation_rules.v2` binds relation evidence in this order: resolved top-level
 identity, the newest qualifying complete-v2 contract-evidence sidecar, a direct
 source market row for diagnostics, then candidate data for fields still
@@ -335,6 +351,8 @@ disable, or satisfy the requirement. Exact instrument equivalence still
 requires resolved market, instrument, and outcome.
 
 ### Sports audit artifacts (generated, unregistered)
+
+Producer: pmkt-trading.
 
 `sports_review_label.v2` is a human-reviewed CSV at exact cross-venue
 instrument-pair grain. Its unique key is Polymarket market/instrument plus
@@ -619,7 +637,7 @@ A normalized executed trade observation.
 | `schema_version` | Always `trade.v1`. |
 | `collector_run_id` | Capture-run authority for streaming trades; null only for non-capture historical trade rows. |
 | `venue` | Venue name. |
-| `venue_trade_id` | Native trade id if available. |
+| `venue_trade_id` | Required; part of the primary key with `venue`. Kalshi's native trade id, or a stable synthesized id when a backfill payload has none. Polymarket streaming rows use a derived observation hash, not a venue execution id. |
 | `venue_market_id` | Parent market id. |
 | `instrument_id` | Tradable instrument id. |
 | `outcome` | Outcome label. |
@@ -635,6 +653,8 @@ A normalized executed trade observation.
 | `raw_json_sha256` | SHA-256 of raw payload when raw JSON is stored elsewhere. |
 
 ## Market match schema: `market_match.v2`
+
+Producer: pmkt-trading.
 
 A cross-venue equivalence candidate. `market_match.v1` remains registered as
 `market_match_v1` for legacy persisted files, but new match outputs should use
@@ -692,6 +712,8 @@ A cross-venue equivalence candidate. `market_match.v1` remains registered as
 
 ## Co-resolution observation schema: `co_resolution_observation.v1`
 
+Producer: pmkt-trading.
+
 An offline research sidecar built from `market_match.v2` candidate pairs and
 authoritative `market_resolution.v1` cache rows. It is the training/evaluation
 input for CR-14 Bayesian co-resolution models and is not accepted by live,
@@ -732,6 +754,8 @@ evidence.
 
 ## Co-resolution score schema: `co_resolution_score.v1`
 
+Producer: pmkt-trading.
+
 An offline, research-only score sidecar produced by CR-14 co-resolution models.
 It is designed for research reports and manual review, not live execution.
 
@@ -755,14 +779,16 @@ Core columns:
 | Bucket diagnostics | Selected bucket level, selected bucket row count, feature bucket version, score source, and model diagnostics JSON. |
 | Safety fields | `complement_residual`, `data_quality_flags`, `risk_flags`, `research_only`, and `allowed_consumers_json`. |
 
-Validation invariants require posterior probabilities and intervals to be
+Core validation invariants require posterior probabilities and intervals to be
 present, stay in `[0, 1]`, intervals to be ordered, the composite score key to
-be unique and non-empty, CR-14 rows to be `research_only=true`, allowed
-consumers to exclude paper/live/signal/OMS paths, and incoherent same+inverse
-complements to carry
+be unique and non-empty, and incoherent same+inverse complements to carry
 `binary_complement_incoherent` in both `data_quality_flags` and `risk_flags`.
+`research_only=true` and the exclusion of paper/live/signal/OMS consumers are
+checked by `pmkt_trading.data.validation`, not core.
 
 ## Websocket tracking match schema: `tracking_match.v1`
+
+Producer: pmkt-trading.
 
 `websocket_tracking_matches.parquet` is a validated match-oriented table
 derived from generic matcher output. It contains only cross-venue relationships
@@ -774,12 +800,12 @@ rules, or scan candidate pairs. The candidate-pair path is review/tracking
 oriented: it joins scan pairs back to source market rows and applies tracking
 relation rules without promoting the rows to strict equivalence.
 
-`pmkt build-tracking-matches --diagnostics-out` can write a JSON sidecar with
+`pmkt-trading build-tracking-matches --diagnostics-out` can write a JSON sidecar with
 the build mode, output counts, tier/relation counts, zero-output reasons, and
 candidate-pair resolution counters such as `source_rows_joined`,
 `source_rows_missing`, `relation_detected`, and `no_tracking_relation`.
 
-`pmkt build-websocket-tracking-set` runs the tracking-only pipeline end to end:
+`pmkt-trading build-websocket-tracking-set` runs the tracking-only pipeline end to end:
 it writes `tracking_match.v1`, converts it to `match_relation.v1`, builds a
 `subscription_plan.v1`, and writes validation/diagnostic JSON sidecars.
 Both `build-match-relations` and `build-websocket-tracking-set` accept
@@ -808,6 +834,8 @@ Important columns:
 
 ## Match relation schema: `match_relation.v1`
 
+Producer: pmkt-trading.
+
 A source-level relation used to separate strict trading equivalence from
 websocket/event tracking relationships. Relation rows are instrument-level:
 market-level tracking rows with multiple Polymarket tokens are expanded into one
@@ -820,7 +848,7 @@ are explicitly relation-linked.
 | `match_id` | Stable relation id derived from venue market and instrument identifiers. |
 | `relation_version` | Rule version used to assign the relation. |
 | `polymarket_market_key` / `kalshi_market_key` | Venue market identifiers. |
-| `polymarket_instrument_key` / `kalshi_instrument_key` | Venue instrument identifiers when known. |
+| `polymarket_instrument_key` / `kalshi_instrument_key` | Required venue instrument identifiers; validation rejects nulls. |
 | `polymarket_token_id` | One Polymarket CLOB token id, not a serialized token list. |
 | `polymarket_outcome` / `kalshi_outcome` | Outcome labels when known. |
 | `relation_label` | One of `exact_equivalent`, `inverse_equivalent`, `same_event_different_outcome`, `same_event_different_cutoff`, `same_event_different_settlement_scope`, `same_event_different_resolution_source`, `same_context_only`, `parlay_or_composite`, `ambiguous_requires_review`, or `unrelated`. |
@@ -870,6 +898,8 @@ plans.
 
 ## Websocket subscription plan: `subscription_plan.v1`
 
+Producer: pmkt-trading. Not a registered table schema.
+
 A source-backed manifest for opening market-data websocket subscriptions from a
 match set. The plan is match-oriented: when `is_tracking_useful` exists on the
 source relation table, only rows with `is_tracking_useful=true` are included.
@@ -883,8 +913,8 @@ Important fields:
 | `schema_version` | Always `subscription_plan.v1`. |
 | `plan_id` | Stable run or operator-provided plan identifier. |
 | `mode` | Intended use, usually `tracking`, `paper`, or `canary`. |
-| `source_match_relation_path` | Relation file used to build and preflight the plan. Stream commands require this path, or an explicit `--relations` override, when `--plan` is used. |
-| `source_market_registry_path` | Source market registry paths. The normal generated form is a JSON object with `polymarket` and `kalshi` paths. Stream commands require these paths, or venue-specific CLI overrides, when `--plan` is used. |
+| `source_match_relation_path` | Relation file used to build and preflight the plan. |
+| `source_market_registry_path` | Source market registry paths. The normal generated form is a JSON object with `polymarket` and `kalshi` paths. |
 | `polymarket.assets_ids` | Flattened Polymarket CLOB token IDs for the market websocket. |
 | `kalshi.market_tickers` | Kalshi market tickers for `orderbook_delta` websocket subscription. |
 | `kalshi.use_yes_price` | Whether Kalshi orderbook subscriptions request YES-price convention. |
@@ -910,19 +940,15 @@ such as `KXTEST:YES`. Missing evidence remains `null`, and conflicting or
 multi-sided evidence is surfaced as `conflict` or `ambiguous`; the builder does
 not infer outcomes from token order or from `kalshi.use_yes_price`.
 
-Before opening sockets from `pmkt stream-books --plan` or
-`pmkt stream-kalshi-books --plan`, the CLI reloads those source files and
-revalidates the plan against source token IDs, Kalshi tickers, active/tradable
-status, duplicate identifiers, blocked reasons, relation match links, and any
-explicit outcome metadata. In plan mode, explicit token IDs or tickers are
-subset selectors; they cannot add ad hoc instruments outside the preflighted
-match plan.
+No `pmkt` stream command accepts a plan. `pmkt-trading validate-subscription-plan
+--plan PATH` checks a plan against optional `--polymarket-markets`,
+`--kalshi-markets`, and `--relations` files before sockets are opened.
 
-Stream run manifests created from a plan include a `subscription_plan` block
-with the plan id, plan path, SHA-256 hash, source relation path, source market
-paths, tracking relation count, and relation counts. This lets later
-`tracking_health.v1` reports be traced back to the exact match set used to open
-the websockets.
+Older stream run manifests created from a plan include a `subscription_plan`
+block with the plan id, plan path, SHA-256 hash, source relation path, source
+market paths, tracking relation count, and relation counts. Current `pmkt`
+recordings do not write it. When present, it lets `tracking_health.v1` reports
+be traced back to the exact match set used to open the websockets.
 
 ## Integrity evidence contracts: profile version 3
 
@@ -976,14 +1002,11 @@ after backpressure or a substantial event-loop stall, the receiver gets one
 fresh timeout window to drain replies. These transport decisions never
 initialize a book. Kalshi retains its control-frame keepalive.
 
-Both collectors append `reconnect_diagnostics.jsonl` before each replacement
-attempt invalidates peer state, and project the records into the additive
-manifest `reconnect_diagnostics` list. Records distinguish transport receive
-failures, clean closes, connection setup failures, and supervisor reasons.
-They contain exception type/errno, received close code/reason, attempt number,
-sequence, and feed-control lag metrics; Polymarket also records inbound/ping
-ages and queue/backpressure metrics. Readers may omit this optional field for
-older manifests. No canonical table schema changes are involved.
+The retired profile collectors appended `reconnect_diagnostics.jsonl` before
+each replacement attempt and projected the records into an optional manifest
+`reconnect_diagnostics` list, which older manifests may carry. No current writer
+produces this sidecar; `recording.v1` records disconnects and reconnect attempts
+as `events` rows.
 
 ## Feed health schema: `feed_health.v1`
 
@@ -1049,6 +1072,10 @@ aggregate with the latest causally prior valid detail and fail closed if detail
 is absent, incomplete, or malformed.
 ## Storage profiles and committed capture authority
 
+Historical: `recording.v1` replaced the storage-profile writer, and no current
+command writes profile captures. Legacy readers, `recover-stream-run`, and
+`reconstruct-book-tape` still read them.
+
 Profile stream runs use `extra.dataset_artifacts` as the physical source of
 truth. Each role entry names its exact relative path, dataset identity, schema
 version, row count, segment-manifest path and SHA-256, and completion status.
@@ -1057,11 +1084,11 @@ The manifest's `storage_profile.enabled_roles` must equal the artifact keys and
 `schema_versions`, and `row_counts` remain readable compatibility projections;
 they do not override an exact role entry.
 
-| Profile | Stable status | Mandatory evidence |
+| Profile | Status when retired | Mandatory evidence |
 | --- | --- | --- |
-| `full` | stable and initial default | Legacy parsed/snapshot/level roles, dense topbook/depth, committed book tape, trade, lifecycle, and health. |
-| `book-tape` | experimental pending CR-18.9 acceptance | Committed tape/control, changed topbook plus checkpoints, trade, lifecycle, and health. |
-| `mm-compact` | experimental pending CR-18.9 acceptance | Changed topbook plus checkpoints, topbook-backed validity controls, trade, lifecycle, and health. No depth-reconstruction promise. |
+| `full` | former default | Legacy parsed/snapshot/level roles, dense topbook/depth, committed book tape, trade, lifecycle, and health. |
+| `book-tape` | experimental; never passed CR-18.9 acceptance | Committed tape/control, changed topbook plus checkpoints, trade, lifecycle, and health. |
+| `mm-compact` | experimental; never passed CR-18.9 acceptance | Changed topbook plus checkpoints, topbook-backed validity controls, trade, lifecycle, and health. No depth-reconstruction promise. |
 
 Overrides are additive only. Raw JSONL, dense topbooks, full depth, and legacy
 book artifacts may be added; a caller cannot subtract a mandatory role.
@@ -1084,8 +1111,8 @@ record formats in one run fail closed.
 authority. The final manifest projects it exactly under
 `capture_durability.configuration` and adds terminal metrics for accepted,
 published, and discarded groups, published cause counts, queue depth/waits,
-acceptance-to-journal latency percentiles, and maximum uncommitted age. New
-captures begin in inline publication mode; async publication remains gated.
+acceptance-to-journal latency percentiles, and maximum uncommitted age. Profile
+captures used inline publication; the async publication candidate was rejected.
 
 A crash-recovered manifest can prove published groups and journal-derived cause
 counts, but represents the process-local accepted/discarded, queue,
@@ -1167,12 +1194,14 @@ prove past liveness; malformed or unavailable required detail fails closed.
 
 ## Tracking health schema: `tracking_health.v1`
 
+Producer: pmkt-trading.
+
 `tracking_health.v1` joins `match_relation.v1` rows to latest per-venue
 `topbook.v1` observations. It is a monitoring artifact for deciding whether a
 matched relation is ready to track over websockets; it is not an arbitrage or
 execution signal.
 
-The `pmkt build-tracking-health` CLI writes this artifact from a relation file
+The `pmkt-trading build-tracking-health` CLI writes this artifact from a relation file
 and Polymarket/Kalshi topbook files. Optional per-venue `feed_health` inputs and
 stream manifests add control-plane readiness checks, so reconnects, sequence
 gaps, stale feed messages, and missing shard health can block a relation even
@@ -1184,7 +1213,7 @@ per-book validity, `fresh_two_sided_count` adds quote-age freshness,
 `ready_relation_count` additionally requires clean feed-health and manifest
 provenance.
 
-`pmkt filter-ready-relations` can use this artifact to materialize the rows
+`pmkt-trading filter-ready-relations` can use this artifact to materialize the rows
 whose `tracking_ready=true` as a new `match_relation.v1` file. This is useful
 when a broad tracking set is observable over websockets but only a subset has
 fresh, valid books at the current observation time.
@@ -1233,6 +1262,8 @@ mismatches produce `polymarket_manifest_relation_source_mismatch` or
 
 ## Scan candidate pairs
 
+Producer: pmkt-trading.
+
 Scan planning writes `candidate_pairs.parquet` as a prefilter artifact for
 matching and websocket collection. New files retain legacy
 `polymarket_row_id` and `kalshi_row_id` columns for backward compatibility, but
@@ -1255,13 +1286,6 @@ shared-token, specific-token, pair-score, and top-k truncation rejections.
 `candidate_pair_zero_output_reasons` highlights the dominant reason when a scan
 selects markets but emits no pairs.
 
-When `pmkt match-markets --nlp-diagnostics-out` is used, the NLP output is a
-non-canonical sidecar. It contains character TF-IDF nearest-neighbor rows,
-RapidFuzz score components, blank-spaCy rule-entity overlaps, and whether a
-diagnostic pair appeared in scan candidates or emitted matches. These columns
-are for review and tuning only and do not extend the canonical market-match
-schema.
-
 Large-universe matching uses two distinct category concepts:
 
 - `category` / scan category is the broad recall route used to avoid obvious
@@ -1280,6 +1304,8 @@ same fine stratum, close-date match, subtype compatibility, and top-k caps as
 precision/ranking features unless the run is intentionally high precision.
 
 ## Market match label schemas
+
+Producer: pmkt-trading.
 
 Evaluation labels are not canonical persisted market data, but the matcher
 evaluation tools expect stable CSV schemas.
@@ -1306,6 +1332,8 @@ Supported labels include `match`, `non_match`, `exact_equivalent`,
 `parlay_or_composite`, and `ambiguous_requires_review`.
 
 ## Signal schema: `signal.v1`
+
+Producer: pmkt-trading.
 
 `signal.v1` is the deterministic top-of-book opportunity state produced after
 relation validation and live book freshness checks. It is not an order and does
@@ -1364,13 +1392,15 @@ plans, but the canonical schema itself grants no execution authority.
 
 ## Paper execution artifacts
 
+Producer: pmkt-trading, for this section and its four schemas.
+
 The paper execution artifacts are deterministic simulator outputs for matched
 relations selected by `select_simulation_eligible_signals()`. They are not
 venue order payloads and must not be interpreted as live submissions.
 Tracking-only matches remain observable websocket pairs and are skipped by the
 simulator even when they have positive-looking price metrics.
 
-`replay_topbook_paper_execution()` and the `pmkt replay-paper-signals` CLI
+`replay_topbook_paper_execution()` and the `pmkt-trading replay-paper-signals` CLI
 connect the Phase 3 replay path: `match_relation.v1` plus per-venue
 `topbook.v1` inputs produce full `signals.parquet`, `signal_block_report`,
 `eligible_signals.parquet`, `order_intents.parquet`, `paper_fills.parquet`,
@@ -1487,6 +1517,8 @@ equal net PnL.
 
 ## Arbitrage candidate schema: `arbitrage_candidate.v1`
 
+Producer: pmkt-trading.
+
 A price-dislocation review artifact. This is not an order instruction.
 
 | Column | Meaning |
@@ -1564,6 +1596,8 @@ columns from `ARBITRAGE_CANDIDATE_COLUMNS`, including:
   `max_observed_net_edge`, and `median_observed_net_edge`.
 
 ## Passive quote replay schemas
+
+Producer: pmkt-trading.
 
 The passive quote replay CLI writes local analysis artifacts, not exchange fill
 evidence and not order instructions. Its `manifest.json` is a `run_manifest.v1`

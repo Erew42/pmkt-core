@@ -9,16 +9,18 @@ installed version.
 
 - `schema list|show`: inspect canonical dataset schemas.
 - `dataset validate|validate-manifest|stats|archive-run`: validate and manage
-  local read-only dataset artifacts.
+  local dataset artifacts. `archive-run` writes a verified archive of a
+  finalized run; with `--delete-source` it then deletes the unpacked run.
 - `markets discover-new|refresh-current|promote-history|compact-history|status`:
   maintain a local market catalog. Without `history/LATEST.json`,
   `discover-new` bootstraps from the current snapshot (`LATEST.json`): its
-  census as_of sets the first cutoff and its markets are the known keys, so a
-  market that closed before that census is reported as new. The `kalshi-mve`
-  stream needs `--bootstrap-cutoff` unless the snapshot holds its MVE census.
+  census as_of minus 24 hours sets the first cutoff and its markets are the
+  known keys, so a market that closed before that census is reported as new.
+  The `kalshi-mve` stream needs `--bootstrap-cutoff` unless the snapshot holds
+  its MVE census.
   `promote-history` and `compact-history` still require history.
   Discovery reports a known Polymarket market as an upsert only when a
-  contract or lifecycle field changes (question, rules, outcomes, tokens,
+  contract or lifecycle field changes (question, description, outcomes, tokens,
   open/start/close times including the nested event's, event identity, line,
   closed/active status, resolution, fees, tick size); price, volume and
   liquidity changes are counted as `payload_only_changes`. Kalshi upserts
@@ -67,8 +69,9 @@ installed version.
 
 - `collect-books` / `stream-books`: collect or stream public Polymarket books.
 - `collect-kalshi-books` / `stream-kalshi-books`: collect or stream Kalshi
-  books. Authenticated read access requires a separately installed read-auth
-  provider; core never loads a private key.
+  books. Only `stream-kalshi-books` takes read auth, through
+  `--header-provider` and a separately installed provider; core never loads a
+  private key.
 - `recover-stream-run`: validate and recover a durable capture run.
 - `reconstruct-book-tape`: reconstruct books from committed capture evidence.
 
@@ -92,12 +95,14 @@ recording, then verified Parquet exports. `--mode full` is the default;
   when the book differs from the last saved snapshot.
 - `--depth-on-best-price-change`: also save depth after best bid/ask changes.
 - `--depth-check-interval-s off --depth-on-best-price-change`: use price changes
-  as the only ongoing depth trigger. Initial/recovery/final snapshots remain.
+  as the only ongoing depth trigger. Initial and recovery snapshots remain; a
+  graceful stop saves a final snapshot only if depth changed since the last one.
 - `--raw-messages`: additionally save diagnostic decoded messages to JSONL.
 
 Use repeated `--token-id` / `--ticker` or a `--markets` Parquet file to select
 instruments. Each invocation uses one connection. Duration, message limit,
-reconnect budget and transport bounds remain explicit options. Kalshi requires
+reconnect budget and transport bounds are options with defaults: without
+`--duration` a run records for 300 seconds. Kalshi requires
 `--header-provider MODULE:ATTRIBUTE` and subscribes to public books, trades and
 market lifecycle messages.
 
@@ -130,63 +135,6 @@ command or require account credentials.
 ## Research scripts
 
 `python scripts/collect_polymarket_wallets_rpc.py --output data/wallet-registry`
-collects a wallet registry from public Polygon RPC trade events. It runs on
-Linux, requires only core dependencies, and never loads account profiles or
-keys. Requests default to a one-second minimum interval (`--request-delay 1`);
-startup checks and retries use the same limiter. Throttling and `Retry-After`
-preserve the range. Recognized range limits and two consecutive capacity
-timeouts or HTTP 502/504 responses on the same range can reduce its window
-without advancing the checkpoint. A cooldown over 900 seconds fails with its
-full deadline saved rather than retrying early. This pacing does not guarantee
-a provider quota; Tenderly currently documents a 3,000-result public query limit
-and no numeric public requests-per-second guarantee.
-
-For unattended backfills, `--adaptive-rpc-pacing --request-delay 5` enables
-persistent pacing and in-process throttle recovery. On throttling, the effective
-interval doubles up to 60 seconds; cooldowns grow from one minute to 15 minutes,
-respecting any longer `Retry-After`. A restart preserves the interval and
-deadline. Each 100 successful requests reduce the interval by 10% toward the
-configured minimum. Throttle recovery continues until success, interruption or
-the request budget; ordinary transient failures retain bounded retries. These
-client settings do not establish a guaranteed public quota.
-
-Full exports default to a 12-hour schedule (`--export-interval-s 43200`).
-`--export-mode sync` is the default and pauses collection during exports.
-`--export-mode snapshot` uses one bounded worker while collection continues and
-requires `--export-scratch-dir` on an SSD outside the checkout. Copy defaults
-are `--snapshot-timeout-s 900`, `--snapshot-max-wal-bytes 2147483648`,
-`--snapshot-min-free-bytes 10737418240` and `--snapshot-pause-s 0.01`.
-Resource limits can defer exports; live status reports export health/freshness.
-
-Stream checkpoints commit after every accepted range, and status is
-updated after each productive collection iteration. Ctrl+C, SIGTERM, startup
-errors and request-budget exits do not initiate a full export. Normal completion
-and offline `--export-only` retain final exports; export-only makes no RPC calls.
-It rejects a missing or uninitialized registry without creating a database.
-`latest-export.json` selects a matching immutable CSV/evidence/manifest bundle.
-Root symlinks remain compatibility views and can span generations across reads;
-the snapshot manifest does not overwrite live status. Export controls are
-invocation metadata and may change on resume without changing the dataset's
-anchor, schemas, grain or provenance.
-
-Collection verifies SQLite WAL mode. Committed status totals are cached to avoid
-repeated full-table scans. The writer reclaims oversized retained WAL allocation
-at startup, before snapshot launches and after worker release while collection
-continues; a busy reader defers reclamation. The 64 MiB retained-size target does
-not cap growth during an active snapshot. Status includes RPC cooldowns, phase
-timings and WAL maintenance; export manifests report bounded provenance-cache
-statistics. Workers inherit the collector's CPU and I/O priority.
-
-For example, after factory and AMM scans are complete:
-
-```shell
-python scripts/collect_polymarket_wallets_rpc.py \
-  --output data/wallet-registry-example --streams exchange \
-  --request-delay 1 --export-interval-s 43200 \
-  --export-mode snapshot \
-  --export-scratch-dir /path/to/ssd/wallet-registry-export-scratch
-```
-
-Replace the scratch placeholder with an SSD directory outside the checkout.
-See [the collection and evidence contract](docs/wallet_registry_rpc.md) for
-source scope, resumability, copy limits, bounded pilots and coverage limitations.
+collects a wallet registry from public Polygon RPC trade events. See
+[the collection and evidence contract](docs/wallet_registry_rpc.md) for its
+options, RPC pacing, exports, resumability and coverage limits.

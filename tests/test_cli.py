@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import re
+
 from typer.testing import CliRunner
 
 from pmkt.cli.app import app
@@ -56,3 +59,17 @@ def test_public_cli_help_is_available() -> None:
     assert result.exit_code == 0, result.output
     for command in PUBLIC_COMMANDS:
         assert command in result.output
+
+
+def test_cli_commands_doc_covers_root_inventory() -> None:
+    docs = Path("CLI_COMMANDS.md").read_text(encoding="utf-8")
+    registered = {command.name for command in app.registered_commands}
+    registered.update(group.name for group in app.registered_groups)
+    # Groups are documented with their subcommands, e.g. `schema list|show`.
+    missing = [
+        name
+        for name in sorted(str(name) for name in registered)
+        if re.search(rf"`{re.escape(name)}[` ]", docs) is None
+    ]
+
+    assert missing == []
