@@ -44,6 +44,8 @@ def recording_trade(venue: str, message: Mapping[str, Any]) -> dict[str, Any] | 
             "venue_trade_id": _required_text(payload, "trade_id"),
             "price": price,
             "quantity": quantity,
+            # The outcome the taker is positioned for, not the book side consumed:
+            # "yes" lifted resting YES asks. See the note in historical_books.py.
             "reported_side": _optional_text(payload.get("taker_side")),
             "venue_time_utc": _first_timestamp(
                 payload,

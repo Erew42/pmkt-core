@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from fractions import Fraction
+import json
 from pathlib import Path
 import re
 
@@ -96,6 +97,47 @@ def test_data_dictionary_covers_registered_schema_versions() -> None:
     documented_versions = set(re.findall(r"`([a-z0-9_]+\.v\d+)`", docs))
 
     assert registry_module.schema_documentation_gaps(documented_versions) == {}
+
+
+DICTIONARY_COLUMN_GAPS_PATH = Path("tests/fixtures/data_dictionary_column_gaps.json")
+
+
+def _columns_missing_from_dictionary(docs: str) -> dict[str, list[str]]:
+    gaps: dict[str, list[str]] = {}
+    for spec in list_table_specs():
+        missing = sorted(
+            field.name
+            for field in spec.fields
+            if not re.search(
+                rf"(?<![A-Za-z0-9_]){re.escape(field.name)}(?![A-Za-z0-9_])", docs
+            )
+        )
+        if missing:
+            gaps[spec.version] = missing
+    return gaps
+
+
+def test_data_dictionary_column_gaps_only_shrink() -> None:
+    # The baseline records columns that were already undocumented; it may only shrink.
+    docs = Path("docs/data_dictionary.md").read_text(encoding="utf-8")
+    baseline: dict[str, list[str]] = json.loads(
+        DICTIONARY_COLUMN_GAPS_PATH.read_text(encoding="utf-8")
+    )
+    gaps = _columns_missing_from_dictionary(docs)
+
+    new_gaps = {
+        version: sorted(set(columns) - set(baseline.get(version, [])))
+        for version, columns in gaps.items()
+    }
+    new_gaps = {version: columns for version, columns in new_gaps.items() if columns}
+    assert new_gaps == {}, "Describe these columns in docs/data_dictionary.md"
+
+    closed_gaps = {
+        version: sorted(set(columns) - set(gaps.get(version, [])))
+        for version, columns in baseline.items()
+    }
+    closed_gaps = {version: columns for version, columns in closed_gaps.items() if columns}
+    assert closed_gaps == {}, f"Remove these documented columns from {DICTIONARY_COLUMN_GAPS_PATH}"
 
 
 def test_schema_specs_carry_source_truth_metadata() -> None:

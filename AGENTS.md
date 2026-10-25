@@ -38,21 +38,77 @@ change does not require reviewing every package contract.
 
 - Supported Python versions are 3.10 through 3.12.
 - Keep the import name and console script `pmkt`.
-- Update `CLI_COMMANDS.md` with supported CLI changes.
-- Update `openapi/polymarket.min.json` before adding a Polymarket endpoint.
 - Keep generated OpenAPI examples untracked under `generated/`.
 - Preserve canonical schema versions, grain, identifiers, timestamps, and
   provenance unless a deliberate schema migration is part of the change.
+  Removing or renaming a persisted column, changing its meaning, or no longer
+  keeping a raw field counts as such a migration.
+- Normalize venue payloads at one boundary and keep the raw payload or its
+  hash with the canonical row.
 - Keep Kalshi authentication behind the narrow read-auth protocol. Core must
   reject write methods before invoking an authenticator or network transport.
 
-## Pull request attribution
+### Where facts live
 
-When creating a PR, end its description with
-`Created with <model name> (<reasoning effort> reasoning)`. Use the exact model
-identity provided by the runtime when available; otherwise use the known model
-family, such as GPT, Gemini, or Claude. Omit reasoning effort if unavailable.
-Never guess either value.
+Read or change these at their source; do not restate them in this file.
+
+- Columns, dtypes, units and primary keys: `src/pmkt/data/registry.py`
+  (`pmkt schema show <version>`).
+- Column meaning and the timestamp, price and raw-retention conventions:
+  `docs/data_dictionary.md`.
+- Schema status and retirement: `docs/schema_lifecycle.md` and
+  `docs/schema_lifecycle.json`.
+- Venue quirks: comments next to the code that parses the field.
+
+### Changes that travel together
+
+| If you change | Also update in the same PR | Checked by |
+| --- | --- | --- |
+| A registered schema or its columns | `docs/data_dictionary.md`, `docs/schema_lifecycle.json` | `tests/test_schema_registry_validation.py`, `tests/test_schema_lifecycle.py` |
+| The supported CLI | `CLI_COMMANDS.md` | review |
+| A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review |
+
+## Pull request descriptions
+
+Write for the owner deciding whether to merge the current head, who has not
+seen the agent session.
+
+Title: imperative and behavior-level, under 72 characters, no type prefix.
+
+Start the body with **<Type>:** and one or two sentences: the problem and what
+this PR does about it. State the problem so it would stay true under a
+different fix. Types: feature, bug fix, refactor, pin bump, docs, research,
+chore. Put `Closes #N` or stacking notes on the next line. Then:
+
+- **Scope**: the one problem this PR solves, and related work deliberately not
+  done. If the changes cover more than one independent problem, split the PR.
+- **Changes**: bullets grouped by behavior, not by file.
+- **Contracts**: `none`, or each change with a reason: schema versions and
+  columns added, removed or retyped; raw fields no longer kept; public API or
+  CLI changes.
+- **Review focus**: one to three places where a mistake would be costly. Omit
+  for trivial PRs.
+- **Validation**: commands run, their results, the commit, Python version and
+  OS. Name failures that also occur on `main`. List skipped checks as
+  `Not run: <check> (<reason>)`. Do not list checks CI already runs.
+- **Follow-ups** (optional): known gaps, with issue links.
+- **Suggested AGENTS.md changes** (optional): rules this work showed are
+  missing. The owner decides.
+
+End with `Created with <model name> (<reasoning effort> reasoning)`. Use the
+exact model identity provided by the runtime when available; otherwise use the
+model family, such as GPT, Gemini, or Claude. Omit reasoning effort if
+unavailable. Never guess either value.
+
+Keep most PRs under 40 lines. After each push, rewrite the body to match the
+head; put review rounds and history in PR comments. Leave out conversation
+history, abandoned approaches and local paths. The headings are in
+`.github/pull_request_template.md`.
+
+## Editing this file
+
+Do not add rules here to record a one-off fix; add a test instead. Propose new
+rules under "Suggested AGENTS.md changes" in the PR description.
 
 ## Verification
 

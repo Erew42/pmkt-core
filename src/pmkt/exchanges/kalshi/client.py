@@ -100,11 +100,13 @@ _CANDLE_PARAMETER_ALLOWLIST = frozenset(
     {"start_ts", "end_ts", "period_interval", "include_latest_before_start"}
 )
 # Adapter chunk size in elapsed periods (`end_ts - start_ts`), not candle count.
-# Kalshi's single-market live and historical candlestick endpoints use inclusive
-# `start_ts`/`end_ts` labels (candles ending on or after start, on or before end)
-# and do not publish a numeric cap. The batch endpoint caps 10,000 candles across
-# at most 100 tickers. A window of N elapsed periods can include N+1 inclusive
-# end-labels, so 5,000 elapsed periods stays well under that published batch cap.
+# Kalshi's single-market live and historical candlestick endpoints reject a
+# request with HTTP 400 ("max candlesticks: 5000") when
+# `(end_ts - start_ts) / period` exceeds 5,000. The limit is undocumented and
+# applies to the requested range, not to the rows returned: exactly 5,000
+# one-minute periods pass and one more second fails (verified live 2026-09-14
+# and 2026-10-25). Labels are inclusive: candles ending on or after start, on or
+# before end.
 KALSHI_CANDLE_QUERY_ELAPSED_PERIODS_PER_REQUEST = 5_000
 
 
