@@ -891,3 +891,177 @@ def test_kalshi_negative_exact_size_is_integrity_failure():
         "msg": {"side": "yes", "price_dollars": "0.3", "delta_fp": "-0.1000000001"}})
     assert not state.book_integrity_valid
     assert "malformed_book" in state.quality_flags
+
+
+@pytest.mark.parametrize("use_yes_price", [True, False])
+@pytest.mark.parametrize("side", ["yes", "no"])
+@pytest.mark.parametrize("delta_field", ["delta_fp", "delta", "size_delta"])
+def test_kalshi_decimal_quantity_exhaustion(
+    use_yes_price: bool, side: str, delta_field: str
+) -> None:
+    # Fractional quantities whose binary-float sum leaves a residue; NO prices
+    # use the requested wire basis.
+    no_price, next_no_price = (
+        ("0.0950", "0.0970") if use_yes_price else ("0.9050", "0.9030")
+    )
+    state = KalshiOrderBookState("KXTEST", use_yes_price=use_yes_price)
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {
+                "yes_dollars_fp": [["0.0930", "1.00"], ["0.0940", "44.67"]],
+                "no_dollars_fp": [[no_price, "44.67"], [next_no_price, "226502.59"]],
+            },
+        }
+    )
+    price = "0.0940" if side == "yes" else no_price
+    levels = state.yes_bids if side == "yes" else state.no_bids
+    for seq, delta in ((2, "-0.48"), (3, "-44.19")):
+        snapshot = state.apply_delta(
+            {
+                "type": "orderbook_delta", "sid": 1, "seq": seq,
+                "msg": {"side": side, "price_dollars": price, delta_field: delta},
+            }
+        )
+        if seq == 2:
+            assert levels[Decimal(price)] == Decimal("44.19")
+    assert Decimal(price) not in levels
+    assert snapshot.valid_state
+    assert snapshot.book_integrity_valid
+    assert not snapshot.quality_flags
+    if side == "yes":
+        assert snapshot.yes_bid == 0.093
+        assert snapshot.yes_bid_size == 1.0
+        assert snapshot.yes_bid_depth == 1
+    else:
+        assert snapshot.yes_ask == 0.097
+        assert snapshot.yes_ask_size == 226502.59
+        assert snapshot.no_bid_depth == 1
+        # The genuine later bid must not cross a phantom 0.0950 ask.
+        snapshot = state.apply_delta(
+            {
+                "type": "orderbook_delta", "sid": 1, "seq": 4,
+                "msg": {"side": "yes", "price_dollars": "0.0960", "delta_fp": "5000.00"},
+            }
+        )
+        assert snapshot.yes_bid == 0.096
+        assert snapshot.yes_ask == 0.097
+        assert snapshot.valid_state
+        assert snapshot.book_integrity_valid
+        assert not snapshot.quality_flags
+
+
+@pytest.mark.parametrize("side", ["yes", "no"])
+@pytest.mark.parametrize(
+    ("delta", "remaining"),
+    [("-44.66", "0.01"), ("-44.669999999999", "0.000000000001")],
+)
+def test_kalshi_positive_quantity_is_not_clamped(
+    side: str, delta: str, remaining: str
+) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {"yes_dollars_fp": [["0.4", "44.67"]], "no_dollars_fp": [["0.6", "44.67"]]},
+        }
+    )
+    price = "0.4" if side == "yes" else "0.6"
+    snapshot = state.apply_delta(
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {"side": side, "price_dollars": price, "delta_fp": delta},
+        }
+    )
+    levels = state.yes_bids if side == "yes" else state.no_bids
+    assert levels[Decimal(price)] == Decimal(remaining)
+    assert snapshot.valid_state
+    assert snapshot.book_integrity_valid
+
+
+@pytest.mark.parametrize("side", ["yes", "no"])
+def test_kalshi_real_quantity_deficit_still_invalidates(side: str) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {"yes_dollars_fp": [["0.4", "1.00"]], "no_dollars_fp": [["0.6", "1.00"]]},
+        }
+    )
+    price = "0.4" if side == "yes" else "0.6"
+    snapshot = state.apply_delta(
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {"side": side, "price_dollars": price, "delta_fp": "-1.01"},
+        }
+    )
+    levels = state.yes_bids if side == "yes" else state.no_bids
+    assert Decimal(price) not in levels
+    assert "malformed_book" in snapshot.quality_flags
+    assert not snapshot.valid_state
+    assert not snapshot.book_integrity_valid
+
+
+@pytest.mark.parametrize("delta_field", ["delta_fp", "delta", "size_delta"])
+@pytest.mark.parametrize("invalid", ["NaN", "Infinity", "-Infinity", "bad", True])
+def test_kalshi_quantity_validation_precedes_decimal_addition(
+    delta_field: str, invalid: Any
+) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {"yes_dollars_fp": [["0.4", "1.00"]], "no_dollars_fp": [["0.6", "1.00"]]},
+        }
+    )
+    # A valid lower-priority alias must not mask an invalid preferred field.
+    fields: dict[str, Any] = {"size_delta": "2.00"}
+    fields[delta_field] = invalid
+    snapshot = state.apply_delta(
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {"side": "yes", "price_dollars": "0.4", **fields},
+        }
+    )
+    assert state.yes_bids == {Decimal("0.4"): Decimal("1")}
+    assert state.no_bids == {Decimal("0.6"): Decimal("1")}
+    assert "malformed_book" in snapshot.quality_flags
+    assert not snapshot.book_integrity_valid
+
+
+@pytest.mark.parametrize("delta_field", ["delta", "size_delta"])
+def test_kalshi_legacy_numeric_quantity_delta(delta_field: str) -> None:
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {"yes": [[0.4, 2]], "no": [[0.6, 3]]},
+        }
+    )
+    snapshot = state.apply_delta(
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {"side": "yes", "price": 0.4, delta_field: -1},
+        }
+    )
+    assert state.yes_bids == {Decimal("0.4"): Decimal("1")}
+    assert snapshot.valid_state
+    assert snapshot.book_integrity_valid
+
+
+def test_kalshi_genuine_price_crossing_still_invalidates() -> None:
+    state = KalshiOrderBookState("KXTEST")
+    state.apply_snapshot(
+        {
+            "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+            "msg": {"yes_dollars_fp": [["0.0940", "1.00"]], "no_dollars_fp": [["0.0950", "0.01"]]},
+        }
+    )
+    snapshot = state.apply_delta(
+        {
+            "type": "orderbook_delta", "sid": 1, "seq": 2,
+            "msg": {"side": "yes", "price_dollars": "0.0960", "delta_fp": "5000.00"},
+        }
+    )
+    assert {"crossed_book", "negative_spread"} <= set(snapshot.quality_flags)
+    assert not snapshot.book_integrity_valid
