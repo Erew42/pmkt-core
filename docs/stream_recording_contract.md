@@ -41,8 +41,9 @@ periodic depth check is disabled. Connection-liveness reporting remains enabled.
 
 ## Topbook recording
 
-Record the first initialized topbook and subsequent changes in best bid/ask
-price or size, tick size, minimum order size, side availability, or book validity.
+Record the first observed topbook, even before the book initializes, and
+subsequent changes in best bid/ask price or size, tick size, minimum order
+size, side availability, or book validity.
 These observations are processed on arrival, independently of the depth timer.
 Deeper-level changes alone do not produce topbook rows.
 
@@ -168,17 +169,18 @@ and book correctness; research owns research feature choices.
 
 `trades.parquet` records received public trade reports in both modes, independently
 of depth checks and topbook changes. Each row identifies the instrument and source
-observation, reported price, quantity when supplied, venue time when supplied,
-receipt time and reported side when supplied. A trade can arrive without changing
+observation, reported price, quantity (Polymarket may omit it; a Kalshi trade
+without a count stops the recording), venue time when supplied, receipt time
+and reported side when supplied. A trade can arrive without changing
 the best quote. A change in displayed book quantity is not itself a trade report;
 do not infer trades from book differences. These are public market observations,
 not the user's orders or account fills.
 
 The existing Polymarket producer consumes `last_trade_price` messages. Quantity
-can be missing, and its generated ID identifies an observation rather than a
-venue-unique execution. It does not deduplicate separate messages as the same
-execution. The existing Kalshi producer consumes `trade` messages and deduplicates
-their venue trade IDs within a run. Preserve these distinctions; do not claim a
+can be missing, and `venue_trade_id` is always null: a row is identified by its
+recorder coordinates, not by a venue-unique execution. It does not deduplicate
+separate messages as the same execution. The existing Kalshi producer consumes
+`trade` messages and deduplicates their venue trade IDs within a run. Preserve these distinctions; do not claim a
 complete, globally deduplicated transaction history. Reported side retains its
 venue meaning. An absent venue timestamp must remain distinguishable from receipt
 time in the new format, even where the old producer used receipt time as fallback.
@@ -222,10 +224,12 @@ file; compression can be an offline operation.
 ## Recording report
 
 Report requested instruments, initialized instruments, missing initial books,
-per-instrument connection/initialization and final integrity state, counts of
-topbooks/snapshots/trades, gap/reconnect events, actual start/end times, stop
-reason, storage/export errors and committed progress. Keep facts sufficient to
-identify missing or invalid intervals, not only total counters.
+per-instrument initialization, integrity state and latest book observation,
+the run's connection generation and reconnect count, counts of
+topbooks/snapshots/trades, start time and report time (`as_of_utc`), stop
+reason, storage/export errors and committed progress. The report has no
+per-instrument connection state or separate end time; gaps and reconnects are
+`events` rows, which identify missing or invalid intervals.
 
 Use one small terminal verdict:
 
@@ -272,6 +276,16 @@ health-emission wrapper and connection-group orchestration have been removed.
 Historical readers/recovery/conversion code lives in `streaming/legacy` and is
 not imported by the new live recording path. Shared book/transport validation
 and independently used supervisor utilities remain.
+
+The `book-tape` and `mm-compact` tape profiles were dropped because they never
+passed CR-18.9 acceptance. In the 2026-07-24 one-hour measurement the reduced
+Polymarket profiles exceeded their storage budgets (85 and 25 MiB/hour against
+50 and 15), every Polymarket profile missed the 99% dense-health reduction gate,
+and the mandatory one-hour reconstruction ran out of memory. A later
+asynchronous-publication candidate saturated its bounded publication queue and
+discarded accepted groups, and was rejected. The records are pmkt-trading's
+`CR-18.9-ONE-HOUR-NO-GO-20260724.md` and
+`REVIEW-CR-18.9-ASYNC-PUBLICATION-20260728.md`.
 
 ## Where to look after a month away
 

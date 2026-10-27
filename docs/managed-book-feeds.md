@@ -57,9 +57,12 @@ returned book is not a freshness lease and cannot be revoked after it is returne
 `PublicBook` contains full bids descending, full asks ascending, raw source
 timestamp of the last depth update, native market ID when supplied, local
 monotonic application receipt time (after dequeue), and quality flags.
-Metadata events do not advance either depth timestamp. Market IDs and other
-state metadata are cleared on invalidation and never inherited from an older
-connection generation. Kalshi always subscribes with `use_yes_price=True`: bids are
+Metadata events do not advance either depth timestamp. The book's market ID and
+other state metadata are cleared on invalidation and never inherited from an
+older connection generation. Separately, the feed keeps each instrument's
+first-seen market ID across resets and generations, so market-scoped resolution
+events still reach instruments under recovery and a book naming another market
+is detected. Kalshi always subscribes with `use_yes_price=True`: bids are
 YES bids and asks are YES asks (the wire NO ladder on the YES price basis).
 To construct NO bids, complement YES asks with `Decimal(1) - price`; NO asks
 come from complemented YES bids. Quantities retain their source ladder's size.
@@ -71,9 +74,9 @@ last observed transport-liveness age, book-update age, generation, reconnect and
 error counts, last error, and current quality flags. Times and ages are seconds
 on the local monotonic clock, not UTC and not venue event time. A source timestamp
 is preserved, not rewritten with read time. This API does not manufacture a fresh
-book timestamp on each poll. Counters are per shard; book flags and ages are per
-instrument. Typical reasons include `not_started`, `no_initial_snapshot`,
-`disconnected`, `heartbeat_failed`, `liveness_expired`, `snapshot_timeout`,
+book timestamp on each poll. Counters and transport-liveness age are per shard;
+book flags and book-update age are per instrument. Typical reasons include
+`not_started`, `no_initial_snapshot`, `disconnected`, `heartbeat_failed`, `liveness_expired`, `snapshot_timeout`,
 `crossed_book`, `book_integrity_failed`, `recovery_timeout`, `market_resolved`,
 and `closed`. Treat the reason as diagnostic text, not
 an exhaustive policy enum.
@@ -111,8 +114,9 @@ Fault scope is explicit:
 
 Polymarket locked or crossed depth from a price change is withheld immediately
 with reason `crossed_book`. Only these nonpersistent ladder flags qualify for a
-250 ms grace. Later complete depth updates may correct the retained ladder;
-neither best-price hints nor activity events repair it. Repeated invalid updates
+250 ms grace. During the grace, any `price_change` or `book` message that leaves
+the retained ladder intact clears the recovery; best-price hints and activity
+events do not change the ladder. Repeated invalid updates
 do not extend the deadline. Reads and ingress latch expiry before a late update
 can revive the book. This managed policy accepts corrective updates across
 timestamps/hashes; it does not change the recorder's narrower complementary-delta

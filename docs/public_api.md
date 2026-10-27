@@ -169,8 +169,10 @@ implicitly. Applications and CLI entrypoints load configuration and pass it down
 
 Import `RequestPolicy` and `OperationExpiry` from `pmkt.runtime`.
 `RequestPolicy(max_attempts=N)` means N total attempts, including the first;
-positive integers are required. The old retry-name alias is removed. CLOB retries
-read-only POSTs only for `/books` and `/batch-prices-history`; the Kalshi
+positive integers are required. It applies to idempotent methods and to
+requests carrying an idempotency header; other requests get one attempt unless
+`retry_non_idempotent_methods=True`. The old retry-name alias is removed. CLOB
+retries read-only POSTs only for `/books` and `/batch-prices-history`; the Kalshi
 pre-authentication GET-only boundary remains unchanged. REST `timeout_s` must
 be finite and positive.
 
@@ -363,14 +365,15 @@ distinct conditions, and returns the envelope's `data` rows unchanged. Each
 row has `condition_id` and `value`; the value is priced gross open interest
 in USD, not outcome-token shares. This bounded aggregate has no cursor.
 
-`normalize_polymarket_open_interest(condition_ids, payload)` accepts those
+`normalize_polymarket_open_interest(condition_ids, payload)`, imported from
+`pmkt.exchanges.polymarket.data_api`, accepts those
 rows or the complete v2 envelope. It retains Decimal values, rejects duplicate,
 unexpected, or conflicting identifiers and invalid values, and records omitted
 conditions separately from served zero values. Saved v1 rows with `market`
 remain readable; network requests always use v2. An omitted condition did not
 resolve to a servable market, so consumers must not invent a zero for it.
 
-Data API v1 retires on October 24, 2026. Consumers of the raw page must replace
+Data API v1 retired on October 24, 2026. Consumers of the raw page must replace
 `row["market"]` with `row["condition_id"]` and split batches at 20 conditions.
 The normalized batch fields and canonical stored schemas are unchanged.
 See the [upstream migration guide](https://docs.polymarket.com/migrate/data-api-v1-to-v2)
@@ -478,8 +481,9 @@ atomic snapshot or a list of historical holders. Each holder has a
 `market_trades_page(condition_id=...)` returns wallet-attributed trades from
 one condition. It sends `taker_only=false` to include maker fills and explicitly
 requests the `TOKENS` filter with a 0.01-share minimum. The source
-fixes condition-scoped queries to a three-year window and applies a minimum
-size of 0.01 shares even when a caller asks for zero. Those limits remain
+fixes condition-scoped queries to a three-year window and applies the 0.01-share
+minimum even to a zero request, so the method has no parameter for it. Those
+limits remain
 explicit on `PolymarketMarketTradesPage`; exhausting its cursor does not make
 the result a lifetime trade ledger. The existing `trades_page(wallet=...)`
 keeps its full-history `start=1` behavior and `(rows, cursor)` return shape.
@@ -594,6 +598,9 @@ support, even when the caller supplies a series hint. It then fetches the full
 current `orderbook_fp` once without a native depth cap. Only the qualified
 `yes_dollars` and `no_dollars` probability/contract ladders are accepted by this
 workflow; legacy integer-cent or ambiguous aliases raise `InvalidDataError`.
+Inconsistent capability evidence also raises `InvalidDataError`; a market that
+is not a qualified binary book raises `UnsupportedCapabilityError`; a 404 from
+the metadata or book request raises `MarketNotFoundError`.
 Native `orderbook` and `normalized_orderbook` behavior remains available.
 
 YES bids come directly from the YES ladder and YES asks complement the NO ladder
@@ -633,7 +640,7 @@ history: CandleHistoryResult = await kalshi.get_candles(
 `period_minutes` is exactly `1`, `60`, or `1440`. Both bounds must be aware;
 they are normalized to UTC before ordering. Returned candles are fully
 contained in the original window and complete against one UTC clock value
-frozen at operation start. Thus 10:30â€“12:00 includes the 11:00â€“12:00 hourly
+frozen at operation start. Thus 10:30–12:00 includes the 11:00–12:00 hourly
 bar only. Inclusive native end-label requests may overlap at internal adapter
 boundaries; all valid keys are reconciled before original-window containment,
 completion filtering, and the output cap. Chunk size is 5,000 elapsed periods
@@ -697,7 +704,8 @@ candle response.
 ## Retained native venue clients
 
 The public async clients are `pmkt.exchanges.polymarket.AsyncGammaClient`,
-`pmkt.exchanges.polymarket.AsyncClobClient`, and
+`pmkt.exchanges.polymarket.AsyncClobClient`,
+`pmkt.exchanges.polymarket.AsyncPolymarketDataClient`, and
 `pmkt.exchanges.kalshi.AsyncKalshiClient`. The former aliases `GammaClient`,
 `ClobClient`, and `KalshiClient` have been removed. Use
 `async with`; calling a synchronous context manager raises `RuntimeError`.
@@ -733,7 +741,8 @@ existing signatures, interval suppression, models, and validation.
 `AsyncKalshiClient` retains:
 
 - market and event reads: `markets_page`, `market`, `historical_market`,
-  `iter_markets`, `events_page`, and `iter_events`;
+  `historical_markets_page`, `iter_markets`, `iter_historical_markets`,
+  `events_page`, and `iter_events`;
 - books: `orderbook` and `normalized_orderbook`;
 - time series: `market_candlesticks`, `batch_market_candlesticks`,
   `historical_market_candlesticks`, `historical_cutoff`, `trades`, and
