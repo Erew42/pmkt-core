@@ -43,8 +43,10 @@ change does not require reviewing every package contract.
   provenance unless a deliberate schema migration is part of the change.
   Removing or renaming a persisted column, changing its meaning, or no longer
   keeping a raw field counts as such a migration.
-- Normalize venue payloads at one boundary and keep the raw payload or its
-  hash with the canonical row.
+- Normalize venue payloads at one boundary. Keep the raw payload or its hash
+  where the schema or workflow requires it; `recording.v1` deliberately keeps
+  raw messages off by default (`RecordingOptions.raw_messages=False`).
+  Artifact, normalized-row and source-payload hashes are not interchangeable.
 - Keep Kalshi authentication behind the narrow read-auth protocol. Core must
   reject write methods before invoking an authenticator or network transport.
 
@@ -67,6 +69,10 @@ Read or change these at their source; do not restate them in this file.
 | A registered schema or its columns | `docs/data_dictionary.md`, `docs/schema_lifecycle.json` | `tests/test_schema_registry_validation.py`, `tests/test_schema_lifecycle.py` |
 | The supported CLI | `CLI_COMMANDS.md` | review |
 | A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review |
+
+The checks are partial. The dictionary test only finds each column name
+somewhere in `docs/data_dictionary.md`, and the lifecycle test only requires a
+record per registered version. Neither checks that a description is correct.
 
 ## Pull request descriptions
 
