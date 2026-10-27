@@ -621,6 +621,11 @@ def _kalshi_trade_rows(
                 price_dollars=price,
                 size_contracts=size,
                 notional_dollars=price * size if price is not None and size is not None else None,
+                # Kalshi's taker side is the outcome the taker is positioned for,
+                # not the book side consumed: "yes" means the taker bought YES or
+                # sold NO, lifting resting YES asks. `taker_side` is deprecated in
+                # favor of `taker_outcome_side` (same values); `taker_book_side`
+                # "bid" means the same as "yes".
                 aggressor_side=_first_present(trade, "taker_side", "side", "action"),
                 raw_json=trade,
             )
