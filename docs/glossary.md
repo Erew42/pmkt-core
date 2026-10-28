@@ -19,9 +19,10 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
   It is the Polymarket `instrument_id` (`pmkt.tokens.extract_token_ids`).
 - **CTF.** The Conditional Tokens contract on Polygon. Resolution reads payouts
   from it (`PolygonCtfClient`, `CTF_CONTRACT_ADDRESS`, source `polygon_ctf`).
-- **Kalshi ticker and `instrument_id`.** One ticker holds both outcomes, so an
-  instrument is `<ticker>:YES` or `<ticker>:NO`; trades are recorded against
-  `<ticker>:YES` at the YES price.
+- **Kalshi ticker and `instrument_id`.** One ticker holds both outcomes:
+  `topbook.v1` and `depth.v1` use `<ticker>:YES` and `<ticker>:NO`, while
+  `recording.v1` and the managed feed keep only `<ticker>:YES`. Trades are
+  recorded against `<ticker>:YES` at the YES price.
 - **MVE.** Kalshi parlay-style markets, kept apart from conventional ones:
   `mve_filter` on listings, `KXMVE` prefix (`KALSHI_LEGACY_MVE_PREFIX`), catalog
   `native_family` `kalshi_mve`.
@@ -36,11 +37,13 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
 - **`use_yes_price` and `depth.v1`.** Kalshi WebSocket flag, default true
   (`kalshi_public_subscription_payload`). True: the NO ladder arrives on the YES
   price scale (its lowest value is a direct YES ask); false: it is a direct NO bid
-  (`project_kalshi_quotes`). Capture settings store it; absent means true
-  (`resolve_kalshi_use_yes_price`). **Trap:** `depth.v1` `outcome=NO` rows copy the
-  native NO ladder uncomplemented, so `price_dollars` is YES-scale for WebSocket
-  captures with the flag true (`_kalshi_depth`) and NO-scale for REST polls
-  (`source=rest_poll`, `_kalshi_depth_rows`). The row does not record which.
+  (`project_kalshi_quotes`). Legacy capture settings store it; absent means true
+  (`resolve_kalshi_use_yes_price`). `recording.v1` and the managed feed hard-code
+  true (`VenueBooks`), so their asks are the NO ladder as received. **Trap:**
+  `depth.v1` `outcome=NO` rows copy the native NO ladder uncomplemented, so
+  `price_dollars` is YES-scale for tape reconstruction with the flag true
+  (`_kalshi_depth`) and NO-scale for REST polls (`source=rest_poll`,
+  `_kalshi_depth_rows`). The row does not record which.
 - **Trap: Kalshi `taker_side`.** It names the outcome the taker is positioned for,
   not the book side consumed: `yes` means a YES ask was lifted (taker bought YES
   or sold NO). The venue deprecates it for `taker_outcome_side` (same values);
