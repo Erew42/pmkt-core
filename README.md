@@ -31,8 +31,10 @@ pmkt ingest-kalshi-markets --out data/kalshi_markets.parquet
 pmkt resolve-market-resolutions --help
 ```
 
-See [CLI_COMMANDS.md](CLI_COMMANDS.md) for the supported command surface and
-[docs/data_dictionary.md](docs/data_dictionary.md) for canonical datasets.
+See [CLI_COMMANDS.md](CLI_COMMANDS.md) for the supported command surface,
+[docs/data_dictionary.md](docs/data_dictionary.md) for canonical datasets, and
+[docs/glossary.md](docs/glossary.md) for the terms and venue traps this
+repository uses.
 
 ## Capture recovery
 
