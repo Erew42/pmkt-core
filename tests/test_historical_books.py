@@ -338,3 +338,49 @@ async def test_historical_trade_pagination_rejects_nonpositive_bounds(max_pages,
             None, ["A"], run_id="r", start_ts=1, end_ts=2,
             max_pages=max_pages, limit=limit,
         )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_page", [False, True])
+@pytest.mark.parametrize("malformed", [
+    {}, {"trades": None}, {"trades": "bad"}, {"trades": [None]},
+    {"trades": {"error": "bad"}},
+    {"trades": [{"trade_id": "partial", "yes_price": 42, "count": 1}, None]},
+])
+async def test_malformed_trade_page_stays_incomplete_and_retains_prior_rows(
+    tmp_path, malformed, prior_page
+):
+    import json
+
+    trade = {"trade_id": "kept", "yes_price": 42, "count_fp": "1.75", "created_ts": 1}
+
+    class FakeKalshi:
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, **params):
+            if prior_page and params["cursor"] is None:
+                return {"trades": [trade], "cursor": "next"}
+            return malformed
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=1, end_ts=2, use_historical=True,
+        kalshi_client=FakeKalshi(), max_trade_pages=3,
+    )
+    partition = result.summary["trade_partitions"][0]
+    assert partition["complete"] is False
+    assert partition["stop_reason"] == "fetch_error"
+    assert partition["page_count"] == int(prior_page)
+    assert partition["row_count"] == int(prior_page)
+    assert partition["continuation_cursor"] == ("next" if prior_page else None)
+    paths = write_historical_backfill_result(result, tmp_path)
+    assert json.loads(paths["summary"].read_text())["trade_partitions"] == [partition]
+    gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = gaps[gaps["capability"] == "historical_trades"]
+    assert len(trade_gaps) == 1
+    assert trade_gaps.iloc[0]["status"] == "fetch_error"
+    assert json.loads(trade_gaps.iloc[0]["raw_json"])["complete"] is False
+    trades = pd.read_parquet(paths["trades"])
+    assert len(trades) == int(prior_page)
+    if prior_page:
+        assert json.loads(trades.iloc[0]["raw_json"]) == trade

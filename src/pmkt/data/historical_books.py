@@ -503,6 +503,11 @@ async def _backfill_kalshi_trades(
                     limit=limit,
                     cursor=cursor,
                 )
+                trades = _as_mapping(payload).get("trades")
+                if not isinstance(trades, list) or any(
+                    not isinstance(trade, Mapping) for trade in trades
+                ):
+                    raise ValueError("historical trade page must contain a list of trade objects")
                 page_trades = _kalshi_trade_rows(
                     payload,
                     collector_run_id=run_id,
