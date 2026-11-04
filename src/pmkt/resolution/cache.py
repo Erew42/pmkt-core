@@ -642,6 +642,12 @@ async def resolve_market_resolution_cache(
         for pair, row in existing_current_rows.items()
         if pair in requested_pairs and pair in skip_keys
     }
+    # Scope limits resolution work, not the retained history used by later runs.
+    if output_path.exists():
+        for retained in pd.read_parquet(output_path).to_dict("records"):
+            pair = _row_pair(retained)
+            if pair not in requested_pairs:
+                rows_by_pair[pair] = retained
     for row in resolved:
         pair = _row_pair(row)
         existing_row = existing_merge_rows.get(pair)

@@ -909,6 +909,9 @@ relabeling them; conflicts remain ineligible for terminal labels. A refresh with
 weaker evidence carries forward the original payout and resolver version, while
 contradictory canonical finals retain conflict handling. The existing unsafe v1
 cache migration behavior is unchanged.
+Scopes (`--matches` and `--max-markets`) limit resolution work; rows outside
+the requested scope remain unchanged in `market_resolutions.parquet`. The file
+and its summary describe the complete retained cache, not just the scoped run.
 
 Native REST methods use `ValueError` for invalid caller parameters, `TypeError`
 or `ValueError` for malformed upstream payloads, and propagate `httpx` request
