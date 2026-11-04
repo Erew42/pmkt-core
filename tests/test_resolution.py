@@ -2503,8 +2503,11 @@ async def test_resolution_cache_retained_finals_are_universe_and_version_aware(
     )
 
     written = pd.read_parquet(output_dir / "market_resolutions.parquet")
-    assert written["market_key"].tolist() == ["KXRAIN"]
-    [row] = written.to_dict("records")
+    assert written["market_key"].tolist() == ["KXOLD", "KXRAIN"]
+    retained = written.set_index("market_key").loc["KXOLD"]
+    assert retained["observed_at_utc"] == "2026-06-20T00:00:00+00:00"
+    assert retained["winner"] == "yes"
+    [row] = written.loc[written["market_key"] == "KXRAIN"].to_dict("records")
     assert row["resolver_version"] == RESOLVER_VERSION
     assert row["resolution_state"] == "final"
     assert row["winner"] == "yes"
