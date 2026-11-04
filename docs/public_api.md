@@ -927,6 +927,10 @@ and sink classes. These are retained native contracts even when a schema name
 describes paper, order, matching, or tracking data: core owns policy-neutral
 physical schemas, while consumer policy remains outside this package.
 
+`ParquetSink` accepts an optional keyword-only Arrow `schema` for stable types
+across flushes. The legacy order-book summary collector supplies nullable
+numeric quotes and `list<string>` quality flags, including for empty book sides.
+
 The authoritative list of schema versions, lifecycle states, compatibility
 decisions, and removal gates is
 [`schema_lifecycle.json`](schema_lifecycle.json). Grain, keys, timestamps,

@@ -65,6 +65,17 @@ async def test_parquet_sink_rejects_directory_output(tmp_path) -> None:
         ParquetSink(tmp_path, columns=["token_id"])
 
 
+async def test_parquet_sink_closes_writer_when_flush_fails(tmp_path) -> None:
+    sink = ParquetSink(tmp_path / "failed.parquet", columns=["value"], flush_interval=1)
+    await sink.write({"value": 1.0})
+    writer = sink._writer
+    with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+        await sink.write({"value": "not numeric"})
+    assert sink._writer is None
+    assert writer is not None and not writer.is_open
+    assert pd.read_parquet(sink.path)["value"].tolist() == [1.0]
+
+
 async def test_streaming_parquet_sink_overwrite_false_rejects_existing_path(
     tmp_path,
 ) -> None:

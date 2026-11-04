@@ -149,13 +149,16 @@ class CsvSink:
 
 
 class ParquetSink:
-    def __init__(self, path: str | Path, columns: Sequence[str], flush_interval: int = 1000):
+    def __init__(
+        self, path: str | Path, columns: Sequence[str], flush_interval: int = 1000,
+        *, schema: Any | None = None,
+    ):
         self.path = _prepare_output_path(path)
         self.columns = list(columns)
         self.flush_interval = flush_interval
         self._rows: list[dict[str, Any]] = []
         self._writer: Any | None = None
-        self._schema: Any | None = None
+        self._schema: Any | None = schema
         self._temp_path: Path | None = None
 
     async def write(self, item: dict[str, Any]) -> None:
@@ -164,6 +167,15 @@ class ParquetSink:
             self._flush()
 
     def _flush(self) -> None:
+        try:
+            self._flush_rows()
+        except BaseException:
+            if self._writer is not None:
+                self._writer.close()
+                self._writer = None
+            raise
+
+    def _flush_rows(self) -> None:
         if not self._rows:
             return
 
@@ -172,7 +184,7 @@ class ParquetSink:
         import pyarrow.parquet as pq
 
         df = pd.DataFrame(self._rows, columns=self.columns)
-        table = pa.Table.from_pandas(df, preserve_index=False)
+        table = pa.Table.from_pandas(df, schema=self._schema, preserve_index=False)
 
         if self._writer is None:
             if self.path.exists():
@@ -182,11 +194,13 @@ class ParquetSink:
 
                 existing = pq.ParquetFile(self.path)
                 existing_rows = existing.metadata.num_rows if existing.metadata else 0
-                self._schema = table.schema if existing_rows == 0 else existing.schema_arrow
+                self._schema = self._schema or (
+                    table.schema if existing_rows == 0 else existing.schema_arrow
+                )
                 self._writer = pq.ParquetWriter(self._temp_path, self._schema)
                 if existing_rows > 0:
                     for idx in range(existing.num_row_groups):
-                        self._writer.write_table(existing.read_row_group(idx))
+                        self._writer.write_table(existing.read_row_group(idx).cast(self._schema))
             else:
                 self._schema = table.schema
                 self._writer = pq.ParquetWriter(self.path, self._schema)
@@ -201,10 +215,12 @@ class ParquetSink:
         self._rows.clear()
 
     async def close(self) -> None:
-        self._flush()
-        if self._writer:
-            self._writer.close()
-            self._writer = None
+        try:
+            self._flush()
+        finally:
+            if self._writer:
+                self._writer.close()
+                self._writer = None
 
         # If we wrote to a temp file, replace original
         if self._temp_path:
@@ -213,7 +229,9 @@ class ParquetSink:
         elif self._writer is None and not self.path.exists():
             # Create empty parquet if nothing wrote.
             import pandas as pd
-            pd.DataFrame(columns=self.columns).to_parquet(self.path, index=False)
+            pd.DataFrame(columns=self.columns).to_parquet(
+                self.path, index=False, **({"schema": self._schema} if self._schema is not None else {})
+            )
 
     async def __aenter__(self) -> "ParquetSink":
         return self
