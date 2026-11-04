@@ -939,10 +939,61 @@ async def test_a_different_condition_never_merges_into_existing_depth():
         clean["market"] = "other-condition"
         clean["hash"] = "h5"
         socket.put(clean)
+        await asyncio.sleep(0.05)
+        assert f.book("a") is None
+        assert f._shards[0].market_ids["a"] == "condition"
+        socket.put(snapshot("polymarket"))
         await until(lambda: f.book("a") is not None)
         book = f.book("a")
-        assert book.market_id == "other-condition"
+        assert book.market_id == "condition"
         assert (Decimal("0.5"), Decimal("0.30")) not in book.bids  # no mixed ladder
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_identity_conflict_requires_established_market_snapshot(venue):
+    connections = Connections()
+    async with feed(venue, connections) as f:
+        await ready(f, connections, venue)
+        shard = f._shards[0]
+        known = shard.market_ids["a"]
+        foreign = snapshot(venue, seq=2)
+        payload = foreign if venue == "polymarket" else foreign["msg"]
+        key = "market" if venue == "polymarket" else "market_id"
+        payload[key] = "foreign"
+        f._ingest(shard, foreign, 2)
+        foreign["seq"] = 3
+        f._ingest(shard, foreign, 3)
+        assert shard.market_ids["a"] == known
+        assert f.book("a") is None
+        anonymous = snapshot(venue, seq=4)
+        del (anonymous if venue == "polymarket" else anonymous["msg"])[key]
+        f._ingest(shard, anonymous, 4)
+        assert f.book("a") is None
+        f._ingest(shard, snapshot(venue, seq=5), 5)
+        assert f.book("a").market_id == known
+
+
+@pytest.mark.asyncio
+async def test_original_market_resolution_after_identity_conflict_is_terminal():
+    connections = Connections()
+    async with feed("polymarket", connections) as f:
+        await ready(f, connections, "polymarket")
+        shard = f._shards[0]
+        foreign = delta("polymarket")
+        foreign["market"] = "foreign"
+        f._ingest(shard, foreign, 2)
+        f._ingest(shard, {"event_type": "market_resolved", "market": "condition"}, 3)
+        assert shard.resolved == {"a"}
+        for market in ("foreign", "condition"):
+            later = snapshot("polymarket")
+            later["market"] = market
+            f._ingest(shard, later, 4)
+            assert f.book("a") is None
+            assert f.health("a").reason == "market_resolved"
+            assert not shard.recovery
+        f._invalidate(shard, "disconnected")
+        assert shard.market_ids["a"] == "condition" and shard.resolved == {"a"}
 
 
 @pytest.mark.asyncio

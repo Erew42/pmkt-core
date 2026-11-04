@@ -679,13 +679,17 @@ class ManagedBookFeed:
             if market and known and market != known:
                 # A message for another market merged into this book: drop the
                 # mixed ladder and require a fresh snapshot.
-                shard.market_ids[instrument] = market
                 self._reset_book(shard, instrument)
-                shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
+                if instrument not in shard.resolved:
+                    shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
                 continue
             if market and not known:
                 shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
+            if recovery is not None and recovery.reason == "market_identity_changed" and not market:
+                # An anonymous snapshot cannot verify the established identity.
+                self._reset_book(shard, instrument)
+                continue
             if "market_resolved" in view.quality_flags or instrument in shard.resolved:
                 shard.resolved.add(instrument)
                 shard.recovery.pop(instrument, None)
