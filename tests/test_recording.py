@@ -281,6 +281,33 @@ async def test_recording_keeps_heartbeat_and_unknown_message_handling(tmp_path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw", [False, True])
+async def test_strict_recording_persists_native_json_numbers(tmp_path, raw):
+    book = {**poly_book(), "tick_size": 0.01, "min_order_size": 1.25,
+            "bids": [{"price": 0.4, "size": 10.25}]}
+    tick = {"event_type": "tick_size_change", "asset_id": "a",
+            "old_tick_size": 0.01, "new_tick_size": 0.001}
+    resolved = {"event_type": "market_resolved", "market": "m", "value": 0.5}
+    socket = Socket([book, tick, resolved])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(raw_messages=raw), max_messages=3,
+        heartbeat_interval=None, connect_factory=lambda _: socket,
+    ), 5)
+    root = Path(report["run_dir"])
+    assert report["status"] == "complete"
+    events = pq.read_table(root / "events.parquet").to_pylist()
+    tick_event = next(e for e in events if e["kind"] == "tick_size_change")
+    assert json.loads(tick_event["details_json"])["new_tick_size"] == 0.001
+    if raw:
+        messages = [json.loads(line)["message"] for line in
+                    (root / "raw_messages.jsonl").read_text().splitlines()]
+        assert messages == [book, tick, resolved]
+    else:
+        assert not (root / "raw_messages.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_polymarket_recording_retains_trade_observations(tmp_path):
     trade = {"event_type": "last_trade_price", "asset_id": "a", "price": "0.42"}
     socket = Socket([poly_book(), trade, trade])

@@ -320,7 +320,10 @@ async def record_feed(
     def messages() -> Any:
         if venue == "polymarket":
             return client.iter_messages(
-                fail_on_clean_close_exhausted=True, strict_decode=True
+                fail_on_clean_close_exhausted=True, strict_decode=True,
+                # Preserve the recorder's JSON-number representation while
+                # validating frame structure strictly. Managed feeds keep Decimal.
+                decimal_numbers=False,
             )
         return client.iter_messages(
             fail_on_clean_close_exhausted=True, on_decode_error=decode_error
