@@ -500,6 +500,7 @@ async def _ingest_markets_keyset_async(
             for partition in partitions:
                 cursor = None
                 final_cursor = None
+                stop_reason = "not_started"
                 seen_cursors: set[str] = set()
                 try:
                     while True:
@@ -542,6 +543,9 @@ async def _ingest_markets_keyset_async(
                         if next_cursor is not None:
                             seen_cursors.add(next_cursor)
                         cursor = next_cursor
+                except asyncio.CancelledError:
+                    stop_reason = "cancelled"
+                    raise
                 except Exception:
                     stop_reason = "error"
                     raise

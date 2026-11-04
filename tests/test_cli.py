@@ -131,3 +131,71 @@ def test_keyset_closed_partitions(monkeypatch, tmp_path, closed, cap, scenario, 
         assert partitions[1]["continuation_cursor"] == "next"
     if scenario in {"duplicate", "failed_closed"}:
         assert partitions[1]["stop_reason"] == "error"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closed_pages", [0, 1])
+async def test_keyset_cancellation_keeps_closed_partition_incomplete(
+    monkeypatch, tmp_path, closed_pages
+):
+    import asyncio
+    import json
+
+    import httpx
+    import pandas as pd
+    import pmkt.cli.ingest as ingest
+    from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
+
+    waiting = asyncio.Event()
+    closed_calls = 0
+
+    async def handler(request):
+        nonlocal closed_calls
+        closed = request.url.params["closed"] == "true"
+        if closed:
+            closed_calls += 1
+            if closed_calls > closed_pages:
+                waiting.set()
+                await asyncio.Event().wait()
+        market_id = "closed" if closed else "open"
+        return httpx.Response(200, json={
+            "markets": [{
+                "id": market_id, "conditionId": "condition-" + market_id,
+                "question": "Test?", "closed": closed,
+                "outcomes": '["Yes", "No"]', "clobTokenIds": '["yes", "no"]',
+            }],
+            "next_cursor": "next" if closed else None,
+        })
+
+    monkeypatch.setattr(ingest, "AsyncGammaClient", lambda **kw: AsyncGammaClient(
+        base_url="https://gamma.example", transport=httpx.MockTransport(handler)))
+    out = tmp_path / "markets.parquet"
+    manifest = tmp_path / "manifest.json"
+    evidence = tmp_path / "evidence.parquet"
+    task = asyncio.create_task(ingest._ingest_markets_keyset_async(
+        out, limit=100, closed=None, max_pages=None,
+        manifest_out=manifest, contract_evidence_out=evidence,
+    ))
+    try:
+        await asyncio.wait_for(waiting.wait(), timeout=5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    metadata = json.loads(manifest.read_text())
+    source = json.loads((tmp_path / "evidence.parquet.bundle"
+                         / "source_collection_manifest.json").read_text())
+    for document in (metadata, source):
+        assert document["collection_complete"] is False
+        assert document["stop_reason"] == "cancelled"
+        assert document["partitions"][0]["complete"] is True
+        assert document["partitions"][1]["complete"] is False
+        assert document["partitions"][1]["stop_reason"] == "cancelled"
+        assert document["partitions"][1]["page_count"] == closed_pages
+    assert set(pd.read_parquet(out)["market_id"]) == (
+        {"open", "closed"} if closed_pages else {"open"}
+    )
