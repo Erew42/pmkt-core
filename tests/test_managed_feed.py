@@ -951,7 +951,8 @@ async def test_a_different_condition_never_merges_into_existing_depth():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-async def test_identity_conflict_requires_established_market_snapshot(venue):
+@pytest.mark.parametrize("transition", ["none", "timeout", "reconnect"])
+async def test_identity_conflict_requires_established_market_snapshot(venue, transition):
     connections = Connections()
     async with feed(venue, connections) as f:
         await ready(f, connections, venue)
@@ -966,12 +967,25 @@ async def test_identity_conflict_requires_established_market_snapshot(venue):
         f._ingest(shard, foreign, 3)
         assert shard.market_ids["a"] == known
         assert f.book("a") is None
+        if transition == "timeout":
+            recovery = shard.recovery["a"]
+            recovery.phase = "waiting"
+            recovery.deadline = 0
+            f._check_books(shard)
+            assert recovery.reason == "recovery_timeout"
+        elif transition == "reconnect":
+            f._invalidate(shard, "disconnected")
+            shard.restart = False
+            shard.connected = shard.alive = asyncio.get_running_loop().time()
+            shard.health.mark_connected(now_monotonic_ns=0)
         anonymous = snapshot(venue, seq=4)
         del (anonymous if venue == "polymarket" else anonymous["msg"])[key]
         f._ingest(shard, anonymous, 4)
         assert f.book("a") is None
+        assert "a" in shard.identity_conflicts
         f._ingest(shard, snapshot(venue, seq=5), 5)
         assert f.book("a").market_id == known
+        assert not shard.identity_conflicts
 
 
 @pytest.mark.asyncio
