@@ -396,6 +396,35 @@ async def test_strict_recording_persists_native_json_numbers(tmp_path, raw):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("routing", ["asset_id", "assets_ids", "asset_ids"])
+async def test_lifecycle_identity_before_first_book_remains_terminal(tmp_path, routing):
+    value = "a" if routing == "asset_id" else ["a"]
+    sockets = iter([
+        Socket([
+            {"event_type": "new_market", "market": "m", routing: value},
+            {"event_type": "new_market", "market": "other", routing: value},
+            OSError("lost"),
+        ]),
+        Socket([{"event_type": "market_resolved", "market": "m"}, poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert report["reconnect_count"] == 1
+    assert report["status"] == "complete"
+    assert top and all(row["venue_market_id"] == "m" for row in top)
+    assert top[-1]["integrity_valid"] and not top[-1]["quote_valid"]
+    assert "market_resolved" in top[-1]["quality_flags_json"]
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert snapshots and all(not row["quote_valid"] for row in snapshots)
+    assert not (root / "raw_messages.jsonl").exists()
+
+
+@pytest.mark.asyncio
 async def test_polymarket_recording_retains_trade_observations(tmp_path):
     trade = {"event_type": "last_trade_price", "asset_id": "a", "price": "0.42"}
     socket = Socket([poly_book(), trade, trade])

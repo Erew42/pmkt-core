@@ -145,6 +145,9 @@ class VenueBooks:
                         market and self.market_ids.get(key) == market
                     )
                 ]
+                if market:
+                    for state in targets:
+                        self.market_ids.setdefault(state.asset_id, market)
                 if kind == "market_resolved":
                     self.resolved.update(state.asset_id for state in targets)
                 snapshots = [
