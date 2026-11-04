@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from pmkt.streaming.recording import BookRecorder, BookView, RecordingOptions
-from pmkt.streaming.recording_feed import RecordingError, record_feed
+from pmkt.streaming.recording_feed import RecordingError, VenueBooks, record_feed
 from pmkt.streaming.recording_store import export_recording
 
 
@@ -278,6 +278,94 @@ async def test_recording_keeps_heartbeat_and_unknown_message_handling(tmp_path):
         connect_factory=lambda _: socket,
     ), 5)
     assert report["status"] == "complete"
+
+
+@pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("kind", ["book", "price_change", "tick_size_change"])
+def test_recorder_identity_conflict_requires_established_market_snapshot(reset, kind):
+    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    if reset:
+        books.reset()
+    wrong = {**poly_book(), "market": "other", "event_type": kind,
+             "tick_size": "0.01", "price_changes": [
+                 {"asset_id": "a", "side": "BUY", "price": "0.5", "size": "10"}]}
+    invalid = books.apply(wrong, 2)[0]
+    assert invalid.venue_market_id == "m"
+    assert not invalid.integrity_valid and not invalid.quote_valid
+    assert "market_identity_changed" in invalid.quality_flags
+    assert invalid.bids == {} and invalid.asks == {}
+    later = {**wrong, "market": "m", "event_type": "price_change"}
+    assert not books.apply(later, 3)[0].integrity_valid
+    recovered = books.apply(poly_book(), 4)[0]
+    assert recovered.integrity_valid and recovered.quote_valid
+    assert recovered.venue_market_id == "m"
+    assert 0.5 not in recovered.bids
+
+
+@pytest.mark.parametrize("routing", ["market", "asset_id", "assets_ids", "asset_ids"])
+def test_recorder_resolution_survives_snapshots_and_reset(routing):
+    books = VenueBooks("polymarket", ["a", "b"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book("b"), "market": "other"}, 2)
+    books.reset()
+    value = "m" if routing == "market" else "a" if routing == "asset_id" else ["a"]
+    resolved = books.apply({"event_type": "market_resolved", routing: value}, 3)
+    assert [v.instrument_id for v in resolved] == ["a"]
+    for count in (4, 5):
+        v = books.apply(poly_book(), count)[0]
+        assert v.integrity_valid and not v.quote_valid
+        assert "market_resolved" in v.quality_flags
+        books.reset()
+    assert books.apply({**poly_book("b"), "market": "other"}, 6)[0].quote_valid
+
+
+@pytest.mark.asyncio
+async def test_record_feed_identity_conflict_persists_and_recovers_only_known_market(tmp_path):
+    wrong_delta = {"event_type": "price_change", "market": "other", "price_changes": [
+        {"asset_id": "a", "side": "BUY", "price": "0.5", "size": "10"}]}
+    sockets = iter([
+        Socket([poly_book(), wrong_delta]),
+        Socket([{**poly_book(), "market": "other"}]),
+        Socket([poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    events = pq.read_table(root / "events.parquet").to_pylist()
+    assert report["status"] == "complete"
+    conflicts = [r for r in top if "market_identity_changed" in r["quality_flags_json"]]
+    assert len(conflicts) == 2
+    assert all(not r["integrity_valid"] and not r["quote_valid"] for r in conflicts)
+    assert all(r["venue_market_id"] in (None, "m") for r in top)
+    assert top[-1]["integrity_valid"] and top[-1]["bid_price"] == 0.4
+    assert any(e["kind"] == "book_recovered" for e in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routing", ["market", "asset_id", "assets_ids", "asset_ids"])
+async def test_record_feed_resolution_stays_terminal_after_reconnect(tmp_path, routing):
+    value = "m" if routing == "market" else "a" if routing == "asset_id" else ["a"]
+    sockets = iter([Socket([
+        poly_book(), {"event_type": "market_resolved", routing: value},
+        poly_book(), OSError("lost"),
+    ]), Socket([poly_book()])])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert report["status"] == "complete"
+    assert all(not r["quote_valid"] for r in top[1:])
+    assert all("market_resolved" in r["quality_flags_json"] for r in top[1:])
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert all(not r["quote_valid"] for r in snapshots[1:])
 
 
 @pytest.mark.asyncio

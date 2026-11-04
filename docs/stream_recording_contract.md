@@ -297,6 +297,14 @@ Existing books are invalidated in topbook quality flags and events, and the run
 cannot finish complete. This applies after reconnects as well. Decode errors do
 not enable raw-message retention; `raw_messages=False` remains the default.
 
+The recorder binds each Polymarket instrument to its first observed nonempty
+market ID. Conflicting books, price changes and tick-size messages invalidate and
+clear that ladder before mutation; recovery requires a snapshot for the established
+market. Reconnects retain the identity. Market resolution is terminal for quote
+validity across later snapshots and reconnects, including resolution routed by
+`asset_id`, `assets_ids`, `asset_ids` or the established market ID. A resolved
+ladder can still have valid book integrity; it cannot have a valid quote.
+
 ```python
 from pmkt.exchanges.polymarket import stream_order_book_data
 
