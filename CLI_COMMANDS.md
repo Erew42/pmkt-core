@@ -67,6 +67,10 @@ installed version.
   cursor per instrument. Page caps, repeated/cyclic cursors, and fetch/parse
   failures leave the requested interval incomplete and emit a trade gap with
   details in `raw_json`; returned trade timestamps do not prove interval coverage.
+  Malformed entries (including empty objects) and duplicate trade keys reject the
+  whole page while retaining accepted earlier pages. Duplicate keys are checked
+  across all requested tickers; valid empty lists still indicate exhaustion when
+  there is no continuation cursor.
 
 ## Capture and reconstruction commands
 

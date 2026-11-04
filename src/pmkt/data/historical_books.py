@@ -488,6 +488,7 @@ async def _backfill_kalshi_trades(
     rows: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
     partitions: list[dict[str, Any]] = []
+    seen_trade_keys: set[tuple[str, str]] = set()
     for ticker in instruments:
         cursor: str | None = None
         seen_cursors: set[str] = set()
@@ -505,20 +506,25 @@ async def _backfill_kalshi_trades(
                 )
                 trades = _as_mapping(payload).get("trades")
                 if not isinstance(trades, list) or any(
-                    not isinstance(trade, Mapping) for trade in trades
+                    not isinstance(trade, Mapping) or not trade for trade in trades
                 ):
-                    raise ValueError("historical trade page must contain a list of trade objects")
+                    raise ValueError("historical trade page must contain a list of nonempty trade objects")
                 page_trades = _kalshi_trade_rows(
                     payload,
                     collector_run_id=run_id,
                     default_ticker=ticker.split(":", 1)[0],
                 )
+                # trade.v1 keys span all ticker partitions in the output artifact.
+                page_keys = {(row["venue"], row["venue_trade_id"]) for row in page_trades}
+                if len(page_keys) != len(page_trades) or seen_trade_keys.intersection(page_keys):
+                    raise ValueError("historical trade page contains duplicate trade keys")
             except Exception as exc:
                 stop_reason = "fetch_error"
                 reason = f"{type(exc).__name__}: {exc}"
                 break
             pages += 1
             rows.extend(page_trades)
+            seen_trade_keys.update(page_keys)
             cursor_value = _as_mapping(payload).get("cursor")
             cursor = str(cursor_value).strip() if cursor_value else None
             if not cursor:
