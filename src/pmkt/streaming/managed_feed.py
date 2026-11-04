@@ -81,7 +81,7 @@ class _Recovery:
     reason: str
     deadline: float
     phase: Literal["grace", "pending", "sending", "waiting", "cooldown"]
-    # A valid snapshot arrived while the request was still being sent.
+    # A valid snapshot arrived during the send and has not since been invalidated.
     answered: bool = False
 
 
@@ -696,10 +696,11 @@ class ManagedBookFeed:
             elif (
                 recovery is not None
                 and recovery.phase == "sending"
-                and view.integrity_valid
-                and kind in {"book", "orderbook_snapshot"}
             ):
-                recovery.answered = True
+                if not view.integrity_valid:
+                    recovery.answered = False
+                elif kind in {"book", "orderbook_snapshot"}:
+                    recovery.answered = True
             elif not view.integrity_valid and recovery is None:
                 grace = (
                     self.venue == "polymarket"

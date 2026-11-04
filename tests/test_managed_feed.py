@@ -1029,6 +1029,59 @@ async def test_recovery_snapshot_received_during_the_send_is_kept(venue):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("replace_snapshot", [False, True])
+async def test_recovery_answer_tracks_latest_integrity_during_send(venue, replace_snapshot):
+    connections = Connections()
+    entered, release = asyncio.Event(), asyncio.Event()
+    requests = []
+    async with feed(venue, connections) as f:
+        await ready(f, connections, venue)
+        shard = f._shards[0]
+
+        async def slow_send(shard, instruments):
+            requests.append(instruments)
+            entered.set()
+            await release.wait()
+
+        f._request_snapshots = slow_send
+        bad = delta(venue, seq=2)
+        if venue == "polymarket":
+            bad["price_changes"][0]["size"] = "NaN"
+        else:
+            bad["msg"]["delta_fp"] = "NaN"
+        f._ingest(shard, bad, 2)
+        await asyncio.wait_for(entered.wait(), 3)
+        f._ingest(shard, snapshot(venue, seq=3), 3)
+        recovery = shard.recovery["a"]
+        assert recovery.answered
+        bad["seq"] = 4
+        f._ingest(shard, bad, 4)
+        assert not recovery.answered
+        if replace_snapshot:
+            f._ingest(shard, snapshot(venue, seq=5), 5)
+            assert recovery.answered
+        release.set()
+        if replace_snapshot:
+            await until(lambda: f.book("a") is not None)
+            assert len(requests) == 1
+        else:
+            await until(lambda: recovery.phase == "waiting")
+            assert f.book("a") is None and shard.recovery["a"] is recovery
+            # Advance existing recovery deadlines without a 30-second test sleep.
+            recovery.deadline = 0
+            f._check_books(shard)
+            assert recovery.phase == "cooldown"
+            recovery.deadline = 0
+            f._check_books(shard)
+            await until(lambda: len(requests) == 2 and recovery.phase == "waiting")
+            f._ingest(shard, snapshot(venue, seq=5), 5)
+            assert f.book("a") is not None
+        assert not shard.recovery
+        assert f.health("a").reconnect_count == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
 async def test_close_during_session_teardown_still_closes_the_socket(venue):
     connections = Connections()
     f = feed(venue, connections)
