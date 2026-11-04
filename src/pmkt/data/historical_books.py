@@ -23,7 +23,7 @@ from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.time import isoformat_source_timestamp, utc_now_iso
 from pmkt.data.types import parse_float, parse_int
 
-from pmkt.exchanges.kalshi.trade_values import _kalshi_yes_price, _first_positive_float
+from pmkt.data.normalize_kalshi_trade import _kalshi_yes_price, _first_positive_float
 
 POLYMARKET_PRICES_HISTORY_DOCS = (
     "https://docs.polymarket.com/api-reference/markets/get-prices-history"

@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Mapping
 
 from pmkt.data.time import EpochUnit, isoformat_source_timestamp
-from pmkt.exchanges.kalshi.trade_values import (
+from pmkt.data.normalize_kalshi_trade import (
     ObservationValidationError as ObservationValidationError,
     _kalshi_yes_price as _kalshi_yes_price,
     _first_positive_float as _first_positive_float,
