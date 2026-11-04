@@ -898,6 +898,9 @@ async def test_metadata_revision_survives_unavailable_local_recovery_until_new_g
         socket.queue.put_nowait(None)
         await until(lambda: f.health("a").generation > generation)
         assert f.health("a").metadata_revision == 0
+        # Generation advances before connect/subscribe finishes. Do not send
+        # the replacement snapshot to the previous, closed socket.
+        await until(lambda: connections.sockets[-1] is not socket and connections.sockets[-1].sent)
         await ready(f, connections, "polymarket")
         assert f.book("a").metadata_revision == 0
 
