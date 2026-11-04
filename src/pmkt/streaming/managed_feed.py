@@ -57,6 +57,7 @@ class PublicBook:
     received_monotonic: float
     source_timestamp: Any
     quality_flags: tuple[str, ...]
+    metadata_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,7 @@ class PublicBookHealth:
     error_count: int
     last_error: str | None
     quality_flags: tuple[str, ...]
+    metadata_revision: int = 0
 
 
 @dataclass
@@ -96,6 +98,8 @@ class _Shard:
     connected: float | None = None
     updates: dict[str, float] = field(default_factory=dict)
     source_timestamps: dict[str, Any] = field(default_factory=dict)
+    # Explicit metadata-event evidence, retained through same-generation recovery.
+    metadata_revisions: dict[str, int] = field(default_factory=dict)
     recovery: dict[str, _Recovery] = field(default_factory=dict)
     restart: bool = True
     reason: str = "not_started"
@@ -416,6 +420,7 @@ class ManagedBookFeed:
             shard.health.error_count,
             shard.last_error,
             tuple(sorted(state.quality_flags)),
+            shard.metadata_revisions.get(instrument, 0),
         )
 
     def book(self, instrument: str) -> PublicBook | None:
@@ -444,6 +449,7 @@ class ManagedBookFeed:
             shard.updates[instrument],
             shard.source_timestamps[instrument],
             health.quality_flags,
+            health.metadata_revision,
         )
 
     async def _run(self, shard: _Shard) -> None:
@@ -469,6 +475,7 @@ class ManagedBookFeed:
         if self._closed:
             raise asyncio.CancelledError()
         shard.generation += 1
+        shard.metadata_revisions.clear()
         shard.restart = False
         shard.reason = "connecting"
         shard.sid = None
@@ -655,6 +662,12 @@ class ManagedBookFeed:
                         or instrument == message.get("asset_id"):
                     shard.resolved.add(instrument)
                     shard.recovery.pop(instrument, None)
+        if self.venue == "polymarket" and kind == "tick_size_change":
+            instrument = str(message.get("asset_id"))
+            if instrument in shard.books.polymarket:
+                # Event evidence only: even repeated or malformed tick values
+                # require consumers to reconsider independently cached metadata.
+                shard.metadata_revisions[instrument] = shard.metadata_revisions.get(instrument, 0) + 1
         views = shard.books.apply(message, count)
         now = time.monotonic()
         shard.health.record_message(now_monotonic_ns=time.monotonic_ns())

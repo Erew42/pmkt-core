@@ -78,6 +78,26 @@ instrument. Typical reasons include `not_started`, `no_initial_snapshot`,
 and `closed`. Treat the reason as diagnostic text, not
 an exhaustive policy enum.
 
+Both result types append `metadata_revision: int = 0`. For each instrument it
+counts explicit Polymarket `tick_size_change` events addressed to that subscribed
+token in the current generation, including repeated events and malformed tick
+values. Unsubscribed-token events and ordinary snapshots/deltas do not increment
+it. Kalshi currently has no supported metadata-change event and reports zero.
+The counter survives local book resets, recovery, resolution and disconnection;
+it resets to zero only when a new connection generation starts. `health()` exposes
+it even when no usable book exists. Depth timestamps and ladders are not refreshed
+by this signal, and metadata events cannot clear identity conflicts.
+
+This is invalidation evidence, not an authoritative tick value, a proof of book
+freshness, or an ordering guarantee for owned orders. Consumers with cached
+constraints can compare `(generation, metadata_revision)` for the same feed
+instance and instrument. Capture that pair before a REST confirmation request;
+a response spanning a pair change must not confirm the newer revision. Consumers
+also own overlapping-request ordering and invalidate confirmation when rebinding
+to another feed instance. Core supplies no signing values, REST refresh policy,
+or book-age limit. This event signal does not cover metadata changes absent from
+the supported stream event.
+
 ## Integrity, liveness, and recovery
 
 Polymarket application heartbeats and inbound-frame diagnostics run independently

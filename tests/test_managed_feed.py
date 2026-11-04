@@ -836,6 +836,112 @@ async def test_polymarket_metadata_event_preserves_depth_timestamp():
         await until(lambda: f._shards[0].books.polymarket["a"].tick_size == 0.01)
         assert f.book("a").source_timestamp == original.source_timestamp
         assert f.book("a").received_monotonic == original.received_monotonic
+        assert original.metadata_revision == 0
+        assert f.book("a").metadata_revision == f.health("a").metadata_revision == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_tick", ["0.1", None, "bad"])
+async def test_metadata_revision_signals_addressed_tick_events_only(new_tick):
+    connections = Connections()
+    async with feed("polymarket", connections, ("a", "b")) as f:
+        socket = await ready(f, connections, "polymarket")
+        aligned = snapshot("polymarket")
+        aligned.update(bids=[{"price": "0.40", "size": "2"}],
+                       asks=[{"price": "0.60", "size": "3"}], tick_size="0.01")
+        socket.put(aligned)
+        socket.put(snapshot("polymarket", "b"))
+        await until(lambda: f.book("b") is not None)
+        original = f.book("a")
+        request_start = (original.generation, original.metadata_revision)
+        for revision in (1, 2):
+            socket.put({"event_type": "tick_size_change", "asset_id": "a",
+                        "market": "condition", "old_tick_size": "0.01",
+                        "new_tick_size": new_tick})
+            await until(lambda: f.health("a").metadata_revision == revision)
+            changed = f.book("a")
+            assert changed.generation == original.generation
+            assert changed.metadata_revision == revision
+            assert changed.bids == original.bids and changed.asks == original.asks
+            assert changed.source_timestamp == original.source_timestamp
+            assert changed.received_monotonic == original.received_monotonic
+            assert f.health("b").metadata_revision == 0
+            assert (changed.generation, changed.metadata_revision) != request_start
+        socket.put({"event_type": "tick_size_change", "asset_id": "unowned",
+                    "new_tick_size": "0.001"})
+        socket.put(snapshot("polymarket"))
+        socket.put(delta("polymarket"))
+        await until(lambda: f.book("a").bids[0][1] == Decimal("0.30"))
+        assert f.book("a").metadata_revision == 2
+
+
+@pytest.mark.asyncio
+async def test_metadata_revision_survives_unavailable_local_recovery_until_new_generation():
+    connections = Connections()
+    async with feed("polymarket", connections) as f:
+        socket = await ready(f, connections, "polymarket")
+        shard = f._shards[0]
+        generation = f.health("a").generation
+        f._reset_book(shard, "a")
+        assert f.book("a") is None
+        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "new_tick_size": "0.1"}, 2)
+        assert f.book("a") is None
+        assert f.health("a").metadata_revision == 1
+        f._reset_book(shard, "a")
+        assert f.health("a").metadata_revision == 1
+        f._ingest(shard, snapshot("polymarket"), 3)
+        assert f.book("a").metadata_revision == 1
+        f._invalidate(shard, "synthetic_disconnect")
+        assert f.health("a").generation == generation
+        assert f.health("a").metadata_revision == 1
+        socket.queue.put_nowait(None)
+        await until(lambda: f.health("a").generation > generation)
+        assert f.health("a").metadata_revision == 0
+        await ready(f, connections, "polymarket")
+        assert f.book("a").metadata_revision == 0
+
+
+@pytest.mark.asyncio
+async def test_metadata_revision_is_visible_before_snapshot_and_cannot_clear_identity_conflict():
+    connections = Connections()
+    async with feed("polymarket", connections, ("a", "b")) as f:
+        await ready(f, connections, "polymarket")
+        shard = f._shards[0]
+        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "b",
+                          "new_tick_size": "0.1"}, 2)
+        assert f.book("b") is None
+        assert f.health("b").metadata_revision == 1
+        f._ingest(shard, snapshot("polymarket", "b"), 3)
+        assert f.book("b").metadata_revision == 1
+        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "market": "foreign", "new_tick_size": "0.1"}, 4)
+        assert f.book("a") is None
+        assert f.health("a").metadata_revision == 1
+        assert shard.market_ids["a"] == "condition"
+        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "market": "condition", "new_tick_size": "0.1"}, 5)
+        assert f.book("a") is None and "a" in shard.identity_conflicts
+        assert f.health("a").metadata_revision == 2
+        f._ingest(shard, snapshot("polymarket"), 6)
+        assert f.book("a").metadata_revision == 2
+
+
+@pytest.mark.asyncio
+async def test_metadata_revision_keeps_kalshi_and_legacy_construction_defaults():
+    from dataclasses import astuple
+
+    from pmkt.streaming.managed_feed import PublicBook, PublicBookHealth
+
+    connections = Connections()
+    async with feed("kalshi", connections) as f:
+        socket = await ready(f, connections, "kalshi")
+        socket.put(delta("kalshi"))
+        await until(lambda: f.book("a").bids[0][1] == Decimal("0.30"))
+        book, health = f.book("a"), f.health("a")
+        assert book.metadata_revision == health.metadata_revision == 0
+        assert PublicBook(*astuple(book)[:-1]) == book
+        assert PublicBookHealth(*astuple(health)[:-1]) == health
 
 
 @pytest.mark.asyncio
