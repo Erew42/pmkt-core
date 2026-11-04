@@ -47,6 +47,7 @@ from .collect import (
     _KX_UPDATED_KEYS,
     _PM_CREATED_KEYS,
     _PM_UPDATED_KEYS,
+    _polymarket_updated_at_sql,
     _collect_kalshi_pages,
     _dedupe_rows,
     collect_kalshi_current_family,
@@ -197,16 +198,6 @@ def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
         f"e -> json_extract_string(e, {event_paths}))"
         "))) END"
     )
-
-
-def _polymarket_updated_at_sql(raw_json_sql: str) -> str:
-    """Read the first parseable _PM_UPDATED_KEYS alias, as discovery observes it."""
-    parts = ", ".join(
-        f"try_cast(json_extract_string({raw_json_sql}, {_quote_sql('$.' + key)}) "
-        "AS TIMESTAMPTZ)"
-        for key in _PM_UPDATED_KEYS
-    )
-    return f"coalesce({parts})"
 
 
 class MarketCatalogService:

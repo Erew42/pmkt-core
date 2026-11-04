@@ -731,7 +731,7 @@ async def test_older_discovery_rows_do_not_replace_a_newer_census_row(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("alias", ["updated_at", "updated"])
+@pytest.mark.parametrize("alias", ["updatedAt", "updated_at", "updated"])
 async def test_replayed_upsert_reads_every_updated_alias(
     tmp_path: Path, alias: str
 ) -> None:
@@ -755,6 +755,16 @@ async def test_replayed_upsert_reads_every_updated_alias(
 
     # The published upsert must replace the known row, so a replay is a no-op.
     assert upserts == [1, 0]
+    for stream in ("kalshi-conventional", "kalshi-mve"):
+        await service.discover(stream, client=FakeKalshi({}))
+    for _ in range(2):
+        compacted = await service.compact_history(force=True)
+        assert compacted["published"] is True
+        _path, manifest = service._history_manifest()
+        frame = pd.read_parquet(service._history_artifact_path(manifest, "polymarket"))
+        selected = frame.loc[frame["market_id"] == "pm-a"].iloc[0]
+        assert selected["question"] == "Edited?"
+        assert json.loads(selected["raw_json"])[alias] == edited[alias]
 
 
 def test_missing_referenced_current_artifact_fails_closed(tmp_path: Path) -> None:

@@ -17,6 +17,7 @@ from pmkt.pagination import normalize_polymarket_cursor
 
 from .fs import (
     _payload_hash,
+    _quote_sql,
     _raw_key,
     iso_utc,
     row_timestamp,
@@ -39,6 +40,17 @@ _KX_CREATED_KEYS = ("created_time", "created_ts", "created_at")
 
 
 _KX_UPDATED_KEYS = ("updated_time", "updated_ts", "updated_at")
+
+
+def _polymarket_updated_at_sql(raw_json_sql: str) -> str:
+    """Read the first parseable _PM_UPDATED_KEYS alias, as discovery observes it."""
+    parts = ", ".join(
+        f"try_cast(json_extract_string({raw_json_sql}, {_quote_sql('$.' + key)}) "
+        "AS TIMESTAMPTZ)"
+        for key in _PM_UPDATED_KEYS
+    )
+    return f"coalesce({parts})"
+
 
 
 def _dedupe_rows(

@@ -17,7 +17,7 @@ from pmkt.data.normalize import markets_dataframe
 from pmkt.data.storage.parquet import write_parquet
 
 from . import fs
-from .collect import kalshi_snapshot_dataframe
+from .collect import _polymarket_updated_at_sql, kalshi_snapshot_dataframe
 from .families import _kalshi_family_sql
 from .fs import (
     _artifact_from_staged,
@@ -96,8 +96,7 @@ def promote_history(service: MarketCatalogService) -> dict[str, Any]:
                     )
                     QUALIFY row_number() OVER (
                       PARTITION BY market_id
-                      ORDER BY try_cast(json_extract_string(raw_json, '$.updatedAt')
-                                        AS TIMESTAMPTZ) DESC NULLS LAST,
+                      ORDER BY {_polymarket_updated_at_sql("raw_json")} DESC NULLS LAST,
                                raw_json_sha256 DESC
                     ) = 1
                     """
@@ -463,10 +462,10 @@ async def compact_history(
         pm_conflicts = [
             str(row[0])
             for row in connection.execute(
-                """
+                f"""
                     WITH timed AS (
                       SELECT *, coalesce(
-                        try_cast(json_extract_string(raw_json, '$.updatedAt') AS TIMESTAMPTZ),
+                        {_polymarket_updated_at_sql("raw_json")},
                         _observed_at
                       ) AS effective_time
                       FROM pm_candidates
@@ -564,8 +563,7 @@ async def compact_history(
                   FROM {pm_candidate_view}
                   QUALIFY row_number() OVER (
                     PARTITION BY market_id
-                    ORDER BY try_cast(json_extract_string(raw_json, '$.updatedAt')
-                                      AS TIMESTAMPTZ) DESC NULLS LAST,
+                    ORDER BY {_polymarket_updated_at_sql("raw_json")} DESC NULLS LAST,
                              _observed_at DESC, raw_json_sha256 DESC
                   ) = 1
                 ) TO {_quote_sql(pm_target.resolve().as_posix())}
