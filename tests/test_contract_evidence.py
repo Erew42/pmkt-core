@@ -834,3 +834,138 @@ def test_v2_manifest_rejects_inconsistent_complete_collection_state(
     )
 
     assert manifest["authoritative_complete"] is False
+
+
+@pytest.mark.parametrize("mode", ["gamma-keyset", "gamma-offset", "kalshi", "kalshi-historical"])
+def test_ingested_evidence_uses_page_receipt_and_projection_clocks(tmp_path, monkeypatch, mode):
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from pmkt.cli import ingest
+    from pmkt.data.contract_evidence_manifest import contract_evidence_bundle_path
+
+    clock = [datetime(2026, 7, 10, 11, tzinfo=timezone.utc)]
+
+    def now():
+        value = clock[0]
+        clock[0] += timedelta(minutes=1)
+        return value.isoformat()
+
+    monkeypatch.setattr(ingest, "_utc_now_iso", now)
+
+    class FakeVenue:
+        calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        def page(self):
+            index = self.calls
+            self.calls += 1
+            clock[0] = datetime(2026, 7, 10, 12 + index, tzinfo=timezone.utc)
+            if mode.startswith("gamma"):
+                row = {**_polymarket_raw(), "id": f"pm-{index}"}
+            else:
+                row = {**_kalshi_raw(), "ticker": f"KX-PAGE-{index}",
+                       "settlement_ts": "2026-07-09T22:00:00Z"}
+            row["description"] = "Earlier rules" if index == 0 else "Later rules"
+            return {"markets": [row], "next_cursor": "next" if index == 0 else "",
+                    "cursor": "next" if index == 0 else ""}
+
+        async def markets_keyset_raw_page(self, **_):
+            return self.page()
+
+        async def markets_raw_page(self, **_):
+            return self.page()["markets"]
+
+        async def markets_page(self, **_):
+            return self.page()
+
+        async def historical_markets_page(self, **_):
+            return self.page()
+
+        async def historical_cutoff(self):
+            return {"market_settled_ts": "2026-07-11T00:00:00Z"}
+
+    fake = FakeVenue()
+    monkeypatch.setattr(ingest, "AsyncGammaClient", lambda **_: fake)
+    monkeypatch.setattr(ingest, "AsyncKalshiClient", lambda **_: fake)
+    out = tmp_path / "markets.parquet"
+    evidence_out = tmp_path / "evidence.parquet"
+    if mode == "gamma-keyset":
+        run = ingest._ingest_markets_keyset_async(
+            out, limit=1, closed=False, contract_evidence_out=evidence_out,
+        )
+        endpoint, scope, venue = "gamma:/markets/keyset", "keyset_list", "polymarket"
+    elif mode == "gamma-offset":
+        run = ingest._ingest_markets_async(out, 2, 1, False, evidence_out)
+        endpoint, scope, venue = "gamma:/markets", "list", "polymarket"
+    elif mode == "kalshi":
+        run = ingest._ingest_kalshi_markets_async(
+            out, limit=1, max_pages=2, status=None, complete=True,
+            contract_evidence_out=evidence_out,
+        )
+        endpoint, scope, venue = "kalshi:/markets", "cursor_list", "kalshi"
+    else:
+        run = ingest._ingest_kalshi_historical_markets_async(
+            out, limit=1, max_pages=2, complete=True, event_ticker=None,
+            series_ticker=None, tickers=None, manifest_out=tmp_path / "run.json",
+            contract_evidence_out=evidence_out,
+        )
+        endpoint, scope, venue = "kalshi:/historical/markets", "cursor_list", "kalshi"
+    asyncio.run(run)
+    bundle = contract_evidence_bundle_path(evidence_out)
+    artifact = bundle / evidence_out.name
+    frame = pd.read_parquet(artifact).sort_values("observed_at_utc")
+    expected = ["2026-07-10T12:00:00+00:00", "2026-07-10T13:00:00+00:00"]
+    assert frame["observed_at_utc"].tolist() == expected
+    assert all(pd.to_datetime(frame["derived_at_utc"], utc=True) >=
+               pd.to_datetime(frame["observed_at_utc"], utc=True))
+    verified = verify_contract_evidence_manifest(
+        frame, artifact_path=artifact, manifest_path=bundle / "manifest.json",
+        expected_venue=venue, expected_source_endpoint=endpoint,
+        expected_payload_scope=scope, expected_observation_time_source="capture_clock",
+        expected_source_payload_kind="venue_api_response",
+    )
+    assert verified["observation_min_utc"] == expected[0]
+    assert verified["observation_max_utc"] == expected[1]
+    assert verified["observation_time_precision"] == "page_response"
+    cutoff = pd.Timestamp("2026-07-10T12:10:00Z")
+    eligible = frame[(pd.to_datetime(frame["observed_at_utc"], utc=True) <= cutoff) &
+                     (pd.to_datetime(frame["derived_at_utc"], utc=True) <= cutoff)]
+    assert len(eligible) == (0 if mode == "gamma-offset" else 1)
+    assert not (eligible["observed_at_utc"] == expected[1]).any()
+    source = json.loads((bundle / "source_collection_manifest.json").read_text())
+    assert source["started_at_utc"] == "2026-07-10T11:00:00+00:00"
+    assert source["finished_at_utc"] >= expected[1]
+
+
+def test_legacy_cli_bundle_is_verified_with_reduced_time_precision(tmp_path):
+    frame = contract_evidence_dataframe(
+        [_polymarket_raw()], venue="polymarket", source_endpoint="gamma:/markets/keyset",
+        payload_scope="keyset_list", observed_at_utc=OBSERVED, derived_at_utc=DERIVED,
+        source_payload_kind="venue_api_response",
+    )
+    artifact, manifest = write_contract_evidence_bundle(
+        frame, artifact_path=tmp_path / "old.parquet", venue="polymarket",
+        source_endpoint="gamma:/markets/keyset", payload_scope="keyset_list",
+        observation_time_source="capture_clock", source_payload_kind="venue_api_response",
+        collection_complete=True, stop_reason="cursor_exhausted", continuation_cursor=None,
+        collection_errors=(), source_collection_manifest={
+            "venue": "polymarket", "source_endpoint": "gamma:/markets/keyset",
+            "payload_scope": "keyset_list", "observed_at_utc": OBSERVED, "page_count": 1,
+            "collection_complete": True, "stop_reason": "cursor_exhausted",
+            "continuation_cursor": None, "collection_errors": [],
+        },
+    )
+    original = manifest.read_bytes(), artifact.read_bytes()
+    verified = verify_contract_evidence_manifest(
+        frame, artifact_path=artifact, manifest_path=manifest, expected_venue="polymarket",
+        expected_source_endpoint="gamma:/markets/keyset", expected_payload_scope="keyset_list",
+        expected_observation_time_source="capture_clock", expected_source_payload_kind="venue_api_response",
+    )
+    assert verified["observation_time_precision"] == "collection_start"
+    assert verified["authoritative_complete"] is False
+    assert (manifest.read_bytes(), artifact.read_bytes()) == original

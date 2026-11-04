@@ -135,7 +135,6 @@ class _StreamingContractEvidenceBundle:
         self.observed_at_utc = observed_at_utc
         self.bounded_memory = bounded_memory
         self.request_parameters = dict(request_parameters) if request_parameters is not None else None
-        self.derived_at_utc = _utc_now_iso()
         self.destination = contract_evidence_bundle_path(out)
         self.destination.parent.mkdir(parents=True, exist_ok=True)
         if self.destination.exists():
@@ -159,14 +158,14 @@ class _StreamingContractEvidenceBundle:
         self.observation_max_utc: str | None = None
         self.payload_authority_valid = True
 
-    def append(self, markets: list[dict[str, object]]) -> None:
+    def append(self, markets: list[dict[str, object]], *, observed_at_utc: str) -> None:
         evidence = contract_evidence_dataframe(
             markets,
             venue=self.venue,  # type: ignore[arg-type]
             source_endpoint=self.source_endpoint,
             payload_scope=self.payload_scope,
-            observed_at_utc=self.observed_at_utc,
-            derived_at_utc=self.derived_at_utc,
+            observed_at_utc=observed_at_utc,
+            derived_at_utc=_utc_now_iso(),
             source_payload_kind="venue_api_response",
         )
         if not self.bounded_memory:
@@ -257,7 +256,9 @@ class _StreamingContractEvidenceBundle:
                 "venue": self.venue,
                 "source_endpoint": self.source_endpoint,
                 "payload_scope": self.payload_scope,
-                "observed_at_utc": self.observed_at_utc,
+                "observation_time_precision": "page_response",
+                "started_at_utc": self.observed_at_utc,
+                "finished_at_utc": _utc_now_iso(),
                 "page_count": int(page_count),
                 "row_count": int(self.writer.row_count),
                 "collection_complete": bool(collection_complete),
@@ -326,18 +327,19 @@ def _market_payload(value: Any) -> dict[str, object]:
 
 async def _gamma_markets_payload_page(
     gamma: Any, *, limit: int, offset: int, closed: bool | None
-) -> list[dict[str, object]]:
+) -> tuple[list[dict[str, object]], str]:
     raw_method = getattr(gamma, "markets_raw_page", None)
     if callable(raw_method):
         rows = await raw_method(limit=limit, offset=offset, closed=closed)
     else:
         rows = await gamma.markets_page(limit=limit, offset=offset, closed=closed)
-    return [_market_payload(row) for row in rows]
+    observed_at = _utc_now_iso()
+    return [_market_payload(row) for row in rows], observed_at
 
 
 async def _gamma_keyset_payload_page(
     gamma: Any, *, limit: int, after_cursor: str | None, closed: bool | None
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], str]:
     raw_method = getattr(gamma, "markets_keyset_raw_page", None)
     if callable(raw_method):
         page = await raw_method(limit=limit, after_cursor=after_cursor, closed=closed)
@@ -345,10 +347,11 @@ async def _gamma_keyset_payload_page(
         page = await gamma.markets_keyset_page(
             limit=limit, after_cursor=after_cursor, closed=closed
         )
+    observed_at = _utc_now_iso()
     rows = page.get("markets")
     if not isinstance(rows, list):
         raise TypeError("Expected keyset response field 'markets' to be a list")
-    return {**page, "markets": [_market_payload(row) for row in rows]}
+    return {**page, "markets": [_market_payload(row) for row in rows]}, observed_at
 
 
 def _closed_option_to_bool(closed: str) -> bool | None:
@@ -368,13 +371,14 @@ async def _ingest_markets_async(
 ) -> None:
     observed_at = _utc_now_iso()
     markets: list[dict[str, object]] = []
+    evidence_pages: list[tuple[list[dict[str, object]], str]] = []
     offset = 0
     page_count = 0
     stop_reason = "page_limit_reached"
     async with AsyncGammaClient( config=PmktConfig.from_env()) as gamma:
         for _ in range(pages):
             try:
-                page = await _gamma_markets_payload_page(
+                page, page_observed_at = await _gamma_markets_payload_page(
                     gamma, limit=limit, offset=offset, closed=closed
                 )
             except httpx.HTTPStatusError as exc:
@@ -387,6 +391,8 @@ async def _ingest_markets_async(
                 stop_reason = "empty_page"
                 break
             markets.extend(page)
+            if contract_evidence_out is not None:
+                evidence_pages.append((page, page_observed_at))
             if len(page) < limit:
                 stop_reason = "short_page"
                 break
@@ -402,7 +408,7 @@ async def _ingest_markets_async(
     )
     if contract_evidence_out is not None:
         _write_contract_evidence(
-            markets,
+            evidence_pages,
             venue="polymarket",
             source_endpoint="gamma:/markets",
             payload_scope="list",
@@ -493,7 +499,7 @@ async def _ingest_markets_keyset_async(
                 if max_pages is not None and page_count >= max_pages:
                     stop_reason = "max_pages_reached"
                     break
-                page = await _gamma_keyset_payload_page(
+                page, page_observed_at = await _gamma_keyset_payload_page(
                     gamma,
                     limit=limit,
                     after_cursor=cursor,
@@ -518,7 +524,7 @@ async def _ingest_markets_keyset_async(
                 market_ids.update(page_ids)
                 writer.append(frame)
                 if evidence_writer is not None:
-                    evidence_writer.append(page_markets)
+                    evidence_writer.append(page_markets, observed_at_utc=page_observed_at)
                 next_cursor = normalize_polymarket_cursor(page.get("next_cursor"))
                 final_cursor = next_cursor
                 cursor_stop_reason = polymarket_cursor_stop_reason(
@@ -691,6 +697,7 @@ async def _ingest_kalshi_markets_async(
                     cursor=cursor,
                     status=status,
                 )
+                page_observed_at = _utc_now_iso()
                 page_count += 1
                 page_markets = page.get("markets")
                 if not isinstance(page_markets, list) or not page_markets:
@@ -716,7 +723,7 @@ async def _ingest_kalshi_markets_async(
                     market_keys.update(page_keys)
                     writer.append(frame)
                     if evidence_writer is not None:
-                        evidence_writer.append(accepted_page)
+                        evidence_writer.append(accepted_page, observed_at_utc=page_observed_at)
                 next_cursor = page.get("cursor") or None
                 final_cursor = next_cursor
                 if not next_cursor:
@@ -960,6 +967,7 @@ async def _ingest_kalshi_historical_markets_async(
                     tickers=tickers,
                     mve_filter=mve_filter,
                 )
+                page_observed_at = _utc_now_iso()
                 page_count += 1
                 markets = page.get("markets")
                 if not isinstance(markets, list) or any(
@@ -978,7 +986,7 @@ async def _ingest_kalshi_historical_markets_async(
                 if retained:
                     writer.append(kalshi_markets_dataframe(retained))
                     if evidence_writer is not None:
-                        evidence_writer.append(retained)
+                        evidence_writer.append(retained, observed_at_utc=page_observed_at)
                 next_cursor = str(page.get("cursor") or "").strip() or None
                 cursor = next_cursor
                 if next_cursor is None:
@@ -1075,7 +1083,7 @@ async def _ingest_kalshi_historical_markets_async(
 
 
 def _write_contract_evidence(
-    markets: list[dict[str, object]],
+    pages: list[tuple[list[dict[str, object]], str]],
     *,
     venue: str,
     source_endpoint: str,
@@ -1088,22 +1096,30 @@ def _write_contract_evidence(
     page_count: int,
     out: Path,
 ) -> tuple[Path, int, Path]:
-    evidence = contract_evidence_dataframe(
-        markets,
-        venue=venue,  # type: ignore[arg-type]
-        source_endpoint=source_endpoint,
-        payload_scope=payload_scope,
-        observed_at_utc=observed_at_utc,
-        derived_at_utc=_utc_now_iso(),
-        source_payload_kind="venue_api_response",
+    frames = [
+        contract_evidence_dataframe(
+            markets,
+            venue=venue,  # type: ignore[arg-type]
+            source_endpoint=source_endpoint,
+            payload_scope=payload_scope,
+            observed_at_utc=page_observed_at,
+            derived_at_utc=_utc_now_iso(),
+            source_payload_kind="venue_api_response",
+        )
+        for markets, page_observed_at in pages
+    ]
+    evidence = pd.concat(frames, ignore_index=True) if frames else contract_evidence_dataframe(
+        [], venue=venue, source_endpoint=source_endpoint, payload_scope=payload_scope,  # type: ignore[arg-type]
     )
     source_collection_manifest = {
         "venue": venue,
         "source_endpoint": source_endpoint,
         "payload_scope": payload_scope,
-        "observed_at_utc": observed_at_utc,
+        "observation_time_precision": "page_response",
+        "started_at_utc": observed_at_utc,
+        "finished_at_utc": _utc_now_iso(),
         "page_count": int(page_count),
-        "row_count": int(len(markets)),
+        "row_count": int(len(evidence)),
         "collection_complete": bool(collection_complete),
         "stop_reason": stop_reason,
         "continuation_cursor": continuation_cursor,
