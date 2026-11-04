@@ -952,7 +952,10 @@ async def test_a_different_condition_never_merges_into_existing_depth():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
 @pytest.mark.parametrize("transition", ["none", "timeout", "reconnect"])
-async def test_identity_conflict_requires_established_market_snapshot(venue, transition):
+@pytest.mark.parametrize("malformed_repair", [False, True])
+async def test_identity_conflict_requires_established_market_snapshot(
+    venue, transition, malformed_repair
+):
     connections = Connections()
     async with feed(venue, connections) as f:
         await ready(f, connections, venue)
@@ -978,14 +981,86 @@ async def test_identity_conflict_requires_established_market_snapshot(venue, tra
             shard.restart = False
             shard.connected = shard.alive = asyncio.get_running_loop().time()
             shard.health.mark_connected(now_monotonic_ns=0)
-        anonymous = snapshot(venue, seq=4)
+        seq = 4
+        if malformed_repair:
+            malformed = snapshot(venue, seq=seq)
+            if venue == "polymarket":
+                malformed["bids"][0]["price"] = "bad"
+            else:
+                malformed["msg"]["yes_dollars_fp"][0][0] = "bad"
+            f._ingest(shard, malformed, seq)
+            assert f.book("a") is None
+            assert "a" in shard.identity_conflicts
+            seq += 1
+        anonymous = snapshot(venue, seq=seq)
         del (anonymous if venue == "polymarket" else anonymous["msg"])[key]
-        f._ingest(shard, anonymous, 4)
+        f._ingest(shard, anonymous, seq)
         assert f.book("a") is None
         assert "a" in shard.identity_conflicts
-        f._ingest(shard, snapshot(venue, seq=5), 5)
+        f._ingest(shard, snapshot(venue, seq=seq + 1), seq + 1)
         assert f.book("a").market_id == known
         assert not shard.identity_conflicts
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_anonymous_snapshot_without_identity_conflict_remains_supported(venue):
+    connections = Connections()
+    async with feed(venue, connections) as f:
+        await ready(f, connections, venue)
+        original = f.book("a")
+        anonymous = snapshot(venue, seq=2)
+        payload = anonymous if venue == "polymarket" else anonymous["msg"]
+        del payload["market" if venue == "polymarket" else "market_id"]
+        f._ingest(f._shards[0], anonymous, 2)
+        assert f.book("a").market_id == original.market_id
+        assert f.book("a").bids == original.bids
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("send_fails", [False, True])
+async def test_identity_repair_cannot_bypass_outstanding_recovery_send(venue, send_fails):
+    connections = Connections()
+    entered, release = asyncio.Event(), asyncio.Event()
+    async with feed(venue, connections) as f:
+        await ready(f, connections, venue)
+        shard = f._shards[0]
+        known = shard.market_ids["a"]
+
+        async def blocked(shard, instruments):
+            entered.set()
+            await release.wait()
+            if send_fails:
+                raise OSError("synthetic recovery send failure")
+
+        f._request_snapshots = blocked
+        bad = delta(venue, seq=2)
+        if venue == "polymarket":
+            bad["price_changes"][0]["size"] = "NaN"
+        else:
+            bad["msg"]["delta_fp"] = "NaN"
+        f._ingest(shard, bad, 2)
+        await asyncio.wait_for(entered.wait(), 1)
+        f._ingest(shard, snapshot(venue, seq=3), 3)
+        assert f.book("a") is None
+        foreign = snapshot(venue, seq=4)
+        payload = foreign if venue == "polymarket" else foreign["msg"]
+        payload["market" if venue == "polymarket" else "market_id"] = "foreign"
+        f._ingest(shard, foreign, 4)
+        f._ingest(shard, snapshot(venue, seq=5), 5)
+        assert not release.is_set()
+        assert f.book("a") is None
+        assert shard.market_ids["a"] == known
+        release.set()
+        if send_fails:
+            await until(lambda: f.health("a").reconnect_count > 0)
+            assert f.book("a") is None
+        else:
+            await until(lambda: f.book("a") is not None)
+            assert f.book("a").market_id == known
+            assert f.book("a").bids == ((Decimal("0.1234567890123456789"), Decimal("0.10")),)
+    assert all(socket.closed for socket in connections.sockets)
 
 
 @pytest.mark.asyncio

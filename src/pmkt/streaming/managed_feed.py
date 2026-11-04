@@ -685,15 +685,27 @@ class ManagedBookFeed:
                 self._reset_book(shard, instrument)
                 shard.identity_conflicts.add(instrument)
                 if instrument not in shard.resolved:
-                    shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
+                    recovery = shard.recovery.get(instrument)
+                    if recovery is not None and recovery.phase == "sending":
+                        # Keep the outstanding send barrier when identity changes.
+                        recovery.reason = "market_identity_changed"
+                        recovery.answered = False
+                    else:
+                        shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
                 continue
             if market and not known:
                 shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
-            if instrument in shard.identity_conflicts and not market:
-                # An anonymous snapshot cannot verify the established identity.
-                self._reset_book(shard, instrument)
-                continue
+            if instrument in shard.identity_conflicts:
+                incoming_market = (
+                    message.get("market") if self.venue == "polymarket"
+                    else message["msg"].get("market_id")
+                )
+                if kind not in {"book", "orderbook_snapshot"} or str(incoming_market or "") != known:
+                    # State can inherit identity from a malformed prior snapshot;
+                    # only the incoming snapshot can explicitly verify it.
+                    self._reset_book(shard, instrument)
+                    continue
             if view.integrity_valid and kind in {"book", "orderbook_snapshot"}:
                 shard.identity_conflicts.discard(instrument)
             if "market_resolved" in view.quality_flags or instrument in shard.resolved:
