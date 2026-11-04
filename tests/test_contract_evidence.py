@@ -942,6 +942,91 @@ def test_ingested_evidence_uses_page_receipt_and_projection_clocks(tmp_path, mon
     assert source["finished_at_utc"] >= expected[1]
 
 
+@pytest.mark.parametrize("ending", ["complete", "cancelled", "page_limit"])
+def test_keyset_partition_clocks_survive_empty_pages_and_incomplete_scans(
+    tmp_path, monkeypatch, ending
+):
+    import asyncio
+    from datetime import datetime, timedelta, timezone
+    from pmkt.cli import ingest
+    from pmkt.data.contract_evidence_manifest import contract_evidence_bundle_path
+
+    clock = [datetime(2026, 7, 10, 11, tzinfo=timezone.utc)]
+    calls = []
+
+    def now():
+        value = clock[0]
+        clock[0] += timedelta(minutes=1)
+        return value.isoformat()
+
+    class FakeGamma:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def markets_keyset_raw_page(self, *, closed, after_cursor, **_):
+            index = len(calls)
+            calls.append((closed, after_cursor))
+            clock[0] = datetime(2026, 7, 10, 12 + index, tzinfo=timezone.utc)
+            if index == 4 and ending == "cancelled":
+                raise asyncio.CancelledError
+            cursor = ["open-1", "open-2", "", "closed-1", ""][index]
+            rows = [] if index == 1 else [{
+                **_polymarket_raw(), "id": f"page-{index}", "closed": closed,
+            }]
+            return {"markets": rows, "next_cursor": cursor}
+
+    monkeypatch.setattr(ingest, "_utc_now_iso", now)
+    monkeypatch.setattr(ingest, "AsyncGammaClient", lambda **_: FakeGamma())
+    out, evidence, manifest = [tmp_path / name for name in (
+        "markets.parquet", "evidence.parquet", "collection.json",
+    )]
+    run = ingest._ingest_markets_keyset_async(
+        out, limit=1, closed=None, max_pages=4 if ending == "page_limit" else None,
+        contract_evidence_out=evidence, manifest_out=manifest,
+    )
+    if ending == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(run)
+    else:
+        asyncio.run(run)
+    expected_calls = [(False, None), (False, "open-1"), (False, "open-2"),
+                      (True, None), (True, "closed-1")]
+    assert calls == expected_calls[:4 if ending == "page_limit" else 5]
+    bundle = contract_evidence_bundle_path(evidence)
+    artifact = bundle / evidence.name
+    frame = pd.read_parquet(artifact).sort_values("observed_at_utc")
+    hours = [12, 14, 15, 16] if ending == "complete" else [12, 14, 15]
+    assert frame["observed_at_utc"].tolist() == [
+        f"2026-07-10T{hour}:00:00+00:00" for hour in hours
+    ]
+    for cutoff, expected_rows in [("2026-07-10T14:10:00Z", 2),
+                                  ("2026-07-10T15:10:00Z", 3)]:
+        eligible = frame[(pd.to_datetime(frame["observed_at_utc"], utc=True) <= pd.Timestamp(cutoff))
+                         & (pd.to_datetime(frame["derived_at_utc"], utc=True) <= pd.Timestamp(cutoff))]
+        assert len(eligible) == expected_rows
+    verified = verify_contract_evidence_manifest(
+        frame, artifact_path=artifact, manifest_path=bundle / "manifest.json",
+        expected_venue="polymarket", expected_source_endpoint="gamma:/markets/keyset",
+        expected_payload_scope="keyset_list", expected_observation_time_source="capture_clock",
+        expected_source_payload_kind="venue_api_response",
+    )
+    assert verified["observation_time_precision"] == "page_response"
+    assert verified["authoritative_complete"] is (ending == "complete")
+    source = json.loads((bundle / "source_collection_manifest.json").read_text())
+    collection = json.loads(manifest.read_text())
+    assert source["partitions"] == collection["partitions"]
+    assert source["partitions"][0]["complete"] is True
+    assert source["partitions"][1]["complete"] is (ending == "complete")
+    assert source["partitions"][1]["stop_reason"] == {
+        "complete": "cursor_exhausted", "cancelled": "cancelled",
+        "page_limit": "max_pages_reached",
+    }[ending]
+    assert source["page_count"] == (5 if ending == "complete" else 4)
+
+
 def test_legacy_cli_bundle_is_verified_with_reduced_time_precision(tmp_path):
     frame = contract_evidence_dataframe(
         [_polymarket_raw()], venue="polymarket", source_endpoint="gamma:/markets/keyset",
