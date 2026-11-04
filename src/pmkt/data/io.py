@@ -160,16 +160,24 @@ class ParquetSink:
         self._writer: Any | None = None
         self._schema: Any | None = schema
         self._temp_path: Path | None = None
+        self._failed = False
 
     async def write(self, item: dict[str, Any]) -> None:
+        if self._failed:
+            raise RuntimeError("ParquetSink cannot be reused after a failed flush")
         self._rows.append(item)
         if len(self._rows) >= self.flush_interval:
             self._flush()
 
     def _flush(self) -> None:
+        if self._failed:
+            raise RuntimeError("ParquetSink cannot be reused after a failed flush")
         try:
             self._flush_rows()
         except BaseException:
+            # Retrying from the original would discard successful append batches;
+            # a partial writer failure also cannot safely be replayed.
+            self._failed = True
             if self._writer is not None:
                 self._writer.close()
                 self._writer = None

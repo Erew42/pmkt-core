@@ -930,6 +930,9 @@ physical schemas, while consumer policy remains outside this package.
 `ParquetSink` accepts an optional keyword-only Arrow `schema` for stable types
 across flushes. The legacy order-book summary collector supplies nullable
 numeric quotes and `list<string>` quality flags, including for empty book sides.
+After a flush fails, that sink instance rejects further writes and closes with
+`RuntimeError`; it does not publish a partially failed append. The original file
+and any closed append `.tmp` artifact remain available for inspection.
 
 The authoritative list of schema versions, lifecycle states, compatibility
 decisions, and removal gates is
