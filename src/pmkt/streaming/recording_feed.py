@@ -74,6 +74,16 @@ class VenueBooks:
 
     def apply(self, message: dict[str, Any], count: int) -> list[BookView]:
         if self.venue == "polymarket":
+            kind = message.get("event_type") or message.get("type")
+            if kind == "book" and not message.get("asset_id"):
+                raise RuntimeError("missing_book_identity")
+            if kind == "price_change":
+                changes = message.get("price_changes")
+                if not isinstance(changes, list) or any(
+                    not isinstance(change, dict) or not change.get("asset_id")
+                    for change in changes
+                ):
+                    raise RuntimeError("malformed_price_changes")
             previous = self.complementary.intact_changed_assets(
                 message, self.polymarket
             )
@@ -303,7 +313,20 @@ async def record_feed(
             public_channels=("orderbook_delta", "trade", "market_lifecycle_v2"),
             **shared,
         )
-    iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
+    def decode_error(reason: str, payload: Any) -> None:
+        # Do not persist raw frames when raw_messages is disabled.
+        raise RuntimeError(f"invalid Kalshi frame: {reason}")
+
+    def messages() -> Any:
+        if venue == "polymarket":
+            return client.iter_messages(
+                fail_on_clean_close_exhausted=True, strict_decode=True
+            )
+        return client.iter_messages(
+            fail_on_clean_close_exhausted=True, on_decode_error=decode_error
+        )
+
+    iterator = messages()
     pump = WebSocketMessagePump(iterator)
     error: BaseException | None = None
     reason, normal = "interrupted", False
@@ -334,7 +357,7 @@ async def record_feed(
                 await budget.run(
                     client.reconnect, retry_first=True, immediate_first=True
                 )
-                iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
+                iterator = messages()
                 pump = WebSocketMessagePump(iterator)
                 continue
             if received:
@@ -404,7 +427,7 @@ async def record_feed(
                 await budget.run(
                     client.reconnect, retry_first=True, immediate_first=True
                 )
-                iterator = client.iter_messages(fail_on_clean_close_exhausted=True)
+                iterator = messages()
                 pump = WebSocketMessagePump(iterator)
     except WebSocketDeadlineExceeded:
         reason, normal = "duration", True

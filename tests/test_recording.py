@@ -202,7 +202,7 @@ class Socket:
             await asyncio.sleep(3600)
         if isinstance(item, BaseException):
             raise item
-        return json.dumps(item)
+        return item if isinstance(item, str) else json.dumps(item)
 
 
 def poly_book(asset="a", *, bids=None, asks=None):
@@ -213,6 +213,71 @@ def poly_book(asset="a", *, bids=None, asks=None):
         "bids": bids if bids is not None else [{"price": "0.4", "size": "10"}],
         "asks": asks if asks is not None else [{"price": "0.6", "size": "10"}],
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reconnected", [False, True])
+@pytest.mark.parametrize("bad", [
+    '{"broken":',
+    {"event_type": "book", "bids": [], "asks": []},
+    {"event_type": "price_change", "price_changes": {}},
+    {"event_type": "price_change", "price_changes": [1]},
+    {"event_type": "price_change", "price_changes": [{"price": "0.6"}]},
+    {"event_type": "price_change", "price_changes": [
+        {"asset_id": "a", "price": "0.5", "size": "2", "side": "BUY"}, 1]},
+])
+async def test_malformed_recording_input_invalidates_persisted_books(
+    tmp_path, bad, reconnected
+):
+    frames = [poly_book(), bad, poly_book()]
+    sockets = iter(
+        [Socket([poly_book(), OSError("lost")]), Socket(frames)]
+        if reconnected else [Socket(frames)]
+    )
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 5)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    events = pq.read_table(root / "events.parquet").to_pylist()
+    assert report["status"] == "partial"
+    assert not top[-1]["integrity_valid"] and not top[-1]["quote_valid"]
+    assert "feed_interrupted" in top[-1]["quality_flags_json"]
+    assert any(e["kind"] == "book_invalidated" for e in events)
+    assert not (root / "raw_messages.jsonl").exists()
+
+
+@pytest.mark.asyncio
+async def test_kalshi_decode_error_invalidates_without_later_sequence(tmp_path):
+    socket = Socket([{
+        "type": "orderbook_snapshot", "sid": 1, "seq": 1,
+        "msg": {"market_ticker": "A", "yes_dollars_fp": [["0.4", "10"]],
+                "no_dollars_fp": [["0.6", "20"]]},
+    }, '{"broken":'])
+    report = await asyncio.wait_for(record_feed(
+        ["A"], venue="kalshi", output_root=tmp_path,
+        options=RecordingOptions(), auth=ReadAuth(),
+        connect_factory=lambda *args: socket,
+    ), 5)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    events = pq.read_table(root / "events.parquet").to_pylist()
+    assert report["status"] == "partial"
+    assert not top[-1]["integrity_valid"]
+    assert any(e["kind"] == "book_invalidated" for e in events)
+
+
+@pytest.mark.asyncio
+async def test_recording_keeps_heartbeat_and_unknown_message_handling(tmp_path):
+    socket = Socket([poly_book(), "PONG", {"event_type": "future_event"}, poly_book()])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=3, heartbeat_interval=None,
+        connect_factory=lambda _: socket,
+    ), 5)
+    assert report["status"] == "complete"
 
 
 @pytest.mark.asyncio
