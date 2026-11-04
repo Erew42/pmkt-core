@@ -320,6 +320,52 @@ def test_recorder_resolution_survives_snapshots_and_reset(routing):
     assert books.apply({**poly_book("b"), "market": "other"}, 6)[0].quote_valid
 
 
+@pytest.mark.parametrize("reset", [False, True])
+def test_recorder_conflict_rejects_anonymous_and_malformed_recovery(reset):
+    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book(), "market": "other"}, 2)
+    if reset:
+        books.reset()
+    anonymous = {key: value for key, value in poly_book().items() if key != "market"}
+    for count, message in enumerate([
+        anonymous, {**poly_book(), "bids": [{"price": "bad", "size": "1"}]}, anonymous,
+    ], 3):
+        invalid = books.apply(message, count)[0]
+        assert invalid.venue_market_id == "m"
+        assert not invalid.integrity_valid and not invalid.quote_valid
+        assert "market_identity_changed" in invalid.quality_flags
+    recovered = books.apply(poly_book(), 6)[0]
+    assert recovered.integrity_valid and recovered.quote_valid
+    assert "market_identity_changed" not in recovered.quality_flags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_record_feed_anonymous_snapshot_cannot_recover_conflict(tmp_path, recover):
+    anonymous = {key: value for key, value in poly_book().items() if key != "market"}
+    sockets = iter([
+        Socket([poly_book(), {**poly_book(), "market": "other"}]),
+        Socket([anonymous]), Socket([poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4 if recover else 3,
+        heartbeat_interval=None, connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    assert report["status"] == ("complete" if recover else "partial")
+    assert report["reconnect_count"] >= 1
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert all(row["venue_market_id"] in (None, "m") for row in top)
+    assert all(not row["quote_valid"] for row in top[1:-1])
+    assert top[-1]["quote_valid"] is recover
+    if not recover:
+        assert "market_identity_changed" in top[-1]["quality_flags_json"]
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert [row["source_sequence"] for row in snapshots] == ([1, 4] if recover else [1])
+
+
 @pytest.mark.asyncio
 async def test_record_feed_identity_conflict_persists_and_recovers_only_known_market(tmp_path):
     wrong_delta = {"event_type": "price_change", "market": "other", "price_changes": [

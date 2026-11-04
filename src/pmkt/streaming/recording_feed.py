@@ -66,12 +66,15 @@ class VenueBooks:
         self.venue_times: dict[str, str | None] = {}
         self.minimum_sizes: dict[str, float | None] = {}
         self.market_ids: dict[str, str] = {}
+        self.identity_conflicts: set[str] = set()
         self.resolved: set[str] = set()
         self.complementary = ComplementaryDeltaRecovery()
 
     def reset(self) -> None:
         for poly in self.polymarket.values():
             poly.mark_reconnect()
+            if poly.asset_id in self.identity_conflicts:
+                poly.quality_flags.add("market_identity_changed")
             if poly.asset_id in self.resolved:
                 poly.quality_flags.add("market_resolved")
         for kalshi in self.kalshi.values():
@@ -102,16 +105,20 @@ class VenueBooks:
             rejected = set()
             market = str(message.get("market") or "")
             for asset in sorted(set(affected)):
-                if asset not in self.polymarket or not market:
+                if asset not in self.polymarket:
                     continue
                 known = self.market_ids.get(asset)
-                if self.enforce_market_identity and known and known != market:
+                if self.enforce_market_identity and known and (
+                    (market and known != market)
+                    or (kind == "book" and asset in self.identity_conflicts and market != known)
+                ):
+                    self.identity_conflicts.add(asset)
                     state = self.polymarket[asset]
                     state.mark_reconnect()
                     state.market = known
                     state.quality_flags.add("market_identity_changed")
                     rejected.add(asset)
-                else:
+                elif market:
                     self.market_ids[asset] = market
             if rejected and kind == "price_change":
                 message = {**message, "price_changes": [
@@ -177,6 +184,16 @@ class VenueBooks:
                                 state.tick_size = value
                             else:
                                 self.minimum_sizes[state.asset_id] = value
+                if state.asset_id in self.identity_conflicts:
+                    if (
+                        kind == "book" and state.asset_id not in rejected
+                        and market == self.market_ids[state.asset_id]
+                        and state.book_integrity_valid
+                    ):
+                        self.identity_conflicts.discard(state.asset_id)
+                    else:
+                        state.valid_state = False
+                        state.quality_flags.add("market_identity_changed")
                 views.append(
                     BookView(
                         state.asset_id,
