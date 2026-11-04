@@ -107,6 +107,9 @@ class _Shard:
     # Native market identity first seen per instrument, kept across book resets so
     # market-scoped lifecycle events still find instruments under recovery.
     market_ids: dict[str, str] = field(default_factory=dict)
+    # Only an established-market snapshot can clear an identity conflict, even
+    # after recovery timeouts or connection replacement.
+    identity_conflicts: set[str] = field(default_factory=set)
 
 
 class ManagedBookFeed:
@@ -680,16 +683,19 @@ class ManagedBookFeed:
                 # A message for another market merged into this book: drop the
                 # mixed ladder and require a fresh snapshot.
                 self._reset_book(shard, instrument)
+                shard.identity_conflicts.add(instrument)
                 if instrument not in shard.resolved:
                     shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
                 continue
             if market and not known:
                 shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
-            if recovery is not None and recovery.reason == "market_identity_changed" and not market:
+            if instrument in shard.identity_conflicts and not market:
                 # An anonymous snapshot cannot verify the established identity.
                 self._reset_book(shard, instrument)
                 continue
+            if view.integrity_valid and kind in {"book", "orderbook_snapshot"}:
+                shard.identity_conflicts.discard(instrument)
             if "market_resolved" in view.quality_flags or instrument in shard.resolved:
                 shard.resolved.add(instrument)
                 shard.recovery.pop(instrument, None)
