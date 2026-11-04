@@ -28,6 +28,13 @@ installed version.
 
 - `ingest-markets`: fetch normalized Polymarket market snapshots.
 - `ingest-markets-keyset`: fetch Polymarket markets by keyset pagination.
+  The default `--closed any` scans explicit open and closed partitions; `open`
+  and `closed` scan one partition. `--max-pages` caps total pages across both.
+  The manifest and evidence source manifest record per-partition completion and
+  continuation cursors. A cap or failed partition keeps the collection incomplete.
+  Duplicate market IDs, including a market changing partitions during the scan,
+  fail the collection rather than silently selecting a version. Restart the scan
+  to obtain a consistent collection; manifests retain the partial scan position.
 - `ingest-kalshi-markets`: fetch normalized Kalshi market snapshots.
 - `ingest-kalshi-historical-markets`: fetch archived Kalshi market snapshots from
   `/historical/markets`. Use one of `--event-ticker`, `--series-ticker`,

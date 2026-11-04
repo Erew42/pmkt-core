@@ -216,6 +216,7 @@ class _StreamingContractEvidenceBundle:
         continuation_cursor: str | None,
         collection_errors: tuple[str, ...],
         page_count: int,
+        collection_partitions: list[dict[str, Any]] | None = None,
     ) -> tuple[Path, int, Path]:
         try:
             artifact = self.writer.finish()
@@ -265,6 +266,8 @@ class _StreamingContractEvidenceBundle:
                 "continuation_cursor": normalized_cursor,
                 "collection_errors": normalized_errors,
             }
+            if collection_partitions is not None:
+                source_manifest["partitions"] = collection_partitions
             if self.request_parameters is not None:
                 source_manifest["request_parameters"] = self.request_parameters
             source_path = self.staging / "source_collection_manifest.json"
@@ -487,48 +490,69 @@ async def _ingest_markets_keyset_async(
     final_cursor: str | None = None
     stop_reason = "not_started"
     errors: list[str] = []
+    partitions: list[dict[str, Any]] = [
+        {"closed": value, "complete": False, "stop_reason": "not_started",
+         "continuation_cursor": None, "page_count": 0}
+        for value in ((False, True) if closed is None else (closed,))
+    ]
     try:
         async with AsyncGammaClient( config=PmktConfig.from_env()) as gamma:
-            while True:
-                if max_pages is not None and page_count >= max_pages:
-                    stop_reason = "max_pages_reached"
-                    break
-                page = await _gamma_keyset_payload_page(
-                    gamma,
-                    limit=limit,
-                    after_cursor=cursor,
-                    closed=closed,
-                )
-                page_count += 1
-                page_markets = page.get("markets")
-                if not isinstance(page_markets, list) or not page_markets:
-                    stop_reason = "empty_page"
-                    final_cursor = page.get("next_cursor") or None
-                    break
-                frame = markets_dataframe(page_markets)
-                page_ids = {
-                    str(value).strip() for value in frame["market_id"].tolist()
-                }
-                duplicates = page_ids & market_ids
-                if duplicates:
-                    raise ValueError(
-                        "duplicate Polymarket market IDs across pages: "
-                        + ", ".join(sorted(duplicates)[:5])
+            for partition in partitions:
+                cursor = None
+                final_cursor = None
+                seen_cursors: set[str] = set()
+                try:
+                    while True:
+                        if max_pages is not None and page_count >= max_pages:
+                            stop_reason = "max_pages_reached"
+                            break
+                        page = await _gamma_keyset_payload_page(
+                            gamma, limit=limit, after_cursor=cursor,
+                            closed=partition["closed"],
+                        )
+                        page_count += 1
+                        partition["page_count"] += 1
+                        page_markets = page.get("markets")
+                        if not isinstance(page_markets, list):
+                            raise ValueError("Gamma keyset markets must be a list")
+                        if page_markets:
+                            frame = markets_dataframe(page_markets)
+                            page_ids = {str(value).strip() for value in frame["market_id"].tolist()}
+                            duplicates = page_ids & market_ids
+                            if duplicates or len(page_ids) != len(frame):
+                                raise ValueError(
+                                    "duplicate Polymarket market IDs across pages or partitions: "
+                                    + ", ".join(sorted(duplicates)[:5])
+                                )
+                            market_ids.update(page_ids)
+                            writer.append(frame)
+                            if evidence_writer is not None:
+                                evidence_writer.append(page_markets)
+                        next_cursor = normalize_polymarket_cursor(page.get("next_cursor"))
+                        final_cursor = next_cursor
+                        cursor_stop_reason = polymarket_cursor_stop_reason(
+                            next_cursor, previous_cursor=cursor,
+                        )
+                        if cursor_stop_reason is not None:
+                            stop_reason = cursor_stop_reason
+                            break
+                        if next_cursor in seen_cursors:
+                            stop_reason = "repeated_cursor"
+                            break
+                        if next_cursor is not None:
+                            seen_cursors.add(next_cursor)
+                        cursor = next_cursor
+                except Exception:
+                    stop_reason = "error"
+                    raise
+                finally:
+                    partition.update(
+                        complete=stop_reason in {"cursor_exhausted", "terminal_cursor_lte"},
+                        stop_reason=stop_reason,
+                        continuation_cursor=final_cursor,
                     )
-                market_ids.update(page_ids)
-                writer.append(frame)
-                if evidence_writer is not None:
-                    evidence_writer.append(page_markets)
-                next_cursor = normalize_polymarket_cursor(page.get("next_cursor"))
-                final_cursor = next_cursor
-                cursor_stop_reason = polymarket_cursor_stop_reason(
-                    next_cursor,
-                    previous_cursor=cursor,
-                )
-                if cursor_stop_reason is not None:
-                    stop_reason = cursor_stop_reason
+                if not partition["complete"]:
                     break
-                cursor = next_cursor
     except Exception as exc:
         stop_reason = "error"
         errors.append(f"{type(exc).__name__}: {exc}")
@@ -548,12 +572,12 @@ async def _ingest_markets_keyset_async(
             if evidence_writer is not None:
                 evidence_path, evidence_count, evidence_manifest_path = (
                     evidence_writer.finish(
-                        collection_complete=stop_reason
-                        in {"empty_page", "cursor_exhausted", "terminal_cursor_lte"},
+                        collection_complete=all(p["complete"] for p in partitions),
                         stop_reason=stop_reason,
                         continuation_cursor=final_cursor,
                         collection_errors=tuple(errors),
                         page_count=page_count,
+                        collection_partitions=partitions,
                     )
                 )
             if manifest_out is not None:
@@ -580,6 +604,8 @@ async def _ingest_markets_keyset_async(
                         "endpoint": "/markets/keyset",
                         "mode": "gamma_markets_keyset",
                         "requested_closed_filter": closed,
+                        "partitions": partitions,
+                        "collection_complete": all(p["complete"] for p in partitions),
                         "started_at_utc": started_at,
                         "finished_at_utc": finished_at,
                         "page_count": page_count,
