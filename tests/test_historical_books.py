@@ -271,3 +271,70 @@ def test_historical_and_recording_reject_ambiguous_trade_prices(economics):
         _kalshi_trade_rows({"trades": [raw]}, collector_run_id="r", default_ticker="KXTEST")
     with pytest.raises(ObservationValidationError):
         recording_trade("kalshi", {"type": "trade", "msg": raw})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cursors,cap,expected", [
+    (["next"], 1, "page_limit"),
+    (["same", "same"], 5, "repeated_cursor"),
+    (["a", "b", "a"], 5, "repeated_cursor"),
+    ([None], 1, "cursor_exhausted"),
+    (["a", None], 2, "cursor_exhausted"),
+    (["a", "error"], 3, "fetch_error"),
+])
+async def test_historical_trade_pagination_completeness(cursors, cap, expected, tmp_path):
+    import json
+
+    class FakeKalshi:
+        def __init__(self):
+            self.calls = {}
+
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, ticker, **params):
+            index = self.calls.get(ticker, 0)
+            self.calls[ticker] = index + 1
+            cursor = cursors[index] if ticker == "A" else None
+            if cursor == "error":
+                raise RuntimeError("fake failure")
+            # Empty pages with cursors must still be treated as incomplete.
+            return {"trades": ([{"trade_id": f"{ticker}-{index}", "yes_price": 1,
+                                 "count_fp": "1.75", "created_ts": 1}]
+                               if index == 0 else []), "cursor": cursor}
+
+    fake = FakeKalshi()
+    result = await backfill_venue_history(
+        "kalshi", ["A", "B"], start_ts=1, end_ts=2,
+        use_historical=True, kalshi_client=fake, max_trade_pages=cap,
+    )
+    a, b = result.summary["trade_partitions"]
+    assert a["stop_reason"] == expected
+    assert a["complete"] == (expected == "cursor_exhausted")
+    assert b["complete"] is True
+    assert a["row_count"] == 1
+    assert b["row_count"] == 1
+    assert a["page_count"] == len(cursors) - (expected == "fetch_error")
+    assert fake.calls["A"] == len(cursors)
+    paths = write_historical_backfill_result(result, tmp_path)
+    summary = json.loads(paths["summary"].read_text())
+    assert summary["trade_partitions"] == result.summary["trade_partitions"]
+    gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = gaps[gaps["capability"] == "historical_trades"]
+    if expected == "cursor_exhausted":
+        assert trade_gaps.empty
+    else:
+        assert len(trade_gaps) == 1
+        assert json.loads(trade_gaps.iloc[0]["raw_json"])["stop_reason"] == expected
+        assert trade_gaps.iloc[0]["start_ts_utc"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_pages,limit", [(0, 1), (1, 0), (-1, 1)])
+async def test_historical_trade_pagination_rejects_nonpositive_bounds(max_pages, limit):
+    from pmkt.data.historical_books import _backfill_kalshi_trades
+    with pytest.raises(ValueError, match="positive"):
+        await _backfill_kalshi_trades(
+            None, ["A"], run_id="r", start_ts=1, end_ts=2,
+            max_pages=max_pages, limit=limit,
+        )

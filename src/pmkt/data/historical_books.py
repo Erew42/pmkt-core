@@ -214,6 +214,9 @@ async def backfill_venue_history(
     venue_normalized = venue.strip().lower()
     if venue_normalized not in {"polymarket", "kalshi"}:
         raise ValueError("venue must be 'polymarket' or 'kalshi'")
+    if venue_normalized == "kalshi" and include_trades:
+        if max_trade_pages < 1 or trade_limit < 1:
+            raise ValueError("max_trade_pages and trade_limit must be positive")
     instrument_ids = _normalize_instruments(instruments)
     if venue_normalized == "kalshi" and (start_ts is None or end_ts is None):
         raise ValueError("Kalshi candlestick backfill requires start_ts and end_ts")
@@ -221,6 +224,7 @@ async def backfill_venue_history(
     run_id = run_id or f"historical-{uuid.uuid4().hex[:12]}"
     checked_at_utc = checked_at_utc or utc_now_iso()
     capabilities = venue_history_capability_matrix(checked_at_utc=checked_at_utc)
+    trade_partitions: list[dict[str, Any]] = []
     price_rows: list[dict[str, Any]] = []
     trade_rows: list[dict[str, Any]] = []
     gap_rows = _unsupported_book_gap_rows(
@@ -257,7 +261,7 @@ async def backfill_venue_history(
         price_rows.extend(rows)
         gap_rows.extend(fetch_gaps)
         if include_trades:
-            rows, trade_gaps = await _backfill_kalshi_trades(
+            rows, trade_gaps, trade_partitions = await _backfill_kalshi_trades(
                 kalshi_client,
                 instrument_ids,
                 run_id=run_id,
@@ -287,6 +291,7 @@ async def backfill_venue_history(
         "series_ticker": series_ticker,
         "use_historical": use_historical,
         "include_trades": include_trades,
+        "trade_partitions": trade_partitions,
     }
     return HistoricalBackfillResult(
         run_id=run_id,
@@ -477,15 +482,19 @@ async def _backfill_kalshi_trades(
     end_ts: int | None,
     max_pages: int,
     limit: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if max_pages < 1 or limit < 1:
+        raise ValueError("max_pages and limit must be positive")
     rows: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
+    partitions: list[dict[str, Any]] = []
     for ticker in instruments:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         pages = 0
+        row_start = len(rows)
+        reason = ""
         while True:
-            if pages >= max_pages:
-                break
             try:
                 payload = await client.historical_trades(
                     ticker=ticker.split(":", 1)[0],
@@ -494,33 +503,55 @@ async def _backfill_kalshi_trades(
                     limit=limit,
                     cursor=cursor,
                 )
-            except Exception as exc:
-                gaps.append(
-                    _gap_row(
-                        run_id=run_id,
-                        exchange="kalshi",
-                        instrument_id=ticker,
-                        capability="historical_trades",
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                        status="fetch_error",
-                        reason=str(exc),
-                        endpoint="/historical/trades",
-                    )
+                page_trades = _kalshi_trade_rows(
+                    payload,
+                    collector_run_id=run_id,
+                    default_ticker=ticker.split(":", 1)[0],
                 )
+            except Exception as exc:
+                stop_reason = "fetch_error"
+                reason = f"{type(exc).__name__}: {exc}"
                 break
             pages += 1
-            page_trades = _kalshi_trade_rows(
-                payload,
-                collector_run_id=run_id,
-                default_ticker=ticker.split(":", 1)[0],
-            )
             rows.extend(page_trades)
             cursor_value = _as_mapping(payload).get("cursor")
             cursor = str(cursor_value).strip() if cursor_value else None
             if not cursor:
+                stop_reason = "cursor_exhausted"
                 break
-    return rows, gaps
+            if cursor in seen_cursors:
+                stop_reason = "repeated_cursor"
+                break
+            seen_cursors.add(cursor)
+            if pages >= max_pages:
+                stop_reason = "page_limit"
+                break
+        partition = {
+            "instrument_id": ticker,
+            "complete": stop_reason == "cursor_exhausted",
+            "stop_reason": stop_reason,
+            "continuation_cursor": cursor,
+            "page_count": pages,
+            "row_count": len(rows) - row_start,
+            "max_pages": max_pages,
+            "limit": limit,
+        }
+        partitions.append(partition)
+        if not partition["complete"]:
+            gaps.append(_gap_row(
+                run_id=run_id,
+                exchange="kalshi",
+                instrument_id=ticker,
+                capability="historical_trades",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                status="fetch_error" if stop_reason == "fetch_error" else "truncated",
+                reason=reason or stop_reason,
+                endpoint="/historical/trades",
+                row_count=len(rows) - row_start,
+                raw_json=partition,
+            ))
+    return rows, gaps, partitions
 
 
 def _polymarket_history_rows(
