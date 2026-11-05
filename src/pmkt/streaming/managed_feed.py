@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import math
 import time
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Awaitable, Callable, Literal, Sequence, TypeVar
 
 from pmkt.exchanges.kalshi.ws import (
     AsyncKalshiWebSocketClient,
@@ -24,6 +24,23 @@ from pmkt.exchanges.read_auth import ReadAuthHeaderProvider
 from pmkt.exchanges.ws_transport import WebSocketMessagePump, WebSocketRetryBudget
 from pmkt.streaming.recording_feed import VenueBooks
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
+
+
+_T = TypeVar("_T")
+
+
+async def _bounded(operation: Awaitable[_T], timeout: float) -> _T:
+    # wait_for can swallow outer cancellation at child completion on 3.10/3.11.
+    task = asyncio.ensure_future(operation)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            raise asyncio.TimeoutError()
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 @dataclass(frozen=True)
@@ -322,7 +339,7 @@ class ManagedBookFeed:
                     for instrument, recovery in pending.items():
                         recovery.phase = "sending"
                         self._reset_book(shard, instrument)
-                    await asyncio.wait_for(
+                    await _bounded(
                         self._request_snapshots(shard, list(pending)),
                         self.connect_timeout,
                     )
@@ -446,6 +463,8 @@ class ManagedBookFeed:
             self._invalidate(shard, "feed_failed")
 
     async def _session(self, shard: _Shard) -> None:
+        if self._closed:
+            raise asyncio.CancelledError()
         shard.generation += 1
         shard.restart = False
         shard.reason = "connecting"
@@ -473,11 +492,15 @@ class ManagedBookFeed:
         probe: asyncio.Task[None] | None = None
         recovery_task: asyncio.Task[None] | None = None
         try:
-            await asyncio.wait_for(client.connect(), self.connect_timeout)
+            await _bounded(client.connect(), self.connect_timeout)
+            if self._closed:
+                raise asyncio.CancelledError()
             if self.venue == "kalshi":
-                shard.command_id = await asyncio.wait_for(
+                shard.command_id = await _bounded(
                     client.subscribe(ids), self.connect_timeout
                 )
+            if self._closed:
+                raise asyncio.CancelledError()
             shard.connected = shard.alive = time.monotonic()
             shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
             iterator = (
@@ -548,7 +571,7 @@ class ManagedBookFeed:
             with contextlib.suppress(Exception):
                 await pump.close()
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(client.close(), self.connect_timeout)
+            await _bounded(client.close(), self.connect_timeout)
 
     async def _probe(self, shard: _Shard) -> None:
         # Waiting for a pong must not suspend receipt/application of book deltas.

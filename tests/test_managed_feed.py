@@ -383,6 +383,39 @@ async def test_close_cancels_silent_connection_setup():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("stage", ["connect", "subscribe"])
+async def test_close_at_setup_completion_preserves_cancellation(venue, stage):
+    sockets, closers = [], []
+
+    async def connect(*args):
+        socket = Socket()
+        sockets.append(socket)
+        if stage == "connect":
+            closers.append(asyncio.create_task(f.close()))
+        else:
+            original_send = socket.send
+
+            async def send(value):
+                await original_send(value)
+                if value.startswith("{"):
+                    closers.append(asyncio.create_task(f.close()))
+
+            socket.send = send
+        return socket
+
+    f = feed(venue, connect)
+    await f.start()
+    await until(lambda: closers)
+    done, _ = await asyncio.wait({closers[0]}, timeout=3)
+    assert done, "shutdown lost cancellation at setup completion"
+    await closers[0]
+    assert len(sockets) == 1 and sockets[0].closed
+    assert f._shards[0].task.done()
+    assert f._shards[0].generation == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
 async def test_reader_latches_expired_liveness_before_monitor_wakes(venue):
     connections = Connections()
     async with feed(venue, connections) as f:
