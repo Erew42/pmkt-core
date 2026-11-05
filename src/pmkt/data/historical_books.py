@@ -23,6 +23,8 @@ from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.time import isoformat_source_timestamp, utc_now_iso
 from pmkt.data.types import parse_float, parse_int
 
+from pmkt.data.normalize_kalshi_trade import _kalshi_yes_price, _first_positive_float
+
 POLYMARKET_PRICES_HISTORY_DOCS = (
     "https://docs.polymarket.com/api-reference/markets/get-prices-history"
 )
@@ -212,6 +214,9 @@ async def backfill_venue_history(
     venue_normalized = venue.strip().lower()
     if venue_normalized not in {"polymarket", "kalshi"}:
         raise ValueError("venue must be 'polymarket' or 'kalshi'")
+    if venue_normalized == "kalshi" and include_trades:
+        if max_trade_pages < 1 or trade_limit < 1:
+            raise ValueError("max_trade_pages and trade_limit must be positive")
     instrument_ids = _normalize_instruments(instruments)
     if venue_normalized == "kalshi" and (start_ts is None or end_ts is None):
         raise ValueError("Kalshi candlestick backfill requires start_ts and end_ts")
@@ -219,6 +224,7 @@ async def backfill_venue_history(
     run_id = run_id or f"historical-{uuid.uuid4().hex[:12]}"
     checked_at_utc = checked_at_utc or utc_now_iso()
     capabilities = venue_history_capability_matrix(checked_at_utc=checked_at_utc)
+    trade_partitions: list[dict[str, Any]] = []
     price_rows: list[dict[str, Any]] = []
     trade_rows: list[dict[str, Any]] = []
     gap_rows = _unsupported_book_gap_rows(
@@ -255,7 +261,7 @@ async def backfill_venue_history(
         price_rows.extend(rows)
         gap_rows.extend(fetch_gaps)
         if include_trades:
-            rows, trade_gaps = await _backfill_kalshi_trades(
+            rows, trade_gaps, trade_partitions = await _backfill_kalshi_trades(
                 kalshi_client,
                 instrument_ids,
                 run_id=run_id,
@@ -285,6 +291,7 @@ async def backfill_venue_history(
         "series_ticker": series_ticker,
         "use_historical": use_historical,
         "include_trades": include_trades,
+        "trade_partitions": trade_partitions,
     }
     return HistoricalBackfillResult(
         run_id=run_id,
@@ -475,15 +482,20 @@ async def _backfill_kalshi_trades(
     end_ts: int | None,
     max_pages: int,
     limit: int,
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    if max_pages < 1 or limit < 1:
+        raise ValueError("max_pages and limit must be positive")
     rows: list[dict[str, Any]] = []
     gaps: list[dict[str, Any]] = []
+    partitions: list[dict[str, Any]] = []
+    seen_trade_keys: set[tuple[str, str]] = set()
     for ticker in instruments:
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         pages = 0
+        row_start = len(rows)
+        reason = ""
         while True:
-            if pages >= max_pages:
-                break
             try:
                 payload = await client.historical_trades(
                     ticker=ticker.split(":", 1)[0],
@@ -492,33 +504,65 @@ async def _backfill_kalshi_trades(
                     limit=limit,
                     cursor=cursor,
                 )
-            except Exception as exc:
-                gaps.append(
-                    _gap_row(
-                        run_id=run_id,
-                        exchange="kalshi",
-                        instrument_id=ticker,
-                        capability="historical_trades",
-                        start_ts=start_ts,
-                        end_ts=end_ts,
-                        status="fetch_error",
-                        reason=str(exc),
-                        endpoint="/historical/trades",
-                    )
+                trades = _as_mapping(payload).get("trades")
+                if not isinstance(trades, list) or any(
+                    not isinstance(trade, Mapping) or not trade for trade in trades
+                ):
+                    raise ValueError("historical trade page must contain a list of nonempty trade objects")
+                page_trades = _kalshi_trade_rows(
+                    payload,
+                    collector_run_id=run_id,
+                    default_ticker=ticker.split(":", 1)[0],
                 )
+                # trade.v1 keys span all ticker partitions in the output artifact.
+                page_keys = {(row["venue"], row["venue_trade_id"]) for row in page_trades}
+                if len(page_keys) != len(page_trades) or seen_trade_keys.intersection(page_keys):
+                    raise ValueError("historical trade page contains duplicate trade keys")
+            except Exception as exc:
+                stop_reason = "fetch_error"
+                reason = f"{type(exc).__name__}: {exc}"
                 break
             pages += 1
-            page_trades = _kalshi_trade_rows(
-                payload,
-                collector_run_id=run_id,
-                default_ticker=ticker.split(":", 1)[0],
-            )
             rows.extend(page_trades)
+            seen_trade_keys.update(page_keys)
             cursor_value = _as_mapping(payload).get("cursor")
             cursor = str(cursor_value).strip() if cursor_value else None
             if not cursor:
+                stop_reason = "cursor_exhausted"
                 break
-    return rows, gaps
+            if cursor in seen_cursors:
+                stop_reason = "repeated_cursor"
+                break
+            seen_cursors.add(cursor)
+            if pages >= max_pages:
+                stop_reason = "page_limit"
+                break
+        partition = {
+            "instrument_id": ticker,
+            "complete": stop_reason == "cursor_exhausted",
+            "stop_reason": stop_reason,
+            "continuation_cursor": cursor,
+            "page_count": pages,
+            "row_count": len(rows) - row_start,
+            "max_pages": max_pages,
+            "limit": limit,
+        }
+        partitions.append(partition)
+        if not partition["complete"]:
+            gaps.append(_gap_row(
+                run_id=run_id,
+                exchange="kalshi",
+                instrument_id=ticker,
+                capability="historical_trades",
+                start_ts=start_ts,
+                end_ts=end_ts,
+                status="fetch_error" if stop_reason == "fetch_error" else "truncated",
+                reason=reason or stop_reason,
+                endpoint="/historical/trades",
+                row_count=len(rows) - row_start,
+                raw_json=partition,
+            ))
+    return rows, gaps, partitions
 
 
 def _polymarket_history_rows(
@@ -584,25 +628,8 @@ def _kalshi_trade_rows(
             )
             or ""
         ).strip()
-        price = parse_float(
-            _first_present(
-                trade,
-                "yes_price_dollars",
-                "price_dollars",
-                "price",
-                "yes_price",
-            )
-        )
-        size = parse_float(
-            _first_present(
-                trade,
-                "count",
-                "count_fp",
-                "size",
-                "quantity",
-                "contracts",
-            )
-        )
+        price = _kalshi_yes_price(trade)
+        size = _first_positive_float(trade, "count_fp", "count", "size", "quantity", "contracts")
         ts = _first_present(trade, "created_time", "created_ts", "ts", "trade_ts")
         trade_ts = isoformat_source_timestamp(ts, epoch_unit="seconds") or (
             str(ts) if ts is not None else None
@@ -621,6 +648,11 @@ def _kalshi_trade_rows(
                 price_dollars=price,
                 size_contracts=size,
                 notional_dollars=price * size if price is not None and size is not None else None,
+                # Kalshi's taker side is the outcome the taker is positioned for,
+                # not the book side consumed: "yes" means the taker bought YES or
+                # sold NO, lifting resting YES asks. `taker_side` is deprecated in
+                # favor of `taker_outcome_side` (same values); `taker_book_side`
+                # "bid" means the same as "yes".
                 aggressor_side=_first_present(trade, "taker_side", "side", "action"),
                 raw_json=trade,
             )

@@ -65,6 +65,39 @@ async def test_parquet_sink_rejects_directory_output(tmp_path) -> None:
         ParquetSink(tmp_path, columns=["token_id"])
 
 
+async def test_parquet_sink_closes_writer_when_flush_fails(tmp_path) -> None:
+    sink = ParquetSink(tmp_path / "failed.parquet", columns=["value"], flush_interval=1)
+    await sink.write({"value": 1.0})
+    writer = sink._writer
+    with pytest.raises((pa.ArrowInvalid, pa.ArrowTypeError)):
+        await sink.write({"value": "not numeric"})
+    assert sink._writer is None
+    assert writer is not None and not writer.is_open
+    assert pd.read_parquet(sink.path)["value"].tolist() == [1.0]
+
+
+async def test_failed_append_cannot_silently_retry_from_stale_original(tmp_path, monkeypatch):
+    path = tmp_path / "append.parquet"
+    async with ParquetSink(path, columns=["value"], flush_interval=1) as initial:
+        await initial.write({"value": 0.0})
+    sink = ParquetSink(path, columns=["value"], flush_interval=1)
+    await sink.write({"value": 1.0})
+
+    def fail_frame(*args, **kwargs):
+        raise MemoryError("injected conversion failure")
+
+    with monkeypatch.context() as fault:
+        fault.setattr(pd, "DataFrame", fail_frame)
+        with pytest.raises(MemoryError, match="injected"):
+            await sink.write({"value": 2.0})
+    with pytest.raises(RuntimeError, match="failed flush"):
+        await sink.close()
+    with pytest.raises(RuntimeError, match="failed flush"):
+        await sink.write({"value": 3.0})
+    assert pd.read_parquet(path)["value"].tolist() == [0.0]
+    assert pd.read_parquet(path.with_suffix(".parquet.tmp"))["value"].tolist() == [0.0, 1.0]
+
+
 async def test_streaming_parquet_sink_overwrite_false_rejects_existing_path(
     tmp_path,
 ) -> None:

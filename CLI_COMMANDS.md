@@ -30,6 +30,13 @@ installed version.
 
 - `ingest-markets`: fetch normalized Polymarket market snapshots.
 - `ingest-markets-keyset`: fetch Polymarket markets by keyset pagination.
+  The default `--closed any` scans explicit open and closed partitions; `open`
+  and `closed` scan one partition. `--max-pages` caps total pages across both.
+  The manifest and evidence source manifest record per-partition completion and
+  continuation cursors. A cap or failed partition keeps the collection incomplete.
+  Duplicate market IDs, including a market changing partitions during the scan,
+  fail the collection rather than silently selecting a version. Restart the scan
+  to obtain a consistent collection; manifests retain the partial scan position.
 - `ingest-kalshi-markets`: fetch normalized Kalshi market snapshots.
 - `ingest-kalshi-historical-markets`: fetch archived Kalshi market snapshots from
   `/historical/markets`. Use one of `--event-ticker`, `--series-ticker`,
@@ -63,7 +70,16 @@ installed version.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
-- `backfill-venue-history`: fetch public venue history.
+- `backfill-venue-history`: fetch public venue history. Kalshi trade backfills
+  require positive `--max-trade-pages` and `--trade-limit`. The persisted summary's
+  `trade_partitions` reports completeness, stop reason, pages, rows and continuation
+  cursor per instrument. Page caps, repeated/cyclic cursors, and fetch/parse
+  failures leave the requested interval incomplete and emit a trade gap with
+  details in `raw_json`; returned trade timestamps do not prove interval coverage.
+  Malformed entries (including empty objects) and duplicate trade keys reject the
+  whole page while retaining accepted earlier pages. Duplicate keys are checked
+  across all requested tickers; valid empty lists still indicate exhaustion when
+  there is no continuation cursor.
 
 ## Capture and reconstruction commands
 

@@ -406,3 +406,41 @@ async def test_collect_order_book_summaries_rejects_empty_token_ids(tmp_path) ->
         )
 
     assert not output_path.exists()
+
+
+@pytest.mark.parametrize("empty_first", [False, True])
+@pytest.mark.parametrize("flush_interval", [1, 1000])
+async def test_summary_schema_survives_one_sided_books_across_flushes(
+    tmp_path, empty_first, flush_interval,
+) -> None:
+    class FakeClob:
+        calls = 0
+
+        async def book(self, token_id):
+            empty = empty_first if self.calls < flush_interval else not empty_first
+            self.calls += 1
+            return {
+                "bids": [{"price": 0.4, "size": 10}],
+                "asks": [] if empty else [{"price": 0.6, "size": 5}],
+            }
+
+    output = tmp_path / "summaries.parquet"
+    await collect_order_book_summaries_parquet(
+        FakeClob(), ["token-1"], output_path=output,
+        poll_interval_s=0.001, max_snapshots=flush_interval + 1, flush_interval=flush_interval,
+    )
+    import pandas as pd
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    frame = pd.read_parquet(output)
+    assert len(frame) == flush_interval + 1
+    empty_index = 0 if empty_first else flush_interval
+    healthy_index = flush_interval if empty_first else 0
+    assert pd.isna(frame.loc[empty_index, "best_ask"])
+    assert frame.loc[healthy_index, "best_ask"] == pytest.approx(0.6)
+    assert "empty_ask" in frame.loc[empty_index, "quality_flags"]
+    assert frame.loc[healthy_index, "quality_flags"].tolist() == []
+    schema = pq.read_schema(output)
+    assert schema.field("quality_flags").type == pa.list_(pa.string())
+    assert schema.field("best_ask").type == pa.float64()

@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 import math
 import time
-from typing import Any, Callable, Literal, Sequence
+from typing import Any, Awaitable, Callable, Literal, Sequence, TypeVar
 
 from pmkt.exchanges.kalshi.ws import (
     AsyncKalshiWebSocketClient,
@@ -26,6 +26,23 @@ from pmkt.streaming.recording_feed import VenueBooks
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
 
 
+_T = TypeVar("_T")
+
+
+async def _bounded(operation: Awaitable[_T], timeout: float) -> _T:
+    # wait_for can swallow outer cancellation at child completion on 3.10/3.11.
+    task = asyncio.ensure_future(operation)
+    try:
+        done, _ = await asyncio.wait({task}, timeout=timeout)
+        if not done:
+            raise asyncio.TimeoutError()
+        return task.result()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @dataclass(frozen=True)
 class PublicBook:
     """A detached depth observation; Kalshi ladders are on the YES price basis."""
@@ -40,6 +57,7 @@ class PublicBook:
     received_monotonic: float
     source_timestamp: Any
     quality_flags: tuple[str, ...]
+    metadata_revision: int = 0
 
 
 @dataclass(frozen=True)
@@ -57,6 +75,7 @@ class PublicBookHealth:
     error_count: int
     last_error: str | None
     quality_flags: tuple[str, ...]
+    metadata_revision: int = 0
 
 
 @dataclass
@@ -64,7 +83,7 @@ class _Recovery:
     reason: str
     deadline: float
     phase: Literal["grace", "pending", "sending", "waiting", "cooldown"]
-    # A valid snapshot arrived while the request was still being sent.
+    # A valid snapshot arrived during the send and has not since been invalidated.
     answered: bool = False
 
 
@@ -79,6 +98,8 @@ class _Shard:
     connected: float | None = None
     updates: dict[str, float] = field(default_factory=dict)
     source_timestamps: dict[str, Any] = field(default_factory=dict)
+    # Explicit metadata-event evidence, retained through same-generation recovery.
+    metadata_revisions: dict[str, int] = field(default_factory=dict)
     recovery: dict[str, _Recovery] = field(default_factory=dict)
     restart: bool = True
     reason: str = "not_started"
@@ -90,6 +111,9 @@ class _Shard:
     # Native market identity first seen per instrument, kept across book resets so
     # market-scoped lifecycle events still find instruments under recovery.
     market_ids: dict[str, str] = field(default_factory=dict)
+    # Only an established-market snapshot can clear an identity conflict, even
+    # after recovery timeouts or connection replacement.
+    identity_conflicts: set[str] = field(default_factory=set)
 
 
 class ManagedBookFeed:
@@ -322,7 +346,7 @@ class ManagedBookFeed:
                     for instrument, recovery in pending.items():
                         recovery.phase = "sending"
                         self._reset_book(shard, instrument)
-                    await asyncio.wait_for(
+                    await _bounded(
                         self._request_snapshots(shard, list(pending)),
                         self.connect_timeout,
                     )
@@ -396,6 +420,7 @@ class ManagedBookFeed:
             shard.health.error_count,
             shard.last_error,
             tuple(sorted(state.quality_flags)),
+            shard.metadata_revisions.get(instrument, 0),
         )
 
     def book(self, instrument: str) -> PublicBook | None:
@@ -424,6 +449,7 @@ class ManagedBookFeed:
             shard.updates[instrument],
             shard.source_timestamps[instrument],
             health.quality_flags,
+            health.metadata_revision,
         )
 
     async def _run(self, shard: _Shard) -> None:
@@ -446,7 +472,10 @@ class ManagedBookFeed:
             self._invalidate(shard, "feed_failed")
 
     async def _session(self, shard: _Shard) -> None:
+        if self._closed:
+            raise asyncio.CancelledError()
         shard.generation += 1
+        shard.metadata_revisions.clear()
         shard.restart = False
         shard.reason = "connecting"
         shard.sid = None
@@ -473,11 +502,15 @@ class ManagedBookFeed:
         probe: asyncio.Task[None] | None = None
         recovery_task: asyncio.Task[None] | None = None
         try:
-            await asyncio.wait_for(client.connect(), self.connect_timeout)
+            await _bounded(client.connect(), self.connect_timeout)
+            if self._closed:
+                raise asyncio.CancelledError()
             if self.venue == "kalshi":
-                shard.command_id = await asyncio.wait_for(
+                shard.command_id = await _bounded(
                     client.subscribe(ids), self.connect_timeout
                 )
+            if self._closed:
+                raise asyncio.CancelledError()
             shard.connected = shard.alive = time.monotonic()
             shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
             iterator = (
@@ -548,7 +581,7 @@ class ManagedBookFeed:
             with contextlib.suppress(Exception):
                 await pump.close()
         with contextlib.suppress(Exception):
-            await asyncio.wait_for(client.close(), self.connect_timeout)
+            await _bounded(client.close(), self.connect_timeout)
 
     async def _probe(self, shard: _Shard) -> None:
         # Waiting for a pong must not suspend receipt/application of book deltas.
@@ -629,6 +662,12 @@ class ManagedBookFeed:
                         or instrument == message.get("asset_id"):
                     shard.resolved.add(instrument)
                     shard.recovery.pop(instrument, None)
+        if self.venue == "polymarket" and kind == "tick_size_change":
+            instrument = str(message.get("asset_id"))
+            if instrument in shard.books.polymarket:
+                # Event evidence only: even repeated or malformed tick values
+                # require consumers to reconsider independently cached metadata.
+                shard.metadata_revisions[instrument] = shard.metadata_revisions.get(instrument, 0) + 1
         views = shard.books.apply(message, count)
         now = time.monotonic()
         shard.health.record_message(now_monotonic_ns=time.monotonic_ns())
@@ -656,23 +695,43 @@ class ManagedBookFeed:
             if market and known and market != known:
                 # A message for another market merged into this book: drop the
                 # mixed ladder and require a fresh snapshot.
-                shard.market_ids[instrument] = market
                 self._reset_book(shard, instrument)
-                shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
+                shard.identity_conflicts.add(instrument)
+                if instrument not in shard.resolved:
+                    recovery = shard.recovery.get(instrument)
+                    if recovery is not None and recovery.phase == "sending":
+                        # Keep the outstanding send barrier when identity changes.
+                        recovery.reason = "market_identity_changed"
+                        recovery.answered = False
+                    else:
+                        shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
                 continue
             if market and not known:
                 shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
+            if instrument in shard.identity_conflicts:
+                incoming_market = (
+                    message.get("market") if self.venue == "polymarket"
+                    else message["msg"].get("market_id")
+                )
+                if kind not in {"book", "orderbook_snapshot"} or str(incoming_market or "") != known:
+                    # State can inherit identity from a malformed prior snapshot;
+                    # only the incoming snapshot can explicitly verify it.
+                    self._reset_book(shard, instrument)
+                    continue
+            if view.integrity_valid and kind in {"book", "orderbook_snapshot"}:
+                shard.identity_conflicts.discard(instrument)
             if "market_resolved" in view.quality_flags or instrument in shard.resolved:
                 shard.resolved.add(instrument)
                 shard.recovery.pop(instrument, None)
             elif (
                 recovery is not None
                 and recovery.phase == "sending"
-                and view.integrity_valid
-                and kind in {"book", "orderbook_snapshot"}
             ):
-                recovery.answered = True
+                if not view.integrity_valid:
+                    recovery.answered = False
+                elif kind in {"book", "orderbook_snapshot"}:
+                    recovery.answered = True
             elif not view.integrity_valid and recovery is None:
                 grace = (
                     self.venue == "polymarket"

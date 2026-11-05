@@ -235,13 +235,27 @@ async def test_cache_reuse_is_universe_and_resolver_version_aware(
     )
 
     written = pd.read_parquet(output_dir / "market_resolutions.parquet")
-    assert set(written["market_key"]) == {"pm-keep", "pm-old", "pm-v3"}
+    assert set(written["market_key"]) == {"pm-keep", "pm-old", "pm-v3", "pm-out"}
     assert calls == ["pm-old"]
     results = written.set_index("market_key")["result"].to_dict()
-    assert results == {"pm-keep": "yes", "pm-old": "no", "pm-v3": "no"}
+    assert results == {"pm-keep": "yes", "pm-old": "no", "pm-v3": "no", "pm-out": "yes"}
     versions = written.set_index("market_key")["resolver_version"].to_dict()
     assert versions["pm-keep"] == "market_resolution_resolver.v2"
     assert versions["pm-v3"] == RESOLVER_VERSION
+
+    # Expanding the scope must still compare against the retained canonical row.
+    await cache_module.resolve_market_resolution_cache(
+        polymarket_markets_path=polymarket_path,
+        kalshi_markets_path=kalshi_path,
+        output_dir=output_dir,
+        refresh=True,
+        gamma_client=FakeGamma(),
+        clob_client=FakeClob(),
+        kalshi_client=FakeKalshiClient(),
+    )
+    expanded = pd.read_parquet(output_dir / "market_resolutions.parquet").set_index("market_key")
+    assert expanded.loc["pm-out", "resolution_state"] == STATE_INCONSISTENT
+    assert expanded.loc["pm-out", "error_type"] == "MarketResolutionCacheConflict"
 
 
 @pytest.mark.asyncio
@@ -1082,6 +1096,21 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
             return _final_record("kalshi", market_key, "no")
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
+
+    before = pd.read_parquet(output_dir / "market_resolutions.parquet")
+    await cache_module.resolve_market_resolution_cache(
+        polymarket_markets_path=polymarket_path,
+        kalshi_markets_path=kalshi_path,
+        output_dir=output_dir,
+        max_markets=0,
+        gamma_client=FakeGamma(),
+        clob_client=FakeClob(),
+        kalshi_client=FakeKalshiClient(),
+    )
+    pd.testing.assert_frame_equal(
+        pd.read_parquet(output_dir / "market_resolutions.parquet"), before,
+        check_dtype=False,
+    )
 
     await cache_module.resolve_market_resolution_cache(
         polymarket_markets_path=polymarket_path,

@@ -1,20 +1,18 @@
-## Public-core change
+**<Type>:** <!-- feature, bug fix, refactor, pin bump, docs, research or chore. One or two sentences: the problem and what this PR does about it. -->
 
-- Data/API/schema/streaming surface affected:
-- Compatibility or schema-version impact:
-- `CLI_COMMANDS.md` updated if the supported CLI changed: yes / no / not needed
-- OpenAPI examples refreshed if the contract changed: yes / no / not needed
+<!-- Closes #N / stacking notes -->
 
-## Boundary review
+### Scope
+<!-- The one problem this PR solves, and related work deliberately not done. -->
 
-- [ ] No matching, trading, execution, credential, private-key, or dashboard code
-- [ ] No import from `pmkt_trading` or removed legacy private modules
-- [ ] No local data, generated output, environment, or secret material
+### Changes
+<!-- Bullets grouped by behavior, not by file. -->
 
-## Validation
+### Contracts
+<!-- `none`, or each change with a reason: schema versions and columns added, removed or retyped; raw fields no longer kept; public API or CLI changes. -->
 
-- [ ] Focused tests
-- [ ] Repository hygiene and lane coverage
-- [ ] Ruff and mypy
-- [ ] Full applicable pytest lanes
-- [ ] Wheel/source-distribution inspection
+### Review focus
+<!-- One to three places where a mistake would be costly. Delete for trivial PRs. -->
+
+### Validation
+<!-- Commands run, results, commit, Python version and OS. Failures that also occur on main. `Not run: <check> (<reason>)`. -->

@@ -918,6 +918,9 @@ relabeling them; conflicts remain ineligible for terminal labels. A refresh with
 weaker evidence carries forward the original payout and resolver version, while
 contradictory canonical finals retain conflict handling. The existing unsafe v1
 cache migration behavior is unchanged.
+Scopes (`--matches` and `--max-markets`) limit resolution work; rows outside
+the requested scope remain unchanged in `market_resolutions.parquet`. The file
+and its summary describe the complete retained cache, not just the scoped run.
 
 Native REST methods use `ValueError` for invalid caller parameters, `TypeError`
 or `ValueError` for malformed upstream payloads, and propagate `httpx` request
@@ -930,11 +933,31 @@ reexport.
 
 ## Canonical data and storage contracts
 
+Paged CLI contract-evidence bundles record each page's response receipt time
+and projection time in the evidence rows. Their source collection manifest uses
+`started_at_utc` and `finished_at_utc` for run clocks, with
+`observation_time_precision: page_response`; bundle observation ranges come
+from the rows. The source manifest's old run-level `observed_at_utc` field is
+replaced by those run clocks.
+
+Verification does not rewrite old bundles. Legacy CLI source manifests with
+`page_count` and the old run-level `observed_at_utc`, without page-response
+precision, return `observation_time_precision: collection_start` and
+`authoritative_complete: false`. Their page receipt times cannot be recovered;
+consumers must not use these bundles for precise historical as-of authority.
+
 `pmkt.data` reexports the registered `*_COLUMNS`, `*_SCHEMA_VERSION`, row
 builders, registry lookup functions, physical validators, provenance hashes,
 and sink classes. These are retained native contracts even when a schema name
 describes paper, order, matching, or tracking data: core owns policy-neutral
 physical schemas, while consumer policy remains outside this package.
+
+`ParquetSink` accepts an optional keyword-only Arrow `schema` for stable types
+across flushes. The legacy order-book summary collector supplies nullable
+numeric quotes and `list<string>` quality flags, including for empty book sides.
+After a flush fails, that sink instance rejects further writes and closes with
+`RuntimeError`; it does not publish a partially failed append. The original file
+and any closed append `.tmp` artifact remain available for inspection.
 
 The authoritative list of schema versions, lifecycle states, compatibility
 decisions, and removal gates is
@@ -962,6 +985,12 @@ in-memory public order-book interfaces for both venues. See
 connection generations, liveness and consumer adoption. Existing mutable state
 ladder keys and sizes now use `Decimal`; legacy snapshot projections and canonical
 storage schemas retain floats at their explicit boundaries.
+
+Both returned observation types include a trailing defaulted `metadata_revision`.
+Together with connection generation, it exposes per-instrument explicit
+Polymarket tick-change evidence, including while depth is unavailable. It supplies
+no signing constraints; consumers own authoritative metadata confirmation. See
+the managed-feed contract for event scope and reset semantics.
 
 ## Inherited advanced surfaces
 

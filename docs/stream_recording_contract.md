@@ -305,6 +305,12 @@ The venue `order_book_stream.py` modules are small public entrypoints. The
 underlying `ws.py` modules still own venue book semantics and WebSocket transport.
 Live recording does not import the historical profile, tape or durability stack.
 
+Malformed WebSocket frames and Polymarket book messages with missing identity or
+malformed price-change envelopes stop recording through the feed-error path.
+Existing books are invalidated in topbook quality flags and events, and the run
+cannot finish complete. This applies after reconnects as well. Decode errors do
+not enable raw-message retention; `raw_messages=False` remains the default.
+
 ```python
 from pmkt.exchanges.polymarket import stream_order_book_data
 

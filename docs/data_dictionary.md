@@ -234,7 +234,7 @@ tradable or executable.
 | `evidence_id` | Deterministic observation identity over venue, market, endpoint/scope, explicit observation time, and canonical raw hash (or normalized source-row hash when raw data is unavailable). |
 | `venue` / `market_key` / `venue_event_key` | Venue identity carried by the observed source payload. |
 | `source_endpoint` / `payload_scope` | Endpoint and projection type, such as list, keyset, detail, snapshot, or fixture. |
-| `observed_at_utc` / `derived_at_utc` | Required explicit UTC venue-observation and projection-generation times. Observation time comes from the function argument first, then the source row; it is never inferred from derivation time. |
+| `observed_at_utc` / `derived_at_utc` | Required explicit UTC venue-observation and projection-generation times. Paged ingestion records each response's receipt time and each page's projection time. Observation time comes from the function argument first, then the source row; it is never inferred from derivation time. |
 | `source_row_hash` | Stable normalized-row hash excluding raw payload fields and transient/internal columns. |
 | `raw_payload_hash` | SHA-256 of the exact decoded venue payload, canonically serialized when raw source data is available. |
 | `evidence_projection_hash` | Stable hash of versioned semantic evidence, excluding endpoint, timestamps, and raw-payload noise. |
@@ -630,7 +630,11 @@ quality_flags
 
 ## Trade schema: `trade.v1`
 
-A normalized executed trade observation.
+A normalized executed trade observation. Kalshi trades prefer explicit dollar prices
+(`yes_price_dollars`, `yes_price_dollars_fp`, then `price_dollars`) and
+`count_fp` over legacy `count`. Legacy `yes_price` is cents; mixed dollar
+and cent fields must agree. A bare `price` has ambiguous units and is rejected.
+Historical normalization retains the native trade payload in `raw_json`.
 
 | Column | Meaning |
 | --- | --- |
