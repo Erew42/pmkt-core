@@ -507,7 +507,28 @@ async def collect_order_book_summaries_parquet(
         "valid_state",
         "quality_flags",
     ]
-    parquet_sink = ParquetSink(output, columns=columns, flush_interval=flush_interval)
+    import pyarrow as pa
+
+    # Empty quote sides and flag lists must not infer null-only first-batch types.
+    schema = pa.schema([
+        ("ts", pa.float64()),
+        ("token_id", pa.string()),
+        ("best_bid", pa.float64()),
+        ("best_ask", pa.float64()),
+        ("mid", pa.float64()),
+        ("spread", pa.float64()),
+        ("spread_bps", pa.float64()),
+        ("request_started_at_utc", pa.string()),
+        ("request_completed_at_utc", pa.string()),
+        ("request_latency_ms", pa.float64()),
+        ("source_endpoint", pa.string()),
+        ("request_batch_size", pa.int64()),
+        ("valid_state", pa.bool_()),
+        ("quality_flags", pa.list_(pa.string())),
+    ])
+    parquet_sink = ParquetSink(
+        output, columns=columns, flush_interval=flush_interval, schema=schema,
+    )
     jsonl_dir = Path(also_jsonl_dir) if also_jsonl_dir is not None else None
     if jsonl_dir is not None:
         jsonl_dir.mkdir(parents=True, exist_ok=True)
