@@ -61,6 +61,7 @@ Read or change these at their source; do not restate them in this file.
 - Schema status and retirement: `docs/schema_lifecycle.md` and
   `docs/schema_lifecycle.json`.
 - Venue quirks: comments next to the code that parses the field.
+- Terms, identifiers and venue traps in one place: `docs/glossary.md`.
 
 ### Changes that travel together
 
