@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+import re
+
 import pytest
 
 from typer.testing import CliRunner
@@ -199,3 +202,17 @@ async def test_keyset_cancellation_keeps_closed_partition_incomplete(
     assert set(pd.read_parquet(out)["market_id"]) == (
         {"open", "closed"} if closed_pages else {"open"}
     )
+
+
+def test_cli_commands_doc_covers_root_inventory() -> None:
+    docs = Path("CLI_COMMANDS.md").read_text(encoding="utf-8")
+    registered = {command.name for command in app.registered_commands}
+    registered.update(group.name for group in app.registered_groups)
+    # Groups are documented with their subcommands, e.g. `schema list|show`.
+    missing = [
+        name
+        for name in sorted(str(name) for name in registered)
+        if re.search(rf"`{re.escape(name)}[` ]", docs) is None
+    ]
+
+    assert missing == []

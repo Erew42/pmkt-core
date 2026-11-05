@@ -1,7 +1,10 @@
 # PR #5: capture initialization, recovery, and coverage
 
-Status: implemented; PR is ready for review. Grid sampling,
-raw/tape reduction, and further storage architecture work remain separate.
+Status: historical record of PR #5 (merged). It describes the storage-profile
+capture path that `recording.v1` later replaced; see the
+[recording contract](../stream_recording_contract.md) for current behavior.
+Some statements no longer hold: nothing writes `reconnect_diagnostics.jsonl`,
+and `ManagedBookFeed` requests targeted snapshots when initialization times out.
 
 ## The problem and the resulting model
 
@@ -206,7 +209,8 @@ lose pending rows; only journaled groups are authoritative. Tests exercise actua
 child-process crashes at staging, pre-journal, and post-journal boundaries.
 The coordinator protocol now explicitly declares checkpoint requests rather than
 using an optional runtime-method lookup. See the
-[capture runbook](../storage_profile_capture_runbook.md) for durability boundaries.
+[recording contract](../stream_recording_contract.md) for current durability
+boundaries.
 
 The identical replay fell to 20.274 seconds and six commit groups, retaining all
 118 checkpoints and matching non-health data semantics. This is useful bounded

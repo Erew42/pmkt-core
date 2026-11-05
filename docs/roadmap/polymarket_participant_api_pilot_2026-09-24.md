@@ -149,9 +149,9 @@ The public RPC supported current `eth_call` and bounded historical logs, but
 rejected `eth_call` at the sampled historical blocks because it lacked the
 required state. A second public endpoint gave inconsistent historical-state
 availability, and another returned HTTP 401. No suitable archival RPC is
-configured in this workspace. `PolygonCtfClient.eth_call` currently fixes
-the block argument to `latest`; a historical check would require a small
-read-side extension even with an archival provider. We did **not** establish
+configured in this workspace. `PolygonCtfClient.eth_call` now accepts a
+keyword-only `block=` (number, tag, or EIP-1898 object), so a historical check
+needs only an archival provider. We did **not** establish
 token-creation blocks, a complete opening state, reorg handling, or the cost
 of a full condition-wide transfer scan. Because token ID is not a topic,
 market-wide extraction must read and decode CTF transfers across a bounded

@@ -37,15 +37,16 @@ That decision did not end or weaken the freeze for any remaining contract.
 | `market_taxonomy_evidence.v1` | `active_experiment` | Retain. It has hash-pinned retained research data, but still needs a tracked producer/reader workflow and artifact-level schema, grain, key, and provenance metadata. |
 | Paper-canary contract family (six schemas) | retired in 0.2 | Removed atomically under the tracked family retirement packet. The remaining `execution_deferred` contracts stay frozen. |
 
-The evidence baseline recorded on 2026-08-20 found no snapshot-v2,
-`market_match.v1`, `event.v1`, `market.v1`, or `instrument.v1` artifacts in the
-main retained roots or a representative `tmp` sample. That sample contained
+The pre-split evidence baseline (`historical_evidence_as_of` in the catalog)
+found no snapshot-v2, `market_match.v1`, `event.v1`, `market.v1`, or
+`instrument.v1` artifacts in the main retained roots or a representative `tmp`
+sample. That sample contained
 unreadable paths and was not exhaustive, so it is not sufficient for removal.
 
 ## Post-split ownership and compatibility
 
-The 2026-09-11 source baseline names each repository and revision separately in
-`evidence_as_of.repositories`. Research has no committed revision yet; its
+The catalog's `evidence_as_of` records the current source baseline: its date,
+scope, and each repository's revision in `evidence_as_of.repositories`. Research has no committed revision yet; its
 source inventory cannot be reproduced from a Git SHA. The older August scan is
 retained as `historical_evidence_as_of`, not represented as a current core commit.
 Historical paths in `evidence_overrides` describe the combined layout.
@@ -53,9 +54,10 @@ Historical paths in `evidence_overrides` describe the combined layout.
 `repository_ownership` covers every registered version. Core owns physical
 contracts and policy-neutral validation. `cross_repository_contract` entries
 have private semantic policy in `pmkt-trading`; registration or public export
-is not an ownership violation. Existing exports remain compatible. No schemas
-are removed by this refresh, and the five proposed dimension/snapshot removals
-still require complete retained-artifact and consumer evidence.
+is not an ownership violation. Existing exports remain compatible. The
+paper-canary family is the only removal so far; the five proposed
+dimension/snapshot removals still require complete retained-artifact and
+consumer evidence.
 
 The generic trading reader is now
 `pmkt-trading:src/pmkt_trading/data/artifact_discovery.py`. Literal token scans

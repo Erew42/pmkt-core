@@ -151,9 +151,8 @@ established opening state for every address claimed.
 
 If a production indexer is justified, publish source events, derived balances,
 and coverage consistently, and handle chain reorganizations before claiming
-canonical history. Direct historical `balanceOf` checks require an RPC
-provider and an `eth_call` block parameter; the current
-`PolygonCtfClient.eth_call` uses `latest` only.
+canonical history. Direct historical `balanceOf` checks require an archival
+RPC provider; `PolygonCtfClient.eth_call` accepts a keyword-only `block=`.
 
 ## Trading-history promise
 
@@ -234,9 +233,9 @@ reconciliation.
 
 ## Delivery order and release gates
 
-1. Add typed `/v2/holders` reads, then condition-scoped trades and wallet
-   activity as separate, opt-in changes; preserve PR #9 defaults. Sync the
-   upstream OpenAPI contract before each new endpoint.
+1. Done: typed `/v2/holders` reads, then condition-scoped trades and wallet
+   activity as separate, opt-in changes (`holders_page`, `market_trades_page`,
+   `activity_page`); PR #9 defaults preserved.
 2. Run the API-only reconstruction pilot against the stated consumer questions.
    Capture durable gross-balance observations if dated *observations* are
    useful; they need not wait for wallet activity or a chain decision.
