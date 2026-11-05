@@ -107,6 +107,9 @@ class _Shard:
     # Native market identity first seen per instrument, kept across book resets so
     # market-scoped lifecycle events still find instruments under recovery.
     market_ids: dict[str, str] = field(default_factory=dict)
+    # Only an established-market snapshot can clear an identity conflict, even
+    # after recovery timeouts or connection replacement.
+    identity_conflicts: set[str] = field(default_factory=set)
 
 
 class ManagedBookFeed:
@@ -679,13 +682,32 @@ class ManagedBookFeed:
             if market and known and market != known:
                 # A message for another market merged into this book: drop the
                 # mixed ladder and require a fresh snapshot.
-                shard.market_ids[instrument] = market
                 self._reset_book(shard, instrument)
-                shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
+                shard.identity_conflicts.add(instrument)
+                if instrument not in shard.resolved:
+                    recovery = shard.recovery.get(instrument)
+                    if recovery is not None and recovery.phase == "sending":
+                        # Keep the outstanding send barrier when identity changes.
+                        recovery.reason = "market_identity_changed"
+                        recovery.answered = False
+                    else:
+                        shard.recovery[instrument] = _Recovery("market_identity_changed", now, "pending")
                 continue
             if market and not known:
                 shard.market_ids[instrument] = market
             recovery = shard.recovery.get(instrument)
+            if instrument in shard.identity_conflicts:
+                incoming_market = (
+                    message.get("market") if self.venue == "polymarket"
+                    else message["msg"].get("market_id")
+                )
+                if kind not in {"book", "orderbook_snapshot"} or str(incoming_market or "") != known:
+                    # State can inherit identity from a malformed prior snapshot;
+                    # only the incoming snapshot can explicitly verify it.
+                    self._reset_book(shard, instrument)
+                    continue
+            if view.integrity_valid and kind in {"book", "orderbook_snapshot"}:
+                shard.identity_conflicts.discard(instrument)
             if "market_resolved" in view.quality_flags or instrument in shard.resolved:
                 shard.resolved.add(instrument)
                 shard.recovery.pop(instrument, None)
