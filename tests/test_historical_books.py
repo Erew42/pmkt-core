@@ -236,3 +236,38 @@ def test_venue_history_capability_matrix_documents_unsupported_orderbook_backfil
         )
     ]
     assert set(price_context["evidence_role"]) == {"price_context"}
+
+
+@pytest.mark.parametrize("economics", [
+    {"yes_price_dollars": "0.42", "count_fp": "1.75"},
+    {"yes_price_dollars_fp": "0.42", "count_fp": "1.75"},
+    {"yes_price": 1, "count": 1, "count_fp": "1.75"},
+    {"yes_price": 42, "count": 2},
+    {"yes_price_dollars": "0.42", "yes_price": 42, "count": 1, "count_fp": "1.75"},
+])
+def test_historical_and_recording_trade_economics_agree(economics):
+    from pmkt.data.historical_books import _kalshi_trade_rows
+    from pmkt.streaming.trades import recording_trade
+
+    raw = {"trade_id": "t", "market_ticker": "KXTEST", **economics}
+    historical = _kalshi_trade_rows({"trades": [raw]}, collector_run_id="r", default_ticker="KXTEST")[0]
+    streaming = recording_trade("kalshi", {"type": "trade", "msg": raw})
+    assert historical["price_dollars"] == streaming["price"]
+    assert historical["size_contracts"] == streaming["quantity"]
+    assert historical["notional_dollars"] == pytest.approx(streaming["price"] * streaming["quantity"])
+    assert historical["raw_json"] == raw
+
+
+@pytest.mark.parametrize("economics", [
+    {"price": 0.42, "count": 1},
+    {"yes_price_dollars": "0.42", "yes_price": 1, "count": 1},
+])
+def test_historical_and_recording_reject_ambiguous_trade_prices(economics):
+    from pmkt.data.historical_books import _kalshi_trade_rows
+    from pmkt.streaming.trades import ObservationValidationError, recording_trade
+
+    raw = {"trade_id": "t", "market_ticker": "KXTEST", **economics}
+    with pytest.raises(ObservationValidationError):
+        _kalshi_trade_rows({"trades": [raw]}, collector_run_id="r", default_ticker="KXTEST")
+    with pytest.raises(ObservationValidationError):
+        recording_trade("kalshi", {"type": "trade", "msg": raw})

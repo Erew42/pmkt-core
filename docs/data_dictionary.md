@@ -612,7 +612,11 @@ quality_flags
 
 ## Trade schema: `trade.v1`
 
-A normalized executed trade observation.
+A normalized executed trade observation. Kalshi trades prefer explicit dollar prices
+(`yes_price_dollars`, `yes_price_dollars_fp`, then `price_dollars`) and
+`count_fp` over legacy `count`. Legacy `yes_price` is cents; mixed dollar
+and cent fields must agree. A bare `price` has ambiguous units and is rejected.
+Historical normalization retains the native trade payload in `raw_json`.
 
 | Column | Meaning |
 | --- | --- |

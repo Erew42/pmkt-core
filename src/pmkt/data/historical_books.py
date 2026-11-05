@@ -23,6 +23,8 @@ from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.time import isoformat_source_timestamp, utc_now_iso
 from pmkt.data.types import parse_float, parse_int
 
+from pmkt.data.normalize_kalshi_trade import _kalshi_yes_price, _first_positive_float
+
 POLYMARKET_PRICES_HISTORY_DOCS = (
     "https://docs.polymarket.com/api-reference/markets/get-prices-history"
 )
@@ -584,25 +586,8 @@ def _kalshi_trade_rows(
             )
             or ""
         ).strip()
-        price = parse_float(
-            _first_present(
-                trade,
-                "yes_price_dollars",
-                "price_dollars",
-                "price",
-                "yes_price",
-            )
-        )
-        size = parse_float(
-            _first_present(
-                trade,
-                "count",
-                "count_fp",
-                "size",
-                "quantity",
-                "contracts",
-            )
-        )
+        price = _kalshi_yes_price(trade)
+        size = _first_positive_float(trade, "count_fp", "count", "size", "quantity", "contracts")
         ts = _first_present(trade, "created_time", "created_ts", "ts", "trade_ts")
         trade_ts = isoformat_source_timestamp(ts, epoch_unit="seconds") or (
             str(ts) if ts is not None else None
