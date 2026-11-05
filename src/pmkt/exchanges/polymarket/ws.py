@@ -137,8 +137,14 @@ def application_heartbeat_token(raw: Any) -> str | None:
     return None
 
 
-def decode_market_messages(raw: Any, *, strict: bool = False) -> list[dict[str, Any]]:
-    """Decode a raw websocket frame into market message dictionaries."""
+def decode_market_messages(
+    raw: Any, *, strict: bool = False, decimal_numbers: bool | None = None
+) -> list[dict[str, Any]]:
+    """Decode market dictionaries; numeric precision defaults to strictness.
+
+    JSON-persisting consumers may request floats while retaining strict frame
+    validation. Existing strict consumers retain Decimal decoding by default.
+    """
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
@@ -146,7 +152,8 @@ def decode_market_messages(raw: Any, *, strict: bool = False) -> list[dict[str, 
         if not frame or frame.upper() in {"PING", "PONG"}:
             return []
         try:
-            decoded = json.loads(frame, parse_float=Decimal if strict else float)
+            use_decimal = strict if decimal_numbers is None else decimal_numbers
+            decoded = json.loads(frame, parse_float=Decimal if use_decimal else float)
         except json.JSONDecodeError:
             if strict:
                 raise WebSocketProtocolError("invalid market JSON") from None
@@ -831,6 +838,7 @@ class AsyncMarketWebSocketClient:
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
         strict_decode: bool = False,
+        decimal_numbers: bool | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # A capture supplies one budget for startup and all iterator generations.
         budget = self._retry_budget or WebSocketRetryBudget(
@@ -864,7 +872,9 @@ class AsyncMarketWebSocketClient:
                     )
                     self.last_frame_received_monotonic_ns = time.monotonic_ns()
                     self.last_frame_sequence += 1
-                    for index, message in enumerate(decode_market_messages(raw, strict=strict_decode)):
+                    for index, message in enumerate(decode_market_messages(
+                        raw, strict=strict_decode, decimal_numbers=decimal_numbers
+                    )):
                         self.last_message_index_in_frame = index
                         yield message
                 if self._heartbeat_error is not None:
