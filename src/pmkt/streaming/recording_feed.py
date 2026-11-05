@@ -155,11 +155,14 @@ class VenueBooks:
                 if market:
                     for state in targets:
                         self.market_ids.setdefault(state.asset_id, market)
-                if kind == "market_resolved":
+                # Only the recorder persists resolution; ManagedBookFeed keeps
+                # its own terminal state keyed by its first-established market.
+                if kind == "market_resolved" and self.enforce_market_identity:
                     self.resolved.update(state.asset_id for state in targets)
                 snapshots = [
                     state.apply_lifecycle(
-                        {**message, "market": self.market_ids.get(state.asset_id)},
+                        {**message, "market": self.market_ids.get(state.asset_id)}
+                        if self.enforce_market_identity else message,
                         str(kind),
                     ) for state in targets
                 ]

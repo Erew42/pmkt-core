@@ -320,6 +320,21 @@ def test_recorder_resolution_survives_snapshots_and_reset(routing):
     assert books.apply({**poly_book("b"), "market": "other"}, 6)[0].quote_valid
 
 
+@pytest.mark.parametrize("routing", ["market", "asset_id"])
+def test_unenforced_books_leave_terminal_resolution_to_their_owner(routing):
+    # ManagedBookFeed keeps its own identity and resolution state; an inner
+    # foreign-market resolution must not outlive a later original snapshot.
+    books = VenueBooks("polymarket", ["a"])
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book(), "market": "foreign"}, 2)
+    value = "foreign" if routing == "market" else "a"
+    books.apply({"event_type": "market_resolved", routing: value, "market": "foreign"}, 3)
+    books.reset()
+    repaired = books.apply(poly_book(), 4)[0]
+    assert repaired.integrity_valid and repaired.quote_valid
+    assert "market_resolved" not in repaired.quality_flags
+
+
 @pytest.mark.parametrize("reset", [False, True])
 def test_recorder_conflict_rejects_anonymous_and_malformed_recovery(reset):
     books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
