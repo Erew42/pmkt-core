@@ -954,6 +954,12 @@ connection generations, liveness and consumer adoption. Existing mutable state
 ladder keys and sizes now use `Decimal`; legacy snapshot projections and canonical
 storage schemas retain floats at their explicit boundaries.
 
+Both returned observation types include a trailing defaulted `metadata_revision`.
+Together with connection generation, it exposes per-instrument explicit
+Polymarket tick-change evidence, including while depth is unavailable. It supplies
+no signing constraints; consumers own authoritative metadata confirmation. See
+the managed-feed contract for event scope and reset semantics.
+
 ## Inherited advanced surfaces
 
 The complete inherited facade membership is recorded in the machine-readable
