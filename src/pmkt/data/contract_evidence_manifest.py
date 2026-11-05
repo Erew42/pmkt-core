@@ -318,6 +318,7 @@ def verify_contract_evidence_manifest(
     if not isinstance(payload, Mapping):
         raise ValueError("contract evidence manifest must be a JSON object")
     errors: list[str] = []
+    source_manifest_payload: Any = None
     manifest_version = payload.get("manifest_version")
     if manifest_version not in {
         CONTRACT_EVIDENCE_MANIFEST_VERSION_V1,
@@ -443,6 +444,20 @@ def verify_contract_evidence_manifest(
     result = dict(payload)
     if manifest_version == CONTRACT_EVIDENCE_MANIFEST_VERSION_V1:
         result["authoritative_complete"] = False
+    if isinstance(source_manifest_payload, Mapping):
+        precision = source_manifest_payload.get("observation_time_precision")
+        # Older CLI bundles stored the run-start clock as every page's receipt.
+        # Verify their original bytes, but do not certify historical authority.
+        if precision is None and (
+            payload.get("observation_time_source") == "capture_clock"
+            and "page_count" in source_manifest_payload
+            and "observed_at_utc" in source_manifest_payload
+        ):
+            precision = "collection_start"
+        if precision == "collection_start":
+            result["authoritative_complete"] = False
+        if precision is not None:
+            result["observation_time_precision"] = precision
     return result
 
 

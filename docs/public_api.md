@@ -924,6 +924,19 @@ reexport.
 
 ## Canonical data and storage contracts
 
+Paged CLI contract-evidence bundles record each page's response receipt time
+and projection time in the evidence rows. Their source collection manifest uses
+`started_at_utc` and `finished_at_utc` for run clocks, with
+`observation_time_precision: page_response`; bundle observation ranges come
+from the rows. The source manifest's old run-level `observed_at_utc` field is
+replaced by those run clocks.
+
+Verification does not rewrite old bundles. Legacy CLI source manifests with
+`page_count` and the old run-level `observed_at_utc`, without page-response
+precision, return `observation_time_precision: collection_start` and
+`authoritative_complete: false`. Their page receipt times cannot be recovered;
+consumers must not use these bundles for precise historical as-of authority.
+
 `pmkt.data` reexports the registered `*_COLUMNS`, `*_SCHEMA_VERSION`, row
 builders, registry lookup functions, physical validators, provenance hashes,
 and sink classes. These are retained native contracts even when a schema name
