@@ -277,15 +277,14 @@ Historical readers/recovery/conversion code lives in `streaming/legacy` and is
 not imported by the new live recording path. Shared book/transport validation
 and independently used supervisor utilities remain.
 
-The `book-tape` and `mm-compact` tape profiles were dropped because they never
-passed CR-18.9 acceptance. In the 2026-07-24 one-hour measurement the reduced
+Current recording does not produce the `book-tape` and `mm-compact` tape
+profiles; they remain defined only for legacy readers because they never passed
+CR-18.9 acceptance. In the 2026-07-24 one-hour measurement the reduced
 Polymarket profiles exceeded their storage budgets (85 and 25 MiB/hour against
 50 and 15), every Polymarket profile missed the 99% dense-health reduction gate,
 and the mandatory one-hour reconstruction ran out of memory. A later
 asynchronous-publication candidate saturated its bounded publication queue and
-discarded accepted groups, and was rejected. The records are pmkt-trading's
-`CR-18.9-ONE-HOUR-NO-GO-20260724.md` and
-`REVIEW-CR-18.9-ASYNC-PUBLICATION-20260728.md`.
+discarded accepted groups, and was rejected.
 
 ## Where to look after a month away
 
