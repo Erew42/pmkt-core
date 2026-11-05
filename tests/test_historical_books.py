@@ -271,3 +271,216 @@ def test_historical_and_recording_reject_ambiguous_trade_prices(economics):
         _kalshi_trade_rows({"trades": [raw]}, collector_run_id="r", default_ticker="KXTEST")
     with pytest.raises(ObservationValidationError):
         recording_trade("kalshi", {"type": "trade", "msg": raw})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cursors,cap,expected", [
+    (["next"], 1, "page_limit"),
+    (["same", "same"], 5, "repeated_cursor"),
+    (["a", "b", "a"], 5, "repeated_cursor"),
+    ([None], 1, "cursor_exhausted"),
+    (["a", None], 2, "cursor_exhausted"),
+    (["a", "error"], 3, "fetch_error"),
+])
+async def test_historical_trade_pagination_completeness(cursors, cap, expected, tmp_path):
+    import json
+
+    class FakeKalshi:
+        def __init__(self):
+            self.calls = {}
+
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, ticker, **params):
+            index = self.calls.get(ticker, 0)
+            self.calls[ticker] = index + 1
+            cursor = cursors[index] if ticker == "A" else None
+            if cursor == "error":
+                raise RuntimeError("fake failure")
+            # Empty pages with cursors must still be treated as incomplete.
+            return {"trades": ([{"trade_id": f"{ticker}-{index}", "yes_price": 1,
+                                 "count_fp": "1.75", "created_ts": 1}]
+                               if index == 0 else []), "cursor": cursor}
+
+    fake = FakeKalshi()
+    result = await backfill_venue_history(
+        "kalshi", ["A", "B"], start_ts=1, end_ts=2,
+        use_historical=True, kalshi_client=fake, max_trade_pages=cap,
+    )
+    a, b = result.summary["trade_partitions"]
+    assert a["stop_reason"] == expected
+    assert a["complete"] == (expected == "cursor_exhausted")
+    assert b["complete"] is True
+    assert a["row_count"] == 1
+    assert b["row_count"] == 1
+    assert a["page_count"] == len(cursors) - (expected == "fetch_error")
+    assert fake.calls["A"] == len(cursors)
+    paths = write_historical_backfill_result(result, tmp_path)
+    summary = json.loads(paths["summary"].read_text())
+    assert summary["trade_partitions"] == result.summary["trade_partitions"]
+    gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = gaps[gaps["capability"] == "historical_trades"]
+    if expected == "cursor_exhausted":
+        assert trade_gaps.empty
+    else:
+        assert len(trade_gaps) == 1
+        assert json.loads(trade_gaps.iloc[0]["raw_json"])["stop_reason"] == expected
+        assert trade_gaps.iloc[0]["start_ts_utc"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_pages,limit", [(0, 1), (1, 0), (-1, 1)])
+async def test_historical_trade_pagination_rejects_nonpositive_bounds(max_pages, limit):
+    from pmkt.data.historical_books import _backfill_kalshi_trades
+    with pytest.raises(ValueError, match="positive"):
+        await _backfill_kalshi_trades(
+            None, ["A"], run_id="r", start_ts=1, end_ts=2,
+            max_pages=max_pages, limit=limit,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_page", [False, True])
+@pytest.mark.parametrize("malformed", [
+    {}, {"trades": None}, {"trades": "bad"}, {"trades": [None]},
+    {"trades": {"error": "bad"}},
+    {"trades": [{"trade_id": "partial", "yes_price": 42, "count": 1}, None]},
+    {"trades": [{}]},
+    {"trades": [{"trade_id": "partial", "yes_price": 42, "count": 1}, {}]},
+])
+async def test_malformed_trade_page_stays_incomplete_and_retains_prior_rows(
+    tmp_path, malformed, prior_page
+):
+    import json
+
+    trade = {"trade_id": "kept", "yes_price": 42, "count_fp": "1.75", "created_ts": 1}
+
+    class FakeKalshi:
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, **params):
+            if prior_page and params["cursor"] is None:
+                return {"trades": [trade], "cursor": "next"}
+            return malformed
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=1, end_ts=2, use_historical=True,
+        kalshi_client=FakeKalshi(), max_trade_pages=3,
+    )
+    partition = result.summary["trade_partitions"][0]
+    assert partition["complete"] is False
+    assert partition["stop_reason"] == "fetch_error"
+    assert partition["page_count"] == int(prior_page)
+    assert partition["row_count"] == int(prior_page)
+    assert partition["continuation_cursor"] == ("next" if prior_page else None)
+    paths = write_historical_backfill_result(result, tmp_path)
+    assert json.loads(paths["summary"].read_text())["trade_partitions"] == [partition]
+    gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = gaps[gaps["capability"] == "historical_trades"]
+    assert len(trade_gaps) == 1
+    assert trade_gaps.iloc[0]["status"] == "fetch_error"
+    assert json.loads(trade_gaps.iloc[0]["raw_json"])["complete"] is False
+    trades = pd.read_parquet(paths["trades"])
+    assert len(trades) == int(prior_page)
+    if prior_page:
+        assert json.loads(trades.iloc[0]["raw_json"]) == trade
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pages,kept_ids,stop_reason", [
+    ([(["one", "one"], None)], [], "fetch_error"),
+    ([(["one"], "a"), (["one"], "a")], ["one"], "fetch_error"),
+    ([(["one"], "a"), (["two", "one"], "b")], ["one"], "fetch_error"),
+    ([(["one"], "a"), (["two"], "a")], ["one", "two"], "repeated_cursor"),
+    ([([], None)], [], "cursor_exhausted"),
+    ([(["one"], "a"), ([], None)], ["one"], "cursor_exhausted"),
+])
+async def test_historical_trade_page_acceptance_preserves_publishable_prefix(
+    tmp_path, pages, kept_ids, stop_reason
+):
+    import json
+
+    def trade(trade_id):
+        return {"trade_id": trade_id, "yes_price": 42, "count": 2,
+                "count_fp": "1.75", "created_ts": 11}
+
+    class FakeKalshi:
+        calls = 0
+
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, **params):
+            assert params["min_ts"] == 10 and params["max_ts"] == 20
+            assert params["cursor"] == (None if self.calls == 0 else "a")
+            ids, cursor = pages[self.calls]
+            self.calls += 1
+            return {"trades": [trade(trade_id) for trade_id in ids], "cursor": cursor}
+
+    fake = FakeKalshi()
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=10, end_ts=20, use_historical=True,
+        kalshi_client=fake, max_trade_pages=5,
+    )
+    partition = result.summary["trade_partitions"][0]
+    assert fake.calls == len(pages)
+    assert partition["stop_reason"] == stop_reason
+    assert partition["complete"] == (stop_reason == "cursor_exhausted")
+    assert partition["row_count"] == len(kept_ids)
+    assert partition["page_count"] == len(pages) - (stop_reason == "fetch_error")
+    expected_cursor = ("a" if len(pages) > 1 else None)
+    if stop_reason != "fetch_error":
+        expected_cursor = pages[-1][1]
+    assert partition["continuation_cursor"] == expected_cursor
+
+    paths = write_historical_backfill_result(result, tmp_path)
+    assert len(paths) == 5 and all(path.is_file() for path in paths.values())
+    assert json.loads(paths["summary"].read_text())["trade_partitions"] == [partition]
+    trades = pd.read_parquet(paths["trades"])
+    assert trades["venue_trade_id"].tolist() == kept_ids
+    assert not trades.duplicated(["venue", "venue_trade_id"]).any()
+    for row in trades.to_dict("records"):
+        assert json.loads(row["raw_json"]) == trade(row["venue_trade_id"])
+        assert row["price_dollars"] == pytest.approx(0.42)
+        assert row["size_contracts"] == pytest.approx(1.75)
+        assert row["notional_dollars"] == pytest.approx(0.735)
+    gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = gaps[gaps["capability"] == "historical_trades"]
+    if stop_reason == "cursor_exhausted":
+        assert trade_gaps.empty
+    else:
+        gap = trade_gaps.iloc[0]
+        assert len(trade_gaps) == 1
+        assert gap["status"] == ("fetch_error" if stop_reason == "fetch_error" else "truncated")
+        assert json.loads(gap["raw_json"]) == partition
+        assert pd.Timestamp(gap["start_ts_utc"]).timestamp() == 10
+        assert pd.Timestamp(gap["end_ts_utc"]).timestamp() == 20
+        if stop_reason == "fetch_error":
+            assert "duplicate" in gap["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate", [False, True])
+async def test_historical_trade_keys_are_unique_across_ticker_partitions(tmp_path, duplicate):
+    class FakeKalshi:
+        async def historical_market_candlesticks(self, ticker, **params):
+            return {"candlesticks": []}
+
+        async def historical_trades(self, ticker, **params):
+            return {"trades": [{"trade_id": "A" if duplicate else ticker,
+                                "ticker": ticker, "yes_price": 42, "count": 1}]}
+
+    result = await backfill_venue_history(
+        "kalshi", ["A", "B"], start_ts=10, end_ts=20,
+        use_historical=True, kalshi_client=FakeKalshi(),
+    )
+    a, b = result.summary["trade_partitions"]
+    assert a["complete"] is True
+    assert b["complete"] is (not duplicate)
+    assert b["stop_reason"] == ("fetch_error" if duplicate else "cursor_exhausted")
+    assert b["page_count"] == b["row_count"] == (0 if duplicate else 1)
+    paths = write_historical_backfill_result(result, tmp_path)
+    trades = pd.read_parquet(paths["trades"])
+    assert trades["venue_trade_id"].tolist() == (["A"] if duplicate else ["A", "B"])

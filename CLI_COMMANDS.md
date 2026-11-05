@@ -61,7 +61,16 @@ installed version.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
-- `backfill-venue-history`: fetch public venue history.
+- `backfill-venue-history`: fetch public venue history. Kalshi trade backfills
+  require positive `--max-trade-pages` and `--trade-limit`. The persisted summary's
+  `trade_partitions` reports completeness, stop reason, pages, rows and continuation
+  cursor per instrument. Page caps, repeated/cyclic cursors, and fetch/parse
+  failures leave the requested interval incomplete and emit a trade gap with
+  details in `raw_json`; returned trade timestamps do not prove interval coverage.
+  Malformed entries (including empty objects) and duplicate trade keys reject the
+  whole page while retaining accepted earlier pages. Duplicate keys are checked
+  across all requested tickers; valid empty lists still indicate exhaustion when
+  there is no continuation cursor.
 
 ## Capture and reconstruction commands
 
