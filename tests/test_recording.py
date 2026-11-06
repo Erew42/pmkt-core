@@ -9,7 +9,7 @@ import pyarrow.parquet as pq
 import pytest
 
 from pmkt.streaming.recording import BookRecorder, BookView, RecordingOptions
-from pmkt.streaming.recording_feed import RecordingError, record_feed
+from pmkt.streaming.recording_feed import RecordingError, VenueBooks, record_feed
 from pmkt.streaming.recording_store import export_recording
 
 
@@ -280,6 +280,155 @@ async def test_recording_keeps_heartbeat_and_unknown_message_handling(tmp_path):
     assert report["status"] == "complete"
 
 
+@pytest.mark.parametrize("reset", [False, True])
+@pytest.mark.parametrize("kind", ["book", "price_change", "tick_size_change"])
+def test_recorder_identity_conflict_requires_established_market_snapshot(reset, kind):
+    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    if reset:
+        books.reset()
+    wrong = {**poly_book(), "market": "other", "event_type": kind,
+             "tick_size": "0.01", "price_changes": [
+                 {"asset_id": "a", "side": "BUY", "price": "0.5", "size": "10"}]}
+    invalid = books.apply(wrong, 2)[0]
+    assert invalid.venue_market_id == "m"
+    assert not invalid.integrity_valid and not invalid.quote_valid
+    assert "market_identity_changed" in invalid.quality_flags
+    assert invalid.bids == {} and invalid.asks == {}
+    later = {**wrong, "market": "m", "event_type": "price_change"}
+    assert not books.apply(later, 3)[0].integrity_valid
+    recovered = books.apply(poly_book(), 4)[0]
+    assert recovered.integrity_valid and recovered.quote_valid
+    assert recovered.venue_market_id == "m"
+    assert 0.5 not in recovered.bids
+
+
+@pytest.mark.parametrize("routing", ["market", "asset_id", "assets_ids", "asset_ids"])
+def test_recorder_resolution_survives_snapshots_and_reset(routing):
+    books = VenueBooks("polymarket", ["a", "b"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book("b"), "market": "other"}, 2)
+    books.reset()
+    value = "m" if routing == "market" else "a" if routing == "asset_id" else ["a"]
+    resolved = books.apply({"event_type": "market_resolved", routing: value}, 3)
+    assert [v.instrument_id for v in resolved] == ["a"]
+    for count in (4, 5):
+        v = books.apply(poly_book(), count)[0]
+        assert v.integrity_valid and not v.quote_valid
+        assert "market_resolved" in v.quality_flags
+        books.reset()
+    assert books.apply({**poly_book("b"), "market": "other"}, 6)[0].quote_valid
+
+
+@pytest.mark.parametrize("routing", ["market", "asset_id"])
+def test_unenforced_books_leave_terminal_resolution_to_their_owner(routing):
+    # ManagedBookFeed keeps its own identity and resolution state; an inner
+    # foreign-market resolution must not outlive a later original snapshot.
+    books = VenueBooks("polymarket", ["a"])
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book(), "market": "foreign"}, 2)
+    value = "foreign" if routing == "market" else "a"
+    books.apply({"event_type": "market_resolved", routing: value, "market": "foreign"}, 3)
+    books.reset()
+    repaired = books.apply(poly_book(), 4)[0]
+    assert repaired.integrity_valid and repaired.quote_valid
+    assert "market_resolved" not in repaired.quality_flags
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_recorder_conflict_rejects_anonymous_and_malformed_recovery(reset):
+    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books.apply(poly_book(), 1)
+    books.apply({**poly_book(), "market": "other"}, 2)
+    if reset:
+        books.reset()
+    anonymous = {key: value for key, value in poly_book().items() if key != "market"}
+    for count, message in enumerate([
+        anonymous, {**poly_book(), "bids": [{"price": "bad", "size": "1"}]}, anonymous,
+    ], 3):
+        invalid = books.apply(message, count)[0]
+        assert invalid.venue_market_id == "m"
+        assert not invalid.integrity_valid and not invalid.quote_valid
+        assert "market_identity_changed" in invalid.quality_flags
+    recovered = books.apply(poly_book(), 6)[0]
+    assert recovered.integrity_valid and recovered.quote_valid
+    assert "market_identity_changed" not in recovered.quality_flags
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recover", [False, True])
+async def test_record_feed_anonymous_snapshot_cannot_recover_conflict(tmp_path, recover):
+    anonymous = {key: value for key, value in poly_book().items() if key != "market"}
+    sockets = iter([
+        Socket([poly_book(), {**poly_book(), "market": "other"}]),
+        Socket([anonymous]), Socket([poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4 if recover else 3,
+        heartbeat_interval=None, connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    assert report["status"] == ("complete" if recover else "partial")
+    assert report["reconnect_count"] >= 1
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert all(row["venue_market_id"] in (None, "m") for row in top)
+    assert all(not row["quote_valid"] for row in top[1:-1])
+    assert top[-1]["quote_valid"] is recover
+    if not recover:
+        assert "market_identity_changed" in top[-1]["quality_flags_json"]
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert [row["source_sequence"] for row in snapshots] == ([1, 4] if recover else [1])
+
+
+@pytest.mark.asyncio
+async def test_record_feed_identity_conflict_persists_and_recovers_only_known_market(tmp_path):
+    wrong_delta = {"event_type": "price_change", "market": "other", "price_changes": [
+        {"asset_id": "a", "side": "BUY", "price": "0.5", "size": "10"}]}
+    sockets = iter([
+        Socket([poly_book(), wrong_delta]),
+        Socket([{**poly_book(), "market": "other"}]),
+        Socket([poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    events = pq.read_table(root / "events.parquet").to_pylist()
+    assert report["status"] == "complete"
+    conflicts = [r for r in top if "market_identity_changed" in r["quality_flags_json"]]
+    assert len(conflicts) == 2
+    assert all(not r["integrity_valid"] and not r["quote_valid"] for r in conflicts)
+    assert all(r["venue_market_id"] in (None, "m") for r in top)
+    assert top[-1]["integrity_valid"] and top[-1]["bid_price"] == 0.4
+    assert any(e["kind"] == "book_recovered" for e in events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routing", ["market", "asset_id", "assets_ids", "asset_ids"])
+async def test_record_feed_resolution_stays_terminal_after_reconnect(tmp_path, routing):
+    value = "m" if routing == "market" else "a" if routing == "asset_id" else ["a"]
+    sockets = iter([Socket([
+        poly_book(), {"event_type": "market_resolved", routing: value},
+        poly_book(), OSError("lost"),
+    ]), Socket([poly_book()])])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert report["status"] == "complete"
+    assert all(not r["quote_valid"] for r in top[1:])
+    assert all("market_resolved" in r["quality_flags_json"] for r in top[1:])
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert all(not r["quote_valid"] for r in snapshots[1:])
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("raw", [False, True])
 async def test_strict_recording_persists_native_json_numbers(tmp_path, raw):
@@ -305,6 +454,35 @@ async def test_strict_recording_persists_native_json_numbers(tmp_path, raw):
         assert messages == [book, tick, resolved]
     else:
         assert not (root / "raw_messages.jsonl").exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("routing", ["asset_id", "assets_ids", "asset_ids"])
+async def test_lifecycle_identity_before_first_book_remains_terminal(tmp_path, routing):
+    value = "a" if routing == "asset_id" else ["a"]
+    sockets = iter([
+        Socket([
+            {"event_type": "new_market", "market": "m", routing: value},
+            {"event_type": "new_market", "market": "other", routing: value},
+            OSError("lost"),
+        ]),
+        Socket([{"event_type": "market_resolved", "market": "m"}, poly_book()]),
+    ])
+    report = await asyncio.wait_for(record_feed(
+        ["a"], venue="polymarket", output_root=tmp_path,
+        options=RecordingOptions(), max_messages=4, heartbeat_interval=None,
+        connect_factory=lambda _: next(sockets),
+    ), 10)
+    root = Path(report["run_dir"])
+    top = pq.read_table(root / "topbook.parquet").to_pylist()
+    assert report["reconnect_count"] == 1
+    assert report["status"] == "complete"
+    assert top and all(row["venue_market_id"] == "m" for row in top)
+    assert top[-1]["integrity_valid"] and not top[-1]["quote_valid"]
+    assert "market_resolved" in top[-1]["quality_flags_json"]
+    snapshots = pq.read_table(root / "book_snapshots.parquet").to_pylist()
+    assert snapshots and all(not row["quote_valid"] for row in snapshots)
+    assert not (root / "raw_messages.jsonl").exists()
 
 
 @pytest.mark.asyncio
