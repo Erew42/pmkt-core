@@ -283,9 +283,15 @@ def test_history_cli_only_forwards_supplied_settings(monkeypatch, tmp_path, venu
     assert actual == expected
 
 
-def test_history_help_explains_sampling_and_candle_units():
+@pytest.mark.parametrize("force_color", [False, True])
+def test_history_help_explains_sampling_and_candle_units(monkeypatch, force_color):
+    if force_color:
+        monkeypatch.setenv("FORCE_COLOR", "1")
+    else:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
     result = CliRunner().invoke(app, ["backfill-venue-history", "--help"], color=False)
     assert result.exit_code == 0
-    output = " ".join(result.output.replace(chr(0x2502), " ").split())
+    plain_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    output = " ".join(plain_output.replace(chr(0x2502), " ").split())
     assert "sampling resolution in minutes" in output
     assert "candlestick period in minutes" in output
