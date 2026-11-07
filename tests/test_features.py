@@ -41,6 +41,8 @@ def test_default_feature_windows_keep_minute_grain_and_rolling_context() -> None
     default = compute_features(frame)
     assert default["n_obs"].tolist() == [2, 1, 1]
     assert default.iloc[1]["rv"] > 0
+    # The final 600 s window retains all three returns; a 60 s window has one.
+    assert default.iloc[-1]["rv"] == pytest.approx(0.5821755410922375)
     override = compute_features(frame, bar_seconds=120, window_seconds=30)
     assert override["n_obs"].tolist() == [3, 1]
     assert override.iloc[0]["rv"] == pytest.approx(0.0)
