@@ -56,6 +56,11 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
 
 ## Books and streams
 
+- **Raw capture.** `record-raw-ws` stores verbatim public messages and transport
+  controls as `<venue>.public_raw_frame.v1` envelopes with per-chunk JSON
+  manifests. It is separate from normalized `recording.v1`; collector receive
+  times are not network arrival times, and a local hash chain does not prove
+  network losslessness. See the [artifact contract](raw_capture_contract.md).
 - **Topbook, depth.** `topbook.v1`: best bid/ask per instrument. `depth.v1`: one
   row per level of a full-book snapshot (`is_delta` is always false).
   `recording.v1` equivalents: `recording_topbook.v1`, `recording_book_snapshots.v1`

@@ -6,6 +6,11 @@ belong to `pmkt-trading`. Retained trading-facing schema registrations describe
 physical interchange formats, not permission to trade or public execution APIs.
 See [schema ownership and lifecycle](schema_lifecycle.md).
 
+Verbatim WebSocket JSONL and chunk/session JSON artifacts have their own
+[raw capture contract](raw_capture_contract.md). They are not normalized table
+schemas and are not registered as columns in this dictionary or the lifecycle
+catalog.
+
 This document defines the first stable normalized schemas for prediction-market
 research in `pmkt`. The raw exchange clients may expose venue-specific payloads,
 but durable research datasets should move toward these canonical rows.

@@ -439,6 +439,7 @@
         "StreamSinkSet",
         "SubscriptionPlanValidation",
         "SubscriptionPlanValidator",
+        "capture_raw_ws",
         "default_cli_import_timing_specs",
         "export_recording",
         "measure_cli_import_timing",
@@ -449,7 +450,8 @@
       "tier_overrides": {
         "ManagedBookFeed": "supported",
         "PublicBook": "supported",
-        "PublicBookHealth": "supported"
+        "PublicBookHealth": "supported",
+        "capture_raw_ws": "supported"
       }
     },
     "pmkt.text": {

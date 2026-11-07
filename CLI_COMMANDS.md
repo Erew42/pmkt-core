@@ -90,6 +90,21 @@ installed version.
   private key.
 - `recover-stream-run`: validate and recover a durable capture run.
 - `reconstruct-book-tape`: reconstruct books from committed capture evidence.
+- `record-raw-ws`: capture verbatim public WebSocket frames for one connection
+  and its reconnects in rotating gzip JSONL chunks (POSIX). This uses the separate
+  [raw capture contract](docs/raw_capture_contract.md), not `recording.v1`.
+  Supply `--venue polymarket|kalshi`, `--markets LIST.json`, absolute
+  `--runs-root RUNS` and `--root RUNS/RUN/INSTANCE`, and `--end-utc` with an
+  explicit UTC ISO timestamp. Kalshi requires the same
+  `--header-provider MODULE:ATTRIBUTE` injection as `stream-kalshi-books`.
+  Optional overrides are `--chunk-seconds`, `--gzip-level`, `--lag-warn-ms`,
+  `--low-free` (warning only, in bytes), `--critical-free` (pause writing and
+  count dropped frames, in bytes), and `--gap-reconnect-min-interval` (seconds
+  between Kalshi gap reconnects). Omitted options use the recorder's named
+  library defaults. Events use standard logging at INFO on stderr; journal JSON
+  formatting belongs downstream. Install `pmkt[streaming,uvloop]` for optional uvloop;
+  otherwise it uses asyncio. Deadline completion exits zero; partial stops exit
+  nonzero. Deployment and upload tools are downstream responsibilities.
 
 ## Resolution commands
 
