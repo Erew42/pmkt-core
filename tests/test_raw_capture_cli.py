@@ -1,4 +1,5 @@
 import json
+import re
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,12 @@ from typer.testing import CliRunner
 
 from pmkt.cli.app import app
 from pmkt.streaming import raw_capture as rr
+
+_ANSI_ESCAPE_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
+
+
+def _normalized_cli_output(value: str) -> str:
+    return "".join(_ANSI_ESCAPE_RE.sub("", value).split())
 
 
 def arguments(tmp_path, venue="polymarket"):
@@ -86,7 +93,8 @@ def test_cli_reuses_injected_read_auth_loader(tmp_path, monkeypatch, factory):
 
 def test_cli_requires_kalshi_header_provider_before_creating_output(tmp_path):
     result = CliRunner().invoke(app, arguments(tmp_path, "kalshi"))
-    assert result.exit_code != 0 and "--header-provider" in result.output
+    assert result.exit_code != 0
+    assert "--header-provider" in _normalized_cli_output(result.output)
     assert not (tmp_path / "runs").exists()
 
 
