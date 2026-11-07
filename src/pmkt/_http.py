@@ -225,7 +225,7 @@ class HttpClient:
             return response
 
         async def acquire_and_send() -> httpx.Response:
-            if self.limiter:
+            if self.limiter is not None:
                 async with self.limiter:
                     return await send()
             return await send()

@@ -396,3 +396,53 @@ async def test_service_rate_presets_and_explicit_limiter(name):
     finally:
         await client.close()
         await explicit.close()
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+async def test_public_clients_acquire_falsey_limiter(name):
+    from aiolimiter import AsyncLimiter
+
+    acquisitions = []
+
+    class FalseyLimiter(AsyncLimiter):
+        def __bool__(self):
+            return False
+
+        async def __aenter__(self):
+            acquisitions.append(True)
+            return await super().__aenter__()
+
+    limiter = FalseyLimiter(1)
+    client = _default_test_client(
+        name, limiter=limiter,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+    )
+    http = client if isinstance(client, HttpClient) else client._http
+    try:
+        assert http.limiter is limiter
+        assert await http.request_json("GET", "/read") == {"ok": True}
+        assert acquisitions == [True]
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+async def test_public_clients_default_request_makes_three_attempts(monkeypatch, name):
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(http_module.asyncio, "sleep", no_sleep)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, json={"error": "offline"})
+
+    client = _default_test_client(name, transport=httpx.MockTransport(handler))
+    http = client if isinstance(client, HttpClient) else client._http
+    try:
+        response = await http.request_response("GET", "/read")
+        assert response.status_code == 503
+        assert len(requests) == 3
+    finally:
+        await client.close()
