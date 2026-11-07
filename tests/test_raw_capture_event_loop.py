@@ -3,6 +3,7 @@
 import asyncio
 import gzip
 import json
+import logging
 import os
 import runpy
 import signal
@@ -27,8 +28,9 @@ from raw_capture_helpers import validate_chunk
     [(signal.SIGTERM, 6, 5000), (signal.SIGINT, 9, 2500)],
 )
 def test_cli_tls_fsync_and_signal_seals_chunk(
-    tmp_path, monkeypatch, stop_signal, gzip_level, lag_warn_ms, use_uvloop
+    tmp_path, monkeypatch, caplog, stop_signal, gzip_level, lag_warn_ms, use_uvloop
 ):
+    caplog.set_level(logging.INFO, logger=rr.__name__)
     uvloop = pytest.importorskip("uvloop") if use_uvloop else None
     monkeypatch.setattr(rr, "uvloop", uvloop)
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "synthetic.pem"
@@ -155,13 +157,14 @@ def test_cli_tls_fsync_and_signal_seals_chunk(
     assert final["reason"] == "signal_or_control_storage_error" and final["partial"]
     assert final["closed_chunk_count"] == 1 and final["errors"] == 0
     assert not list(session.glob("*.part"))
-    events = [json.loads(line.split(">", 1)[1]) for line in result.stderr.splitlines()]
-    assert [e["implementation"] for e in events if e["event"] == "event_loop"] == [
+    events = [r for r in caplog.records if r.name == rr.__name__]
+    assert [r.implementation for r in events if r.getMessage() == "event_loop"] == [
         provenance["event_loop"]
     ]
 
 
-def test_run_falls_back_when_uvloop_cannot_be_imported(monkeypatch, capsys):
+def test_run_falls_back_when_uvloop_cannot_be_imported(monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger="<run_path>")
     monkeypatch.setitem(sys.modules, "uvloop", None)
     module = runpy.run_path(rr.__file__)
     assert module["uvloop"] is None
@@ -193,11 +196,8 @@ def test_run_falls_back_when_uvloop_cannot_be_imported(monkeypatch, capsys):
     assert asyncio.get_event_loop_policy() is policy
     assert len(loops) == 1 and loops[0].is_closed()
     assert cancelled == generators_closed == [True]
-    events = [
-        json.loads(line.split(">", 1)[1])
-        for line in capsys.readouterr().err.splitlines()
-    ]
-    assert [e["implementation"] for e in events if e["event"] == "event_loop"] == [
+    events = [r for r in caplog.records if r.name == "<run_path>"]
+    assert [r.implementation for r in events if r.getMessage() == "event_loop"] == [
         "asyncio"
     ]
 

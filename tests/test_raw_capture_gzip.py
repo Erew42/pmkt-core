@@ -62,5 +62,5 @@ def test_gzip_levels_reach_compressor_and_preserve_exact_envelopes(
         assert [e["payload_raw"] for e in envelopes] == payloads
         assert validate_chunk(chunk, str(chunk) + ".manifest.json")["ok"]
         decompressed.append(lines)
-    assert calls == [(6, 0), (1, 0), (6, 0), (9, 0)]
+    assert calls == [(rr.GZIP_LEVEL, 0), (1, 0), (6, 0), (9, 0)]
     assert all(lines == decompressed[0] for lines in decompressed)

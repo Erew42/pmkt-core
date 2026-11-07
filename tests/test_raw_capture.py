@@ -280,7 +280,6 @@ def test_market_list_validation(tmp_path):
         market_list(tmp_path, "polymarket", ["1", "2"]), "polymarket"
     )["instruments"] == ["1", "2"]
     bad = [
-        ("polymarket", [str(i) for i in range(381)]),
         ("polymarket", ["1", "1"]),
         ("polymarket", []),
         ("kalshi", ["X:YES"]),
@@ -295,6 +294,21 @@ def test_market_list_validation(tmp_path):
     path.write_text(path.read_text().replace(K_URL, "wss://example.com/ws"))
     with pytest.raises(ValueError):
         rr.load_markets(path, "kalshi")
+
+
+@pytest.mark.parametrize("venue,count", [("polymarket", 381), ("kalshi", 1001)])
+def test_market_lists_above_former_caps_are_preserved(tmp_path, venue, count):
+    ids = [str(i) for i in range(count)]
+    assert (
+        rr.load_markets(market_list(tmp_path, venue, ids), venue)["instruments"] == ids
+    )
+    for raw in rr.subscriptions(venue, ids):
+        payload = json.loads(raw)
+        assert (
+            payload["assets_ids"]
+            if venue == "polymarket"
+            else payload["params"]["market_tickers"]
+        ) == ids
 
 
 def test_roots_must_be_runs_run_instance(tmp_path):
@@ -575,10 +589,14 @@ async def test_kalshi_refuses_redirects_that_would_carry_signed_headers(tmp_path
             response.headers["Location"] = target_url
             return response
 
-        async with serve(lambda ws: None, "127.0.0.1", 0, process_request=redirect) as server:
+        async with serve(
+            lambda ws: None, "127.0.0.1", 0, process_request=redirect
+        ) as server:
             redirect_url = "ws://127.0.0.1:%d" % server.sockets[0].getsockname()[1]
             # Plain websockets follows the redirect and forwards the headers.
-            async with connect(redirect_url, additional_headers={"X-Synthetic-Signature": "probe"}):
+            async with connect(
+                redirect_url, additional_headers={"X-Synthetic-Signature": "probe"}
+            ):
                 pass
             assert reached == ["probe"]
             root = tmp_path / "runs" / "run1" / "kalshi_00"
@@ -587,19 +605,25 @@ async def test_kalshi_refuses_redirects_that_would_carry_signed_headers(tmp_path
                 end_in(0.6),
                 "kalshi",
                 market_list(tmp_path, "kalshi", ["K-A"]),
-                connector=lambda url, **kwargs: rr.NoRedirectConnect(redirect_url, **kwargs),
+                connector=lambda url, **kwargs: rr.NoRedirectConnect(
+                    redirect_url, **kwargs
+                ),
                 auth=FakeProvider(),
                 runs_root=tmp_path / "runs",
                 **FAST,
             )
     assert reason == "deadline" and reached == ["probe"]
     [session] = root.iterdir()
-    errors = [f["payload_raw"] for f in frames(session) if f["frame_type"] == "transport_error"]
+    errors = [
+        f["payload_raw"]
+        for f in frames(session)
+        if f["frame_type"] == "transport_error"
+    ]
     assert errors and all("302" in error for error in errors)
 
 
 @pytest.mark.asyncio
-async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, capsys):
+async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, caplog):
     def connector(url, **kwargs):
         raise OSError("echoed " + kwargs["additional_headers"]["X-Synthetic-Signature"])
 
@@ -616,9 +640,22 @@ async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, caps
     )
     assert reason == "deadline"
     [session] = root.iterdir()
-    errors = [f["payload_raw"] for f in frames(session) if f["frame_type"] == "transport_error"]
+    errors = [
+        f["payload_raw"]
+        for f in frames(session)
+        if f["frame_type"] == "transport_error"
+    ]
     assert errors and all(error == "OSError: echoed <redacted>" for error in errors)
-    recorded = "".join(p.read_text() for p in session.glob("*.json")) + capsys.readouterr().err
+    logs = [
+        r
+        for r in caplog.records
+        if r.name == rr.__name__ and r.getMessage() == "transport_error"
+    ]
+    assert logs and all(
+        r.levelno == logging.WARNING and r.error == errors[0] for r in logs
+    )
+    recorded = "".join(p.read_text() for p in session.glob("*.json")) + caplog.text
+    recorded += repr([r.__dict__ for r in logs])
     assert "<redacted>" in recorded and "sig-" not in recorded
 
 
@@ -685,8 +722,9 @@ async def test_offline_connector_retries_until_deadline(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_disk_critical_pauses_then_resumes_with_fresh_generation(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
+    caplog.set_level(logging.INFO, logger=rr.__name__)
     handlers = capture_signals(monkeypatch)
     readings = iter([10 * rr.GiB] * 3 + [100 * rr.MiB] * 4 + [rr.GiB] * 4)
     connections = []
@@ -728,6 +766,49 @@ async def test_disk_critical_pauses_then_resumes_with_fresh_generation(
     )
     final = json.loads((session / "FINAL.json").read_text())
     assert final["dropped_frames_total"] > 0 and final["disk"] == "ok"
+    disk_logs = [
+        r
+        for r in caplog.records
+        if r.name == rr.__name__ and r.getMessage() == "disk_state"
+    ]
+    assert {r.disk: r.levelno for r in disk_logs} == {
+        "critical": logging.ERROR,
+        "low": logging.WARNING,
+        "ok": logging.INFO,
+    }
+    assert all(
+        r.instance == "polymarket_00" and isinstance(r.free_bytes, int)
+        for r in disk_logs
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("free,disk,dropped", [(150, "low", 0), (50, "critical", 2)])
+async def test_custom_disk_thresholds_warn_or_pause_writes(
+    tmp_path, monkeypatch, free, disk, dropped
+):
+    handlers = capture_signals(monkeypatch)
+    feed = FakeFeed(
+        ['{"event_type":"book","asset_id":"1"}'],
+        on_exhausted=lambda: handlers[signal.SIGTERM](),
+    )
+    root = tmp_path / "runs/run1/polymarket_00"
+    await rr.capture_raw_ws(
+        root,
+        end_in(5),
+        "polymarket",
+        market_list(tmp_path, "polymarket", ["1"]),
+        runs_root=tmp_path / "runs",
+        connector=lambda url, **kwargs: feed,
+        free_bytes=lambda: free,
+        low_free=200,
+        critical_free=100,
+        **FAST,
+    )
+    [session] = root.iterdir()
+    final = json.loads((session / "FINAL.json").read_text())
+    assert final["disk"] == disk and final["dropped_frames_total"] == dropped
+    assert len(frames(session)) == 2 - dropped
 
 
 @pytest.mark.asyncio
@@ -1059,6 +1140,63 @@ async def test_buffered_kalshi_gap_reconnects_immediately_and_throttles_later_ga
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "interval,advance,reconnects", [(10, 9, 1), (10, 10, 2), (0, 0, 2)]
+)
+async def test_gap_reconnect_interval_controls_when_fresh_snapshots_are_requested(
+    tmp_path, monkeypatch, interval, advance, reconnects
+):
+    handlers = capture_signals(monkeypatch)
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+    snapshot = (
+        '{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"K"}}'
+    )
+    gap = '{"type":"orderbook_delta","sid":1,"seq":4,"msg":{"market_ticker":"K"}}'
+
+    class LaterGap(FakeFeed):
+        async def recv(self):
+            if self.received == 1:
+                clock.offset = advance
+            return await super().recv()
+
+    feeds = [
+        FakeFeed([snapshot, gap]),
+        LaterGap([snapshot, gap], on_exhausted=lambda: handlers[signal.SIGTERM]()),
+        FakeFeed([snapshot], on_exhausted=lambda: handlers[signal.SIGTERM]()),
+    ]
+    connections = []
+
+    def connector(url, **kwargs):
+        feed = feeds[len(connections)]
+        connections.append(feed)
+        return feed
+
+    root = tmp_path / "runs/run1/kalshi_00"
+    await asyncio.wait_for(
+        rr.capture_raw_ws(
+            root,
+            end_in(30),
+            "kalshi",
+            market_list(tmp_path, "kalshi", ["K"]),
+            runs_root=tmp_path / "runs",
+            auth=FakeProvider(),
+            connector=connector,
+            gap_reconnect_min_interval=interval,
+            **FAST,
+        ),
+        timeout=3,
+    )
+    [session] = root.iterdir()
+    final = json.loads((session / "FINAL.json").read_text())
+    assert final["seq_gaps"] == 2
+    assert final["gap_reconnects"] == final["reconnects"] == reconnects
+    assert len(connections) == reconnects + 1
+    assert sum(f["frame_type"] == "seq_gap" for f in frames(session)) == 2
+    assert all(feed.closed for feed in connections)
+
+
+@pytest.mark.asyncio
 async def test_disk_recovery_cancels_pending_receive_before_reconnecting(
     tmp_path, monkeypatch
 ):
@@ -1173,7 +1311,8 @@ async def test_signal_and_deadline_finish_promptly_and_seal_pending_or_busy_rece
 # ---------------------------------------------------------------- sampled lag supervision
 
 
-async def scripted_lag_capture(tmp_path, monkeypatch, steps, **options):
+async def scripted_lag_capture(tmp_path, monkeypatch, caplog, steps, **options):
+    caplog.set_level(logging.INFO, logger=rr.__name__)
     handlers = capture_signals(monkeypatch)
     clock = CaptureClock()
     clock.monotonic = lambda: 1000 + clock.offset
@@ -1182,13 +1321,14 @@ async def scripted_lag_capture(tmp_path, monkeypatch, steps, **options):
     monkeypatch.setattr(rr, "time", clock)
     inbox, delivered = asyncio.Queue(), asyncio.Event()
     logs = []
-    monkeypatch.setattr(
-        rr,
-        "log",
-        lambda event, **fields: logs.append(
-            dict(event=event, at=clock.offset, **fields)
-        ),
-    )
+
+    class CollectLogs(logging.Handler):
+        def emit(self, record):
+            logs.append(
+                dict(record.__dict__, event=record.getMessage(), at=clock.offset)
+            )
+
+    monkeypatch.setattr(rr.logger, "handlers", [CollectLogs()])
 
     class ScriptedFeed(FakeFeed):
         async def recv(self):
@@ -1248,15 +1388,15 @@ def lag_payload(lag_ms):
 
 @pytest.mark.asyncio
 async def test_lag_warnings_need_ten_samples_rate_limit_and_recover_once(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     steps = [(1, [lag_payload(8000)]) for _ in range(75)]
     steps += [(1, [lag_payload(100)]) for _ in range(40)]
-    session, logs = await scripted_lag_capture(tmp_path, monkeypatch, steps)
+    session, logs = await scripted_lag_capture(tmp_path, monkeypatch, caplog, steps)
     warnings = [entry for entry in logs if entry["event"] == "lag_warning"]
     assert [entry["at"] for entry in warnings] == [10, 70]
     assert all(
-        entry["level"] == 4 and entry["exchange_lag_ms_p50_60s"] == 8000
+        entry["levelno"] == logging.WARNING and entry["exchange_lag_ms_p50_60s"] == 8000
         for entry in warnings
     )
     assert [entry["lag_samples_60s"] for entry in warnings] == [10, 60]
@@ -1276,13 +1416,13 @@ async def test_lag_warnings_need_ten_samples_rate_limit_and_recover_once(
 
 @pytest.mark.asyncio
 async def test_lag_threshold_is_strict_and_silence_is_not_recovery(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, caplog
 ):
     steps = [(1, [lag_payload(100)]) for _ in range(10)]
     steps += [(1, [lag_payload(101)]) for _ in range(10)]
     steps += [(61, []), (1, []), (1, [lag_payload(-25)]), (1, [])]
     session, logs = await scripted_lag_capture(
-        tmp_path, monkeypatch, steps, lag_warn_ms=100
+        tmp_path, monkeypatch, caplog, steps, lag_warn_ms=100
     )
     warnings = [entry for entry in logs if entry["event"] == "lag_warning"]
     assert len(warnings) == 1 and warnings[0]["at"] == 20
@@ -1292,15 +1432,15 @@ async def test_lag_threshold_is_strict_and_silence_is_not_recovery(
 
 
 @pytest.mark.asyncio
-async def test_loop_stall_latest_frame_sampling_and_additive_state_contract(
-    tmp_path, monkeypatch
+async def test_loop_stall_latest_frame_sampling_and_provenance_only_disclaimers(
+    tmp_path, monkeypatch, caplog
 ):
     steps = [
         (1, [lag_payload(9999), lag_payload(-25), b"\x00\xff"]),
         (1.25, []),
         (1, []),
     ]
-    session, logs = await scripted_lag_capture(tmp_path, monkeypatch, steps)
+    session, logs = await scripted_lag_capture(tmp_path, monkeypatch, caplog, steps)
     live = json.loads((session / "live_state.json").read_text())
     final = json.loads((session / "FINAL.json").read_text())
     lag_values = dict(
@@ -1317,8 +1457,7 @@ async def test_loop_stall_latest_frame_sampling_and_additive_state_contract(
         "recording_id venue instance session updated_utc connected ready connection_generation "
         "book_count_current_generation expected_book_count subscribed_channels frame_count sealed_chunks "
         "disk free_bytes paused dropped_frames_total last_error errors reconnects seq_gaps gap_reconnects "
-        "ready_generations raw_only recording_v1 reconstruction_pending network_losslessness_proven "
-        "timestamp_semantics".split()
+        "ready_generations".split()
     )
     assert set(live) == original_keys | lag_values.keys()
     final_keys = set(
@@ -1353,13 +1492,21 @@ async def test_loop_stall_latest_frame_sampling_and_additive_state_contract(
         )
     )
     assert live["subscribed_channels"] == []
-    assert json.loads((session / "PROVENANCE.json").read_text())["lag_warn_ms"] == 5000
+    provenance = json.loads((session / "PROVENANCE.json").read_text())
+    assert provenance["lag_warn_ms"] == rr.LAG_WARN_MS
+    assert provenance["gzip_level"] == rr.GZIP_LEVEL
+    assert {key: provenance[key] for key in rr.DISCLAIMER} == rr.DISCLAIMER
+    for path in session.glob("*.json"):
+        if path.name != "PROVENANCE.json":
+            assert rr.DISCLAIMER.keys().isdisjoint(json.loads(path.read_text()))
     assert not any(entry["event"] == "lag_warning" for entry in logs)
 
 
 @pytest.mark.asyncio
-async def test_loop_lag_detects_stall_without_any_frames(tmp_path, monkeypatch):
-    session, _ = await scripted_lag_capture(tmp_path, monkeypatch, [(1.5, []), (1, [])])
+async def test_loop_lag_detects_stall_without_any_frames(tmp_path, monkeypatch, caplog):
+    session, _ = await scripted_lag_capture(
+        tmp_path, monkeypatch, caplog, [(1.5, []), (1, [])]
+    )
     final = json.loads((session / "FINAL.json").read_text())
     assert final["loop_lag_ms_max_60s"] == 500 and final["lag_samples_60s"] == 0
     assert all(
@@ -1374,7 +1521,7 @@ async def test_loop_lag_detects_stall_without_any_frames(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_read_auth_failures_do_not_persist_provider_exception_text(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, caplog
 ):
     clock = CaptureClock()
     monkeypatch.setattr(rr, "time", clock)
@@ -1413,7 +1560,10 @@ async def test_read_auth_failures_do_not_persist_provider_exception_text(
     assert "synthetic-sensitive-header" not in "".join(
         path.read_text() for path in session.glob("*.json")
     )
-    assert "synthetic-sensitive-header" not in capsys.readouterr().err
+    assert "synthetic-sensitive-header" not in caplog.text
+    assert "synthetic-sensitive-header" not in repr(
+        [r.__dict__ for r in caplog.records]
+    )
 
 
 @pytest.mark.asyncio

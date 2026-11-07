@@ -57,14 +57,71 @@ WS_URLS = {
         "wss://api.elections.kalshi.com/trade-api/ws/v2",
     },
 }
-MAX_INSTRUMENTS = {"polymarket": 380, "kalshi": 1000}
 KALSHI_CHANNELS = ("orderbook_delta", "trade", "market_lifecycle_v2")
 GiB, MiB = 1024**3, 1024**2
-LOW_FREE, CRITICAL_FREE = 2 * GiB, 512 * MiB
+# Warn below 2 GiB free; warning only, leaving room to archive while recording continues.
+LOW_FREE = 2 * GiB
+# Below 512 MiB free, pause writing and count dropped frames to preserve disk headroom.
+CRITICAL_FREE = 512 * MiB
+# Rotate once per minute to bound the active, unsealed portion of a recording.
 CHUNK_SECONDS = 60
+# Refresh replaceable state every five seconds without frequent heartbeat fsyncs.
 STATE_SECONDS = 5
+# Start retries at one second for prompt recovery from brief disconnects.
+BACKOFF_START = 1
+# Cap retry delays at half a minute so outages are retried without a tight loop.
 BACKOFF_MAX = 30
+# Reset retry delays after a stable minute, even if readiness is incomplete.
+BACKOFF_RESET_SECONDS = 60
+# Double retry delays to back off exponentially during sustained outages.
+BACKOFF_MULTIPLIER = 2
+# Add +/-20% jitter to spread simultaneous reconnects across collectors.
+BACKOFF_JITTER = (0.8, 1.2)
+# Flush/check disk once per second to limit buffered data and react to disk pressure.
+TICK_SECONDS = 1
+# Supervise once per second for liveness and lag without per-frame timer work.
+SUPERVISE_SECONDS = 1.0
+# Tolerate brief heartbeat stalls (25 s Polymarket, 60 s Kalshi) before reconnecting.
+RECEIVE_TIMEOUTS = {"polymarket": 25, "kalshi": 60}
+# After a Kalshi sequence gap, reconnect for fresh snapshots at most once per
+# interval; intervening gaps are recorded and logged only, avoiding reconnect churn.
 GAP_RECONNECT_MIN_INTERVAL = 300
+# Level 6 roughly halves CPU (owner laptop, Polymarket/Kalshi: 13/6 vs 29/14 us
+# per frame at level 9). Recompressing tests/fixtures/raw_capture/{venue}_00.jsonl.gz
+# (all JSONL bytes, gzip.GzipFile/BytesIO, mtime=0, zlib 1.3.1) on 2026-11-07:
+# Polymarket 37,610 vs 36,551 B (level 9 saves 1,059 B, 2.82%); Kalshi 14,067 vs
+# 13,261 B (806 B, 5.73%). The modest size savings favor the cheaper default.
+GZIP_LEVEL = 6
+# Warn above a five-second sampled exchange-lag median to flag sustained delays.
+LAG_WARN_MS = 5000
+# Keep a minute of lag samples to smooth short bursts while exposing recent stalls.
+LAG_WINDOW_SECONDS = 60
+# Require ten samples before warning so isolated delayed frames do not trigger it.
+LAG_MIN_SAMPLES = 10
+# Repeat persistent lag warnings once per minute to limit log volume.
+LAG_WARN_SECONDS = 60
+# Repeat persistent disk warnings once per minute to limit log volume.
+DISK_LOG_SECONDS = 60
+# Summarize once per minute for a compact operational history.
+SUMMARY_SECONDS = 60
+# Offload fsync every ten seconds to balance durability and event-loop stalls.
+SYNC_SECONDS = 10
+# Allow 15 seconds for a handshake, tolerating brief connection stalls.
+OPEN_TIMEOUT = 15
+# Bound closing to two seconds so an unresponsive peer cannot stall recovery.
+CLOSE_TIMEOUT = 2
+# Accept snapshots up to 16 MiB to accommodate large public order books.
+MAX_SIZE = 16 * MiB
+# Buffer at most 128 frames to absorb short bursts with bounded queue growth.
+MAX_QUEUE = 128
+# Ping Kalshi every 20 seconds to keep otherwise quiet connections alive.
+KALSHI_PING_INTERVAL = 20
+# Allow 20 seconds for the pong to tolerate brief transport stalls.
+KALSHI_PING_TIMEOUT = 20
+# Polymarket expects an application heartbeat every ten seconds.
+POLYMARKET_PING_SECONDS = 10
+# Yield during buffered bursts so timers and shutdown signals can run promptly.
+RECEIVE_YIELD_FRAMES = 128
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}")
 KALSHI_DELTA = re.compile(
     r'\{"type":"orderbook_delta","sid":(-?(?:0|[1-9][0-9]{0,18})),'
@@ -77,6 +134,7 @@ EXCHANGE_TIMESTAMP = {
     "kalshi": re.compile(r'"sending_ts_ms"\s*:\s*(0|[1-9][0-9]{0,18})(?=\s*[,}])'),
     "polymarket": re.compile(r'"timestamp"\s*:\s*"([0-9]{1,19})"'),
 }
+logger = logging.getLogger(__name__)
 # The websockets client logs handshake request headers, including Kalshi signatures, at DEBUG.
 WS_LOGGER = logging.getLogger(__name__ + ".websockets")
 WS_LOGGER.setLevel(logging.INFO)
@@ -102,16 +160,6 @@ def utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def log(event, **fields):
-    """One JSON line per event on stderr (journal). Never pass credentials here."""
-    level = fields.pop("level", 6)
-    print(
-        f"<{level}>" + json.dumps(dict(event=event, utc=utc(), **fields), default=str),
-        file=sys.stderr,
-        flush=True,
-    )
-
-
 def event_loop_name(loop: asyncio.AbstractEventLoop) -> str:
     return (
         f"uvloop {uvloop.__version__}"
@@ -129,12 +177,15 @@ def run(coro: Coroutine[Any, Any, _Result]) -> _Result:
         with asyncio.Runner(
             loop_factory=uvloop.new_event_loop if uvloop is not None else None
         ) as runner:
-            log("event_loop", implementation=event_loop_name(runner.get_loop()))
+            logger.info(
+                "event_loop",
+                extra=dict(implementation=event_loop_name(runner.get_loop())),
+            )
             return runner.run(coro)
     loop = uvloop.new_event_loop() if uvloop is not None else asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        log("event_loop", implementation=event_loop_name(loop))
+        logger.info("event_loop", extra=dict(implementation=event_loop_name(loop)))
         return loop.run_until_complete(coro)
     finally:
         # Match asyncio.run's cleanup without changing the process-wide loop policy.
@@ -216,12 +267,11 @@ def load_markets(path: Path, venue: str) -> dict[str, Any]:
     if (
         not isinstance(ids, list)
         or not ids
-        or len(ids) > MAX_INSTRUMENTS[venue]
         or any(not isinstance(x, str) or not x or x.strip() != x for x in ids)
         or len(set(ids)) != len(ids)
     ):
         raise ValueError(
-            f"instruments must be 1..{MAX_INSTRUMENTS[venue]} unique nonempty strings"
+            "instruments must be a nonempty list of unique nonempty strings"
         )
     if venue == "kalshi" and any(x.endswith(":YES") for x in ids):
         raise ValueError("Kalshi lists use native tickers without :YES")
@@ -320,7 +370,7 @@ class ChunkWriter:
         venue: str,
         instance: str,
         *,
-        gzip_level: int = 6,
+        gzip_level: int = GZIP_LEVEL,
     ) -> None:
         self.root, self.recording_id, self.venue, self.instance = (
             root,
@@ -434,7 +484,6 @@ class ChunkWriter:
             continuity="local_sequence_only; reconnects_and_network_gaps_possible",
             dependencies="prior_chunk_chain_contains_earlier_generation_baselines",
             seal_reason=reason,
-            **DISCLAIMER,
         )
         atomic(self.root / (dest.name + ".manifest.json"), manifest)
         # Chain state lives in memory only, so uploaded-and-deleted predecessors are never re-read.
@@ -465,7 +514,7 @@ class LagMonitor:
 
     def stats(self, now):
         for samples in (self.exchange, self.loop):
-            while samples and samples[0][0] <= now - 60:
+            while samples and samples[0][0] <= now - LAG_WINDOW_SECONDS:
                 samples.popleft()
         exchange = [value for _, value in self.exchange]
         return dict(
@@ -495,12 +544,13 @@ async def capture_raw_ws(
     low_free: int = LOW_FREE,
     critical_free: int = CRITICAL_FREE,
     receive_timeout: float | None = None,
-    backoff_start: float = 1,
+    backoff_start: float = BACKOFF_START,
     backoff_max: float = BACKOFF_MAX,
-    tick_seconds: float = 1,
-    supervise_seconds: float = 1.0,
-    gzip_level: int = 6,
-    lag_warn_ms: float = 5000,
+    tick_seconds: float = TICK_SECONDS,
+    supervise_seconds: float = SUPERVISE_SECONDS,
+    gzip_level: int = GZIP_LEVEL,
+    lag_warn_ms: float = LAG_WARN_MS,
+    gap_reconnect_min_interval: float = GAP_RECONNECT_MIN_INTERVAL,
 ) -> str:
     """Record until explicit UTC ``end`` or SIGTERM/SIGINT; return the FINAL reason.
 
@@ -521,14 +571,20 @@ async def capture_raw_ws(
         raise ValueError("chunk-seconds must be finite and positive")
     if not math.isfinite(lag_warn_ms) or lag_warn_ms < 0:
         raise ValueError("lag-warn-ms must be finite and nonnegative")
+    if not math.isfinite(gap_reconnect_min_interval) or gap_reconnect_min_interval < 0:
+        raise ValueError("gap-reconnect-min-interval must be finite and nonnegative")
+    if not 0 <= critical_free <= low_free:
+        raise ValueError("disk thresholds must satisfy 0 <= critical-free <= low-free")
     root = validate_root(root, runs_root)
     end = parse_end(end.isoformat())
     spec = load_markets(markets_path, venue)
     instruments, url, instance = spec["instruments"], spec["ws_url"], root.name
     free_bytes = free_bytes or (lambda: shutil.disk_usage(root).free)
-    receive_timeout = receive_timeout or (25 if venue == "polymarket" else 60)
+    receive_timeout = receive_timeout or RECEIVE_TIMEOUTS[venue]
     if end <= datetime.now(timezone.utc):
-        log("end_already_passed", instance=instance, end_utc=end.isoformat())
+        logger.info(
+            "end_already_passed", extra=dict(instance=instance, end_utc=end.isoformat())
+        )
         return "end_already_passed"
     if venue == "kalshi" and auth is None:
         raise ReadAuthenticationRequiredError(
@@ -594,12 +650,14 @@ async def capture_raw_ws(
                 **DISCLAIMER,
             ),
         )
-        log(
+        logger.info(
             "session_start",
-            instance=instance,
-            venue=venue,
-            session=session.name,
-            instruments=len(instruments),
+            extra=dict(
+                instance=instance,
+                venue=venue,
+                session=session.name,
+                instruments=len(instruments),
+            ),
         )
 
         def state():
@@ -624,7 +682,6 @@ async def capture_raw_ws(
                 last_error=status["last_error"],
                 **counters,
                 **lag.stats(time.monotonic()),
-                **DISCLAIMER,
             )
             # Heartbeats skip fsync: they are rewritten every few seconds and only matter while running.
             atomic(session / "live_state.json", value, sync=False)
@@ -636,24 +693,21 @@ async def capture_raw_ws(
             lag.sample(now, intended_wake)
             values = lag.stats(now)
             p50 = values["exchange_lag_ms_p50_60s"]
-            if values["lag_samples_60s"] >= 10 and p50 > lag_warn_ms:
-                if not lag_warned or now - last_lag_warning >= 60:
+            if values["lag_samples_60s"] >= LAG_MIN_SAMPLES and p50 > lag_warn_ms:
+                if not lag_warned or now - last_lag_warning >= LAG_WARN_SECONDS:
                     counters["lag_warnings"] += 1
-                    log(
+                    logger.warning(
                         "lag_warning",
-                        level=4,
-                        instance=instance,
-                        lag_warn_ms=lag_warn_ms,
-                        **values,
+                        extra=dict(
+                            instance=instance, lag_warn_ms=lag_warn_ms, **values
+                        ),
                     )
                     last_lag_warning = now
                 lag_warned = True
             elif lag_warned and p50 is not None and p50 <= lag_warn_ms:
-                log(
+                logger.info(
                     "lag_recovered",
-                    instance=instance,
-                    lag_warn_ms=lag_warn_ms,
-                    **values,
+                    extra=dict(instance=instance, lag_warn_ms=lag_warn_ms, **values),
                 )
                 lag_warned = False
 
@@ -673,10 +727,9 @@ async def capture_raw_ws(
                             direction="received_control_base64",
                         )
                     except OSError as exc:
-                        log(
+                        logger.error(
                             "control_frame_write_failed",
-                            level=2,
-                            error=type(exc).__name__,
+                            extra=dict(error=type(exc).__name__),
                         )
                         stop.set()
                 super().process_event(event)
@@ -692,17 +745,24 @@ async def capture_raw_ws(
                 else "ok"
             )
             if level != status["disk"] or (
-                level != "ok" and time.monotonic() - status["disk_logged"] >= 60
+                level != "ok"
+                and time.monotonic() - status["disk_logged"] >= DISK_LOG_SECONDS
             ):
-                log(
-                    "disk_state",
-                    level=2 if level != "ok" else 5,
-                    instance=instance,
-                    disk=level,
-                    free_bytes=free,
-                    action="frames_dropped_until_space_returns"
+                logger.log(
+                    logging.ERROR
                     if level == "critical"
-                    else "recording",
+                    else logging.WARNING
+                    if level == "low"
+                    else logging.INFO,
+                    "disk_state",
+                    extra=dict(
+                        instance=instance,
+                        disk=level,
+                        free_bytes=free,
+                        action="frames_dropped_until_space_returns"
+                        if level == "critical"
+                        else "recording",
+                    ),
                 )
                 status["disk_logged"] = time.monotonic()
             status["disk"] = level
@@ -722,7 +782,7 @@ async def capture_raw_ws(
                 # Data reaches the page cache every tick (survives a process crash); fsync, which can stall
                 # for long on a busy SSD, runs off the event loop every 10 s and at every seal.
                 writer.flush(sync=False)
-                if writer.file and time.monotonic() - last_sync >= 10:
+                if writer.file and time.monotonic() - last_sync >= SYNC_SECONDS:
                     last_sync = time.monotonic()
                     with contextlib.suppress(OSError, ValueError):
                         await asyncio.to_thread(os.fsync, writer.file.fileno())
@@ -733,22 +793,24 @@ async def capture_raw_ws(
                 if now - last_state >= STATE_SECONDS:
                     state()
                     last_state = now
-                if now - last_summary >= 60:
+                if now - last_summary >= SUMMARY_SECONDS:
                     values = lag.stats(now)
-                    log(
+                    logger.info(
                         "summary",
-                        instance=instance,
-                        generation=tracker.generation,
-                        connected=status["connected"],
-                        books=len(tracker.books),
-                        expected=len(tracker.expected),
-                        frames=writer.seq,
-                        sealed=writer.sealed_count,
-                        disk=status["disk"],
-                        **counters,
-                        exchange_lag_ms_p50_60s=values["exchange_lag_ms_p50_60s"],
-                        exchange_lag_ms_max_60s=values["exchange_lag_ms_max_60s"],
-                        loop_lag_ms_max_60s=values["loop_lag_ms_max_60s"],
+                        extra=dict(
+                            instance=instance,
+                            generation=tracker.generation,
+                            connected=status["connected"],
+                            books=len(tracker.books),
+                            expected=len(tracker.expected),
+                            frames=writer.seq,
+                            sealed=writer.sealed_count,
+                            disk=status["disk"],
+                            **counters,
+                            exchange_lag_ms_p50_60s=values["exchange_lag_ms_p50_60s"],
+                            exchange_lag_ms_max_60s=values["exchange_lag_ms_max_60s"],
+                            loop_lag_ms_max_60s=values["loop_lag_ms_max_60s"],
+                        ),
                     )
                     last_summary = now
 
@@ -756,10 +818,10 @@ async def capture_raw_ws(
 
         def connect_kwargs():
             common = dict(
-                open_timeout=15,
-                close_timeout=2,
-                max_size=16 * MiB,
-                max_queue=128,
+                open_timeout=OPEN_TIMEOUT,
+                close_timeout=CLOSE_TIMEOUT,
+                max_size=MAX_SIZE,
+                max_queue=MAX_QUEUE,
                 proxy=None,
                 create_connection=ObservedConnection,
                 logger=WS_LOGGER,
@@ -779,7 +841,10 @@ async def capture_raw_ws(
                 ) from None
             sent_header_values[:] = [value for value in headers.values() if value]
             return dict(
-                common, additional_headers=headers, ping_interval=20, ping_timeout=20
+                common,
+                additional_headers=headers,
+                ping_interval=KALSHI_PING_INTERVAL,
+                ping_timeout=KALSHI_PING_TIMEOUT,
             )
 
         async def transport():
@@ -791,10 +856,11 @@ async def capture_raw_ws(
                 try:
                     async with connector(url, **connect_kwargs()) as ws:
                         status["connected"] = True
-                        log(
+                        logger.info(
                             "connected",
-                            instance=instance,
-                            generation=tracker.generation,
+                            extra=dict(
+                                instance=instance, generation=tracker.generation
+                            ),
                         )
                         for payload in subscriptions(venue, instruments):
                             await ws.send(payload)
@@ -803,7 +869,7 @@ async def capture_raw_ws(
                             )
                         state()
                         status["last_activity"] = time.monotonic()
-                        next_ping = status["last_activity"] + 10
+                        next_ping = status["last_activity"] + POLYMARKET_PING_SECONDS
 
                         async def receive():
                             nonlocal backoff, was_ready, last_gap_reconnect
@@ -839,11 +905,13 @@ async def capture_raw_ws(
                                     was_ready = True
                                     backoff = backoff_start
                                     counters["ready_generations"] += 1
-                                    log(
+                                    logger.info(
                                         "ready",
-                                        instance=instance,
-                                        generation=tracker.generation,
-                                        books=len(tracker.books),
+                                        extra=dict(
+                                            instance=instance,
+                                            generation=tracker.generation,
+                                            books=len(tracker.books),
+                                        ),
                                     )
                                 if tracker.gap is not None:
                                     counters["seq_gaps"] += 1
@@ -853,16 +921,14 @@ async def capture_raw_ws(
                                         tracker.generation,
                                         "local",
                                     )
-                                    log(
+                                    logger.warning(
                                         "seq_gap",
-                                        level=4,
-                                        instance=instance,
-                                        **tracker.gap,
+                                        extra=dict(instance=instance, **tracker.gap),
                                     )
                                     tracker.gap = None
                                     if (
                                         time.monotonic() - last_gap_reconnect
-                                        >= GAP_RECONNECT_MIN_INTERVAL
+                                        >= gap_reconnect_min_interval
                                     ):
                                         last_gap_reconnect = time.monotonic()
                                         counters["gap_reconnects"] += 1
@@ -871,7 +937,7 @@ async def capture_raw_ws(
                                         )
                                 # Buffered recv() calls may not suspend; let timers and signals run during bursts.
                                 received += 1
-                                if received == 128:
+                                if received == RECEIVE_YIELD_FRAMES:
                                     received = 0
                                     await asyncio.sleep(0)
 
@@ -889,7 +955,7 @@ async def capture_raw_ws(
                                 check_lag(time.monotonic(), intended_wake)
                                 if receiver in done:
                                     receiver.result()
-                                if time.monotonic() - opened >= 60:
+                                if time.monotonic() - opened >= BACKOFF_RESET_SECONDS:
                                     backoff = backoff_start
                                 if force.is_set():
                                     raise ForcedReconnect(
@@ -901,7 +967,7 @@ async def capture_raw_ws(
                                     writer.write(
                                         "app_ping", "PING", tracker.generation, "sent"
                                     )
-                                    next_ping = now + 10
+                                    next_ping = now + POLYMARKET_PING_SECONDS
                                 if now - status["last_activity"] >= receive_timeout:
                                     raise TimeoutError(
                                         f"{receive_timeout} second receive timeout"
@@ -924,13 +990,13 @@ async def capture_raw_ws(
                     counters["reconnects"] += 1
                     delay = min(
                         backoff, max(0, deadline - time.monotonic())
-                    ) * random.uniform(0.8, 1.2)
+                    ) * random.uniform(*BACKOFF_JITTER)
                     state()
                     try:
                         await asyncio.wait_for(stop.wait(), timeout=delay)
                     except asyncio.TimeoutError:
                         pass
-                    backoff = min(backoff_max, backoff * 2)
+                    backoff = min(backoff_max, backoff * BACKOFF_MULTIPLIER)
 
         def on_error(exc):
             counters["errors"] += 1
@@ -942,12 +1008,13 @@ async def capture_raw_ws(
             writer.write(
                 "transport_error", status["last_error"], tracker.generation, "local"
             )
-            log(
+            logger.warning(
                 "transport_error",
-                level=4,
-                instance=instance,
-                generation=tracker.generation,
-                error=status["last_error"],
+                extra=dict(
+                    instance=instance,
+                    generation=tracker.generation,
+                    error=status["last_error"],
+                ),
             )
 
         check_disk()
@@ -1004,12 +1071,14 @@ async def capture_raw_ws(
                         source_hashes=source_hashes,
                     ),
                 )
-                log(
+                logger.info(
                     "session_end",
-                    instance=instance,
-                    reason=reason,
-                    frames=writer.seq,
-                    sealed=writer.sealed_count,
-                    **counters,
+                    extra=dict(
+                        instance=instance,
+                        reason=reason,
+                        frames=writer.seq,
+                        sealed=writer.sealed_count,
+                        **counters,
+                    ),
                 )
         return reason

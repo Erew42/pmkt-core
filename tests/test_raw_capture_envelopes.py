@@ -1,6 +1,7 @@
 """Direct envelope formatting must produce the original json.dumps bytes."""
 
 import gzip
+import io
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -102,10 +103,21 @@ def test_every_recorded_envelope_has_identical_bytes(
             current["direction"],
         )
     manifest = writer.seal()
-    actual = gzip.decompress((tmp_path / manifest["filename"]).read_bytes()).splitlines(
-        keepends=True
-    )
+    compressed = (tmp_path / manifest["filename"]).read_bytes()
+    actual = gzip.decompress(compressed).splitlines(keepends=True)
     assert actual == expected
+    reference = io.BytesIO()
+    with gzip.GzipFile(
+        filename=manifest["filename"] + ".part",
+        fileobj=reference,
+        mode="wb",
+        compresslevel=rr.GZIP_LEVEL,
+        mtime=0,
+    ) as out:
+        for line in expected:
+            out.write(line)
+    assert compressed == reference.getvalue()
+    assert rr.DISCLAIMER.keys().isdisjoint(manifest)
     assert manifest["frame_count"] == count
     assert manifest["first_frame_seq"] == rows[0]["local_frame_seq"]
     assert manifest["last_frame_seq"] == rows[-1]["local_frame_seq"]

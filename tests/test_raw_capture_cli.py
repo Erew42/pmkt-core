@@ -1,5 +1,6 @@
 import json
 import re
+import subprocess
 import sys
 import types
 from datetime import datetime, timedelta, timezone
@@ -56,13 +57,93 @@ def test_cli_wires_capture_options_and_terminal_status(
     assert result.exit_code == exit_code, result.output
     assert reason in result.output
     assert calls[0][0][2] == "polymarket"
-    assert calls[0][1] == dict(
-        runs_root=tmp_path / "runs",
-        auth=None,
-        chunk_seconds=60,
-        gzip_level=6,
-        lag_warn_ms=5000,
+    assert calls[0][1] == dict(runs_root=tmp_path / "runs")
+
+
+@pytest.mark.parametrize(
+    "name,value",
+    [
+        ("chunk_seconds", 12.5),
+        ("gzip_level", 9),
+        ("lag_warn_ms", 0),
+        ("low_free", 4 * rr.GiB),
+        ("critical_free", 64 * rr.MiB),
+        ("gap_reconnect_min_interval", 12.5),
+        ("gap_reconnect_min_interval", 0),
+    ],
+)
+def test_cli_passes_only_supplied_tuning_options(tmp_path, monkeypatch, name, value):
+    calls = []
+
+    async def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return "deadline"
+
+    monkeypatch.setattr(rr, "capture_raw_ws", capture)
+    result = CliRunner().invoke(
+        app, arguments(tmp_path) + ["--" + name.replace("_", "-"), str(value)]
     )
+    assert result.exit_code == 0, result.output
+    assert calls == [dict(runs_root=tmp_path / "runs", **{name: value})]
+
+
+def test_cli_emits_info_events_on_stderr_with_standard_logging(tmp_path):
+    markets = tmp_path / "markets.json"
+    markets.write_text(
+        json.dumps(
+            dict(
+                venue="polymarket",
+                name="instance",
+                instruments=["1"],
+                ws_url="wss://ws-subscriptions-clob.polymarket.com/ws/market",
+            )
+        )
+    )
+    args = arguments(tmp_path)
+    args[-1] = "2000-01-01T00:00:00Z"
+    result = subprocess.run(
+        [sys.executable, "-c", "from pmkt.cli.entrypoint import main; main()", *args],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "INFO:pmkt.streaming.raw_capture:event_loop" in result.stderr
+    assert "INFO:pmkt.streaming.raw_capture:end_already_passed" in result.stderr
+    assert "Raw capture: end_already_passed" in result.stdout
+    assert not (tmp_path / "runs").exists()
+
+
+def test_cli_import_and_help_leave_streaming_extra_optional(tmp_path):
+    script = """
+import importlib.abc
+import sys
+
+class WithoutWebsockets(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] == 'websockets':
+            raise ModuleNotFoundError('synthetic missing websockets', name='websockets')
+
+sys.meta_path.insert(0, WithoutWebsockets())
+from typer.testing import CliRunner
+from pmkt.cli.app import app
+
+runner = CliRunner()
+help_result = runner.invoke(app, ['record-raw-ws', '--help'])
+assert help_result.exit_code == 0, help_result.output
+assert 'pmkt.streaming.raw_capture' not in sys.modules
+result = runner.invoke(app, sys.argv[1:])
+assert result.exit_code != 0
+assert 'install pmkt[streaming]' in result.output, result.output
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script, *arguments(tmp_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert not (tmp_path / "runs").exists()
 
 
 @pytest.mark.parametrize("factory", [False, True])
@@ -100,7 +181,8 @@ def test_cli_masks_read_auth_initializer_errors(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, module.__name__, module)
     result = CliRunner().invoke(
         app,
-        arguments(tmp_path, "kalshi") + ["--header-provider", module.__name__ + ":provider"],
+        arguments(tmp_path, "kalshi")
+        + ["--header-provider", module.__name__ + ":provider"],
     )
     assert result.exit_code != 0
     assert "RuntimeError" in _normalized_cli_output(result.output)
@@ -126,6 +208,12 @@ def test_cli_requires_kalshi_header_provider_before_creating_output(tmp_path):
         ("--chunk-seconds", "nan"),
         ("--lag-warn-ms", "-1"),
         ("--lag-warn-ms", "nan"),
+        ("--low-free", "-1"),
+        ("--critical-free", "-1"),
+        ("--low-free", "1"),
+        ("--gap-reconnect-min-interval", "-1"),
+        ("--gap-reconnect-min-interval", "nan"),
+        ("--gap-reconnect-min-interval", "inf"),
         ("--end-utc", "2026-11-06T12:00:00"),
     ],
 )
