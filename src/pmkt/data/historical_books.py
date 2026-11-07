@@ -192,20 +192,35 @@ def venue_history_capability_matrix(*, checked_at_utc: str | None = None) -> pd.
     return pd.DataFrame(rows, columns=VENUE_HISTORY_CAPABILITY_COLUMNS)
 
 
+# Keep the existing one-day Polymarket history-span preset for bounded research reads.
+DEFAULT_HISTORY_INTERVAL = "1d"
+# Daily candles keep historical output compact. Kalshi expresses this in minutes:
+# https://docs.kalshi.com/api-reference/market/get-market-candlesticks (2026-11-07).
+DEFAULT_HISTORY_PERIOD_INTERVAL_MINUTES = 1440
+# Prefer current endpoints unless an archived-market read is explicitly requested.
+DEFAULT_HISTORY_USE_HISTORICAL = False
+# Preserve trade observations alongside candles unless the caller opts out.
+DEFAULT_HISTORY_INCLUDE_TRADES = True
+# Bound the initial trade-history request budget; existing coverage reports retain gaps.
+DEFAULT_HISTORY_MAX_TRADE_PAGES = 10
+# Retain the existing page size for efficient bounded history pulls.
+DEFAULT_HISTORY_TRADE_LIMIT = 1000
+
+
 async def backfill_venue_history(
     venue: str,
     instruments: Sequence[str],
     *,
     start_ts: int | None = None,
     end_ts: int | None = None,
-    interval: str | None = "1d",
+    interval: str | None = DEFAULT_HISTORY_INTERVAL,
     fidelity: int | None = None,
-    period_interval: int = 1440,
+    period_interval: int = DEFAULT_HISTORY_PERIOD_INTERVAL_MINUTES,
     series_ticker: str | None = None,
-    use_historical: bool = False,
-    include_trades: bool = True,
-    max_trade_pages: int = 10,
-    trade_limit: int = 1000,
+    use_historical: bool = DEFAULT_HISTORY_USE_HISTORICAL,
+    include_trades: bool = DEFAULT_HISTORY_INCLUDE_TRADES,
+    max_trade_pages: int = DEFAULT_HISTORY_MAX_TRADE_PAGES,
+    trade_limit: int = DEFAULT_HISTORY_TRADE_LIMIT,
     polymarket_client: Any | None = None,
     kalshi_client: Any | None = None,
     run_id: str | None = None,

@@ -5,12 +5,18 @@ from pmkt.config import PmktConfig
 import asyncio
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import pandas as pd
 import typer
 
 from pmkt.data.historical_books import (
+    DEFAULT_HISTORY_INTERVAL,
+    DEFAULT_HISTORY_PERIOD_INTERVAL_MINUTES,
+    DEFAULT_HISTORY_USE_HISTORICAL,
+    DEFAULT_HISTORY_INCLUDE_TRADES,
+    DEFAULT_HISTORY_MAX_TRADE_PAGES,
+    DEFAULT_HISTORY_TRADE_LIMIT,
     backfill_venue_history,
     write_historical_backfill_result,
 )
@@ -76,16 +82,60 @@ def backfill_venue_history_cmd(
     ),
     start_ts: Annotated[Optional[int], typer.Option("--start-ts")] = None,
     end_ts: Annotated[Optional[int], typer.Option("--end-ts")] = None,
-    interval: Annotated[Optional[str], typer.Option("--interval")] = "1d",
-    fidelity: Annotated[Optional[int], typer.Option("--fidelity")] = None,
-    period_interval: Annotated[int, typer.Option("--period-interval")] = 1440,
+    interval: Annotated[
+        Optional[str],
+        typer.Option(
+            "--interval",
+            help="Polymarket history time span (venue interval selector).",
+            show_default=str(DEFAULT_HISTORY_INTERVAL),
+        ),
+    ] = None,
+    # Polymarket CLOB OpenAPI /prices-history defines fidelity in minutes:
+    # https://docs.polymarket.com/api-spec/clob-openapi.yaml (2026-11-07).
+    fidelity: Annotated[
+        Optional[int],
+        typer.Option(
+            "--fidelity",
+            help="Polymarket sampling resolution in minutes.",
+        ),
+    ] = None,
+    period_interval: Annotated[
+        Optional[int],
+        typer.Option(
+            "--period-interval",
+            help="Kalshi candlestick period in minutes.",
+            show_default=str(DEFAULT_HISTORY_PERIOD_INTERVAL_MINUTES),
+        ),
+    ] = None,
     series_ticker: Annotated[Optional[str], typer.Option("--series-ticker")] = None,
-    historical: Annotated[bool, typer.Option("--historical/--live")] = False,
+    historical: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--historical/--live",
+            show_default=str(DEFAULT_HISTORY_USE_HISTORICAL),
+        ),
+    ] = None,
     include_trades: Annotated[
-        bool, typer.Option("--include-trades/--skip-trades")
-    ] = True,
-    max_trade_pages: Annotated[int, typer.Option("--max-trade-pages")] = 10,
-    trade_limit: Annotated[int, typer.Option("--trade-limit")] = 1000,
+        Optional[bool],
+        typer.Option(
+            "--include-trades/--skip-trades",
+            show_default=str(DEFAULT_HISTORY_INCLUDE_TRADES),
+        ),
+    ] = None,
+    max_trade_pages: Annotated[
+        Optional[int],
+        typer.Option(
+            "--max-trade-pages",
+            show_default=str(DEFAULT_HISTORY_MAX_TRADE_PAGES),
+        ),
+    ] = None,
+    trade_limit: Annotated[
+        Optional[int],
+        typer.Option(
+            "--trade-limit",
+            show_default=str(DEFAULT_HISTORY_TRADE_LIMIT),
+        ),
+    ] = None,
     run_id: Annotated[Optional[str], typer.Option("--run-id")] = None,
 ) -> None:
     """Backfill documented historical prices, candles, trades, and gaps."""
@@ -93,6 +143,22 @@ def backfill_venue_history_cmd(
     if not instruments:
         raise typer.BadParameter("provide --instrument or --instruments-file")
     normalized_venue = venue.strip().lower()
+    common_overrides: dict[str, Any] = {
+        key: value for key, value in {
+            "start_ts": start_ts, "end_ts": end_ts, "run_id": run_id,
+        }.items() if value is not None
+    }
+    polymarket_overrides: dict[str, Any] = {
+        key: value for key, value in {"interval": interval, "fidelity": fidelity}.items()
+        if value is not None
+    }
+    kalshi_overrides: dict[str, Any] = {
+        key: value for key, value in {
+            "period_interval": period_interval, "series_ticker": series_ticker,
+            "use_historical": historical, "include_trades": include_trades,
+            "max_trade_pages": max_trade_pages, "trade_limit": trade_limit,
+        }.items() if value is not None
+    }
 
     async def run():
         if normalized_venue == "polymarket":
@@ -100,12 +166,9 @@ def backfill_venue_history_cmd(
                 return await backfill_venue_history(
                     normalized_venue,
                     instruments,
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                    interval=interval,
-                    fidelity=fidelity,
+                    **common_overrides,
+                    **polymarket_overrides,
                     polymarket_client=client,
-                    run_id=run_id,
                 )
         if normalized_venue != "kalshi":
             raise typer.BadParameter("--venue must be polymarket or kalshi")
@@ -113,16 +176,9 @@ def backfill_venue_history_cmd(
             return await backfill_venue_history(
                 normalized_venue,
                 instruments,
-                start_ts=start_ts,
-                end_ts=end_ts,
-                period_interval=period_interval,
-                series_ticker=series_ticker,
-                use_historical=historical,
-                include_trades=include_trades,
-                max_trade_pages=max_trade_pages,
-                trade_limit=trade_limit,
+                **common_overrides,
+                **kalshi_overrides,
                 kalshi_client=client,
-                run_id=run_id,
             )
 
     result = asyncio.run(run())
