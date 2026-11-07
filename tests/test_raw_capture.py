@@ -489,6 +489,49 @@ async def test_polymarket_reconnects_with_new_generation_and_records_exact_frame
 
 
 @pytest.mark.asyncio
+async def test_control_frame_payloads_are_recorded_exactly(tmp_path, monkeypatch):
+    handlers = capture_signals(monkeypatch)
+    ping, pong = b"ping\x00\xff", b"pong\xff\x00"
+    close_reason = "synthetic-close-\u00e9"
+
+    async def handler(ws):
+        await ws.recv()
+        await (await ws.ping(ping))
+        await ws.pong(pong)
+        await ws.close(code=1000, reason=close_reason)
+        handlers[signal.SIGTERM]()
+
+    root = tmp_path / "runs/run1/polymarket_00"
+    async with local_server(handler) as local:
+        await asyncio.wait_for(
+            rr.capture_raw_ws(
+                root,
+                end_in(5),
+                "polymarket",
+                market_list(tmp_path, "polymarket", ["1"]),
+                connector=connector_to(local),
+                runs_root=tmp_path / "runs",
+                **FAST,
+            ),
+            timeout=3,
+        )
+    [session] = root.iterdir()
+    assert [
+        (
+            frame["frame_type"],
+            frame["direction"],
+            base64.b64decode(frame["payload_raw"], validate=True),
+        )
+        for frame in frames(session)
+        if frame["frame_type"] in ("ws_ping", "ws_pong", "ws_close")
+    ] == [
+        ("ws_ping", "received_control_base64", ping),
+        ("ws_pong", "received_control_base64", pong),
+        ("ws_close", "received_control_base64", b"\x03\xe8" + close_reason.encode()),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_kalshi_signed_subscriptions_errors_and_gap_reconnect(tmp_path):
     tickers = ["K-A", "K-B"]
     seen = []
@@ -1177,6 +1220,71 @@ async def test_buffered_kalshi_gap_reconnects_immediately_and_throttles_later_ga
 
 
 @pytest.mark.asyncio
+async def test_kalshi_gap_reconnect_resumes_after_cooldown_with_fresh_signatures(
+    tmp_path, monkeypatch
+):
+    handlers = capture_signals(monkeypatch)
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+    snapshot = (
+        '{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"K"}}'
+    )
+    gap = '{"type":"orderbook_delta","sid":1,"seq":%d,"msg":{"market_ticker":"K"}}'
+
+    class LaterGaps(FakeFeed):
+        async def recv(self):
+            if self.received == 1:
+                clock.offset = 1  # Inside the default 300-second cooldown.
+            elif self.received == 2:
+                clock.offset = 301  # A later gap must request fresh snapshots again.
+            return await super().recv()
+
+    feeds = [
+        FakeFeed([snapshot, gap % 4]),
+        LaterGaps(
+            [snapshot, gap % 4, gap % 7],
+            on_exhausted=lambda: handlers[signal.SIGTERM](),
+        ),
+        FakeFeed([snapshot], on_exhausted=lambda: handlers[signal.SIGTERM]()),
+    ]
+    calls = []
+
+    def connector(url, **kwargs):
+        calls.append(kwargs)
+        return feeds[len(calls) - 1]
+
+    provider = FakeProvider()
+    root = tmp_path / "runs/run1/kalshi_00"
+    await asyncio.wait_for(
+        rr.capture_raw_ws(
+            root,
+            end_in(600),
+            "kalshi",
+            market_list(tmp_path, "kalshi", ["K"]),
+            runs_root=tmp_path / "runs",
+            auth=provider,
+            connector=connector,
+            **FAST,
+        ),
+        timeout=3,
+    )
+    [session] = root.iterdir()
+    final = json.loads((session / "FINAL.json").read_text())
+    assert final["seq_gaps"] == 3
+    assert final["gap_reconnects"] == final["reconnects"] == 2
+    assert [
+        call["additional_headers"]["X-Synthetic-Signature"] for call in calls
+    ] == ["sig-1", "sig-2", "sig-3"]
+    assert provider.paths == ["/trade-api/ws/v2"] * 3
+    assert [
+        (frame["connection_generation"], json.loads(frame["payload_raw"])["got"])
+        for frame in frames(session)
+        if frame["frame_type"] == "seq_gap"
+    ] == [(1, 4), (2, 4), (2, 7)]
+    assert all(feed.closed for feed in feeds)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "interval,advance,reconnects", [(10, 9, 1), (10, 10, 2), (0, 0, 2)]
 )
@@ -1638,6 +1746,55 @@ async def test_fatal_frame_write_retains_partial_chunk_without_manifest(
     assert final["active_partial_filename"] == partial.name
     assert final["final_chunk_sha256"] is None and final["closed_chunk_count"] == 0
     assert not list(session.glob("*.manifest.json"))
+    assert feed.closed and feed.active_recv == 0
+
+
+@pytest.mark.asyncio
+async def test_terminal_seal_failure_reports_partial_and_retains_evidence(
+    tmp_path, monkeypatch
+):
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+    digest = rr.digest
+    seal_attempts = []
+
+    def fail_seal_digest(path):
+        if path.suffix == ".part":
+            seal_attempts.append(path)
+            raise OSError("synthetic terminal seal failure")
+        return digest(path)
+
+    monkeypatch.setattr(rr, "digest", fail_seal_digest)
+    book = '{"event_type":"book","asset_id":"1"}'
+    feed = FakeFeed([book], on_exhausted=lambda: setattr(clock, "offset", 6))
+    root = tmp_path / "runs/run1/polymarket_00"
+    reason = await asyncio.wait_for(
+        rr.capture_raw_ws(
+            root,
+            end_in(5),
+            "polymarket",
+            market_list(tmp_path, "polymarket", ["1"]),
+            runs_root=tmp_path / "runs",
+            connector=lambda *args, **kwargs: feed,
+            **dict(FAST, chunk_seconds=600),
+        ),
+        timeout=3,
+    )
+    [session] = root.iterdir()
+    [partial] = session.glob("*.part")
+    final = json.loads((session / "FINAL.json").read_text())
+    assert reason == final["reason"] == "partial_seal_OSError"
+    assert final["partial"] is True
+    assert final["active_partial_filename"] == partial.name
+    assert final["final_chunk_sha256"] is None and final["closed_chunk_count"] == 0
+    assert seal_attempts == [partial]
+    assert not list(session.glob("*.jsonl.gz"))
+    assert not list(session.glob("*.manifest.json"))
+    evidence = [
+        json.loads(line) for line in gzip.decompress(partial.read_bytes()).splitlines()
+    ]
+    assert [frame["frame_type"] for frame in evidence] == ["subscription", "text"]
+    assert evidence[-1]["payload_raw"] == book
     assert feed.closed and feed.active_recv == 0
 
 

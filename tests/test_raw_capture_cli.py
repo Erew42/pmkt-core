@@ -18,6 +18,13 @@ def _normalized_cli_output(value: str) -> str:
     return "".join(_ANSI_ESCAPE_RE.sub("", value).split())
 
 
+@pytest.fixture(autouse=True)
+def stable_terminal(monkeypatch):
+    monkeypatch.setenv("COLUMNS", "160")
+    monkeypatch.delenv("FORCE_COLOR", raising=False)
+    monkeypatch.setenv("NO_COLOR", "1")
+
+
 def arguments(tmp_path, venue="polymarket"):
     return [
         "record-raw-ws",

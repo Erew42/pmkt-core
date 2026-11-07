@@ -1,6 +1,7 @@
 """Exercise the CLI with local TLS, synthetic certificates, fsync and signals."""
 
 import asyncio
+import base64
 import gzip
 import json
 import logging
@@ -143,7 +144,11 @@ def test_cli_tls_fsync_and_signal_seals_chunk(
         json.loads(line) for line in gzip.decompress(chunk.read_bytes()).splitlines()
     ]
     assert any(f["payload_raw"] == raw and f["frame_type"] == "text" for f in frames)
-    assert any(f["frame_type"] == "ws_ping" for f in frames)
+    assert [
+        base64.b64decode(f["payload_raw"], validate=True)
+        for f in frames
+        if f["frame_type"] == "ws_ping"
+    ] == [b"local-tls"]
     assert sync_calls and all(func is os.fsync for func in sync_calls)
     provenance = json.loads((session / "PROVENANCE.json").read_text())
     assert provenance["event_loop"] == (
