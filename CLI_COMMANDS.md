@@ -150,6 +150,12 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+Recording connection options inherit `WebSocketRetryBudget` and
+`WebSocketTransportSettings` when omitted. Explicit `--max-reconnects 0`
+disables replacement attempts. Finite capture budgets remain distinct from
+managed feeds' unlimited replacements and capped delay. Polymarket heartbeat
+and corrective-grace policies are owned by its WebSocket and recovery modules.
+
 ## Runtime configuration in 0.2
 
 Application entrypoints explicitly load `PmktConfig.from_env()` and pass the

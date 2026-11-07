@@ -69,6 +69,14 @@ class WebSocketDeadlineExceeded(ConnectionError):
     """The capture deadline expired before transport recovery completed."""
 
 
+# Finite captures retain a small replacement budget after the free initial socket.
+DEFAULT_RECONNECT_ATTEMPTS = 3
+# A short linear delay avoids tight reconnect loops without stalling short captures.
+DEFAULT_RECONNECT_BACKOFF_SECONDS = 0.5
+# None explicitly means unlimited retries in the budget; omission must be distinct.
+_UNSET_RECONNECTS = object()
+
+
 class WebSocketRetryBudget:
     """One attempt counter shared by startup, receive, and requested recovery.
 
@@ -79,9 +87,9 @@ class WebSocketRetryBudget:
 
     def __init__(
         self,
-        max_reconnects: int | None = 3,
+        max_reconnects: int | None = DEFAULT_RECONNECT_ATTEMPTS,
         *,
-        backoff: float = 0.5,
+        backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
         max_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         on_retry: Callable[[dict[str, Any]], None] | None = None,

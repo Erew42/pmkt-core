@@ -8,7 +8,7 @@ from dataclasses import asdict
 import math
 from pathlib import Path
 import time
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Sequence, cast
 
 import pmkt
 from pmkt.provenance import implementation_identity
@@ -22,6 +22,7 @@ from pmkt.exchanges.kalshi.ws import (
 )
 from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
+    _UNSET_HEARTBEAT_INTERVAL,
     MarketBookState,
     _normalize_asset_ids,
     apply_market_message,
@@ -284,15 +285,19 @@ async def record_feed(
     run_name: str | None = None,
     duration_s: float = 300.0,
     max_messages: int | None = None,
-    max_reconnects: int = 3,
+    max_reconnects: int | None = None,
     ws_url: str | None = None,
     connect_factory: Callable[..., Any] | None = None,
     auth: Any = None,
-    heartbeat_interval: float | None = 10.0,
+    heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
     custom_feature_enabled: bool = True,
     websocket_max_size_bytes: int | None = None,
     websocket_max_queue_frames: int | None = None,
 ) -> dict[str, Any]:
+    """Record with a finite retry budget inherited when max_reconnects is None.
+
+    Omitted heartbeat_interval inherits the venue default; explicit None disables it.
+    """
     ids = (
         _normalize_asset_ids(instruments)
         if venue == "polymarket"
@@ -308,12 +313,16 @@ async def record_feed(
         or max_messages < 1
     ):
         raise ValueError("max_messages must be a positive integer")
-    if (
+    if max_reconnects is not None and (
         isinstance(max_reconnects, bool)
         or not isinstance(max_reconnects, int)
         or max_reconnects < 0
     ):
         raise ValueError("max_reconnects must be a nonnegative integer")
+    retry_overrides: dict[str, Any] = {}
+    if max_reconnects is not None:
+        retry_overrides["max_reconnects"] = max_reconnects
+    budget = WebSocketRetryBudget(**retry_overrides)
     settings = WebSocketTransportSettings(
         max_size_bytes=websocket_max_size_bytes
         if websocket_max_size_bytes is not None
@@ -332,7 +341,7 @@ async def record_feed(
         provenance={
             "implementation": implementation_identity(pmkt.__file__, "pmkt").as_dict(),
             "transport": asdict(settings),
-            "max_reconnects": max_reconnects,
+            "max_reconnects": budget.max_reconnects,
             "duration_s": duration_s,
             "max_messages": max_messages,
             "adapter": {
@@ -360,12 +369,9 @@ async def record_feed(
         invalidate("disconnect")
         books.reset()
 
-    budget = WebSocketRetryBudget(
-        max_reconnects,
-        deadline=deadline,
-        on_reconnect=disconnected,
-        on_retry=lambda details: recorder.event("reconnect_attempt", details),
-    )
+    budget.deadline = deadline
+    budget.on_reconnect = disconnected
+    budget.on_retry = lambda details: recorder.event("reconnect_attempt", details)
     shared: dict[str, Any] = {
         "ws_url": ws_url,
         "connect_factory": connect_factory,
@@ -378,9 +384,12 @@ async def record_feed(
     }
     client: Any
     if venue == "polymarket":
+        client_overrides: dict[str, Any] = {}
+        if heartbeat_interval is not _UNSET_HEARTBEAT_INTERVAL:
+            client_overrides["heartbeat_interval"] = heartbeat_interval
         client = AsyncMarketWebSocketClient(
             ids,
-            heartbeat_interval=heartbeat_interval,
+            **client_overrides,
             custom_feature_enabled=custom_feature_enabled,
             **shared,
         )

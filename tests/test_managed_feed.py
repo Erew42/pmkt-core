@@ -1302,3 +1302,24 @@ async def test_close_during_session_teardown_still_closes_the_socket(venue):
     release.set()
     await asyncio.wait_for(closer, 3)
     assert socket.closed
+
+
+
+@pytest.mark.asyncio
+async def test_managed_retry_preset_remains_unlimited_with_capped_delay(monkeypatch):
+    import pmkt.streaming.managed_feed as module
+    calls = []
+
+    class Budget:
+        def __init__(self, max_reconnects, **kwargs):
+            calls.append((max_reconnects, kwargs))
+        async def run(self, operation):
+            raise asyncio.CancelledError()
+
+    monkeypatch.setattr(module, "WebSocketRetryBudget", Budget)
+    f = ManagedBookFeed(["a"], venue="polymarket")
+    with pytest.raises(asyncio.CancelledError):
+        await f._run(object())
+    assert calls[0][0] is None
+    assert calls[0][1]["max_backoff"] == 30.0
+    assert calls[0][1]["backoff"] == 0.5

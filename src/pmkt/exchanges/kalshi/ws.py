@@ -27,6 +27,9 @@ from websockets.protocol import State
 from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels, snapshot_ladder
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
+    DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
+    DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
+    _UNSET_RECONNECTS,
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
     WebSocketRetryBudget,
@@ -52,8 +55,6 @@ SleepFunc = Callable[[float], Awaitable[None]]
 DecodeErrorCallback = Callable[[str, Any], None]
 RawFrameCallback = Callable[[str | bytes], None | Awaitable[None]]
 
-DEFAULT_RECONNECT_ATTEMPTS = 3
-DEFAULT_RECONNECT_BACKOFF_SECONDS = 0.5
 
 
 def normalize_market_tickers(tickers: str | Iterable[str]) -> list[str]:
@@ -882,17 +883,23 @@ class AsyncKalshiWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int = DEFAULT_RECONNECT_ATTEMPTS,
-        reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
+        max_reconnects: int = cast(Any, _UNSET_RECONNECTS),
+        reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         on_decode_error: DecodeErrorCallback | None = None,
         decimal_numbers: bool = False,
         on_raw_frame: RawFrameCallback | None = None,
         fail_on_clean_close_exhausted: bool = False,
     ) -> AsyncIterator[dict[str, Any]]:
-        budget = self._retry_budget or WebSocketRetryBudget(
-            max_reconnects if reconnect else 0,
-            backoff=reconnect_backoff,
+        retry_overrides: dict[str, Any] = {}
+        if not reconnect:
+            retry_overrides["max_reconnects"] = 0
+        elif max_reconnects is not _UNSET_RECONNECTS:
+            retry_overrides["max_reconnects"] = max_reconnects
+        if reconnect_backoff is not None:
+            retry_overrides["backoff"] = reconnect_backoff
+        budget = self._retry_budget if self._retry_budget is not None else WebSocketRetryBudget(
+            **retry_overrides,
             on_reconnect=on_reconnect,
             sleep=self._sleep,
         )

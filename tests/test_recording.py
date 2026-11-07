@@ -839,3 +839,47 @@ async def test_late_complementary_correction_cannot_erase_recovery_bound(
     assert report["reconnect_count"] == 1
     assert report["status"] == "complete"
     assert report["counts"]["book_snapshots"] == 2
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_recording_wrappers_only_forward_explicit_connection_options(monkeypatch, venue, explicit):
+    import importlib
+    module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
+    calls = []
+
+    async def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(module, "record_feed", capture)
+    capture = module.stream_order_book_data if venue == "polymarket" else module.stream_kalshi_order_book_data
+    options = {"max_reconnects": 0} if explicit else {}
+    if explicit and venue == "polymarket":
+        options["heartbeat_interval"] = None
+    await capture(["a"], **options)
+    actual = {key: value for key, value in calls[0].items() if key in {"max_reconnects", "heartbeat_interval"}}
+    assert actual == options
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reconnects", [None, 0])
+async def test_record_feed_records_resolved_retry_budget_before_capture(monkeypatch, tmp_path, reconnects):
+    import pmkt.streaming.recording_feed as module
+    calls = []
+
+    class CaptureConfigured(Exception):
+        pass
+
+    def recorder(**kwargs):
+        calls.append(kwargs)
+        raise CaptureConfigured()
+
+    monkeypatch.setattr(module, "BookRecorder", recorder)
+    overrides = {} if reconnects is None else {"max_reconnects": reconnects}
+    with pytest.raises(CaptureConfigured):
+        await module.record_feed(["a"], venue="polymarket", output_root=tmp_path,
+                                 options=RecordingOptions(), **overrides)
+    assert calls[0]["provenance"]["max_reconnects"] == (3 if reconnects is None else reconnects)

@@ -1,3 +1,5 @@
+import pytest
+
 from typer.testing import CliRunner
 
 from pmkt.cli.app import app
@@ -64,3 +66,29 @@ def test_invalid_configuration_does_not_create_output(tmp_path):
     )
     assert result.exit_code != 0
     assert not (tmp_path / "absent").exists()
+
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("command,attribute,flag", [
+    ("stream-books", "stream_order_book_data", "--token-id"),
+    ("stream-kalshi-books", "stream_kalshi_order_book_data", "--ticker"),
+])
+def test_recording_cli_inherits_connection_settings(monkeypatch, explicit, command, attribute, flag):
+    calls = []
+
+    async def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return {"status": "complete", "run_dir": "test"}
+
+    monkeypatch.setattr(streaming, attribute, capture)
+    monkeypatch.setattr(streaming, "_load_read_auth_header_provider", lambda value: object())
+    args = [command, flag, "a"]
+    if explicit:
+        args += ["--max-reconnects", "0", "--websocket-max-size-bytes", "0", "--websocket-max-queue-frames", "0"]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    actual = {key: value for key, value in calls[0].items() if key in {
+        "max_reconnects", "websocket_max_size_bytes", "websocket_max_queue_frames"
+    }}
+    assert actual == ({"max_reconnects": 0, "websocket_max_size_bytes": 0, "websocket_max_queue_frames": 0} if explicit else {})
