@@ -146,7 +146,7 @@ def log_event(level: int, event: str, **fields: Any) -> None:
         level,
         "%s %s",
         event,
-        json.dumps(fields, sort_keys=True, separators=(",", ":")),
+        json.dumps(fields, sort_keys=True, separators=(",", ":"), default=str),
         extra=fields,
     )
 
