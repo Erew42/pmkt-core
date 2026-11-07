@@ -1,3 +1,5 @@
+import re
+
 import pytest
 
 from typer.testing import CliRunner
@@ -134,3 +136,19 @@ def test_topbook_cli_preserves_preset_and_disabled_syntax(monkeypatch, tmp_path,
         "duration_s", "interval_s", "max_stale_seconds"
     }}
     assert actual == expected
+
+
+@pytest.mark.parametrize("command", ["stream-books", "stream-kalshi-books"])
+def test_recording_help_shows_effective_defaults(command):
+    result = CliRunner().invoke(app, [command, "--help"], env={"COLUMNS": "200"})
+    assert result.exit_code == 0, result.output
+    help_text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", result.output)
+    help_text = " ".join(help_text.split())
+    for option, expected in (
+        ("--duration", "300"),
+        ("--mode", "full"),
+        ("--depth-check-interval-s", "10"),
+    ):
+        assert option in help_text, help_text
+        option_help = help_text.split(option, 1)[1].split("--", 1)[0]
+        assert f"[default: ({expected})]" in option_help

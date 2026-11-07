@@ -14,6 +14,11 @@ from typing import Annotated, Any, Optional
 import pandas as pd
 import typer
 
+from pmkt.streaming.recording import (
+    DEFAULT_DEPTH_CHECK_INTERVAL_S,
+    DEFAULT_RECORDING_DURATION_S,
+    DEFAULT_RECORDING_MODE,
+)
 from pmkt.tokens import flatten_token_ids
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.read_auth import (
@@ -662,10 +667,10 @@ def stream_books(
     markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
     output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_ORDER_BOOK_STREAM_ROOT,
     run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
-    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.")] = None,
+    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.", show_default=f"{DEFAULT_RECORDING_DURATION_S:g}")] = None,
     max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
-    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.")] = None,
-    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.")] = None,
+    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.", show_default=DEFAULT_RECORDING_MODE)] = None,
+    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
     depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
     raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
     max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,
@@ -708,10 +713,10 @@ def stream_kalshi_books(
     markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
     output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
     run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
-    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.")] = None,
+    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.", show_default=f"{DEFAULT_RECORDING_DURATION_S:g}")] = None,
     max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
-    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.")] = None,
-    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.")] = None,
+    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.", show_default=DEFAULT_RECORDING_MODE)] = None,
+    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
     depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
     raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
     max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,

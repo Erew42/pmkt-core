@@ -152,6 +152,7 @@ format. Historical profile recovery and `reconstruct-book-tape` remain available
 
 Recording option ownership: `stream-books` and `stream-kalshi-books` inherit
 sampling and retention from `RecordingOptions`, and duration from `record_feed`.
+Both commands show the effective duration, mode, and depth-check defaults in help.
 Only explicit overrides are forwarded, including `--depth-check-interval-s off`
 and negative boolean flags. Raw messages remain off by default.
 `record-topbooks` retains `TOPBOOK_CLI_DURATION_S` as its bounded-session preset;

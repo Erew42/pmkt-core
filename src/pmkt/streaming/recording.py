@@ -21,6 +21,8 @@ from pmkt.streaming.recording_store import (
 )
 
 
+# Keep captures bounded to a short observation session unless explicitly changed.
+DEFAULT_RECORDING_DURATION_S = 300.0
 # Retain selected depth as well as quotes so recordings support book inspection.
 DEFAULT_RECORDING_MODE: Literal["topbook", "full"] = "full"
 # Coarse checks limit depth writes compared with persisting every delta.

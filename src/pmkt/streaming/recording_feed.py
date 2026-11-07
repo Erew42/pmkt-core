@@ -34,7 +34,12 @@ from pmkt.exchanges.ws_transport import (
     WebSocketTransportSettings,
 )
 from pmkt.streaming.trades import recording_trade
-from pmkt.streaming.recording import BookRecorder, BookView, RecordingOptions
+from pmkt.streaming.recording import (
+    DEFAULT_RECORDING_DURATION_S,
+    BookRecorder,
+    BookView,
+    RecordingOptions,
+)
 
 
 class RecordingError(RuntimeError):
@@ -273,10 +278,6 @@ class VenueBooks:
             state.initial_snapshot_received and not state.book_integrity_valid
             for state in self.kalshi.values()
         )
-
-
-# Keep captures bounded to a short observation session unless explicitly changed.
-DEFAULT_RECORDING_DURATION_S = 300.0
 
 
 async def record_feed(
