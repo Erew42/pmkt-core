@@ -21,16 +21,28 @@ from pmkt.streaming.recording_store import (
 )
 
 
+# Retain selected depth as well as quotes so recordings support book inspection.
+DEFAULT_RECORDING_MODE: Literal["topbook", "full"] = "full"
+# Coarse checks limit depth writes compared with persisting every delta.
+DEFAULT_DEPTH_CHECK_INTERVAL_S = 10.0
+# Periodic sampling is the normal path; immediate depth triggers are opt-in.
+DEFAULT_DEPTH_ON_BEST_PRICE_CHANGE = False
+# recording.v1 keeps diagnostic payloads opt-in to bound storage and retention.
+DEFAULT_RAW_MESSAGES = False
+# None disables checks, so forwarding APIs need a separate omitted marker.
+_UNSET_DEPTH_CHECK_INTERVAL = object()
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
 @dataclass(frozen=True)
 class RecordingOptions:
-    mode: Literal["topbook", "full"] = "full"
-    depth_check_interval_s: float | None = 10.0
-    depth_on_best_price_change: bool = False
-    raw_messages: bool = False
+    mode: Literal["topbook", "full"] = DEFAULT_RECORDING_MODE
+    depth_check_interval_s: float | None = DEFAULT_DEPTH_CHECK_INTERVAL_S
+    depth_on_best_price_change: bool = DEFAULT_DEPTH_ON_BEST_PRICE_CHANGE
+    raw_messages: bool = DEFAULT_RAW_MESSAGES
 
     def __post_init__(self) -> None:
         if self.mode not in {"topbook", "full"}:

@@ -5,7 +5,7 @@ from pmkt.config import PmktConfig
 import asyncio
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated, Any, Optional
 
 import pandas as pd
 import typer
@@ -14,7 +14,12 @@ from pmkt.data.historical_books import (
     backfill_venue_history,
     write_historical_backfill_result,
 )
-from pmkt.data.recorder import record_topbooks
+from pmkt.data.recorder import (
+    DEFAULT_TOPBOOK_INTERVAL_S,
+    DEFAULT_TOPBOOK_MAX_STALE_SECONDS,
+    TOPBOOK_CLI_DURATION_S,
+    record_topbooks,
+)
 from pmkt.data.storage.parquet import read_parquet
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
@@ -141,16 +146,36 @@ def record_topbooks_cmd(
     out_dir: Annotated[Path, typer.Option("--out-dir")] = Path(
         "generated/topbook_recordings"
     ),
-    duration: Annotated[Optional[float], typer.Option("--duration")] = 60.0,
-    interval: Annotated[float, typer.Option("--interval")] = 1.0,
+    duration: Annotated[
+        Optional[float],
+        typer.Option(
+            "--duration",
+            help="Session duration in seconds; omitted uses the bounded CLI preset.",
+            show_default=str(TOPBOOK_CLI_DURATION_S),
+        ),
+    ] = None,
+    interval: Annotated[
+        Optional[float],
+        typer.Option("--interval", help="Seconds between observations.", show_default=str(DEFAULT_TOPBOOK_INTERVAL_S)),
+    ] = None,
     max_cycles: Annotated[Optional[int], typer.Option("--max-cycles")] = None,
     depth: Annotated[Optional[int], typer.Option("--depth")] = None,
     max_stale_seconds: Annotated[
-        Optional[float], typer.Option("--max-stale-seconds")
-    ] = 30.0,
+        Optional[float],
+        typer.Option(
+            "--max-stale-seconds",
+            help="Observational age flag in seconds; a negative value disables it.",
+            show_default=str(DEFAULT_TOPBOOK_MAX_STALE_SECONDS),
+        ),
+    ] = None,
     run_id: Annotated[Optional[str], typer.Option("--run-id")] = None,
 ) -> None:
     """Record public topbooks for instrument relations supplied as data."""
+    overrides: dict[str, Any] = {"duration_s": TOPBOOK_CLI_DURATION_S if duration is None else duration}
+    if interval is not None:
+        overrides["interval_s"] = interval
+    if max_stale_seconds is not None:
+        overrides["max_stale_seconds"] = None if max_stale_seconds < 0 else max_stale_seconds
 
     async def run():
         async with AsyncClobClient( config=PmktConfig.from_env()) as polymarket, AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
@@ -160,15 +185,9 @@ def record_topbooks_cmd(
                 kalshi_client=kalshi,
                 out_dir=out_dir,
                 run_id=run_id,
-                interval_s=interval,
-                duration_s=duration,
+                **overrides,
                 max_cycles=max_cycles,
                 depth=depth,
-                max_stale_seconds=(
-                    None
-                    if max_stale_seconds is not None and max_stale_seconds < 0
-                    else max_stale_seconds
-                ),
             )
 
     result = asyncio.run(run())

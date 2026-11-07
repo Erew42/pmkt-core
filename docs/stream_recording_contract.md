@@ -344,3 +344,8 @@ connection-group and `runtime_projection_recorder` arguments are removed.
 Sampled recording tables are not a private execution-feed projection. The private
 consumer's existing exact core dependency pin must be upgraded separately with
 its execution-feed integration checked against the chosen public feed API.
+
+Sampling and retention defaults are owned by the named constants beside
+`RecordingOptions`; `record_feed.DEFAULT_RECORDING_DURATION_S` owns duration.
+Venue wrappers and CLIs inherit omitted options. Explicit `None` still disables
+periodic depth checks, and raw retention remains opt-in.

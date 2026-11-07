@@ -275,6 +275,10 @@ class VenueBooks:
         )
 
 
+# Keep captures bounded to a short observation session unless explicitly changed.
+DEFAULT_RECORDING_DURATION_S = 300.0
+
+
 async def record_feed(
     instruments: Sequence[str],
     *,
@@ -282,7 +286,7 @@ async def record_feed(
     output_root: str | Path,
     options: RecordingOptions,
     run_name: str | None = None,
-    duration_s: float = 300.0,
+    duration_s: float = DEFAULT_RECORDING_DURATION_S,
     max_messages: int | None = None,
     max_reconnects: int = 3,
     ws_url: str | None = None,

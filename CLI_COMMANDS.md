@@ -150,6 +150,15 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+Recording option ownership: `stream-books` and `stream-kalshi-books` inherit
+sampling and retention from `RecordingOptions`, and duration from `record_feed`.
+Only explicit overrides are forwarded, including `--depth-check-interval-s off`
+and negative boolean flags. Raw messages remain off by default.
+`record-topbooks` retains `TOPBOOK_CLI_DURATION_S` as its bounded-session preset;
+the Python API still makes one cycle when both bounds are omitted. Its interval
+and observational age defaults come from `record_topbooks`;
+`--max-stale-seconds` accepts a negative value to disable that age flag.
+
 ## Runtime configuration in 0.2
 
 Application entrypoints explicitly load `PmktConfig.from_env()` and pass the
