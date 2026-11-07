@@ -10,6 +10,7 @@ _EXPORTS = {
     **dict.fromkeys(("FeedPreflightReport", "FeedRecoveryAction", "FeedShardHealth", "LiveFeedSupervisor", "SubscriptionPlanValidation", "SubscriptionPlanValidator"), "supervisor"),
     **dict.fromkeys(("ManagedBookFeed", "PublicBook", "PublicBookHealth"), "managed_feed"),
     "RecordingOptions": "recording",
+    "capture_raw_ws": "raw_capture",
     "export_recording": "recording_store",
 }
 __all__ = list(_EXPORTS)

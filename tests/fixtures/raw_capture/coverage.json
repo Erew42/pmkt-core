@@ -1,0 +1,33 @@
+{
+  "kalshi": {
+    "source_frames": 12314,
+    "frames": 203,
+    "text_frames": 202,
+    "bytes": 13261,
+    "uncompressed_bytes": 130984,
+    "kinds": [
+      "event:market_lifecycle_v2",
+      "event:orderbook_delta",
+      "event:trade",
+      "frame:text:received",
+      "frame:ws_pong:received_control_base64"
+    ]
+  },
+  "polymarket": {
+    "source_frames": 9791,
+    "frames": 205,
+    "text_frames": 202,
+    "bytes": 36551,
+    "uncompressed_bytes": 199921,
+    "kinds": [
+      "event:best_bid_ask",
+      "event:book",
+      "event:last_trade_price",
+      "event:new_market",
+      "event:price_change",
+      "frame:app_ping:sent",
+      "frame:app_pong:received",
+      "frame:text:received"
+    ]
+  }
+}

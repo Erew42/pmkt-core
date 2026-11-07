@@ -46,6 +46,40 @@ class BookOutputFormat(str, Enum):
     TOPBOOK = "topbook"
 
 
+class RawCaptureVenue(str, Enum):
+    POLYMARKET = "polymarket"
+    KALSHI = "kalshi"
+
+
+def record_raw_ws(
+    venue: Annotated[RawCaptureVenue, typer.Option(help="Public market-data venue.")],
+    markets: Annotated[Path, typer.Option(help="Market-list JSON with venue, name, ws_url and instruments.")],
+    runs_root: Annotated[Path, typer.Option(help="Absolute, non-symlink root containing RUN/INSTANCE directories.")],
+    root: Annotated[Path, typer.Option(help="Absolute runs-root/RUN/INSTANCE output path.")],
+    end_utc: Annotated[str, typer.Option(help="Stop at this explicit UTC timestamp (ISO 8601).")],
+    header_provider: Annotated[Optional[str], typer.Option(help="Kalshi read-auth provider MODULE:ATTRIBUTE.")] = None,
+    chunk_seconds: Annotated[float, typer.Option(help="Chunk rotation period in seconds.", min=0.001)] = 60,
+    gzip_level: Annotated[int, typer.Option(help="Gzip compression level.", min=1, max=9)] = 6,
+    lag_warn_ms: Annotated[float, typer.Option(help="Warn above this sampled 60-second exchange-lag median.", min=0)] = 5000,
+) -> None:
+    """Capture verbatim public WebSocket frames in gzip JSONL chunks (POSIX)."""
+    capture = _load_stream_collector("pmkt.streaming.raw_capture", "capture_raw_ws")
+    run = _load_stream_collector("pmkt.streaming.raw_capture", "run")
+    parse_end = _load_stream_collector("pmkt.streaming.raw_capture", "parse_end")
+    auth = _load_read_auth_header_provider(header_provider) if venue == RawCaptureVenue.KALSHI else None
+    try:
+        end = parse_end(end_utc)
+        reason = run(capture(
+            root, end, venue.value, markets, runs_root=runs_root, auth=auth,
+            chunk_seconds=chunk_seconds, gzip_level=gzip_level, lag_warn_ms=lag_warn_ms,
+        ))
+    except (ValueError, OSError, RuntimeError) as exc:
+        error_exit(str(exc))
+    print(f"Raw capture: {reason}")
+    if reason not in {"deadline", "end_already_passed"}:
+        raise typer.Exit(code=1)
+
+
 DEFAULT_ORDER_BOOK_STREAM_ROOT = Path("generated/order_book_streams")
 DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT = Path("generated/kalshi_order_book_streams")
 

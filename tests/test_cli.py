@@ -24,6 +24,7 @@ PUBLIC_COMMANDS = {
     "query",
     "reconstruct-book-tape",
     "record-topbooks",
+    "record-raw-ws",
     "recover-stream-run",
     "resolve-market-resolutions",
     "schema",

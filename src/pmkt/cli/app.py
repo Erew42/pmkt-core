@@ -19,6 +19,7 @@ from pmkt.cli.schema import dataset_app, schema_app
 from pmkt.cli.streaming import (
     collect_books,
     collect_kalshi_books,
+    record_raw_ws,
     stream_books,
     stream_kalshi_books,
 )
@@ -38,6 +39,7 @@ app.command("collect-books")(collect_books)
 app.command("collect-kalshi-books")(collect_kalshi_books)
 app.command("stream-books")(stream_books)
 app.command("stream-kalshi-books")(stream_kalshi_books)
+app.command("record-raw-ws")(record_raw_ws)
 app.command("compute-features")(compute_features_cmd)
 app.command("backfill-venue-history")(backfill_venue_history_cmd)
 app.command("record-topbooks")(record_topbooks_cmd)

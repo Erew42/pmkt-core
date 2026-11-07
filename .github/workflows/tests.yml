@@ -110,6 +110,13 @@ jobs:
               tests/test_managed_feed.py
               tests/test_recording.py
               tests/test_recording_cli.py
+              tests/test_raw_capture.py
+              tests/test_raw_capture_cli.py
+              tests/test_raw_capture_envelopes.py
+              tests/test_raw_capture_event_loop.py
+              tests/test_raw_capture_gzip.py
+              tests/test_raw_capture_lag.py
+              tests/test_raw_capture_tracker.py
               tests/test_streaming_collector.py
               tests/test_streaming_measurement.py
               tests/test_ws_transport.py
