@@ -12,7 +12,7 @@ from pmkt.runtime import OperationExpiry
 from pmkt.resolution.providers import KalshiResolutionProvider
 from pmkt.exchanges.read_auth import ReadAuthenticationRequiredError
 from pmkt.records import KalshiMarketRef
-from pmkt.resolution._batch import resolve_ordered_batch
+from pmkt.resolution._batch import DEFAULT_RESOLUTION_CONCURRENCY, resolve_ordered_batch
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
     CONFIDENCE_INCONSISTENT,
@@ -596,7 +596,7 @@ class KalshiResolutionResolver:
         self,
         markets: Sequence[KalshiMarketRef],
         *,
-        concurrency: int = 8,
+        concurrency: int = DEFAULT_RESOLUTION_CONCURRENCY,
         deadline_s: float = 120.0,
     ) -> list[ResolutionRecord]:
         return await resolve_ordered_batch(

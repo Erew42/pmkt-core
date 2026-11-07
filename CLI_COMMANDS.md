@@ -109,6 +109,8 @@ installed version.
 ## Resolution commands
 
 - `resolve-market-resolutions`: build canonical market-resolution evidence.
+  Omitted `--concurrency` inherits the resolution default; explicit values must
+  be positive integers. Invalid values fail before cache or network I/O.
 
 ## Excluded interfaces
 
