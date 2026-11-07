@@ -7,6 +7,7 @@ import gzip
 import hashlib
 import itertools
 import json
+import logging
 import os
 import signal
 import time
@@ -557,6 +558,91 @@ async def test_kalshi_signed_subscriptions_errors_and_gap_reconnect(tmp_path):
     provenance = json.loads((session / "PROVENANCE.json").read_text())
     assert provenance["venue"] == "kalshi" and provenance["instruments"] == tickers
     assert "sig-" not in "".join(p.read_text() for p in session.glob("*.json"))
+
+
+@pytest.mark.asyncio
+async def test_kalshi_refuses_redirects_that_would_carry_signed_headers(tmp_path):
+    reached = []
+
+    async def target(ws):
+        reached.append(ws.request.headers.get("X-Synthetic-Signature"))
+        await ws.close()
+
+    async with local_server(target) as target_url:
+
+        def redirect(connection, request):
+            response = connection.respond(302, "")
+            response.headers["Location"] = target_url
+            return response
+
+        async with serve(lambda ws: None, "127.0.0.1", 0, process_request=redirect) as server:
+            redirect_url = "ws://127.0.0.1:%d" % server.sockets[0].getsockname()[1]
+            # Plain websockets follows the redirect and forwards the headers.
+            async with connect(redirect_url, additional_headers={"X-Synthetic-Signature": "probe"}):
+                pass
+            assert reached == ["probe"]
+            root = tmp_path / "runs" / "run1" / "kalshi_00"
+            reason = await rr.capture_raw_ws(
+                root,
+                end_in(0.6),
+                "kalshi",
+                market_list(tmp_path, "kalshi", ["K-A"]),
+                connector=lambda url, **kwargs: rr.NoRedirectConnect(redirect_url, **kwargs),
+                auth=FakeProvider(),
+                runs_root=tmp_path / "runs",
+                **FAST,
+            )
+    assert reason == "deadline" and reached == ["probe"]
+    [session] = root.iterdir()
+    errors = [f["payload_raw"] for f in frames(session) if f["frame_type"] == "transport_error"]
+    assert errors and all("302" in error for error in errors)
+
+
+@pytest.mark.asyncio
+async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, capsys):
+    def connector(url, **kwargs):
+        raise OSError("echoed " + kwargs["additional_headers"]["X-Synthetic-Signature"])
+
+    root = tmp_path / "runs" / "run1" / "kalshi_00"
+    reason = await rr.capture_raw_ws(
+        root,
+        end_in(0.4),
+        "kalshi",
+        market_list(tmp_path, "kalshi", ["K-A"]),
+        connector=connector,
+        auth=FakeProvider(),
+        runs_root=tmp_path / "runs",
+        **FAST,
+    )
+    assert reason == "deadline"
+    [session] = root.iterdir()
+    errors = [f["payload_raw"] for f in frames(session) if f["frame_type"] == "transport_error"]
+    assert errors and all(error == "OSError: echoed <redacted>" for error in errors)
+    recorded = "".join(p.read_text() for p in session.glob("*.json")) + capsys.readouterr().err
+    assert "<redacted>" in recorded and "sig-" not in recorded
+
+
+@pytest.mark.asyncio
+async def test_debug_logging_does_not_emit_signed_handshake_headers(tmp_path, caplog):
+    caplog.set_level(logging.DEBUG)
+
+    async def handler(ws):
+        await ws.close()
+
+    async with local_server(handler) as local:
+        reason = await rr.capture_raw_ws(
+            tmp_path / "runs" / "run1" / "kalshi_00",
+            end_in(0.3),
+            "kalshi",
+            market_list(tmp_path, "kalshi", ["K-A"]),
+            connector=connector_to(local),
+            auth=FakeProvider(),
+            runs_root=tmp_path / "runs",
+            **FAST,
+        )
+    assert reason == "deadline"
+    client = [r for r in caplog.records if not r.name.startswith("websockets.server")]
+    assert not any("sig-" in r.getMessage() for r in client)
 
 
 @pytest.mark.asyncio

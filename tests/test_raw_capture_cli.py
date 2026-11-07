@@ -91,6 +91,22 @@ def test_cli_reuses_injected_read_auth_loader(tmp_path, monkeypatch, factory):
     assert calls == [provider]
 
 
+def test_cli_masks_read_auth_initializer_errors(tmp_path, monkeypatch):
+    def provider():
+        raise RuntimeError("synthetic-secret-marker")
+
+    module = types.ModuleType("synthetic_failing_raw_auth")
+    module.provider = provider
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    result = CliRunner().invoke(
+        app,
+        arguments(tmp_path, "kalshi") + ["--header-provider", module.__name__ + ":provider"],
+    )
+    assert result.exit_code != 0
+    assert "RuntimeError" in _normalized_cli_output(result.output)
+    assert "synthetic-secret-marker" not in _normalized_cli_output(result.output)
+
+
 def test_cli_requires_kalshi_header_provider_before_creating_output(tmp_path):
     result = CliRunner().invoke(app, arguments(tmp_path, "kalshi"))
     assert result.exit_code != 0

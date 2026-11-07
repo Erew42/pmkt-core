@@ -201,10 +201,11 @@ def _load_read_auth_header_provider(spec: str | None) -> ReadAuthHeaderProvider:
             else candidate
         )
     except Exception as exc:
+        # Initializer messages may contain credential material; report only the type.
         raise typer.BadParameter(
-            f"could not initialize read-auth header provider {spec!r}: {exc}",
+            f"could not initialize read-auth header provider {spec!r}: {type(exc).__name__}",
             param_hint="--header-provider",
-        ) from exc
+        ) from None
     if not callable(getattr(provider, "headers_for_get", None)):
         raise typer.BadParameter(
             f"{spec!r} does not provide a headers_for_get(path) method",

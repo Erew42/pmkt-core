@@ -14,6 +14,7 @@ import contextlib
 import gzip
 import hashlib
 import json
+import logging
 import math
 import os
 import random
@@ -76,6 +77,18 @@ EXCHANGE_TIMESTAMP = {
     "kalshi": re.compile(r'"sending_ts_ms"\s*:\s*(0|[1-9][0-9]{0,18})(?=\s*[,}])'),
     "polymarket": re.compile(r'"timestamp"\s*:\s*"([0-9]{1,19})"'),
 }
+# The websockets client logs handshake request headers, including Kalshi signatures, at DEBUG.
+WS_LOGGER = logging.getLogger(__name__ + ".websockets")
+WS_LOGGER.setLevel(logging.INFO)
+
+
+class NoRedirectConnect(connect):
+    """Refuse handshake redirects: they would carry signed headers past ``WS_URLS``."""
+
+    def process_redirect(self, exc: Exception) -> Exception | str:
+        return exc
+
+
 DISCLAIMER = dict(
     raw_only=True,
     recording_v1=False,
@@ -476,7 +489,7 @@ async def capture_raw_ws(
     *,
     runs_root: Path,
     auth: ReadAuthHeaderProvider | None = None,
-    connector: Callable[..., Any] = connect,
+    connector: Callable[..., Any] = NoRedirectConnect,
     chunk_seconds: float = CHUNK_SECONDS,
     free_bytes: Callable[[], int] | None = None,
     low_free: int = LOW_FREE,
@@ -739,6 +752,8 @@ async def capture_raw_ws(
                     )
                     last_summary = now
 
+        sent_header_values: list[str] = []
+
         def connect_kwargs():
             common = dict(
                 open_timeout=15,
@@ -747,6 +762,7 @@ async def capture_raw_ws(
                 max_queue=128,
                 proxy=None,
                 create_connection=ObservedConnection,
+                logger=WS_LOGGER,
             )
             if venue == "polymarket":
                 return dict(common, ping_interval=None)
@@ -761,6 +777,7 @@ async def capture_raw_ws(
                 raise ReadAuthenticationRequiredError(
                     "Kalshi read-auth provider failed"
                 ) from None
+            sent_header_values[:] = [value for value in headers.values() if value]
             return dict(
                 common, additional_headers=headers, ping_interval=20, ping_timeout=20
             )
@@ -917,7 +934,11 @@ async def capture_raw_ws(
 
         def on_error(exc):
             counters["errors"] += 1
-            status["last_error"] = f"{type(exc).__name__}: {str(exc)[:250]}"
+            text = str(exc)
+            # A misbehaving endpoint can echo request headers into handshake errors.
+            for value in sent_header_values:
+                text = text.replace(value, "<redacted>")
+            status["last_error"] = f"{type(exc).__name__}: {text[:250]}"
             writer.write(
                 "transport_error", status["last_error"], tracker.generation, "local"
             )

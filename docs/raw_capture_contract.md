@@ -32,7 +32,9 @@ Supply an absolute `--runs-root` and an absolute `--root` exactly two levels
 below it: `RUNS/RUN/INSTANCE`. Neither the path nor any ancestor may be a symlink;
 `..` is rejected. RUN and INSTANCE must match
 `[A-Za-z0-9][A-Za-z0-9_-]{0,95}`. The runs root is supplied explicitly, rather
-than inferred from the installed module directory. Every process start creates
+than inferred from the installed module directory. The path checks run once at
+startup and do not guard against concurrent changes, so only the recording user
+may be able to write under the runs root. Every process start creates
 a new session directory, including after a crash:
 
 ```text
