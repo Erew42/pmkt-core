@@ -158,9 +158,9 @@ def test_cli_tls_fsync_and_signal_seals_chunk(
     assert final["closed_chunk_count"] == 1 and final["errors"] == 0
     assert not list(session.glob("*.part"))
     events = [r for r in caplog.records if r.name == rr.__name__]
-    assert [r.implementation for r in events if r.getMessage() == "event_loop"] == [
-        provenance["event_loop"]
-    ]
+    assert [
+        r.implementation for r in events if r.getMessage().startswith("event_loop ")
+    ] == [provenance["event_loop"]]
 
 
 def test_run_falls_back_when_uvloop_cannot_be_imported(monkeypatch, caplog):
@@ -197,9 +197,9 @@ def test_run_falls_back_when_uvloop_cannot_be_imported(monkeypatch, caplog):
     assert len(loops) == 1 and loops[0].is_closed()
     assert cancelled == generators_closed == [True]
     events = [r for r in caplog.records if r.name == "<run_path>"]
-    assert [r.implementation for r in events if r.getMessage() == "event_loop"] == [
-        "asyncio"
-    ]
+    assert [
+        r.implementation for r in events if r.getMessage().startswith("event_loop ")
+    ] == ["asyncio"]
 
 
 def test_run_closes_loop_on_error(monkeypatch):

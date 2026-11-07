@@ -140,6 +140,17 @@ WS_LOGGER = logging.getLogger(__name__ + ".websockets")
 WS_LOGGER.setLevel(logging.INFO)
 
 
+def log_event(level: int, event: str, **fields: Any) -> None:
+    """Expose safe event fields to both plain and structured logging handlers."""
+    logger.log(
+        level,
+        "%s %s",
+        event,
+        json.dumps(fields, sort_keys=True, separators=(",", ":")),
+        extra=fields,
+    )
+
+
 class NoRedirectConnect(connect):
     """Refuse handshake redirects: they would carry signed headers past ``WS_URLS``."""
 
@@ -177,15 +188,16 @@ def run(coro: Coroutine[Any, Any, _Result]) -> _Result:
         with asyncio.Runner(
             loop_factory=uvloop.new_event_loop if uvloop is not None else None
         ) as runner:
-            logger.info(
+            log_event(
+                logging.INFO,
                 "event_loop",
-                extra=dict(implementation=event_loop_name(runner.get_loop())),
+                implementation=event_loop_name(runner.get_loop()),
             )
             return runner.run(coro)
     loop = uvloop.new_event_loop() if uvloop is not None else asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        logger.info("event_loop", extra=dict(implementation=event_loop_name(loop)))
+        log_event(logging.INFO, "event_loop", implementation=event_loop_name(loop))
         return loop.run_until_complete(coro)
     finally:
         # Match asyncio.run's cleanup without changing the process-wide loop policy.
@@ -582,8 +594,11 @@ async def capture_raw_ws(
     free_bytes = free_bytes or (lambda: shutil.disk_usage(root).free)
     receive_timeout = receive_timeout or RECEIVE_TIMEOUTS[venue]
     if end <= datetime.now(timezone.utc):
-        logger.info(
-            "end_already_passed", extra=dict(instance=instance, end_utc=end.isoformat())
+        log_event(
+            logging.INFO,
+            "end_already_passed",
+            instance=instance,
+            end_utc=end.isoformat(),
         )
         return "end_already_passed"
     if venue == "kalshi" and auth is None:
@@ -650,14 +665,13 @@ async def capture_raw_ws(
                 **DISCLAIMER,
             ),
         )
-        logger.info(
+        log_event(
+            logging.INFO,
             "session_start",
-            extra=dict(
-                instance=instance,
-                venue=venue,
-                session=session.name,
-                instruments=len(instruments),
-            ),
+            instance=instance,
+            venue=venue,
+            session=session.name,
+            instruments=len(instruments),
         )
 
         def state():
@@ -696,18 +710,22 @@ async def capture_raw_ws(
             if values["lag_samples_60s"] >= LAG_MIN_SAMPLES and p50 > lag_warn_ms:
                 if not lag_warned or now - last_lag_warning >= LAG_WARN_SECONDS:
                     counters["lag_warnings"] += 1
-                    logger.warning(
+                    log_event(
+                        logging.WARNING,
                         "lag_warning",
-                        extra=dict(
-                            instance=instance, lag_warn_ms=lag_warn_ms, **values
-                        ),
+                        instance=instance,
+                        lag_warn_ms=lag_warn_ms,
+                        **values,
                     )
                     last_lag_warning = now
                 lag_warned = True
             elif lag_warned and p50 is not None and p50 <= lag_warn_ms:
-                logger.info(
+                log_event(
+                    logging.INFO,
                     "lag_recovered",
-                    extra=dict(instance=instance, lag_warn_ms=lag_warn_ms, **values),
+                    instance=instance,
+                    lag_warn_ms=lag_warn_ms,
+                    **values,
                 )
                 lag_warned = False
 
@@ -727,9 +745,10 @@ async def capture_raw_ws(
                             direction="received_control_base64",
                         )
                     except OSError as exc:
-                        logger.error(
+                        log_event(
+                            logging.ERROR,
                             "control_frame_write_failed",
-                            extra=dict(error=type(exc).__name__),
+                            error=type(exc).__name__,
                         )
                         stop.set()
                 super().process_event(event)
@@ -748,21 +767,19 @@ async def capture_raw_ws(
                 level != "ok"
                 and time.monotonic() - status["disk_logged"] >= DISK_LOG_SECONDS
             ):
-                logger.log(
+                log_event(
                     logging.ERROR
                     if level == "critical"
                     else logging.WARNING
                     if level == "low"
                     else logging.INFO,
                     "disk_state",
-                    extra=dict(
-                        instance=instance,
-                        disk=level,
-                        free_bytes=free,
-                        action="frames_dropped_until_space_returns"
-                        if level == "critical"
-                        else "recording",
-                    ),
+                    instance=instance,
+                    disk=level,
+                    free_bytes=free,
+                    action="frames_dropped_until_space_returns"
+                    if level == "critical"
+                    else "recording",
                 )
                 status["disk_logged"] = time.monotonic()
             status["disk"] = level
@@ -795,22 +812,21 @@ async def capture_raw_ws(
                     last_state = now
                 if now - last_summary >= SUMMARY_SECONDS:
                     values = lag.stats(now)
-                    logger.info(
+                    log_event(
+                        logging.INFO,
                         "summary",
-                        extra=dict(
-                            instance=instance,
-                            generation=tracker.generation,
-                            connected=status["connected"],
-                            books=len(tracker.books),
-                            expected=len(tracker.expected),
-                            frames=writer.seq,
-                            sealed=writer.sealed_count,
-                            disk=status["disk"],
-                            **counters,
-                            exchange_lag_ms_p50_60s=values["exchange_lag_ms_p50_60s"],
-                            exchange_lag_ms_max_60s=values["exchange_lag_ms_max_60s"],
-                            loop_lag_ms_max_60s=values["loop_lag_ms_max_60s"],
-                        ),
+                        instance=instance,
+                        generation=tracker.generation,
+                        connected=status["connected"],
+                        books=len(tracker.books),
+                        expected=len(tracker.expected),
+                        frames=writer.seq,
+                        sealed=writer.sealed_count,
+                        disk=status["disk"],
+                        **counters,
+                        exchange_lag_ms_p50_60s=values["exchange_lag_ms_p50_60s"],
+                        exchange_lag_ms_max_60s=values["exchange_lag_ms_max_60s"],
+                        loop_lag_ms_max_60s=values["loop_lag_ms_max_60s"],
                     )
                     last_summary = now
 
@@ -856,11 +872,11 @@ async def capture_raw_ws(
                 try:
                     async with connector(url, **connect_kwargs()) as ws:
                         status["connected"] = True
-                        logger.info(
+                        log_event(
+                            logging.INFO,
                             "connected",
-                            extra=dict(
-                                instance=instance, generation=tracker.generation
-                            ),
+                            instance=instance,
+                            generation=tracker.generation,
                         )
                         for payload in subscriptions(venue, instruments):
                             await ws.send(payload)
@@ -905,13 +921,12 @@ async def capture_raw_ws(
                                     was_ready = True
                                     backoff = backoff_start
                                     counters["ready_generations"] += 1
-                                    logger.info(
+                                    log_event(
+                                        logging.INFO,
                                         "ready",
-                                        extra=dict(
-                                            instance=instance,
-                                            generation=tracker.generation,
-                                            books=len(tracker.books),
-                                        ),
+                                        instance=instance,
+                                        generation=tracker.generation,
+                                        books=len(tracker.books),
                                     )
                                 if tracker.gap is not None:
                                     counters["seq_gaps"] += 1
@@ -921,9 +936,11 @@ async def capture_raw_ws(
                                         tracker.generation,
                                         "local",
                                     )
-                                    logger.warning(
+                                    log_event(
+                                        logging.WARNING,
                                         "seq_gap",
-                                        extra=dict(instance=instance, **tracker.gap),
+                                        instance=instance,
+                                        **tracker.gap,
                                     )
                                     tracker.gap = None
                                     if (
@@ -1008,13 +1025,12 @@ async def capture_raw_ws(
             writer.write(
                 "transport_error", status["last_error"], tracker.generation, "local"
             )
-            logger.warning(
+            log_event(
+                logging.WARNING,
                 "transport_error",
-                extra=dict(
-                    instance=instance,
-                    generation=tracker.generation,
-                    error=status["last_error"],
-                ),
+                instance=instance,
+                generation=tracker.generation,
+                error=status["last_error"],
             )
 
         check_disk()
@@ -1071,14 +1087,13 @@ async def capture_raw_ws(
                         source_hashes=source_hashes,
                     ),
                 )
-                logger.info(
+                log_event(
+                    logging.INFO,
                     "session_end",
-                    extra=dict(
-                        instance=instance,
-                        reason=reason,
-                        frames=writer.seq,
-                        sealed=writer.sealed_count,
-                        **counters,
-                    ),
+                    instance=instance,
+                    reason=reason,
+                    frames=writer.seq,
+                    sealed=writer.sealed_count,
+                    **counters,
                 )
         return reason

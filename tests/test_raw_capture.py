@@ -5,6 +5,7 @@ import base64
 import contextlib
 import gzip
 import hashlib
+import io
 import itertools
 import json
 import logging
@@ -649,7 +650,7 @@ async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, capl
     logs = [
         r
         for r in caplog.records
-        if r.name == rr.__name__ and r.getMessage() == "transport_error"
+        if r.name == rr.__name__ and r.getMessage().startswith("transport_error ")
     ]
     assert logs and all(
         r.levelno == logging.WARNING and r.error == errors[0] for r in logs
@@ -680,6 +681,42 @@ async def test_debug_logging_does_not_emit_signed_handshake_headers(tmp_path, ca
     assert reason == "deadline"
     client = [r for r in caplog.records if not r.name.startswith("websockets.server")]
     assert not any("sig-" in r.getMessage() for r in client)
+
+
+@pytest.mark.asyncio
+async def test_transport_error_renders_fields_with_plain_basic_config(
+    tmp_path, monkeypatch
+):
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+
+    def connector(url, **kwargs):
+        clock.offset = 6
+        raise OSError("synthetic offline")
+
+    output = io.StringIO()
+    with monkeypatch.context() as logging_patch:
+        logging_patch.setattr(logging.root, "handlers", [])
+        logging_patch.setattr(logging.root, "level", logging.NOTSET)
+        logging.basicConfig(level=logging.INFO, stream=output)
+        reason = await rr.capture_raw_ws(
+            tmp_path / "runs/run1/polymarket_00",
+            end_in(5),
+            "polymarket",
+            market_list(tmp_path, "polymarket", ["1"]),
+            connector=connector,
+            runs_root=tmp_path / "runs",
+            **FAST,
+        )
+
+    assert reason == "deadline"
+    [line] = [
+        line for line in output.getvalue().splitlines() if ":transport_error" in line
+    ]
+    assert line == (
+        'WARNING:pmkt.streaming.raw_capture:transport_error '
+        '{"error":"OSError: synthetic offline","generation":1,"instance":"polymarket_00"}'
+    )
 
 
 @pytest.mark.asyncio
@@ -769,7 +806,7 @@ async def test_disk_critical_pauses_then_resumes_with_fresh_generation(
     disk_logs = [
         r
         for r in caplog.records
-        if r.name == rr.__name__ and r.getMessage() == "disk_state"
+        if r.name == rr.__name__ and r.getMessage().startswith("disk_state ")
     ]
     assert {r.disk: r.levelno for r in disk_logs} == {
         "critical": logging.ERROR,
@@ -1325,7 +1362,11 @@ async def scripted_lag_capture(tmp_path, monkeypatch, caplog, steps, **options):
     class CollectLogs(logging.Handler):
         def emit(self, record):
             logs.append(
-                dict(record.__dict__, event=record.getMessage(), at=clock.offset)
+                dict(
+                    record.__dict__,
+                    event=record.getMessage().split(" ", 1)[0],
+                    at=clock.offset,
+                )
             )
 
     monkeypatch.setattr(rr.logger, "handlers", [CollectLogs()])
