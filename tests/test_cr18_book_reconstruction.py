@@ -146,7 +146,10 @@ def test_depth_parity_bucket_count_rejects_invalid_environment_override(
     result = _import_depth_parity_bucket_count(value)
 
     assert result.returncode != 0
-    assert "positive" in result.stderr
+    message = result.stderr.splitlines()[-1]
+    assert "PMKT_DEPTH_PARITY_BUCKET_COUNT" in message
+    assert repr(value) in message
+    assert "positive" in message
 
 
 def _eligibility_evidence(*instrument_ids: str) -> dict[str, dict[str, str]]:

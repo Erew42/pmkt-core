@@ -125,12 +125,17 @@ class ParityOptions:
         else:
             count = os.environ.get("PMKT_DEPTH_PARITY_BUCKET_COUNT")
             if count is not None:
+                message = (
+                    "PMKT_DEPTH_PARITY_BUCKET_COUNT must be a positive integer; "
+                    f"got {count!r}"
+                )
                 try:
-                    overrides["depth_bucket_count"] = int(count)
+                    parsed_count = int(count)
                 except ValueError as exc:
-                    raise ValueError(
-                        "PMKT_DEPTH_PARITY_BUCKET_COUNT must be a positive integer"
-                    ) from exc
+                    raise ValueError(message) from exc
+                if parsed_count <= 0:
+                    raise ValueError(message)
+                overrides["depth_bucket_count"] = parsed_count
         return cls(**overrides)
 
 
