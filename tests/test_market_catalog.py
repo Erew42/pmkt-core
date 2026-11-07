@@ -2164,6 +2164,8 @@ async def test_catalog_page_cap_fails_before_incomplete_result(venue, cap):
         DEFAULT_MAX_PAGES_PER_LANE, collect_polymarket_current, _collect_kalshi_pages,
     )
 
+    assert DEFAULT_MAX_PAGES_PER_LANE == 10_000
+
     class Client:
         calls = 0
         async def page(self, **kwargs):
