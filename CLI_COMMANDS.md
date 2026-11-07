@@ -150,6 +150,12 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+Catalog discovery and current refresh inherit the collector-owned
+`DEFAULT_MAX_PAGES_PER_LANE` when `--max-pages` is omitted. The cap is a local
+request budget: needing another page after the cap remains an error and never
+publishes partial coverage. Compaction keeps its existing condition keys and
+strict ratio boundaries; named catalog policy constants own the trigger values.
+
 ## Runtime configuration in 0.2
 
 Application entrypoints explicitly load `PmktConfig.from_env()` and pass the

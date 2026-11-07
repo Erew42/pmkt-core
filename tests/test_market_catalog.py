@@ -2153,3 +2153,112 @@ async def test_kalshi_discovery_resolves_five_digit_fraction_created_time() -> N
     assert result.high_watermark == datetime(
         2026, 8, 23, 11, 45, 22, 716630, tzinfo=timezone.utc
     )
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("cap", [None, 0, 1])
+async def test_catalog_page_cap_fails_before_incomplete_result(venue, cap):
+    from pmkt.data.market_catalog.collect import (
+        DEFAULT_MAX_PAGES_PER_LANE, collect_polymarket_current, _collect_kalshi_pages,
+    )
+
+    class Client:
+        calls = 0
+        async def page(self, **kwargs):
+            self.calls += 1
+            return {"markets": [], "next_cursor": str(self.calls), "cursor": str(self.calls)}
+        markets_keyset_raw_page = page
+        markets_page = page
+
+    client = Client()
+    collect = collect_polymarket_current if venue == "polymarket" else _collect_kalshi_pages
+    options = {} if cap is None else {"max_pages": cap}
+    with pytest.raises(CatalogError, match="exceeded"):
+        await collect(client, **options)
+    assert client.calls == (DEFAULT_MAX_PAGES_PER_LANE if cap is None else cap)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_catalog_terminal_page_at_cap_is_complete(venue):
+    from pmkt.data.market_catalog.collect import collect_polymarket_current, _collect_kalshi_pages
+
+    class Client:
+        async def page(self, **kwargs):
+            return {"markets": [], "next_cursor": "", "cursor": ""}
+        markets_keyset_raw_page = page
+        markets_page = page
+
+    collect = collect_polymarket_current if venue == "polymarket" else _collect_kalshi_pages
+    rows, details = await collect(Client(), max_pages=1)
+    assert rows == []
+    assert details["pages"] == 1
+    assert details["complete"] is True
+
+
+@pytest.mark.parametrize("metrics,expected", [
+    ({"promotion_layer_count": 3}, set()),
+    ({"promotion_layer_count": 4}, {"four_weekly_promotion_layers"}),
+    ({"promotion_layer_count": 5}, {"four_weekly_promotion_layers"}),
+    ({"base_row_count": 100, "uncompacted_delta_rows": 9}, set()),
+    ({"base_row_count": 100, "uncompacted_delta_rows": 10}, set()),
+    ({"base_row_count": 100, "uncompacted_delta_rows": 11}, {"delta_rows_exceed_ten_percent"}),
+    ({"base_parquet_file_count": 100, "uncompacted_delta_parquet_file_count": 24}, set()),
+    ({"base_parquet_file_count": 100, "uncompacted_delta_parquet_file_count": 25}, set()),
+    ({"base_parquet_file_count": 100, "uncompacted_delta_parquet_file_count": 26}, {"delta_files_exceed_twenty_five_percent"}),
+    ({"uncompacted_delta_rows": 100, "uncompacted_delta_parquet_file_count": 100}, set()),
+])
+def test_catalog_compaction_policy_boundaries_and_condition_keys(tmp_path, monkeypatch, metrics, expected):
+    service = MarketCatalogService(tmp_path)
+    monkeypatch.setattr(service, "_history_manifest", lambda: (tmp_path, metrics))
+    result = service.compaction_due()
+    assert set(result["conditions"]) == {
+        "four_weekly_promotion_layers", "delta_rows_exceed_ten_percent",
+        "delta_files_exceed_twenty_five_percent",
+    }
+    assert {key for key, value in result["conditions"].items() if value} == expected
+    assert result["due"] == bool(expected)
+
+
+@pytest.mark.parametrize("command", ["discover-new", "refresh-current"])
+@pytest.mark.parametrize("cap", [None, 1, 0])
+def test_catalog_cli_only_forwards_explicit_page_cap(monkeypatch, command, cap):
+    from pmkt.cli import market_catalog as cli
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    class Service:
+        def __init__(self, root):
+            pass
+        async def discover(self, *args, **kwargs):
+            calls.append(kwargs)
+            return {}
+        refresh_current = discover
+
+    monkeypatch.setattr(cli, "MarketCatalogService", Service)
+    monkeypatch.setattr(cli, "AsyncGammaClient", Client)
+    monkeypatch.setattr(cli, "AsyncKalshiClient", Client)
+    monkeypatch.setattr(cli.PmktConfig, "from_env", lambda: None)
+    args = [command]
+    if command == "discover-new":
+        args += ["--stream", "polymarket"]
+    if cap is not None:
+        args += ["--max-pages", str(cap)]
+    result = CliRunner().invoke(markets_app, args)
+    if cap == 0:
+        assert result.exit_code != 0
+        assert calls == []
+    else:
+        assert result.exit_code == 0, result.output
+        assert {key: value for key, value in calls[0].items() if key == "max_pages"} == (
+            {} if cap is None else {"max_pages": cap}
+        )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pmkt.data.market_catalog.collect import DEFAULT_MAX_PAGES_PER_LANE
 from pmkt.config import PmktConfig
 
 from typing import Annotated, Any, Literal, cast
@@ -78,8 +79,13 @@ def discover_new_cmd(
         typer.Option(help="Override the stream-specific safety overlap."),
     ] = None,
     max_pages: Annotated[
-        int, typer.Option(help="Safety cap per cursor lane.")
-    ] = 10_000,
+        int | None,
+        typer.Option(
+            help="Local safety cap per cursor lane; an incomplete lane at the cap fails.",
+            min=1,
+            show_default=str(DEFAULT_MAX_PAGES_PER_LANE),
+        ),
+    ] = None,
     no_publish: Annotated[
         bool,
         typer.Option(
@@ -89,11 +95,12 @@ def discover_new_cmd(
     ] = False,
 ) -> None:
     """Discover markets created since each stream's overlap watermark."""
+    page_overrides: dict[str, Any] = {}
+    if max_pages is not None:
+        page_overrides["max_pages"] = max_pages
     valid = ("polymarket", "kalshi-conventional", "kalshi-mve")
     if all_streams == (stream is not None):
         raise typer.BadParameter("choose exactly one of --stream or --all")
-    if max_pages < 1:
-        raise typer.BadParameter("must be at least 1", param_hint="--max-pages")
     if overlap_seconds is not None and overlap_seconds < 0:
         raise typer.BadParameter("must be nonnegative", param_hint="--overlap-seconds")
     requested = valid if all_streams else (str(stream),)
@@ -118,7 +125,7 @@ def discover_new_cmd(
                     stream_name,
                     bootstrap_cutoff=_cutoff(bootstrap_cutoff),
                     overlap_seconds=overlap_seconds,
-                    max_pages=max_pages,
+                    **page_overrides,
                     publish=not no_publish,
                     client=client,
                 )
@@ -163,14 +170,20 @@ def refresh_current_cmd(
         ),
     ] = None,
     max_pages: Annotated[
-        int, typer.Option(help="Safety cap per cursor lane.")
-    ] = 10_000,
+        int | None,
+        typer.Option(
+            help="Local safety cap per cursor lane; an incomplete lane at the cap fails.",
+            min=1,
+            show_default=str(DEFAULT_MAX_PAGES_PER_LANE),
+        ),
+    ] = None,
 ) -> None:
     """Publish a complete current nonterminal market census."""
+    page_overrides: dict[str, Any] = {}
+    if max_pages is not None:
+        page_overrides["max_pages"] = max_pages
     if scope not in {"standard", "all"}:
         raise typer.BadParameter("must be standard or all", param_hint="--scope")
-    if max_pages < 1:
-        raise typer.BadParameter("must be at least 1", param_hint="--max-pages")
 
     async def run() -> dict[str, Any]:
         async with AsyncGammaClient(
@@ -181,7 +194,7 @@ def refresh_current_cmd(
             return await MarketCatalogService(market_root).refresh_current(
                 scope=cast(Literal["standard", "all"], scope),
                 bootstrap_cutoff=_cutoff(bootstrap_cutoff),
-                max_pages=max_pages,
+                **page_overrides,
                 polymarket_client=polymarket,
                 kalshi_client=kalshi,
             )

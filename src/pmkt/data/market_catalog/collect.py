@@ -30,6 +30,10 @@ from .types import (
 )
 
 
+# Bound a cursor lane's local request budget; this is not a venue page ceiling.
+# Needing another page after the cap must fail instead of publishing a partial census.
+DEFAULT_MAX_PAGES_PER_LANE = 10_000
+
 _PM_CREATED_KEYS = ("createdAt", "created_at", "created")
 
 
@@ -104,7 +108,7 @@ async def collect_polymarket_discovery(
     client: Any,
     *,
     cutoff: datetime,
-    max_pages: int = 10_000,
+    max_pages: int = DEFAULT_MAX_PAGES_PER_LANE,
     retry_delay_seconds: float = 0.0,
 ) -> CollectionResult:
     """Collect creation-ordered open and closed lanes, failing closed on gaps."""
@@ -264,7 +268,7 @@ async def collect_polymarket_discovery(
 async def _collect_kalshi_pages(
     client: Any,
     *,
-    max_pages: int,
+    max_pages: int = DEFAULT_MAX_PAGES_PER_LANE,
     **params: Any,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     cursor: str | None = None
@@ -307,12 +311,15 @@ async def collect_kalshi_discovery(
     *,
     cutoff: datetime,
     native_family: Literal["kalshi_conventional", "kalshi_mve"],
-    max_pages: int = 10_000,
+    max_pages: int | None = None,
 ) -> CollectionResult:
+    page_overrides: dict[str, Any] = {}
+    if max_pages is not None:
+        page_overrides["max_pages"] = max_pages
     mve_filter = "only" if native_family == "kalshi_mve" else "exclude"
     rows, details = await _collect_kalshi_pages(
         client,
-        max_pages=max_pages,
+        **page_overrides,
         status=None,
         mve_filter=mve_filter,
         min_created_ts=int(cutoff.timestamp()),
@@ -355,9 +362,12 @@ async def verify_kalshi_filter_agreement(
     *,
     cutoff: datetime,
     window_end: datetime | None = None,
-    max_pages: int = 10_000,
+    max_pages: int | None = None,
 ) -> dict[str, Any]:
     """Verify that Kalshi's MVE filters partition one exhausted recent window."""
+    page_overrides: dict[str, Any] = {}
+    if max_pages is not None:
+        page_overrides["max_pages"] = max_pages
     fixed_end = (window_end or utc_now()).astimezone(timezone.utc)
     if fixed_end < cutoff:
         raise ValueError("Kalshi filter-agreement window end precedes its cutoff")
@@ -366,7 +376,7 @@ async def verify_kalshi_filter_agreement(
     for name, mve_filter in (("only", "only"), ("exclude", "exclude"), ("all", None)):
         rows, details = await _collect_kalshi_pages(
             client,
-            max_pages=max_pages,
+            **page_overrides,
             status=None,
             mve_filter=mve_filter,
             min_created_ts=int(cutoff.timestamp()),
@@ -396,7 +406,7 @@ async def verify_kalshi_filter_agreement(
 
 
 async def collect_polymarket_current(
-    client: Any, *, max_pages: int = 10_000
+    client: Any, *, max_pages: int = DEFAULT_MAX_PAGES_PER_LANE
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     cursor: str | None = None
     seen: set[str] = set()
@@ -445,15 +455,18 @@ async def collect_kalshi_current_family(
     client: Any,
     *,
     native_family: Literal["kalshi_conventional", "kalshi_mve"],
-    max_pages: int = 10_000,
+    max_pages: int | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, Any]]:
+    page_overrides: dict[str, Any] = {}
+    if max_pages is not None:
+        page_overrides["max_pages"] = max_pages
     mve_filter = "only" if native_family == "kalshi_mve" else "exclude"
     outputs: dict[str, list[dict[str, Any]]] = {}
     details: dict[str, Any] = {}
     for status in ("open", "unopened", "paused"):
         rows, lane = await _collect_kalshi_pages(
             client,
-            max_pages=max_pages,
+            **page_overrides,
             status=status,
             mve_filter=mve_filter,
         )
