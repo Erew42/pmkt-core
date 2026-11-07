@@ -150,6 +150,13 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+`reconstruct-book-tape` accepts `--parity-memory-limit` (a DuckDB size string)
+and `--depth-parity-bucket-count` (positive integer). Explicit flags override
+`PMKT_DUCKDB_PARITY_MEMORY_LIMIT` / `PMKT_DEPTH_PARITY_BUCKET_COUNT`; otherwise
+the retained environment names override `ParityOptions` defaults. Values resolve
+when reconstruction starts, rather than on module import, and stay fixed for
+that run. Omitted `--batch-rows` inherits the stream owner's batch default.
+
 ## Runtime configuration in 0.2
 
 Application entrypoints explicitly load `PmktConfig.from_env()` and pass the
