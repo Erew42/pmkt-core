@@ -13,7 +13,7 @@ import httpx
 from pmkt.runtime import OperationExpiry
 from pmkt.resolution.providers import ClobResolutionProvider, GammaResolutionProvider, CtfResolutionProvider
 from pmkt.records import PolymarketMarketRef
-from pmkt.resolution._batch import resolve_ordered_batch
+from pmkt.resolution._batch import DEFAULT_RESOLUTION_CONCURRENCY, resolve_ordered_batch
 from pmkt.resolution.evm import EvmRpcError, _normalize_hex32
 from pmkt.resolution.models import (
     CONFIDENCE_CANONICAL,
@@ -728,7 +728,7 @@ class PolymarketResolutionResolver:
         self,
         markets: Sequence[PolymarketMarketRef],
         *,
-        concurrency: int = 8,
+        concurrency: int = DEFAULT_RESOLUTION_CONCURRENCY,
         deadline_s: float = 120.0,
     ) -> list[ResolutionRecord]:
         return await resolve_ordered_batch(

@@ -715,6 +715,13 @@
         "ensure_polygon",
         "payout_vector"
       ]
+    },
+    {
+      "path": "pmkt.data.book_reconstruction_streaming.ParityOptions",
+      "tier": "advanced",
+      "methods": [
+        "from_env"
+      ]
     }
   ]
 }

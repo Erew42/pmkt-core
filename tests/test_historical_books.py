@@ -484,3 +484,25 @@ async def test_historical_trade_keys_are_unique_across_ticker_partitions(tmp_pat
     paths = write_historical_backfill_result(result, tmp_path)
     trades = pd.read_parquet(paths["trades"])
     assert trades["venue_trade_id"].tolist() == (["A"] if duplicate else ["A", "B"])
+
+
+class _FailIfCalled:
+    def __getattr__(self, name):
+        raise AssertionError(f"client.{name} must not be used after invalid interval input")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, -1])
+async def test_backfill_rejects_nonpositive_polymarket_fidelity_before_fetch(value):
+    with pytest.raises(ValueError, match="fidelity must be a positive"):
+        await backfill_venue_history(
+            "polymarket", ["token"], fidelity=value, polymarket_client=_FailIfCalled())
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, -1])
+async def test_backfill_rejects_nonpositive_kalshi_period_interval_before_fetch(value):
+    with pytest.raises(ValueError, match="period_interval must be a positive"):
+        await backfill_venue_history(
+            "kalshi", ["KXTEST"], start_ts=0, end_ts=60, period_interval=value,
+            kalshi_client=_FailIfCalled())

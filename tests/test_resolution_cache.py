@@ -1240,3 +1240,55 @@ async def test_cache_inconsistent_record_is_not_collapsed_into_existing_final(
     [row] = pd.read_parquet(output_dir / "market_resolutions.parquet").to_dict("records")
     assert row["resolution_state"] == STATE_INCONSISTENT
     assert row["error_type"] == "Conflict"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency,error", [
+    (0, ValueError), (-1, ValueError), (True, TypeError),
+    (False, TypeError), (1.5, TypeError), (None, TypeError),
+])
+async def test_cache_rejects_invalid_concurrency_before_io(tmp_path, monkeypatch, concurrency, error):
+    def unexpected_io(*args, **kwargs):
+        raise AssertionError("I/O started before validation")
+
+    monkeypatch.setattr(cache_module, "_matches_universe", unexpected_io)
+    monkeypatch.setattr(cache_module, "AsyncGammaClient", unexpected_io)
+    output = tmp_path / "not-created"
+    with pytest.raises(error, match="concurrency"):
+        await cache_module.resolve_market_resolution_cache(
+            polymarket_markets_path=tmp_path / "missing-pm",
+            kalshi_markets_path=tmp_path / "missing-kalshi",
+            output_dir=output,
+            concurrency=concurrency,
+        )
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("concurrency", [None, 1, 0, -1])
+def test_resolution_cli_forwards_only_explicit_concurrency(tmp_path, monkeypatch, concurrency):
+    from typer.testing import CliRunner
+    from pmkt.cli.app import app
+    import pmkt.cli.resolution as cli
+
+    calls = []
+
+    async def resolve(**kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(cli, "resolve_market_resolution_cache", resolve)
+    args = ["resolve-market-resolutions", "--polymarket-markets", str(tmp_path),
+            "--kalshi-markets", str(tmp_path), "--output-dir", str(tmp_path)]
+    if concurrency is not None:
+        args += ["--concurrency", str(concurrency)]
+    result = CliRunner().invoke(app, args)
+    if concurrency is not None and concurrency <= 0:
+        assert result.exit_code != 0
+        assert "concurrency must be positive" in result.output
+        assert not calls
+    else:
+        assert result.exit_code == 0, result.output
+        assert len(calls) == 1
+        assert {k: v for k, v in calls[0].items() if k == "concurrency"} == (
+            {} if concurrency is None else {"concurrency": concurrency}
+        )
