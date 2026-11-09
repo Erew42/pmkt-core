@@ -271,16 +271,33 @@ def test_history_cli_only_forwards_supplied_settings(monkeypatch, tmp_path, venu
         args += ["--start-ts", "0", "--end-ts", "1", "--run-id", ""]
         expected = {"start_ts": 0, "end_ts": 1, "run_id": ""}
         if venue == "polymarket":
-            args += ["--interval", "", "--fidelity", "0"]
-            expected.update(interval="", fidelity=0)
+            args += ["--interval", "", "--fidelity", "1"]
+            expected.update(interval="", fidelity=1)
         else:
-            args += ["--period-interval", "0", "--skip-trades", "--live", "--max-trade-pages", "0", "--trade-limit", "0"]
-            expected.update(period_interval=0, include_trades=False, use_historical=False,
+            args += ["--period-interval", "1", "--skip-trades", "--live", "--max-trade-pages", "0", "--trade-limit", "0"]
+            expected.update(period_interval=1, include_trades=False, use_historical=False,
                             max_trade_pages=0, trade_limit=0)
     result = CliRunner().invoke(app, args)
     assert result.exit_code == 0, result.output
     actual = {key: value for key, value in calls[0].items() if key not in {"polymarket_client", "kalshi_client"}}
     assert actual == expected
+
+
+@pytest.mark.parametrize(("venue", "option"), [("polymarket", "--fidelity"), ("kalshi", "--period-interval")])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_history_cli_rejects_nonpositive_sampling_intervals(monkeypatch, tmp_path, venue, option, value):
+    from pmkt.cli import history as cli
+
+    async def backfill(*args, **kwargs):
+        raise AssertionError("a nonpositive interval must be rejected before backfill")
+
+    monkeypatch.setattr(cli, "backfill_venue_history", backfill)
+    result = CliRunner().invoke(app, [
+        "backfill-venue-history", "--venue", venue, "--instrument", "a", "--out-dir", str(tmp_path),
+        "--start-ts", "0", "--end-ts", "1", option, value,
+    ])
+    assert result.exit_code == 2
+    assert option in result.output
 
 
 @pytest.mark.parametrize("force_color", [False, True])

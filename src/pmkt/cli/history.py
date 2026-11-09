@@ -96,6 +96,7 @@ def backfill_venue_history_cmd(
         Optional[int],
         typer.Option(
             "--fidelity",
+            min=1,
             help="Polymarket sampling resolution in minutes.",
         ),
     ] = None,
@@ -103,6 +104,7 @@ def backfill_venue_history_cmd(
         Optional[int],
         typer.Option(
             "--period-interval",
+            min=1,
             help="Kalshi candlestick period in minutes.",
             show_default=str(DEFAULT_HISTORY_PERIOD_INTERVAL_MINUTES),
         ),

@@ -154,8 +154,10 @@ format. Historical profile recovery and `reconstruct-book-tape` remain available
 their library APIs own the defaults. History `--fidelity` is Polymarket sampling
 resolution in minutes; `--period-interval` is Kalshi candle duration in minutes.
 Polymarket `--interval` selects the history time span rather than sampling
-resolution. Explicit zero, empty selectors, and `--skip-trades`/`--live` are
-forwarded to the existing owner validation without being replaced by defaults.
+resolution. `--fidelity` and `--period-interval` must be at least 1; the
+library also rejects nonpositive values before any fetch. Explicit zero
+timestamps, empty selectors, and `--skip-trades`/`--live` are forwarded to the
+existing owner validation without being replaced by defaults.
 
 ## Runtime configuration in 0.2
 

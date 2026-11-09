@@ -229,6 +229,11 @@ async def backfill_venue_history(
     venue_normalized = venue.strip().lower()
     if venue_normalized not in {"polymarket", "kalshi"}:
         raise ValueError("venue must be 'polymarket' or 'kalshi'")
+    # Validate sampling intervals before any fetch; zero would write interval_seconds=0.
+    if venue_normalized == "polymarket" and fidelity is not None and fidelity < 1:
+        raise ValueError("fidelity must be a positive number of minutes")
+    if venue_normalized == "kalshi" and period_interval < 1:
+        raise ValueError("period_interval must be a positive number of minutes")
     if venue_normalized == "kalshi" and include_trades:
         if max_trade_pages < 1 or trade_limit < 1:
             raise ValueError("max_trade_pages and trade_limit must be positive")
