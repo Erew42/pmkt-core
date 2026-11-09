@@ -30,7 +30,10 @@ async def stream_order_book_data(
 ) -> dict[str, Any]:
     """Record changed topbooks and optional full snapshots into SQLite/Parquet.
 
-    ``None`` disables periodic depth checks when the best-price trigger is on.
+    Omitted or explicit ``None`` for ``mode``, ``depth_on_best_price_change``,
+    ``raw_messages`` and ``duration_s`` inherits the owner default; explicit
+    ``depth_check_interval_s=None`` instead disables periodic depth checks when
+    the best-price trigger is on.
     Historical storage-profile arguments and outputs have been retired.
     """
     option_overrides: dict[str, Any] = {

@@ -346,6 +346,9 @@ consumer's existing exact core dependency pin must be upgraded separately with
 its execution-feed integration checked against the chosen public feed API.
 
 Sampling and retention defaults are owned by the named constants beside
-`RecordingOptions`; `record_feed.DEFAULT_RECORDING_DURATION_S` owns duration.
-Venue wrappers and CLIs inherit omitted options. Explicit `None` still disables
-periodic depth checks, and raw retention remains opt-in.
+`RecordingOptions`; `pmkt.streaming.recording.DEFAULT_RECORDING_DURATION_S`
+owns duration. Venue wrappers and CLIs inherit omitted options; in the venue
+wrappers an explicit `None` for `mode`, `depth_on_best_price_change`,
+`raw_messages` or `duration_s` also inherits the owner default. Explicit
+`depth_check_interval_s=None` still disables periodic depth checks, and raw
+retention remains opt-in.
