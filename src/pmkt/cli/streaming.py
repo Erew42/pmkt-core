@@ -14,6 +14,11 @@ from typing import Annotated, Any, Optional
 import pandas as pd
 import typer
 
+from pmkt.streaming.recording import (
+    DEFAULT_DEPTH_CHECK_INTERVAL_S,
+    DEFAULT_RECORDING_DURATION_S,
+    DEFAULT_RECORDING_MODE,
+)
 from pmkt.tokens import flatten_token_ids
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.read_auth import (
@@ -663,12 +668,12 @@ def stream_books(
     markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
     output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_ORDER_BOOK_STREAM_ROOT,
     run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
-    duration: Annotated[float, typer.Option(help="Recording duration in seconds.")] = 300.0,
+    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.", show_default=f"{DEFAULT_RECORDING_DURATION_S:g}")] = None,
     max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
-    mode: Annotated[str, typer.Option(help="topbook or full; full adds selected depth snapshots.")] = "full",
-    depth_check_interval_s: Annotated[str, typer.Option(help="Seconds between changed-book checks; 'off' disables periodic checks.")] = "10",
-    depth_on_best_price_change: Annotated[bool, typer.Option(help="Save depth immediately on best bid/ask price changes.")] = False,
-    raw_messages: Annotated[bool, typer.Option(help="Also save diagnostic raw_messages.jsonl.")] = False,
+    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.", show_default=DEFAULT_RECORDING_MODE)] = None,
+    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
+    depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
+    raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
     max_reconnects: Annotated[Optional[int], typer.Option(help="Bound on replacement connection attempts.", show_default=str(DEFAULT_RECONNECT_ATTEMPTS))] = None,
     websocket_max_size_bytes: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_SIZE_BYTES))] = None,
     websocket_max_queue_frames: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_QUEUE_FRAMES))] = None,
@@ -679,21 +684,23 @@ def stream_books(
         instruments = list(dict.fromkeys([*instruments, *_tokens_from_markets_parquet(markets)]))
     if not instruments:
         error_exit("provide --token-id or --markets")
-    transport_overrides = {
+    overrides: dict[str, Any] = {
         name: value for name, value in {
+            "duration_s": duration,
+            "mode": mode,
+            "depth_on_best_price_change": depth_on_best_price_change,
+            "raw_messages": raw_messages,
             "max_reconnects": max_reconnects,
             "websocket_max_size_bytes": websocket_max_size_bytes,
             "websocket_max_queue_frames": websocket_max_queue_frames,
         }.items() if value is not None
     }
-    interval = _recording_interval(depth_check_interval_s)
+    if depth_check_interval_s is not None:
+        overrides["depth_check_interval_s"] = _recording_interval(depth_check_interval_s)
     try:
         manifest = asyncio.run(stream_order_book_data(
             instruments, output_root=output_dir, run_name=run_name,
-            duration_s=duration, max_messages=max_messages, mode=mode,
-            depth_check_interval_s=interval,
-            depth_on_best_price_change=depth_on_best_price_change,
-            raw_messages=raw_messages, **transport_overrides,
+            max_messages=max_messages, **overrides,
         ))
     except (ValueError, RuntimeError) as exc:
         error_exit(str(exc))
@@ -707,12 +714,12 @@ def stream_kalshi_books(
     markets: Annotated[Optional[Path], typer.Option(help="Markets Parquet providing instrument IDs.")] = None,
     output_dir: Annotated[Path, typer.Option(help="Root directory for recording runs.")] = DEFAULT_KALSHI_ORDER_BOOK_STREAM_ROOT,
     run_name: Annotated[Optional[str], typer.Option(help="New run directory name.")] = None,
-    duration: Annotated[float, typer.Option(help="Recording duration in seconds.")] = 300.0,
+    duration: Annotated[Optional[float], typer.Option(help="Recording duration in seconds; omitted uses record_feed default.", show_default=f"{DEFAULT_RECORDING_DURATION_S:g}")] = None,
     max_messages: Annotated[Optional[int], typer.Option(help="Stop after this many source messages.")] = None,
-    mode: Annotated[str, typer.Option(help="topbook or full; full adds selected depth snapshots.")] = "full",
-    depth_check_interval_s: Annotated[str, typer.Option(help="Seconds between changed-book checks; 'off' disables periodic checks.")] = "10",
-    depth_on_best_price_change: Annotated[bool, typer.Option(help="Save depth immediately on best bid/ask price changes.")] = False,
-    raw_messages: Annotated[bool, typer.Option(help="Also save diagnostic raw_messages.jsonl.")] = False,
+    mode: Annotated[Optional[str], typer.Option(help="topbook or full; omitted uses RecordingOptions.mode.", show_default=DEFAULT_RECORDING_MODE)] = None,
+    depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
+    depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
+    raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
     max_reconnects: Annotated[Optional[int], typer.Option(help="Bound on replacement connection attempts.", show_default=str(DEFAULT_RECONNECT_ATTEMPTS))] = None,
     websocket_max_size_bytes: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_SIZE_BYTES))] = None,
     websocket_max_queue_frames: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_QUEUE_FRAMES))] = None,
@@ -724,21 +731,23 @@ def stream_kalshi_books(
         instruments = list(dict.fromkeys([*instruments, *_tickers_from_kalshi_markets_parquet(markets)]))
     if not instruments:
         error_exit("provide --ticker or --markets")
-    transport_overrides = {
+    overrides: dict[str, Any] = {
         name: value for name, value in {
+            "duration_s": duration,
+            "mode": mode,
+            "depth_on_best_price_change": depth_on_best_price_change,
+            "raw_messages": raw_messages,
             "max_reconnects": max_reconnects,
             "websocket_max_size_bytes": websocket_max_size_bytes,
             "websocket_max_queue_frames": websocket_max_queue_frames,
         }.items() if value is not None
     }
-    interval = _recording_interval(depth_check_interval_s)
+    if depth_check_interval_s is not None:
+        overrides["depth_check_interval_s"] = _recording_interval(depth_check_interval_s)
     try:
         manifest = asyncio.run(stream_kalshi_order_book_data(
             instruments, output_root=output_dir, run_name=run_name,
-            duration_s=duration, max_messages=max_messages, mode=mode,
-            depth_check_interval_s=interval,
-            depth_on_best_price_change=depth_on_best_price_change,
-            raw_messages=raw_messages, **transport_overrides,
+            max_messages=max_messages, **overrides,
         auth=_load_read_auth_header_provider(header_provider),
         ))
     except (ValueError, RuntimeError) as exc:

@@ -841,6 +841,76 @@ async def test_late_complementary_correction_cannot_erase_recovery_bound(
     assert report["counts"]["book_snapshots"] == 2
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_venue_recording_wrappers_inherit_owner_options(monkeypatch, venue, explicit):
+    import importlib
+    from pmkt.streaming.recording import RecordingOptions
+    from pmkt.streaming.recording_feed import DEFAULT_RECORDING_DURATION_S
+
+    module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
+    calls = []
+    option_calls = []
+
+    def options(**kwargs):
+        option_calls.append(kwargs)
+        return RecordingOptions(**kwargs)
+
+    async def feed(instruments, *, duration_s=DEFAULT_RECORDING_DURATION_S, **kwargs):
+        calls.append((duration_s, kwargs))
+        return {}
+
+    monkeypatch.setattr(module, "RecordingOptions", options)
+    monkeypatch.setattr(module, "record_feed", feed)
+    capture = module.stream_order_book_data if venue == "polymarket" else module.stream_kalshi_order_book_data
+    supplied = ({"mode": "topbook", "raw_messages": False,
+                 "depth_on_best_price_change": False, "depth_check_interval_s": None,
+                 "duration_s": 0.0} if explicit else {})
+    await capture(["a"], **supplied)
+    assert option_calls == ([{key: value for key, value in supplied.items() if key != "duration_s"}] if explicit else [{}])
+    duration, kwargs = calls[0]
+    assert duration == (0.0 if explicit else DEFAULT_RECORDING_DURATION_S)
+    assert kwargs["options"].raw_messages is False
+    if not explicit:
+        assert kwargs["options"] == RecordingOptions()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_venue_recording_wrappers_treat_explicit_none_as_inheritance(monkeypatch, venue):
+    import importlib
+    from pmkt.streaming.recording import DEFAULT_RECORDING_DURATION_S, RecordingOptions
+
+    module = importlib.import_module(f"pmkt.exchanges.{venue}.order_book_stream")
+    calls = []
+
+    async def feed(instruments, *, duration_s=DEFAULT_RECORDING_DURATION_S, **kwargs):
+        calls.append((duration_s, kwargs))
+        return {}
+
+    monkeypatch.setattr(module, "record_feed", feed)
+    capture = module.stream_order_book_data if venue == "polymarket" else module.stream_kalshi_order_book_data
+    await capture(["a"], mode=None, depth_on_best_price_change=None, raw_messages=None, duration_s=None)
+    duration, kwargs = calls[0]
+    assert kwargs["options"] == RecordingOptions()
+    assert duration == DEFAULT_RECORDING_DURATION_S
+    # Explicit None for the depth-check interval keeps its distinct "disable" meaning.
+    await capture(["a"], depth_check_interval_s=None, depth_on_best_price_change=True)
+    assert calls[1][1]["options"].depth_check_interval_s is None
+    assert RecordingOptions().depth_check_interval_s is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overrides", [{"mode": ""}, {"depth_check_interval_s": 0}])
+async def test_recording_wrapper_preserves_invalid_explicit_values(tmp_path, overrides):
+    from pmkt.exchanges.polymarket.order_book_stream import stream_order_book_data
+
+    with pytest.raises(ValueError):
+        await stream_order_book_data(["a"], output_root=tmp_path / "absent", **overrides)
+    assert not (tmp_path / "absent").exists()
+
+
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])

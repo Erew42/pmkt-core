@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Literal, Sequence, cast
 
 from pmkt.exchanges.polymarket.ws import _UNSET_HEARTBEAT_INTERVAL
-from pmkt.streaming.recording import RecordingOptions
+from pmkt.streaming.recording import RecordingOptions, _UNSET_DEPTH_CHECK_INTERVAL
 from pmkt.streaming.recording_feed import record_feed
 
 DEFAULT_ORDER_BOOK_STREAM_ROOT = Path("generated/order_book_streams")
@@ -13,13 +13,13 @@ DEFAULT_ORDER_BOOK_STREAM_ROOT = Path("generated/order_book_streams")
 
 async def stream_order_book_data(
     asset_ids: Sequence[str], *,
-    mode: Literal["topbook", "full"] = "full",
-    depth_check_interval_s: float | None = 10.0,
-    depth_on_best_price_change: bool = False,
-    raw_messages: bool = False,
+    mode: Literal["topbook", "full"] | None = None,
+    depth_check_interval_s: float | None = cast(Any, _UNSET_DEPTH_CHECK_INTERVAL),
+    depth_on_best_price_change: bool | None = None,
+    raw_messages: bool | None = None,
     output_root: str | Path = "generated/order_book_streams",
     run_name: str | None = None,
-    duration_s: float = 300.0,
+    duration_s: float | None = None,
     max_messages: int | None = None,
     max_reconnects: int | None = None,
     ws_url: str | None = None,
@@ -31,19 +31,33 @@ async def stream_order_book_data(
 ) -> dict[str, Any]:
     """Record changed topbooks and optional full snapshots into SQLite/Parquet.
 
-    ``None`` disables periodic depth checks when the best-price trigger is on.
+    Omitted or explicit ``None`` for ``mode``, ``depth_on_best_price_change``,
+    ``raw_messages`` and ``duration_s`` inherits the owner default; explicit
+    ``depth_check_interval_s=None`` instead disables periodic depth checks when
+    the best-price trigger is on.
     Historical storage-profile arguments and outputs have been retired.
     """
+    option_overrides: dict[str, Any] = {
+        name: value for name, value in {
+            "mode": mode,
+            "depth_on_best_price_change": depth_on_best_price_change,
+            "raw_messages": raw_messages,
+        }.items() if value is not None
+    }
+    if depth_check_interval_s is not _UNSET_DEPTH_CHECK_INTERVAL:
+        option_overrides["depth_check_interval_s"] = depth_check_interval_s
+    options = RecordingOptions(**option_overrides)
     feed_overrides: dict[str, Any] = {}
+    if duration_s is not None:
+        feed_overrides["duration_s"] = duration_s
     if max_reconnects is not None:
         feed_overrides["max_reconnects"] = max_reconnects
     if heartbeat_interval is not _UNSET_HEARTBEAT_INTERVAL:
         feed_overrides["heartbeat_interval"] = heartbeat_interval
-    options = RecordingOptions(mode, depth_check_interval_s, depth_on_best_price_change, raw_messages)
     return await record_feed(
         asset_ids, venue="polymarket", options=options,
-        output_root=output_root, run_name=run_name, duration_s=duration_s,
-        max_messages=max_messages, **feed_overrides,
+        output_root=output_root, run_name=run_name, **feed_overrides,
+        max_messages=max_messages,
         ws_url=ws_url, connect_factory=connect_factory,
         websocket_max_size_bytes=websocket_max_size_bytes,
         websocket_max_queue_frames=websocket_max_queue_frames,

@@ -70,33 +70,75 @@ from pmkt.streaming.legacy.recovery import (
 )
 from pmkt.streaming.legacy.recovery_contracts import CaptureCommitRecord, RunStateV1
 
+# Retain bounded Arrow batches instead of materializing an entire reconstruction.
 DEFAULT_RECONSTRUCTION_BATCH_ROWS = 50_000
 MAX_RECONSTRUCTION_MATERIALIZED_ROWS = 250_000
-DUCKDB_PARITY_MEMORY_LIMIT = os.environ.get(
-    "PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "384MB"
-)
+# Compatibility preset: retain the existing bounded DuckDB budget, separate from Arrow.
+DEFAULT_DUCKDB_PARITY_MEMORY_LIMIT = "384MB"
+# Retain the fixed fan-out that bounds each depth-comparison working set.
+DEFAULT_DEPTH_PARITY_BUCKET_COUNT = 64
 MAX_PARITY_MISMATCH_DETAILS = 100
 
 
-def _positive_int_environment(name: str, default: int) -> int:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-    try:
-        value = int(raw_value)
-    except ValueError as exc:
-        raise ValueError(
-            f"{name} must be a positive integer; got {raw_value!r}"
-        ) from exc
-    if value <= 0:
-        raise ValueError(f"{name} must be greater than zero; got {raw_value!r}")
-    return value
+@dataclass(frozen=True)
+class ParityOptions:
+    """Resolved parity resources; direct construction uses deterministic defaults."""
+
+    memory_limit: str = DEFAULT_DUCKDB_PARITY_MEMORY_LIMIT
+    depth_bucket_count: int = DEFAULT_DEPTH_PARITY_BUCKET_COUNT
+
+    def __post_init__(self) -> None:
+        if isinstance(self.depth_bucket_count, bool) or not isinstance(
+            self.depth_bucket_count, int
+        ):
+            raise TypeError("depth_bucket_count must be an int")
+        if self.depth_bucket_count <= 0:
+            raise ValueError("depth_bucket_count must be positive")
+        if not isinstance(self.memory_limit, str):
+            raise TypeError("memory_limit must be a DuckDB size string")
+        if not self.memory_limit.strip():
+            raise ValueError("memory_limit must be a nonempty DuckDB size string")
+        try:
+            # Let DuckDB validate its own size grammar, including existing valid
+            # environment values. This connection is in-memory and reads no files.
+            duckdb.connect(config={"memory_limit": self.memory_limit}).close()
+        except duckdb.Error as exc:
+            raise ValueError("memory_limit must be a valid DuckDB size string") from exc
+
+    @classmethod
+    def from_env(
+        cls,
+        *,
+        memory_limit: str | None = None,
+        depth_bucket_count: int | None = None,
+    ) -> ParityOptions:
+        """Resolve explicit overrides, then legacy environment values, then defaults."""
+        overrides: dict[str, Any] = {}
+        if memory_limit is not None:
+            overrides["memory_limit"] = memory_limit
+        else:
+            memory = os.environ.get("PMKT_DUCKDB_PARITY_MEMORY_LIMIT")
+            if memory is not None:
+                overrides["memory_limit"] = memory
+        if depth_bucket_count is not None:
+            overrides["depth_bucket_count"] = depth_bucket_count
+        else:
+            count = os.environ.get("PMKT_DEPTH_PARITY_BUCKET_COUNT")
+            if count is not None:
+                message = (
+                    "PMKT_DEPTH_PARITY_BUCKET_COUNT must be a positive integer; "
+                    f"got {count!r}"
+                )
+                try:
+                    parsed_count = int(count)
+                except ValueError as exc:
+                    raise ValueError(message) from exc
+                if parsed_count <= 0:
+                    raise ValueError(message)
+                overrides["depth_bucket_count"] = parsed_count
+        return cls(**overrides)
 
 
-_DEPTH_PARITY_BUCKET_COUNT = _positive_int_environment(
-    "PMKT_DEPTH_PARITY_BUCKET_COUNT",
-    64,
-)
 _PARITY_METADATA_COLUMNS = (
     "_reconstruction_event_id",
     "_reconstruction_event_kind",
@@ -146,9 +188,15 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         *,
         venue_book_id: str | None = None,
         batch_rows: int = DEFAULT_RECONSTRUCTION_BATCH_ROWS,
+        parity_options: ParityOptions | None = None,
     ) -> None:
         if batch_rows <= 0:
             raise ValueError("batch_rows must be positive")
+        if parity_options is not None and not isinstance(parity_options, ParityOptions):
+            raise TypeError("parity_options must be ParityOptions")
+        self._parity_options = (
+            parity_options if parity_options is not None else ParityOptions.from_env()
+        )
         requested_book = None
         if venue_book_id is not None:
             requested_book = venue_book_id.strip()
@@ -408,6 +456,7 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
         topbook_comparison = _duckdb_topbook_parity(
             self._paths["reconstructed_topbook"],
             self._paths["source_topbook"],
+            parity_options=self._parity_options,
         )
         topbook_parity_completed_at = time.perf_counter()
         depth_comparison = _duckdb_depth_parity(
@@ -417,6 +466,7 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
             available=self._depth_comparison_available,
             reconstructed_count=self._depth_count,
             venue_book_id=self._requested_book,
+            parity_options=self._parity_options,
         )
         depth_parity_completed_at = time.perf_counter()
         _verify_streaming_authority(self._evidence, verify_artifacts=True)
@@ -495,7 +545,7 @@ class BookTapeReconstructionStream(Iterator[BookTapeArrowBatch]):
                 "arrow_batch_rows": self._batch_rows,
                 "bounded_output_materialization": True,
                 "parity_engine": "duckdb",
-                "duckdb_memory_limit": DUCKDB_PARITY_MEMORY_LIMIT,
+                "duckdb_memory_limit": self._parity_options.memory_limit,
                 "maximum_mismatch_details": MAX_PARITY_MISMATCH_DETAILS,
                 "phase_seconds": {
                     "authority_load": (
@@ -1366,12 +1416,18 @@ def stream_reconstruct_book_tape(
     manifest_path: str | Path,
     *,
     venue_book_id: str | None = None,
-    batch_rows: int = DEFAULT_RECONSTRUCTION_BATCH_ROWS,
+    batch_rows: int | None = None,
+    parity_options: ParityOptions | None = None,
 ) -> BookTapeReconstructionStream:
+    overrides: dict[str, Any] = {}
+    if batch_rows is not None:
+        overrides["batch_rows"] = batch_rows
+    if parity_options is not None:
+        overrides["parity_options"] = parity_options
     return BookTapeReconstructionStream(
         manifest_path,
         venue_book_id=venue_book_id,
-        batch_rows=batch_rows,
+        **overrides,
     )
 
 
@@ -1478,6 +1534,8 @@ def sql_literal(value: str) -> str:
 def _duckdb_topbook_parity(
     reconstructed_path: Path,
     source_path: Path,
+    *,
+    parity_options: ParityOptions,
 ) -> dict[str, Any]:
     fields: tuple[str, ...] = (
         "venue_market_id",
@@ -1501,7 +1559,7 @@ def _duckdb_topbook_parity(
         # both stages on the same connection contract.
         spill_root = source_path.parent / "topbook-spill"
         spill_root.mkdir(exist_ok=True)
-        connection.execute(f"SET memory_limit = '{DUCKDB_PARITY_MEMORY_LIMIT}'")
+        connection.execute(f"SET memory_limit = {sql_literal(parity_options.memory_limit)}")
         connection.execute("SET threads = 2")
         connection.execute("SET preserve_insertion_order = false")
         connection.execute(f"SET temp_directory = {sql_literal(spill_root.as_posix())}")
@@ -1738,6 +1796,7 @@ def _duckdb_depth_parity(
     available: bool,
     reconstructed_count: int,
     venue_book_id: str | None,
+    parity_options: ParityOptions,
 ) -> dict[str, Any]:
     comparison_policy = "state-key-hash-bucketed-duckdb.v1"
     if not available:
@@ -1745,7 +1804,7 @@ def _duckdb_depth_parity(
             "available": False,
             "status": "not_available",
             "comparison_policy": comparison_policy,
-            "bucket_count": _DEPTH_PARITY_BUCKET_COUNT,
+            "bucket_count": parity_options.depth_bucket_count,
 
             "excluded_fields": ["book_hash"],
             "source_row_count": 0,
@@ -1786,7 +1845,7 @@ def _duckdb_depth_parity(
                 "source_artifact_ordinal": artifact_ordinal,
                 "group_ordinal": group_ordinal,
                 "group_bucket": (
-                    group_ordinal // _DEPTH_PARITY_BUCKET_COUNT
+                    group_ordinal // parity_options.depth_bucket_count
                 ),
             }
         )
@@ -1800,7 +1859,7 @@ def _duckdb_depth_parity(
         {
             "group_id": group_id,
             "group_ordinal": ordinal,
-            "group_bucket": ordinal // _DEPTH_PARITY_BUCKET_COUNT,
+            "group_bucket": ordinal // parity_options.depth_bucket_count,
         }
         for ordinal, group_id in enumerate(journal_group_ids)
     ]
@@ -1835,7 +1894,7 @@ def _duckdb_depth_parity(
     parity_bucket_expression = (
         "(hash("
         + ", ".join(parity_bucket_fields)
-        + f") % {_DEPTH_PARITY_BUCKET_COUNT})::BIGINT"
+        + f") % {parity_options.depth_bucket_count})::BIGINT"
     )
 
     parity_started_at = time.perf_counter()
@@ -1845,7 +1904,7 @@ def _duckdb_depth_parity(
     try:
         spill_root = stage_root / "spill"
         spill_root.mkdir()
-        connection.execute(f"SET memory_limit = '{DUCKDB_PARITY_MEMORY_LIMIT}'")
+        connection.execute(f"SET memory_limit = {sql_literal(parity_options.memory_limit)}")
         connection.execute("SET threads = 2")
         connection.execute("SET preserve_insertion_order = false")
         connection.execute("SET partitioned_write_max_open_files = 4")
@@ -2067,7 +2126,7 @@ def _duckdb_depth_parity(
         periodic_missing = 0
         periodic_mismatch = 0
         mismatch_rows: list[dict[str, Any]] = []
-        bucket_count = _DEPTH_PARITY_BUCKET_COUNT
+        bucket_count = parity_options.depth_bucket_count
         bucket_comparison_started_at = time.perf_counter()
         for bucket in range(bucket_count):
             source_bucket = source_stage_root / f"_parity_bucket={bucket}"
@@ -2314,7 +2373,7 @@ def _duckdb_depth_parity(
             "available": True,
             "status": "match" if discrepancy_count == 0 else "mismatch",
             "comparison_policy": comparison_policy,
-            "bucket_count": _DEPTH_PARITY_BUCKET_COUNT,
+            "bucket_count": parity_options.depth_bucket_count,
             "phase_seconds": {
                 "setup": staging_started_at - parity_started_at,
                 "staging": staging_completed_at - staging_started_at,
@@ -2370,6 +2429,7 @@ def _normalize_mismatch_row(row: Mapping[str, Any]) -> dict[str, Any]:
 
 
 __all__ = [
+    "ParityOptions",
     "BookTapeArrowBatch",
     "BookTapeReconstructionStream",
     "DEFAULT_RECONSTRUCTION_BATCH_ROWS",

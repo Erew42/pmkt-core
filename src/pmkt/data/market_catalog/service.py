@@ -200,6 +200,14 @@ def _polymarket_contract_hash_sql(raw_json_sql: str) -> str:
     )
 
 
+# Retain the existing small promotion-layer budget to cap overlay depth.
+COMPACTION_PROMOTION_LAYER_LIMIT = 4
+# Compact when delta rows become a material share of the base scan.
+COMPACTION_DELTA_ROW_FRACTION = 0.10
+# Retain the file-proliferation trigger to bound per-file scan overhead.
+COMPACTION_DELTA_FILE_FRACTION = 0.25
+
+
 class MarketCatalogService:
     """Own catalog lineage, collection, publication, and reader registration."""
 
@@ -1081,10 +1089,13 @@ class MarketCatalogService:
         *,
         bootstrap_cutoff: datetime | None = None,
         overlap_seconds: int | None = None,
-        max_pages: int = 10_000,
+        max_pages: int | None = None,
         publish: bool = True,
         client: Any,
     ) -> dict[str, Any]:
+        page_overrides: dict[str, Any] = {}
+        if max_pages is not None:
+            page_overrides["max_pages"] = max_pages
         defaults = {
             "polymarket": 1800,
             "kalshi-conventional": 1800,
@@ -1107,7 +1118,7 @@ class MarketCatalogService:
         if stream == "polymarket":
             active_client = client
             result = await collect_polymarket_discovery(
-                active_client, cutoff=cutoff, max_pages=max_pages
+                active_client, cutoff=cutoff, **page_overrides
             )
             agreement = None
             venue = "polymarket"
@@ -1125,7 +1136,7 @@ class MarketCatalogService:
                     Literal["kalshi_conventional", "kalshi_mve"],
                     native_family,
                 ),
-                max_pages=max_pages,
+                **page_overrides,
             )
             prior_agreement = self._prior_filter_agreement() if publish else None
             if prior_agreement is not None:
@@ -1137,7 +1148,7 @@ class MarketCatalogService:
                         active_client,
                         cutoff=agreement_cutoff,
                         window_end=started,
-                        max_pages=max_pages,
+                        **page_overrides,
                     )
                 except FilterAgreementError as exc:
                     if publish:
@@ -1403,11 +1414,14 @@ class MarketCatalogService:
         *,
         scope: Literal["standard", "all"] = "standard",
         bootstrap_cutoff: datetime | None = None,
-        max_pages: int = 10_000,
+        max_pages: int | None = None,
         polymarket_client: Any,
         kalshi_client: Any,
     ) -> dict[str, Any]:
         """Publish one complete nonterminal census without deleting history."""
+        page_overrides: dict[str, Any] = {}
+        if max_pages is not None:
+            page_overrides["max_pages"] = max_pages
         if scope not in {"standard", "all"}:
             raise ValueError("scope must be 'standard' or 'all'")
         if bootstrap_cutoff is not None:
@@ -1440,12 +1454,12 @@ class MarketCatalogService:
         kx_client = kalshi_client
         try:
             pm_rows, pm_collection = await collect_polymarket_current(
-                pm_client, max_pages=max_pages
+                pm_client, **page_overrides
             )
             conventional, kx_collection = await collect_kalshi_current_family(
                 kx_client,
                 native_family="kalshi_conventional",
-                max_pages=max_pages,
+                **page_overrides,
             )
             mve: dict[str, list[dict[str, Any]]] | None = None
             mve_collection: dict[str, Any] | None = None
@@ -1455,7 +1469,7 @@ class MarketCatalogService:
                 mve, mve_collection = await collect_kalshi_current_family(
                     kx_client,
                     native_family="kalshi_mve",
-                    max_pages=max_pages,
+                    **page_overrides,
                 )
                 prior_mve = previous.get("kalshi_mve_current_markets")
                 prior_as_of = (
@@ -1474,14 +1488,14 @@ class MarketCatalogService:
                     lifecycle_cutoff_source = "history_evidence"
                 closed, closed_details = await _collect_kalshi_pages(
                     kx_client,
-                    max_pages=max_pages,
+                    **page_overrides,
                     status="closed",
                     mve_filter="only",
                     min_close_ts=int(lifecycle_cutoff.timestamp()),
                 )
                 settled, settled_details = await _collect_kalshi_pages(
                     kx_client,
-                    max_pages=max_pages,
+                    **page_overrides,
                     status="settled",
                     mve_filter="only",
                     min_settled_ts=int(lifecycle_cutoff.timestamp()),
@@ -1775,12 +1789,12 @@ class MarketCatalogService:
         delta_files = int(manifest.get("uncompacted_delta_parquet_file_count") or 0)
         base_files = int(manifest.get("base_parquet_file_count") or 0)
         conditions = {
-            "four_weekly_promotion_layers": layers >= 4,
+            "four_weekly_promotion_layers": layers >= COMPACTION_PROMOTION_LAYER_LIMIT,
             "delta_rows_exceed_ten_percent": bool(
-                base_rows and delta_rows > base_rows * 0.10
+                base_rows and delta_rows > base_rows * COMPACTION_DELTA_ROW_FRACTION
             ),
             "delta_files_exceed_twenty_five_percent": bool(
-                base_files and delta_files > base_files * 0.25
+                base_files and delta_files > base_files * COMPACTION_DELTA_FILE_FRACTION
             ),
         }
         return {

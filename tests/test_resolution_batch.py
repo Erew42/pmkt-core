@@ -63,11 +63,13 @@ async def test_batch_validates_options_and_all_inputs_before_io() -> None:
         await kalshi.resolve_many(  # type: ignore[list-item]
             [KalshiMarketRef("KX-1"), PolymarketMarketRef("pm-wrong")]
         )
-    for concurrency, error in ((True, TypeError), (1.5, TypeError), (0, ValueError)):
-        with pytest.raises(error):
-            await polymarket.resolve_many(  # type: ignore[arg-type]
-                [PolymarketMarketRef("pm-1")], concurrency=concurrency
-            )
+    for concurrency, error in ((True, TypeError), (False, TypeError), (1.5, TypeError), (0, ValueError), (-1, ValueError)):
+        for resolver, markets in (
+            (polymarket, [PolymarketMarketRef("pm-1")]),
+            (kalshi, [KalshiMarketRef("KX-1")]),
+        ):
+            with pytest.raises(error, match="concurrency"):
+                await resolver.resolve_many(markets, concurrency=concurrency)
     for deadline, error in (
         (None, TypeError),
         (True, TypeError),
@@ -516,3 +518,24 @@ async def test_batch_timeout_in_retry_backoff_starts_no_late_retry() -> None:
     finally:
         await client.close()
     assert record.market_key == "reused"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [None, 1])
+async def test_batch_effective_concurrency(monkeypatch, concurrency) -> None:
+    resolver = PolymarketResolutionResolver()
+    active = 0
+    peak = 0
+
+    async def resolve(prepared, *, expiry):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        await asyncio.sleep(0)
+        active -= 1
+        return _record(prepared.market_key)
+
+    monkeypatch.setattr(resolver, "_resolve_prepared_with_expiry", resolve)
+    options = {} if concurrency is None else {"concurrency": concurrency}
+    await resolver.resolve_many([PolymarketMarketRef(str(i)) for i in range(12)], **options)
+    assert peak == (batch_module.DEFAULT_RESOLUTION_CONCURRENCY if concurrency is None else concurrency)

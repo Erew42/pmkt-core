@@ -81,8 +81,8 @@ def _import_depth_parity_bucket_count(
             "-c",
             (
                 "from pmkt.data.book_reconstruction_streaming import "
-                "_DEPTH_PARITY_BUCKET_COUNT; "
-                "print(_DEPTH_PARITY_BUCKET_COUNT)"
+                "ParityOptions; "
+                "print(ParityOptions.from_env().depth_bucket_count)"
             ),
         ],
         cwd=Path(__file__).resolve().parents[1],
@@ -105,8 +105,8 @@ def _import_duckdb_parity_memory_limit(
             "-c",
             (
                 "from pmkt.data.book_reconstruction_streaming import "
-                "DUCKDB_PARITY_MEMORY_LIMIT; "
-                "print(DUCKDB_PARITY_MEMORY_LIMIT)"
+                "ParityOptions; "
+                "print(ParityOptions.from_env().memory_limit)"
             ),
         ],
         cwd=Path(__file__).resolve().parents[1],
@@ -146,7 +146,10 @@ def test_depth_parity_bucket_count_rejects_invalid_environment_override(
     result = _import_depth_parity_bucket_count(value)
 
     assert result.returncode != 0
-    assert "PMKT_DEPTH_PARITY_BUCKET_COUNT must be" in result.stderr
+    message = result.stderr.splitlines()[-1]
+    assert "PMKT_DEPTH_PARITY_BUCKET_COUNT" in message
+    assert repr(value) in message
+    assert "positive" in message
 
 
 def _eligibility_evidence(*instrument_ids: str) -> dict[str, dict[str, str]]:
@@ -1257,6 +1260,7 @@ def test_streaming_topbook_parity_ignores_invalid_reconstructed_transitions(
     comparison = reconstruction_streaming._duckdb_topbook_parity(
         reconstructed_path,
         source_path,
+        parity_options=reconstruction_streaming.ParityOptions(),
     )
 
     assert comparison["status"] == "match"
@@ -1431,3 +1435,131 @@ def test_depth_comparison_is_separate_and_reports_source_coordinates() -> None:
     assert mismatch["source_provenance"]["role"] == "depth_main"
     assert set(mismatch["fields"]) == {"size_contracts"}
     assert comparison["excluded_fields"] == ["book_hash"]
+
+
+
+def test_parity_options_resolve_at_call_time_with_explicit_precedence(monkeypatch):
+    Options = reconstruction_streaming.ParityOptions
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "256MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "8")
+    first = Options.from_env()
+    assert (first.memory_limit, first.depth_bucket_count) == ("256MB", 8)
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "512MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "16")
+    second = Options.from_env()
+    assert (second.memory_limit, second.depth_bucket_count) == ("512MB", 16)
+    assert (first.memory_limit, first.depth_bucket_count) == ("256MB", 8)
+    explicit = Options.from_env(memory_limit="384MB", depth_bucket_count=1)
+    assert (explicit.memory_limit, explicit.depth_bucket_count) == ("384MB", 1)
+    deterministic = Options()
+    assert (deterministic.memory_limit, deterministic.depth_bucket_count) == ("384MB", 64)
+
+
+@pytest.mark.parametrize("overrides,error", [
+    ({"depth_bucket_count": 0}, ValueError),
+    ({"depth_bucket_count": -1}, ValueError),
+    ({"depth_bucket_count": False}, TypeError),
+    ({"depth_bucket_count": 1.5}, TypeError),
+    ({"memory_limit": ""}, ValueError),
+    ({"memory_limit": "not-a-size"}, ValueError),
+    ({"memory_limit": False}, TypeError),
+])
+def test_parity_options_preserve_invalid_explicit_values(monkeypatch, overrides, error):
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "384MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "64")
+    with pytest.raises(error):
+        reconstruction_streaming.ParityOptions.from_env(**overrides)
+
+
+def test_parity_options_explicit_values_override_invalid_environment(monkeypatch):
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "invalid")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "invalid")
+    options = reconstruction_streaming.ParityOptions.from_env(memory_limit="384MB", depth_bucket_count=2)
+    assert (options.memory_limit, options.depth_bucket_count) == ("384MB", 2)
+
+
+def test_invalid_parity_environment_does_not_fail_module_import():
+    environment = os.environ.copy()
+    environment["PMKT_DUCKDB_PARITY_MEMORY_LIMIT"] = "invalid"
+    environment["PMKT_DEPTH_PARITY_BUCKET_COUNT"] = "invalid"
+    result = subprocess.run(
+        [sys.executable, "-c", "import pmkt.data.book_reconstruction_streaming; print('imported')"],
+        env=environment, cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "imported"
+
+
+@pytest.mark.parametrize("name,value", [
+    ("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", ""),
+    ("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "bad"),
+    ("PMKT_DEPTH_PARITY_BUCKET_COUNT", "0"),
+    ("PMKT_DEPTH_PARITY_BUCKET_COUNT", "-1"),
+    ("PMKT_DEPTH_PARITY_BUCKET_COUNT", "bad"),
+])
+def test_parity_options_validate_before_reconstruction_io(monkeypatch, tmp_path, name, value):
+    monkeypatch.delenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", raising=False)
+    monkeypatch.delenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", raising=False)
+    monkeypatch.setenv(name, value)
+    manifest = tmp_path / "missing.json"
+    output = tmp_path / "absent" / "output"
+    with pytest.raises(ValueError):
+        stream_reconstruct_book_tape(manifest)
+    with pytest.raises(ValueError):
+        reconstruction_cli.publish_streamed_book_tape_reconstruction(manifest, output)
+    assert not output.parent.exists()
+
+
+def test_parity_options_are_frozen_for_one_reconstruction(monkeypatch, polymarket_tape_manifest):
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "384MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "2")
+    stream = stream_reconstruct_book_tape(polymarket_tape_manifest, batch_rows=1)
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "512MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "4")
+    try:
+        list(stream)
+        assert stream.report["status"] == "success"
+        assert stream.report["streaming"]["duckdb_memory_limit"] == "384MB"
+        assert stream.report["depth_comparison"]["bucket_count"] == 2
+    finally:
+        stream.close()
+
+
+@pytest.mark.parametrize("flags,expected", [
+    ([], {}),
+    (["--batch-rows", "1", "--parity-memory-limit", "512MB", "--depth-parity-bucket-count", "2"],
+     {"batch_rows": 1, "memory_limit": "512MB", "depth_bucket_count": 2}),
+])
+def test_parity_cli_only_forwards_explicit_resources(monkeypatch, tmp_path, flags, expected):
+    monkeypatch.delenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", raising=False)
+    monkeypatch.delenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", raising=False)
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    calls = []
+
+    def publish(*args, **kwargs):
+        calls.append(kwargs)
+        return {}
+
+    monkeypatch.setattr(reconstruction_cli, "publish_streamed_book_tape_reconstruction", publish)
+    result = CliRunner().invoke(app, ["reconstruct-book-tape", "--manifest", str(manifest), "--out-dir", str(tmp_path / "out"), *flags])
+    assert result.exit_code == 0, result.output
+    actual = {key: value for key, value in calls[0].items() if key == "batch_rows"}
+    if "parity_options" in calls[0]:
+        options = calls[0]["parity_options"]
+        actual.update(memory_limit=options.memory_limit, depth_bucket_count=options.depth_bucket_count)
+    assert actual == expected
+
+
+@pytest.mark.parametrize("flags", [
+    ["--parity-memory-limit", ""], ["--depth-parity-bucket-count", "0"], ["--batch-rows", "0"],
+])
+def test_parity_cli_rejects_invalid_explicit_values(monkeypatch, tmp_path, flags):
+    monkeypatch.setenv("PMKT_DUCKDB_PARITY_MEMORY_LIMIT", "384MB")
+    monkeypatch.setenv("PMKT_DEPTH_PARITY_BUCKET_COUNT", "64")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text("{}", encoding="utf-8")
+    output = tmp_path / "not-created"
+    result = CliRunner().invoke(app, ["reconstruct-book-tape", "--manifest", str(manifest), "--out-dir", str(output), *flags])
+    assert result.exit_code != 0
+    assert not output.exists()

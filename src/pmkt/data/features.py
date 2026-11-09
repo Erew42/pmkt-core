@@ -15,11 +15,17 @@ def logit(p: Any, eps: float = 1e-6) -> float | None:
     return math.log(value / (1.0 - value))
 
 
+# Retain minute bars as the compact research summary grain.
+DEFAULT_FEATURE_BAR_SECONDS = 60
+# Retain the longer rolling context used to summarize short-term variation.
+DEFAULT_FEATURE_WINDOW_SECONDS = 600
+
+
 def compute_features(
     book_df,
     *,
-    bar_seconds: int = 60,
-    window_seconds: int = 600,
+    bar_seconds: int = DEFAULT_FEATURE_BAR_SECONDS,
+    window_seconds: int = DEFAULT_FEATURE_WINDOW_SECONDS,
 ):
     import pandas as pd
 
