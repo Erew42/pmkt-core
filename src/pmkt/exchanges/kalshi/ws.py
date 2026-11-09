@@ -883,7 +883,7 @@ class AsyncKalshiWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int = cast(Any, _UNSET_RECONNECTS),
+        max_reconnects: int | None = cast(Any, _UNSET_RECONNECTS),
         reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         on_decode_error: DecodeErrorCallback | None = None,

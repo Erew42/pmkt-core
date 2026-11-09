@@ -839,7 +839,7 @@ class AsyncMarketWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int = cast(Any, _UNSET_RECONNECTS),
+        max_reconnects: int | None = cast(Any, _UNSET_RECONNECTS),
         reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
@@ -1012,7 +1012,7 @@ async def collect_market_snapshots(
     ws_url: str | None = None,
     custom_feature_enabled: bool = True,
     heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
-    reconnect_attempts: int = cast(Any, _UNSET_RECONNECTS),
+    reconnect_attempts: int | None = cast(Any, _UNSET_RECONNECTS),
     connect_factory: ConnectFactory | None = None,
 ) -> list[dict[str, Any]]:
     """Collect a bounded set of market websocket snapshots."""
