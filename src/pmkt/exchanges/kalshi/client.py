@@ -191,6 +191,11 @@ def kalshi_events_dataframe(events: list[dict[str, Any]]) -> pd.DataFrame:
     return df
 
 
+# Conservative client pacing retained for public Kalshi reads, not a venue quota.
+DEFAULT_KALSHI_MAX_RATE = 10
+DEFAULT_KALSHI_PERIOD_SECONDS = 1
+
+
 class KalshiHttpClient(HttpClient):
     def __init__(
         self,
@@ -198,16 +203,20 @@ class KalshiHttpClient(HttpClient):
         base_url: str,
         auth: ReadAuthHeaderProvider | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
-        timeout_s: float = 10.0,
-        max_attempts: int = 3,
+        timeout_s: float | None = None,
+        max_attempts: int | None = None,
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
     ) -> None:
+        http_overrides: dict[str, Any] = {}
+        if timeout_s is not None:
+            http_overrides["timeout_s"] = timeout_s
+        if max_attempts is not None:
+            http_overrides["max_attempts"] = max_attempts
         super().__init__(
             base_url=base_url,
             transport=transport,
-            timeout_s=timeout_s,
-            max_attempts=max_attempts,
+            **http_overrides,
             limiter=limiter,
             request_policy=request_policy,
         )
@@ -273,7 +282,7 @@ class AsyncKalshiClient:
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
         config: PmktConfig | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
         _utc_now: Callable[[], datetime] | None = None,
     ) -> None:
         self.base_url = (
@@ -285,15 +294,20 @@ class AsyncKalshiClient:
         )
         self.header_provider = auth
         self.transport = transport
-        self.limiter = limiter or AsyncLimiter(10, 1)
+        self.limiter = limiter if limiter is not None else AsyncLimiter(
+            DEFAULT_KALSHI_MAX_RATE, DEFAULT_KALSHI_PERIOD_SECONDS
+        )
         self._utc_now = _utc_now or (lambda: datetime.now(timezone.utc))
+        http_overrides: dict[str, Any] = {}
+        if timeout_s is not None:
+            http_overrides["timeout_s"] = timeout_s
         self._http = KalshiHttpClient(
             base_url=self.base_url,
             auth=self.header_provider,
             transport=self.transport,
             limiter=self.limiter,
             request_policy=request_policy,
-            timeout_s=timeout_s,
+            **http_overrides,
         )
         self._requests = VenueRequests(self._http, venue="kalshi", service="kalshi")
 

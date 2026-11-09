@@ -20,6 +20,10 @@ from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
 from pmkt.resolution.evm import PolygonCtfClient
 from pmkt.resolution.kalshi import KalshiResolutionResolver
+from pmkt.resolution._batch import (
+    DEFAULT_RESOLUTION_CONCURRENCY,
+    validate_resolution_concurrency,
+)
 from pmkt.resolution.models import (
     COMPATIBLE_RESOLVER_VERSIONS,
     CONFIDENCE_CANONICAL,
@@ -530,7 +534,7 @@ async def resolve_market_resolution_cache(
     output_dir: Path,
     matches_path: Path | None = None,
     polygon_rpc_url: str | None = None,
-    concurrency: int = 8,
+    concurrency: int = DEFAULT_RESOLUTION_CONCURRENCY,
     refresh: bool = False,
     max_markets: int | None = None,
     gamma_client: Any | None = None,
@@ -538,6 +542,7 @@ async def resolve_market_resolution_cache(
     kalshi_client: Any | None = None,
     ctf_client: PolygonCtfClient | None = None,
 ) -> dict[str, Any]:
+    validate_resolution_concurrency(concurrency)
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / "market_resolutions.parquet"
     summary_path = output_dir / "summary.json"
@@ -587,7 +592,7 @@ async def resolve_market_resolution_cache(
         ctf_client=ctf_client,
     )
     kalshi_resolver = KalshiResolutionResolver(kalshi_client)
-    semaphore = asyncio.Semaphore(max(1, concurrency))
+    semaphore = asyncio.Semaphore(concurrency)
 
     async def resolve_one(platform: str, row: dict[str, Any]) -> dict[str, Any]:
         async with semaphore:

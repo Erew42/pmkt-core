@@ -867,6 +867,10 @@ records = await resolver.resolve_many(
 ```
 
 `markets` must be a sequence of the resolver's matching market references.
+`concurrency` defaults to 8 and must be a positive `int`: `bool` and other
+non-integers raise `TypeError`, and values below 1 raise `ValueError`.
+`resolve_market_resolution_cache` applies the same rule before any file or
+network I/O; it previously clamped nonpositive values to 1.
 The full sequence and options are validated before requests. Empty input returns
 an empty list. Results preserve input order, cardinality, and duplicates; each
 duplicate is resolved independently and retains its own observations. A fixed
@@ -1034,3 +1038,11 @@ use this environment-resolution boundary at operation start. The immutable
 result supplies both parity stages and their existing resource-report fields.
 Memory strings use DuckDB's size grammar; depth bucket counts must be positive
 integers. Defaults remain with the named constants beside `ParityOptions`.
+
+Public HTTP defaults are owned by `pmkt._http.DEFAULT_HTTP_TIMEOUT_S` and
+`pmkt.runtime.DEFAULT_HTTP_MAX_ATTEMPTS` (`RequestPolicy` counts the initial
+request). Venue client wrappers inherit omitted common settings. The Data API
+retains `DATA_API_TIMEOUT_PRESET_S` as its longer service preset. Explicit
+timeouts still use the transport's finite-positive validation. Each service's
+named limiter defaults are conservative client pacing, not venue quota claims;
+an explicitly supplied limiter or request policy remains authoritative.

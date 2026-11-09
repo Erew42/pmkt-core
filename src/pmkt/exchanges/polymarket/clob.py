@@ -31,6 +31,11 @@ from pmkt.records import (
 from pmkt.tokens import extract_token_ids
 
 
+# Conservative client pacing retained for CLOB public reads, not a venue quota.
+DEFAULT_CLOB_MAX_RATE = 10
+DEFAULT_CLOB_PERIOD_SECONDS = 1
+
+
 class AsyncClobClient:
     """CLOB API client (market data endpoints)."""
 
@@ -41,7 +46,7 @@ class AsyncClobClient:
         limiter: AsyncLimiter | None = None,
         *,
         config: PmktConfig | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
         request_policy: RequestPolicy | None = None,
     ) -> None:
         self.base_url = (
@@ -52,12 +57,17 @@ class AsyncClobClient:
             else PmktConfig().clob_api_url
         )
         self.transport = transport
-        self.limiter = limiter or AsyncLimiter(10, 1)
+        self.limiter = limiter if limiter is not None else AsyncLimiter(
+            DEFAULT_CLOB_MAX_RATE, DEFAULT_CLOB_PERIOD_SECONDS
+        )
+        http_overrides: dict[str, Any] = {}
+        if timeout_s is not None:
+            http_overrides["timeout_s"] = timeout_s
         self._http = HttpClient(
             base_url=self.base_url,
             transport=self.transport,
             limiter=self.limiter,
-            timeout_s=timeout_s,
+            **http_overrides,
             request_policy=request_policy,
             retryable_post_paths={"/books", "/batch-prices-history"},
         )

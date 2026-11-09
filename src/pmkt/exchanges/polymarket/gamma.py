@@ -64,6 +64,11 @@ class _DiscoveryPartition:
             self.returned_cursors = set()
 
 
+# Conservative client pacing retained for GAMMA public reads, not a venue quota.
+DEFAULT_GAMMA_MAX_RATE = 10
+DEFAULT_GAMMA_PERIOD_SECONDS = 1
+
+
 class AsyncGammaClient:
     """Gamma API client (discovery endpoints)."""
 
@@ -75,7 +80,7 @@ class AsyncGammaClient:
         request_policy: RequestPolicy | None = None,
         *,
         config: PmktConfig | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float | None = None,
     ) -> None:
         self.base_url = (
             base_url
@@ -85,14 +90,18 @@ class AsyncGammaClient:
             else PmktConfig().gamma_api_url
         )
         self.transport = transport
-        # Default to 10 requests per second if not provided
-        self.limiter = limiter or AsyncLimiter(10, 1)
+        self.limiter = limiter if limiter is not None else AsyncLimiter(
+            DEFAULT_GAMMA_MAX_RATE, DEFAULT_GAMMA_PERIOD_SECONDS
+        )
+        http_overrides: dict[str, Any] = {}
+        if timeout_s is not None:
+            http_overrides["timeout_s"] = timeout_s
         self._http = HttpClient(
             base_url=self.base_url,
             transport=self.transport,
             limiter=self.limiter,
             request_policy=request_policy,
-            timeout_s=timeout_s,
+            **http_overrides,
         )
         self._requests = VenueRequests(self._http, venue="polymarket", service="gamma")
 

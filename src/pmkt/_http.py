@@ -12,6 +12,10 @@ from aiolimiter import AsyncLimiter
 from pmkt.runtime import OperationExpiry, RequestPolicy
 
 
+# Keep individual public reads bounded while allowing ordinary network latency.
+DEFAULT_HTTP_TIMEOUT_S = 10.0
+
+
 def format_url(base_url: httpx.URL, path: str) -> str:
     if path.startswith("http://") or path.startswith("https://"):
         return path
@@ -57,19 +61,22 @@ class HttpClient:
         self,
         base_url: str,
         transport: httpx.AsyncBaseTransport | None = None,
-        timeout_s: float = 10.0,
+        timeout_s: float = DEFAULT_HTTP_TIMEOUT_S,
         headers: dict[str, str] | None = None,
         limiter: AsyncLimiter | None = None,
         request_policy: RequestPolicy | None = None,
         *,
-        max_attempts: int = 3,
+        max_attempts: int | None = None,
         retryable_post_paths: Collection[str] = (),
         follow_redirects: bool = False,
     ) -> None:
 
         self.base_url = base_url
-        self.request_policy = request_policy or RequestPolicy(
-            max_attempts=max_attempts,
+        policy_overrides: dict[str, Any] = {}
+        if max_attempts is not None:
+            policy_overrides["max_attempts"] = max_attempts
+        self.request_policy = (
+            request_policy if request_policy is not None else RequestPolicy(**policy_overrides)
         )
         self.timeout_s = _positive_timeout(timeout_s)
         self._headers = headers or {"Accept": "application/json"}
@@ -218,7 +225,7 @@ class HttpClient:
             return response
 
         async def acquire_and_send() -> httpx.Response:
-            if self.limiter:
+            if self.limiter is not None:
                 async with self.limiter:
                     return await send()
             return await send()
