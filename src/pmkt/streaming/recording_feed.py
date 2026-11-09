@@ -34,7 +34,12 @@ from pmkt.exchanges.ws_transport import (
     WebSocketTransportSettings,
 )
 from pmkt.streaming.trades import recording_trade
-from pmkt.streaming.recording import BookRecorder, BookView, RecordingOptions
+from pmkt.streaming.recording import (
+    DEFAULT_RECORDING_DURATION_S,
+    BookRecorder,
+    BookView,
+    RecordingOptions,
+)
 
 
 class RecordingError(RuntimeError):
@@ -282,7 +287,7 @@ async def record_feed(
     output_root: str | Path,
     options: RecordingOptions,
     run_name: str | None = None,
-    duration_s: float = 300.0,
+    duration_s: float = DEFAULT_RECORDING_DURATION_S,
     max_messages: int | None = None,
     max_reconnects: int = 3,
     ws_url: str | None = None,

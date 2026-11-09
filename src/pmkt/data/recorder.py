@@ -22,6 +22,16 @@ from pmkt.data.types import parse_float
 from pmkt.data.validation import coerce_frame, validate_frame, resolve_evidence_schema
 
 
+# Sample at a modest cadence to bound repeated public REST reads.
+DEFAULT_TOPBOOK_INTERVAL_S = 1.0
+# This retained threshold annotates observations; it is not an execution gate.
+DEFAULT_TOPBOOK_MAX_STALE_SECONDS = 30.0
+# The Python API does one pass when no duration or cycle bound is supplied.
+DEFAULT_TOPBOOK_MAX_CYCLES = 1
+# Preserve the CLI's short bounded session, distinct from the Python one-pass API.
+TOPBOOK_CLI_DURATION_S = 60.0
+
+
 @dataclass(frozen=True)
 class TopbookRecorderResult:
     run_id: str
@@ -40,18 +50,18 @@ async def record_topbooks(
     kalshi_client: Any,
     out_dir: str | Path,
     run_id: str | None = None,
-    interval_s: float = 1.0,
+    interval_s: float = DEFAULT_TOPBOOK_INTERVAL_S,
     duration_s: float | None = None,
     max_cycles: int | None = None,
     depth: int | None = None,
-    max_stale_seconds: float | None = 30.0,
+    max_stale_seconds: float | None = DEFAULT_TOPBOOK_MAX_STALE_SECONDS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     utc_now: Callable[[], str] = utc_now_iso,
 ) -> TopbookRecorderResult:
     if interval_s <= 0:
         raise ValueError("interval_s must be > 0")
     if max_cycles is None and duration_s is None:
-        max_cycles = 1
+        max_cycles = DEFAULT_TOPBOOK_MAX_CYCLES
     if max_cycles is not None and max_cycles <= 0:
         raise ValueError("max_cycles must be > 0 when provided")
     if duration_s is not None and duration_s <= 0:

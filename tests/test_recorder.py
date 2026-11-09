@@ -232,3 +232,16 @@ async def test_record_topbooks_kalshi_fetch_error_uses_relation_instrument_key(t
     assert fetch_errors.shape[0] == 1
     assert fetch_errors.iloc[0]["instrument_id"] == "KXTEST:YES"
     assert fetch_errors.iloc[0]["match_id"] == "fetch-error-match"
+
+
+@pytest.mark.parametrize("overrides", [
+    {"interval_s": 0}, {"duration_s": 0}, {"max_stale_seconds": -1},
+])
+async def test_recorder_invalid_boundaries_do_not_create_output(tmp_path, overrides):
+    output = tmp_path / "absent"
+    with pytest.raises(ValueError):
+        await record_topbooks(
+            pd.DataFrame(), polymarket_client=object(), kalshi_client=object(),
+            out_dir=output, **overrides,
+        )
+    assert not output.exists()
