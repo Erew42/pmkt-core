@@ -446,3 +446,26 @@ async def test_public_clients_default_request_makes_three_attempts(monkeypatch, 
         assert len(requests) == 3
     finally:
         await client.close()
+
+
+async def test_kalshi_http_client_forwards_max_attempts_without_request_policy(monkeypatch):
+    from pmkt.exchanges.kalshi.client import KalshiHttpClient
+
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(http_module.asyncio, "sleep", no_sleep)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, json={"error": "offline"})
+
+    client = KalshiHttpClient(base_url="https://example.test",
+                              transport=httpx.MockTransport(handler), max_attempts=1)
+    try:
+        response = await client.request_response("GET", "/read")
+        assert response.status_code == 503
+        assert len(requests) == 1
+    finally:
+        await client.close()
