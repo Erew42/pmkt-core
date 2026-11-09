@@ -867,6 +867,10 @@ records = await resolver.resolve_many(
 ```
 
 `markets` must be a sequence of the resolver's matching market references.
+`concurrency` defaults to 8 and must be a positive `int`: `bool` and other
+non-integers raise `TypeError`, and values below 1 raise `ValueError`.
+`resolve_market_resolution_cache` applies the same rule before any file or
+network I/O; it previously clamped nonpositive values to 1.
 The full sequence and options are validated before requests. Empty input returns
 an empty list. Results preserve input order, cardinality, and duplicates; each
 duplicate is resolved independently and retains its own observations. A fixed

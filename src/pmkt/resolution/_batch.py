@@ -14,6 +14,17 @@ _PreparedT = TypeVar("_PreparedT")
 _ResultT = TypeVar("_ResultT")
 _MISSING = object()
 
+# Bound parallel public reads while allowing small batches to overlap I/O.
+DEFAULT_RESOLUTION_CONCURRENCY = 8
+
+
+def validate_resolution_concurrency(concurrency: int) -> None:
+    """Reject invalid worker counts before clients, files or tasks are opened."""
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int):
+        raise TypeError("concurrency must be an int")
+    if concurrency <= 0:
+        raise ValueError("concurrency must be positive")
+
 
 async def resolve_ordered_batch(
     items: Sequence[_InputT],
@@ -27,10 +38,7 @@ async def resolve_ordered_batch(
 
     if isinstance(items, (str, bytes, bytearray)) or not isinstance(items, Sequence):
         raise TypeError("markets must be a sequence")
-    if isinstance(concurrency, bool) or not isinstance(concurrency, int):
-        raise TypeError("concurrency must be an int")
-    if concurrency <= 0:
-        raise ValueError("concurrency must be positive")
+    validate_resolution_concurrency(concurrency)
     expiry = OperationExpiry.bounded(deadline_s)
 
     prepared: list[_PreparedT] = []
