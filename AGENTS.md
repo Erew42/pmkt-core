@@ -77,7 +77,7 @@ Read or change these at their source; do not restate them in this file.
 | --- | --- | --- |
 | A registered schema or its columns | `docs/data_dictionary.md`, `docs/schema_lifecycle.json` | `tests/test_schema_registry_validation.py`, `tests/test_schema_lifecycle.py` |
 | The supported CLI | `CLI_COMMANDS.md` | review |
-| A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review |
+| A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review; contract verification under Verification |
 
 The checks are partial. The dictionary test only finds each column name
 somewhere in `docs/data_dictionary.md`, and the lifecycle test only requires a
@@ -138,7 +138,12 @@ it covers; where CI cannot run, record equivalent local results and untested
 scope. Do not use an intermediate head or one parent stack as validation of the
 final combined source.
 
-Repository checks:
+For readiness, select the commands below that cover the changed behavior and its
+direct consumers. Explain why each omitted check does not apply; if the impact
+cannot be bounded, run the full list. Required checks must pass on the exact
+final source commit through CI or equivalent local runs. Documentation-only
+changes require repository hygiene and review of the changed instructions and
+links.
 
 ```bash
 python scripts/check_repo_hygiene.py
@@ -152,9 +157,13 @@ Run packaging and outside-checkout import checks when package contents, entry
 points, dependency pins or release readiness are affected. Use offline schema,
 artifact, CLI and packaging checks for those contracts. Run
 `python scripts/contract_check.py`, which calls live public Polymarket REST APIs,
-only when an affected Polymarket REST contract requires it. After OpenAPI
-changes run `python scripts/update_openapi_examples.py`; after upstream snapshot
-changes run `python scripts/sync_upstream_docs.py`.
+when changing request paths, parameters or response assumptions exercised by its
+live Polymarket probes, their shared HTTP/token-extraction behavior, or the
+checker itself. For other Polymarket REST endpoints, provide endpoint-specific
+contract verification; this script does not cover every endpoint. Offline-only
+schema, artifact, CLI and packaging changes do not require live REST calls.
+After OpenAPI changes run `python scripts/update_openapi_examples.py`; after
+upstream snapshot changes run `python scripts/sync_upstream_docs.py`.
 
 Repeat a broad check only after a change that could invalidate its result, a
 newly identified concrete risk, or a required gate. Label baseline failures,
