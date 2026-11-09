@@ -217,3 +217,101 @@ def test_cli_commands_doc_covers_root_inventory() -> None:
     ]
 
     assert missing == []
+
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+def test_feature_cli_only_forwards_supplied_windows(monkeypatch, tmp_path, explicit):
+    import pandas as pd
+    from pmkt.cli import features as cli
+    calls = []
+
+    def compute(frame, **kwargs):
+        calls.append(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(cli, "read_parquet", lambda path: pd.DataFrame())
+    monkeypatch.setattr(cli, "write_parquet", lambda frame, path, **kwargs: path)
+    monkeypatch.setattr(cli, "compute_features", compute)
+    args = ["compute-features", "--books", str(tmp_path / "unused"), "--out", str(tmp_path / "out")]
+    if explicit:
+        args += ["--bar-seconds", "0", "--window-seconds", "0"]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert calls == ([{"bar_seconds": 0, "window_seconds": 0}] if explicit else [{}])
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+@pytest.mark.parametrize("explicit", [False, True])
+def test_history_cli_only_forwards_supplied_settings(monkeypatch, tmp_path, venue, explicit):
+    from types import SimpleNamespace
+    from pmkt.cli import history as cli
+    calls = []
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+
+    async def backfill(*args, **kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(summary={"historical_price_rows": 0, "trade_rows": 0, "gap_rows": 0})
+
+    monkeypatch.setattr(cli, "AsyncClobClient", Client)
+    monkeypatch.setattr(cli, "AsyncKalshiClient", Client)
+    monkeypatch.setattr(cli.PmktConfig, "from_env", lambda: None)
+    monkeypatch.setattr(cli, "backfill_venue_history", backfill)
+    monkeypatch.setattr(cli, "write_historical_backfill_result", lambda *args: {})
+    args = ["backfill-venue-history", "--venue", venue, "--instrument", "a", "--out-dir", str(tmp_path)]
+    expected = {}
+    if explicit:
+        args += ["--start-ts", "0", "--end-ts", "1", "--run-id", ""]
+        expected = {"start_ts": 0, "end_ts": 1, "run_id": ""}
+        if venue == "polymarket":
+            args += ["--interval", "", "--fidelity", "1"]
+            expected.update(interval="", fidelity=1)
+        else:
+            args += ["--period-interval", "1", "--skip-trades", "--live", "--max-trade-pages", "0", "--trade-limit", "0"]
+            expected.update(period_interval=1, include_trades=False, use_historical=False,
+                            max_trade_pages=0, trade_limit=0)
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    actual = {key: value for key, value in calls[0].items() if key not in {"polymarket_client", "kalshi_client"}}
+    assert actual == expected
+
+
+@pytest.mark.parametrize(("venue", "option"), [("polymarket", "--fidelity"), ("kalshi", "--period-interval")])
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_history_cli_rejects_nonpositive_sampling_intervals(monkeypatch, tmp_path, venue, option, value):
+    from pmkt.cli import history as cli
+
+    async def backfill(*args, **kwargs):
+        raise AssertionError("a nonpositive interval must be rejected before backfill")
+
+    monkeypatch.setattr(cli, "backfill_venue_history", backfill)
+    monkeypatch.setenv("COLUMNS", "200")
+    result = CliRunner().invoke(app, [
+        "backfill-venue-history", "--venue", venue, "--instrument", "a", "--out-dir", str(tmp_path),
+        "--start-ts", "0", "--end-ts", "1", option, value,
+    ], color=False)
+    assert result.exit_code == 2
+    plain_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    output = " ".join(plain_output.replace(chr(0x2502), " ").split())
+    assert option in output
+
+
+@pytest.mark.parametrize("force_color", [False, True])
+def test_history_help_explains_sampling_and_candle_units(monkeypatch, force_color):
+    if force_color:
+        monkeypatch.setenv("FORCE_COLOR", "1")
+    else:
+        monkeypatch.delenv("FORCE_COLOR", raising=False)
+    result = CliRunner().invoke(app, ["backfill-venue-history", "--help"], color=False)
+    assert result.exit_code == 0
+    plain_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    output = " ".join(plain_output.replace(chr(0x2502), " ").split())
+    assert "sampling resolution in minutes" in output
+    assert "candlestick period in minutes" in output

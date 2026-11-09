@@ -152,6 +152,15 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+`backfill-venue-history` and `compute-features` forward only supplied settings;
+their library APIs own the defaults. History `--fidelity` is Polymarket sampling
+resolution in minutes; `--period-interval` is Kalshi candle duration in minutes.
+Polymarket `--interval` selects the history time span rather than sampling
+resolution. `--fidelity` and `--period-interval` must be at least 1; the
+library also rejects nonpositive values before any fetch. Explicit zero
+timestamps, empty selectors, and `--skip-trades`/`--live` are forwarded to the
+existing owner validation without being replaced by defaults.
+
 Catalog discovery and current refresh inherit the collector-owned
 `DEFAULT_MAX_PAGES_PER_LANE` when `--max-pages` is omitted. The cap is a local
 request budget: needing another page after the cap remains an error and never
