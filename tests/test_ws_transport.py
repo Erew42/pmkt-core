@@ -511,3 +511,57 @@ async def test_reconnect_diagnostic_write_failure_is_a_persistence_failure(
     assert connections == 1
     assert manifest["phase"] == "persistence"
     assert manifest["status"] == "failed"
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("options,replacements,backoff", [
+    ({}, 3, 0.5),
+    ({"max_reconnects": 0}, 0, 0.5),
+    ({"max_reconnects": 2, "reconnect_backoff": 0}, 2, 0),
+])
+async def test_iterators_inherit_budget_defaults_and_preserve_zero(retry_client, options, replacements, backoff):
+    calls = 0
+    delays = []
+
+    async def factory(*args):
+        nonlocal calls
+        calls += 1
+        raise OSError("offline")
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    client = retry_client(factory, sleep=sleep)
+    try:
+        with pytest.raises(OSError, match="offline"):
+            await anext(client.iter_messages(**options))
+        assert calls == 1 + replacements
+        assert delays == [backoff * attempt for attempt in range(1, replacements + 1)]
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_iterator_explicit_none_retains_unlimited_replacements(retry_client):
+    calls = 0
+    socket = RetrySocket()
+
+    async def factory(*args):
+        nonlocal calls
+        calls += 1
+        if calls <= 4:
+            raise OSError("offline")
+        return socket
+
+    async def sleep(delay):
+        pass
+
+    client = retry_client(factory, sleep=sleep)
+    iterator = client.iter_messages(max_reconnects=None)
+    try:
+        assert await anext(iterator)
+        assert calls == 5
+    finally:
+        await iterator.aclose()
+        await client.close()

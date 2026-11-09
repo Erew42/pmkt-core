@@ -40,6 +40,7 @@ from pmkt.data.normalize_books import kalshi_orderbook_to_topbook
 from pmkt.data.schemas import TOPBOOK_COLUMNS
 from pmkt.data.storage.parquet import read_parquet, write_parquet
 from pmkt.exchanges.ws_transport import (
+    DEFAULT_RECONNECT_ATTEMPTS,
     WS_MAX_QUEUE_FRAMES,
     WS_MAX_SIZE_BYTES,
 )
@@ -673,9 +674,9 @@ def stream_books(
     depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
     depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
     raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
-    max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,
-    websocket_max_size_bytes: Annotated[int, typer.Option()] = WS_MAX_SIZE_BYTES,
-    websocket_max_queue_frames: Annotated[int, typer.Option()] = WS_MAX_QUEUE_FRAMES,
+    max_reconnects: Annotated[Optional[int], typer.Option(help="Bound on replacement connection attempts.", show_default=str(DEFAULT_RECONNECT_ATTEMPTS))] = None,
+    websocket_max_size_bytes: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_SIZE_BYTES))] = None,
+    websocket_max_queue_frames: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_QUEUE_FRAMES))] = None,
 ) -> None:
     """Record live books and public trades into SQLite, then export Parquet."""
     instruments = list(dict.fromkeys(token_id or []))
@@ -689,6 +690,9 @@ def stream_books(
             "mode": mode,
             "depth_on_best_price_change": depth_on_best_price_change,
             "raw_messages": raw_messages,
+            "max_reconnects": max_reconnects,
+            "websocket_max_size_bytes": websocket_max_size_bytes,
+            "websocket_max_queue_frames": websocket_max_queue_frames,
         }.items() if value is not None
     }
     if depth_check_interval_s is not None:
@@ -696,10 +700,7 @@ def stream_books(
     try:
         manifest = asyncio.run(stream_order_book_data(
             instruments, output_root=output_dir, run_name=run_name,
-            max_messages=max_messages, max_reconnects=max_reconnects,
-            **overrides,
-            websocket_max_size_bytes=websocket_max_size_bytes,
-            websocket_max_queue_frames=websocket_max_queue_frames,
+            max_messages=max_messages, **overrides,
         ))
     except (ValueError, RuntimeError) as exc:
         error_exit(str(exc))
@@ -719,9 +720,9 @@ def stream_kalshi_books(
     depth_check_interval_s: Annotated[Optional[str], typer.Option(help="Seconds between changed-book checks; 'off' disables them; omitted uses RecordingOptions.", show_default=f"{DEFAULT_DEPTH_CHECK_INTERVAL_S:g}")] = None,
     depth_on_best_price_change: Annotated[Optional[bool], typer.Option(help="Save depth immediately on best bid/ask price changes; omitted uses RecordingOptions.")] = None,
     raw_messages: Annotated[Optional[bool], typer.Option(help="Also save diagnostic raw_messages.jsonl; omitted uses RecordingOptions (opt-in retention).")] = None,
-    max_reconnects: Annotated[int, typer.Option(help="Bound on replacement connection attempts.")] = 3,
-    websocket_max_size_bytes: Annotated[int, typer.Option()] = WS_MAX_SIZE_BYTES,
-    websocket_max_queue_frames: Annotated[int, typer.Option()] = WS_MAX_QUEUE_FRAMES,
+    max_reconnects: Annotated[Optional[int], typer.Option(help="Bound on replacement connection attempts.", show_default=str(DEFAULT_RECONNECT_ATTEMPTS))] = None,
+    websocket_max_size_bytes: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_SIZE_BYTES))] = None,
+    websocket_max_queue_frames: Annotated[Optional[int], typer.Option(show_default=str(WS_MAX_QUEUE_FRAMES))] = None,
     header_provider: Annotated[Optional[str], typer.Option(help="Read-auth provider MODULE:ATTRIBUTE.")] = None,
 ) -> None:
     """Record live books and public trades into SQLite, then export Parquet."""
@@ -736,6 +737,9 @@ def stream_kalshi_books(
             "mode": mode,
             "depth_on_best_price_change": depth_on_best_price_change,
             "raw_messages": raw_messages,
+            "max_reconnects": max_reconnects,
+            "websocket_max_size_bytes": websocket_max_size_bytes,
+            "websocket_max_queue_frames": websocket_max_queue_frames,
         }.items() if value is not None
     }
     if depth_check_interval_s is not None:
@@ -743,10 +747,7 @@ def stream_kalshi_books(
     try:
         manifest = asyncio.run(stream_kalshi_order_book_data(
             instruments, output_root=output_dir, run_name=run_name,
-            max_messages=max_messages, max_reconnects=max_reconnects,
-            **overrides,
-            websocket_max_size_bytes=websocket_max_size_bytes,
-            websocket_max_queue_frames=websocket_max_queue_frames,
+            max_messages=max_messages, **overrides,
         auth=_load_read_auth_header_provider(header_provider),
         ))
     except (ValueError, RuntimeError) as exc:

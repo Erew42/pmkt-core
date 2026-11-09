@@ -20,11 +20,17 @@ from pmkt.exchanges.polymarket.ws import (
     MarketBookState,
     _normalize_asset_ids,
 )
+from pmkt.exchanges.polymarket.recovery import CORRECTIVE_DELTA_GRACE_SECONDS
 from pmkt.exchanges.read_auth import ReadAuthHeaderProvider
-from pmkt.exchanges.ws_transport import WebSocketMessagePump, WebSocketRetryBudget
+from pmkt.exchanges.ws_transport import (
+    DEFAULT_RECONNECT_BACKOFF_SECONDS, WebSocketMessagePump, WebSocketRetryBudget,
+)
 from pmkt.streaming.recording_feed import VenueBooks
 from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
 
+
+# Ongoing feeds keep retrying; cap delay so a long outage still gets regular probes.
+MANAGED_FEED_MAX_RECONNECT_BACKOFF_SECONDS = 30.0
 
 _T = TypeVar("_T")
 
@@ -136,7 +142,7 @@ class ManagedBookFeed:
         snapshot_timeout: float = 30.0,
         connect_timeout: float = 10.0,
         probe_interval: float = 10.0,
-        retry_backoff: float = 0.5,
+        retry_backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
         ws_url: str | None = None,
         auth: ReadAuthHeaderProvider | None = None,
         connect_factory: Callable[..., Any] | None = None,
@@ -459,7 +465,7 @@ class ManagedBookFeed:
         budget = WebSocketRetryBudget(
             None,
             backoff=self.retry_backoff,
-            max_backoff=30.0,
+            max_backoff=MANAGED_FEED_MAX_RECONNECT_BACKOFF_SECONDS,
             on_reconnect=reconnecting,
         )
         try:
@@ -741,7 +747,7 @@ class ManagedBookFeed:
                 )
                 shard.recovery[instrument] = _Recovery(
                     "crossed_book" if grace else "book_integrity_failed",
-                    now + 0.25 if grace else now,
+                    now + CORRECTIVE_DELTA_GRACE_SECONDS if grace else now,
                     "grace" if grace else "pending",
                 )
             elif recovery is not None and recovery.phase != "sending":

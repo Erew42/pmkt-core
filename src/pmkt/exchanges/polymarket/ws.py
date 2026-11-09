@@ -17,6 +17,7 @@ from typing import (
     Iterable,
     Literal,
     Sequence,
+    cast,
 )
 
 import websockets
@@ -26,6 +27,9 @@ from websockets.protocol import State
 from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
+    DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
+    DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
+    _UNSET_RECONNECTS,
     WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
     WebSocketTransportSettings,
     WebSocketRetryBudget,
@@ -39,9 +43,11 @@ logger = logging.getLogger(__name__)
 
 MARKET_CHANNEL_TYPE = "market"
 POLYMARKET_MAX_DECIMAL_ASSET_ID_DIGITS = 90
+# Polymarket documents a text PING every ten seconds (checked 2026-11-07):
+# https://github.com/Polymarket/agent-skills/blob/main/websocket.md#heartbeat
 DEFAULT_HEARTBEAT_SECONDS = 10.0
-DEFAULT_RECONNECT_ATTEMPTS = 3
-DEFAULT_RECONNECT_BACKOFF_SECONDS = 0.5
+# None disables heartbeats; forwarding APIs need a separate omitted marker.
+_UNSET_HEARTBEAT_INTERVAL = object()
 POLYMARKET_BOOK_EVENT_TYPES = frozenset({"book", "price_change"})
 
 ConnectFactory = Callable[[str], Any | Awaitable[Any]]
@@ -833,17 +839,23 @@ class AsyncMarketWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int = DEFAULT_RECONNECT_ATTEMPTS,
-        reconnect_backoff: float = DEFAULT_RECONNECT_BACKOFF_SECONDS,
+        max_reconnects: int | None = cast(Any, _UNSET_RECONNECTS),
+        reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
         strict_decode: bool = False,
         decimal_numbers: bool | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
         # A capture supplies one budget for startup and all iterator generations.
-        budget = self._retry_budget or WebSocketRetryBudget(
-            max_reconnects if reconnect else 0,
-            backoff=reconnect_backoff,
+        retry_overrides: dict[str, Any] = {}
+        if not reconnect:
+            retry_overrides["max_reconnects"] = 0
+        elif max_reconnects is not _UNSET_RECONNECTS:
+            retry_overrides["max_reconnects"] = max_reconnects
+        if reconnect_backoff is not None:
+            retry_overrides["backoff"] = reconnect_backoff
+        budget = self._retry_budget if self._retry_budget is not None else WebSocketRetryBudget(
+            **retry_overrides,
             on_reconnect=on_reconnect,
             sleep=self._sleep,
         )
@@ -999,8 +1011,8 @@ async def collect_market_snapshots(
     timeout_seconds: float = 30.0,
     ws_url: str | None = None,
     custom_feature_enabled: bool = True,
-    heartbeat_interval: float | None = DEFAULT_HEARTBEAT_SECONDS,
-    reconnect_attempts: int = DEFAULT_RECONNECT_ATTEMPTS,
+    heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
+    reconnect_attempts: int | None = cast(Any, _UNSET_RECONNECTS),
     connect_factory: ConnectFactory | None = None,
 ) -> list[dict[str, Any]]:
     """Collect a bounded set of market websocket snapshots."""
@@ -1011,11 +1023,18 @@ async def collect_market_snapshots(
     snapshots: list[dict[str, Any]] = []
     deadline = time.monotonic() + float(timeout_seconds)
 
+    client_overrides: dict[str, Any] = {}
+    if heartbeat_interval is not _UNSET_HEARTBEAT_INTERVAL:
+        client_overrides["heartbeat_interval"] = heartbeat_interval
+    retry_overrides: dict[str, Any] = {}
+    if reconnect_attempts is not _UNSET_RECONNECTS:
+        retry_overrides["max_reconnects"] = reconnect_attempts
+
     async with AsyncMarketWebSocketClient(
         normalized_ids,
         ws_url=ws_url,
         custom_feature_enabled=custom_feature_enabled,
-        heartbeat_interval=heartbeat_interval,
+        **client_overrides,
         connect_factory=connect_factory,
     ) as client:
 
@@ -1024,7 +1043,7 @@ async def collect_market_snapshots(
                 state.mark_reconnect()
 
         iterator = client.iter_messages(
-            max_reconnects=reconnect_attempts,
+            **retry_overrides,
             on_reconnect=mark_reconnects,
         )
         while len(snapshots) < max_updates:

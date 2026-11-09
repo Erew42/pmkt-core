@@ -4,6 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence, cast
 
+from pmkt.exchanges.polymarket.ws import _UNSET_HEARTBEAT_INTERVAL
 from pmkt.streaming.recording import RecordingOptions, _UNSET_DEPTH_CHECK_INTERVAL
 from pmkt.streaming.recording_feed import record_feed
 
@@ -20,12 +21,12 @@ async def stream_order_book_data(
     run_name: str | None = None,
     duration_s: float | None = None,
     max_messages: int | None = None,
-    max_reconnects: int = 3,
+    max_reconnects: int | None = None,
     ws_url: str | None = None,
     websocket_max_size_bytes: int | None = None,
     websocket_max_queue_frames: int | None = None,
     connect_factory: Callable[..., Any] | None = None,
-    heartbeat_interval: float | None = 10.0,
+    heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
     custom_feature_enabled: bool = True,
 ) -> dict[str, Any]:
     """Record changed topbooks and optional full snapshots into SQLite/Parquet.
@@ -49,12 +50,16 @@ async def stream_order_book_data(
     feed_overrides: dict[str, Any] = {}
     if duration_s is not None:
         feed_overrides["duration_s"] = duration_s
+    if max_reconnects is not None:
+        feed_overrides["max_reconnects"] = max_reconnects
+    if heartbeat_interval is not _UNSET_HEARTBEAT_INTERVAL:
+        feed_overrides["heartbeat_interval"] = heartbeat_interval
     return await record_feed(
         asset_ids, venue="polymarket", options=options,
         output_root=output_root, run_name=run_name, **feed_overrides,
-        max_messages=max_messages, max_reconnects=max_reconnects,
+        max_messages=max_messages,
         ws_url=ws_url, connect_factory=connect_factory,
         websocket_max_size_bytes=websocket_max_size_bytes,
         websocket_max_queue_frames=websocket_max_queue_frames,
-        heartbeat_interval=heartbeat_interval, custom_feature_enabled=custom_feature_enabled,
+        custom_feature_enabled=custom_feature_enabled,
     )
