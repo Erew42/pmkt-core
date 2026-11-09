@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
+from pmkt.resolution._batch import (
+    DEFAULT_RESOLUTION_CONCURRENCY,
+    validate_resolution_concurrency,
+)
 from pmkt.resolution.cache import resolve_market_resolution_cache
 
 
@@ -62,9 +66,13 @@ def resolve_market_resolutions_cmd(
         ),
     ] = None,
     concurrency: Annotated[
-        int,
-        typer.Option("--concurrency", min=1, help="Maximum concurrent resolver tasks."),
-    ] = 8,
+        int | None,
+        typer.Option(
+            "--concurrency",
+            help="Maximum concurrent resolver tasks; uses the resolution default when omitted.",
+            show_default=str(DEFAULT_RESOLUTION_CONCURRENCY),
+        ),
+    ] = None,
     refresh: Annotated[
         bool,
         typer.Option("--refresh", help="Re-resolve markets even if a final canonical cache row exists."),
@@ -76,6 +84,14 @@ def resolve_market_resolutions_cmd(
 ) -> None:
     """Resolve final market outcomes into canonical cache rows."""
 
+    options: dict[str, Any] = {}
+    if concurrency is not None:
+        try:
+            validate_resolution_concurrency(concurrency)
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(str(exc), param_hint="--concurrency") from exc
+        options["concurrency"] = concurrency
+
     summary = asyncio.run(
         resolve_market_resolution_cache(
             polymarket_markets_path=polymarket_markets,
@@ -83,7 +99,7 @@ def resolve_market_resolutions_cmd(
             output_dir=output_dir,
             matches_path=matches,
             polygon_rpc_url=polygon_rpc_url,
-            concurrency=concurrency,
+            **options,
             refresh=refresh,
             max_markets=max_markets,
         )

@@ -109,6 +109,8 @@ installed version.
 ## Resolution commands
 
 - `resolve-market-resolutions`: build canonical market-resolution evidence.
+  Omitted `--concurrency` inherits the resolution default; explicit values must
+  be positive integers. Invalid values fail before cache or network I/O.
 
 ## Excluded interfaces
 
@@ -158,6 +160,12 @@ resolution. `--fidelity` and `--period-interval` must be at least 1; the
 library also rejects nonpositive values before any fetch. Explicit zero
 timestamps, empty selectors, and `--skip-trades`/`--live` are forwarded to the
 existing owner validation without being replaced by defaults.
+
+Catalog discovery and current refresh inherit the collector-owned
+`DEFAULT_MAX_PAGES_PER_LANE` when `--max-pages` is omitted. The cap is a local
+request budget: needing another page after the cap remains an error and never
+publishes partial coverage. Compaction keeps its existing condition keys and
+strict ratio boundaries; named catalog policy constants own the trigger values.
 
 ## Runtime configuration in 0.2
 
