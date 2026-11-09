@@ -292,12 +292,15 @@ def test_history_cli_rejects_nonpositive_sampling_intervals(monkeypatch, tmp_pat
         raise AssertionError("a nonpositive interval must be rejected before backfill")
 
     monkeypatch.setattr(cli, "backfill_venue_history", backfill)
+    monkeypatch.setenv("COLUMNS", "200")
     result = CliRunner().invoke(app, [
         "backfill-venue-history", "--venue", venue, "--instrument", "a", "--out-dir", str(tmp_path),
         "--start-ts", "0", "--end-ts", "1", option, value,
-    ])
+    ], color=False)
     assert result.exit_code == 2
-    assert option in result.output
+    plain_output = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+    output = " ".join(plain_output.replace(chr(0x2502), " ").split())
+    assert option in output
 
 
 @pytest.mark.parametrize("force_color", [False, True])
