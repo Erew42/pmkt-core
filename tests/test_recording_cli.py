@@ -152,3 +152,28 @@ def test_recording_help_shows_effective_defaults(command):
         assert option in help_text, help_text
         option_help = help_text.split(option, 1)[1].split("--", 1)[0]
         assert f"[default: ({expected})]" in option_help
+
+
+@pytest.mark.parametrize("explicit", [False, True])
+@pytest.mark.parametrize("command,attribute,flag", [
+    ("stream-books", "stream_order_book_data", "--token-id"),
+    ("stream-kalshi-books", "stream_kalshi_order_book_data", "--ticker"),
+])
+def test_recording_cli_inherits_connection_settings(monkeypatch, explicit, command, attribute, flag):
+    calls = []
+
+    async def capture(*args, **kwargs):
+        calls.append(kwargs)
+        return {"status": "complete", "run_dir": "test"}
+
+    monkeypatch.setattr(streaming, attribute, capture)
+    monkeypatch.setattr(streaming, "_load_read_auth_header_provider", lambda value: object())
+    args = [command, flag, "a"]
+    if explicit:
+        args += ["--max-reconnects", "0", "--websocket-max-size-bytes", "0", "--websocket-max-queue-frames", "0"]
+    result = CliRunner().invoke(app, args)
+    assert result.exit_code == 0, result.output
+    actual = {key: value for key, value in calls[0].items() if key in {
+        "max_reconnects", "websocket_max_size_bytes", "websocket_max_queue_frames"
+    }}
+    assert actual == ({"max_reconnects": 0, "websocket_max_size_bytes": 0, "websocket_max_queue_frames": 0} if explicit else {})

@@ -152,6 +152,12 @@ committed rows. The Python equivalent is
 against concurrent export. `dataset validate-manifest` also recognizes the new
 format. Historical profile recovery and `reconstruct-book-tape` remain available.
 
+Recording connection options inherit `WebSocketRetryBudget` and
+`WebSocketTransportSettings` when omitted. Explicit `--max-reconnects 0`
+disables replacement attempts. Finite capture budgets remain distinct from
+managed feeds' unlimited replacements and capped delay. Polymarket heartbeat
+and corrective-grace policies are owned by its WebSocket and recovery modules.
+
 Recording option ownership: `stream-books` and `stream-kalshi-books` inherit
 sampling and retention from `RecordingOptions`, and duration from `record_feed`.
 Both commands show the effective duration, mode, and depth-check defaults in help.

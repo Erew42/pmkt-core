@@ -34,6 +34,13 @@ class _PendingDelta:
     deadline_ns: int | None = None
 
 
+# Retain a brief local correction window before resnapshotting invalid depth.
+# This is the existing recovery policy, not a venue timing guarantee.
+CORRECTIVE_DELTA_GRACE_SECONDS = 0.25
+# Bound unrelated follow-up traffic independently from the wall-clock grace.
+MAX_CORRECTIVE_FOLLOWUP_MESSAGES = 16
+
+
 class ComplementaryDeltaRecovery:
     """Keep invalid evidence while allowing a bounded corrective update.
 
@@ -42,8 +49,8 @@ class ComplementaryDeltaRecovery:
     Neither unrelated traffic nor repeated locked updates renew either bound.
     """
 
-    grace_ns = 250_000_000
-    max_followup_messages = 16
+    grace_ns = int(CORRECTIVE_DELTA_GRACE_SECONDS * 1_000_000_000)
+    max_followup_messages = MAX_CORRECTIVE_FOLLOWUP_MESSAGES
 
     def __init__(self) -> None:
         self.pending: dict[str, _PendingDelta] = {}

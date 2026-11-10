@@ -36,6 +36,7 @@ from statistics import median
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.frames import Frame, Opcode
 
+from pmkt.exchanges.polymarket.ws import DEFAULT_HEARTBEAT_SECONDS
 from pmkt.exchanges.kalshi.ws import kalshi_public_subscription_payload
 from pmkt.exchanges.read_auth import (
     ReadAuthHeaderProvider,
@@ -118,8 +119,8 @@ MAX_QUEUE = 128
 KALSHI_PING_INTERVAL = 20
 # Allow 20 seconds for the pong to tolerate brief transport stalls.
 KALSHI_PING_TIMEOUT = 20
-# Polymarket expects an application heartbeat every ten seconds.
-POLYMARKET_PING_SECONDS = 10
+# Inherit the venue heartbeat used by the normalized market-data client.
+POLYMARKET_PING_SECONDS = DEFAULT_HEARTBEAT_SECONDS
 # Yield during buffered bursts so timers and shutdown signals can run promptly.
 RECEIVE_YIELD_FRAMES = 128
 NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,95}")
