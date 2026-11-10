@@ -317,3 +317,155 @@ async def test_format_url_preserves_absolute_and_joins_relative() -> None:
 
     assert format_url(base_url, "https://other.test/path") == "https://other.test/path"
     assert format_url(base_url, "/markets") == "https://example.com/api/markets"
+
+
+
+def _default_test_client(name, **kwargs):
+    from pmkt.exchanges.kalshi.client import AsyncKalshiClient, KalshiHttpClient
+    from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
+    from pmkt.exchanges.polymarket.clob import AsyncClobClient
+    from pmkt.exchanges.polymarket.data_api import AsyncPolymarketDataClient
+
+    factory = {
+        "http": HttpClient, "kalshi-http": KalshiHttpClient, "kalshi": AsyncKalshiClient,
+        "gamma": AsyncGammaClient, "clob": AsyncClobClient, "data": AsyncPolymarketDataClient,
+    }[name]
+    return factory(base_url="https://example.test", **kwargs)
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+@pytest.mark.parametrize("timeout,attempts", [(None, None), (2.5, 1)])
+async def test_public_clients_effective_timeout_and_total_attempts(name, timeout, attempts):
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, json={"error": "offline"})
+
+    policy_options = {"backoff_base_s": 0.0}
+    if attempts is not None:
+        policy_options["max_attempts"] = attempts
+    options = {} if timeout is None else {"timeout_s": timeout}
+    client = _default_test_client(name, transport=httpx.MockTransport(handler),
+                                  request_policy=RequestPolicy(**policy_options), **options)
+    http = client if isinstance(client, HttpClient) else client._http
+    try:
+        response = await http.request_response("GET", "/read")
+        assert response.status_code == 503
+        assert len(requests) == (3 if attempts is None else attempts)
+        expected = timeout if timeout is not None else (30.0 if name == "data" else 10.0)
+        assert all(request.extensions["timeout"]["read"] == expected for request in requests)
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("name", ["kalshi-http", "kalshi", "gamma", "clob", "data"])
+async def test_public_client_wrappers_do_not_supply_common_defaults(monkeypatch, name):
+    calls = []
+    original = HttpClient.__init__
+
+    def init(self, *args, **kwargs):
+        calls.append({key: value for key, value in kwargs.items() if key in {"timeout_s", "max_attempts"}})
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(HttpClient, "__init__", init)
+    client = _default_test_client(name)
+    try:
+        assert calls == ([{"timeout_s": 30.0}] if name == "data" else [{}])
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+@pytest.mark.parametrize("timeout,error", [(0, ValueError), (-1, ValueError), (False, TypeError), (float("inf"), ValueError)])
+async def test_public_clients_preserve_invalid_explicit_timeouts(name, timeout, error):
+    with pytest.raises(error, match="timeout_s"):
+        _default_test_client(name, timeout_s=timeout)
+
+
+@pytest.mark.parametrize("name", ["kalshi", "gamma", "clob", "data"])
+async def test_service_rate_presets_and_explicit_limiter(name):
+    from aiolimiter import AsyncLimiter
+    client = _default_test_client(name)
+    override = AsyncLimiter(2, 3)
+    explicit = _default_test_client(name, limiter=override)
+    try:
+        assert (client.limiter.max_rate, client.limiter.time_period) == (10, 1)
+        assert explicit.limiter is override
+        assert explicit._http.limiter is override
+    finally:
+        await client.close()
+        await explicit.close()
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+async def test_public_clients_acquire_falsey_limiter(name):
+    from aiolimiter import AsyncLimiter
+
+    acquisitions = []
+
+    class FalseyLimiter(AsyncLimiter):
+        def __bool__(self):
+            return False
+
+        async def __aenter__(self):
+            acquisitions.append(True)
+            return await super().__aenter__()
+
+    limiter = FalseyLimiter(1)
+    client = _default_test_client(
+        name, limiter=limiter,
+        transport=httpx.MockTransport(lambda request: httpx.Response(200, json={"ok": True})),
+    )
+    http = client if isinstance(client, HttpClient) else client._http
+    try:
+        assert http.limiter is limiter
+        assert await http.request_json("GET", "/read") == {"ok": True}
+        assert acquisitions == [True]
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("name", ["http", "kalshi-http", "kalshi", "gamma", "clob", "data"])
+async def test_public_clients_default_request_makes_three_attempts(monkeypatch, name):
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(http_module.asyncio, "sleep", no_sleep)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, json={"error": "offline"})
+
+    client = _default_test_client(name, transport=httpx.MockTransport(handler))
+    http = client if isinstance(client, HttpClient) else client._http
+    try:
+        response = await http.request_response("GET", "/read")
+        assert response.status_code == 503
+        assert len(requests) == 3
+    finally:
+        await client.close()
+
+
+async def test_kalshi_http_client_forwards_max_attempts_without_request_policy(monkeypatch):
+    from pmkt.exchanges.kalshi.client import KalshiHttpClient
+
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(http_module.asyncio, "sleep", no_sleep)
+    requests = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(503, json={"error": "offline"})
+
+    client = KalshiHttpClient(base_url="https://example.test",
+                              transport=httpx.MockTransport(handler), max_attempts=1)
+    try:
+        response = await client.request_response("GET", "/read")
+        assert response.status_code == 503
+        assert len(requests) == 1
+    finally:
+        await client.close()

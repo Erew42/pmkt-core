@@ -1027,3 +1027,12 @@ validate, and query catalogs with pandas, PyArrow, and DuckDB.
 `pmkt[streaming]` adds pandas, PyArrow, and `websockets`. Conversions and modules
 that require an extra may fail at call or import time when that extra is absent;
 the base package does not implicitly install those dependencies.
+
+
+Public HTTP defaults are owned by `pmkt._http.DEFAULT_HTTP_TIMEOUT_S` and
+`pmkt.runtime.DEFAULT_HTTP_MAX_ATTEMPTS` (`RequestPolicy` counts the initial
+request). Venue client wrappers inherit omitted common settings. The Data API
+retains `DATA_API_TIMEOUT_PRESET_S` as its longer service preset. Explicit
+timeouts still use the transport's finite-positive validation. Each service's
+named limiter defaults are conservative client pacing, not venue quota claims;
+an explicitly supplied limiter or request policy remains authoritative.

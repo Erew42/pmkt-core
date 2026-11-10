@@ -138,11 +138,15 @@ def parse_retry_after(
     return seconds if seconds >= 0 else None
 
 
+# Retain a small total public-read budget: tolerate transient failures with bounded work.
+DEFAULT_HTTP_MAX_ATTEMPTS = 3
+
+
 @dataclass(frozen=True)
 class RequestPolicy:
     """Retry budget; max_attempts includes the initial request."""
 
-    max_attempts: int = 3
+    max_attempts: int = DEFAULT_HTTP_MAX_ATTEMPTS
     retry_status_codes: frozenset[int] = frozenset({429, 500, 502, 503, 504})
     retry_non_idempotent_methods: bool = False
     idempotent_methods: frozenset[str] = frozenset(

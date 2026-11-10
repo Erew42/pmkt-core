@@ -22,8 +22,12 @@ from pmkt.records import RequestObservation, ResultProvenance
 
 
 MAX_OPEN_INTEREST_MARKETS = 20
+# Retain conservative activity-service pacing; these are client policy, not venue ceilings.
 DEFAULT_DATA_API_MAX_RATE = 10
 DEFAULT_DATA_API_PERIOD_SECONDS = 1
+# Preserve the activity service's longer request budget rather than shortening
+# existing reads in a default cleanup. This is a local service preset, not an SLA.
+DATA_API_TIMEOUT_PRESET_S = 30.0
 MAX_V2_PAGE_SIZE = 1000
 _USER_PNL_INTERVALS = ("max", "all", "1m", "1w", "1d", "12h", "6h")
 _USER_PNL_FIDELITIES = ("1d", "18h", "12h", "3h", "1h")
@@ -674,7 +678,7 @@ class AsyncPolymarketDataClient:
         limiter: AsyncLimiter | None = None,
         *,
         config: PmktConfig | None = None,
-        timeout_s: float = 30.0,
+        timeout_s: float | None = None,
         request_policy: RequestPolicy | None = None,
     ) -> None:
         self.base_url = (
@@ -684,7 +688,7 @@ class AsyncPolymarketDataClient:
             if config is not None
             else PmktConfig().polymarket_data_api_url
         )
-        self.limiter = limiter or AsyncLimiter(
+        self.limiter = limiter if limiter is not None else AsyncLimiter(
             DEFAULT_DATA_API_MAX_RATE,
             DEFAULT_DATA_API_PERIOD_SECONDS,
         )
@@ -692,7 +696,7 @@ class AsyncPolymarketDataClient:
             base_url=self.base_url,
             transport=transport,
             limiter=self.limiter,
-            timeout_s=timeout_s,
+            timeout_s=DATA_API_TIMEOUT_PRESET_S if timeout_s is None else timeout_s,
             request_policy=request_policy,
         )
         self._requests = VenueRequests(self._http, venue="polymarket", service="data")
