@@ -28,6 +28,14 @@ required validation, provenance, compatibility, and the read-only boundary when
 simplifying. Reusable library infrastructure can justify more structure than a
 single research script.
 
+Keep simple, unshared defaults on their owning type. Name shared defaults or
+values whose names explain units or policy; equal numbers do not make two
+policies the same. Preserve explicit zero, false, empty and nullable inputs
+where supported. Introduce an omission sentinel only when omission must differ
+from an otherwise valid value. Prefer explicit typed construction over
+reflection or untyped argument routing when the latter does not remove
+meaningful repetition.
+
 When asked to grill an idea or review a design, focus on public API and schema
 contracts, data grain and time semantics, provenance, and consumer compatibility.
 Check whether the proposed behavior belongs in core before discussing its
@@ -69,7 +77,7 @@ Read or change these at their source; do not restate them in this file.
 | --- | --- | --- |
 | A registered schema or its columns | `docs/data_dictionary.md`, `docs/schema_lifecycle.json` | `tests/test_schema_registry_validation.py`, `tests/test_schema_lifecycle.py` |
 | The supported CLI | `CLI_COMMANDS.md` | review |
-| A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review |
+| A Polymarket endpoint | `openapi/polymarket.min.json`, before the code | review; contract verification under Verification |
 
 The checks are partial. The dictionary test only finds each column name
 somewhere in `docs/data_dictionary.md`, and the lifecycle test only requires a
@@ -119,7 +127,23 @@ rules under "Suggested AGENTS.md changes" in the PR description.
 
 ## Verification
 
-Run focused tests while working. Before a commit, PR, or readiness claim run:
+During implementation, run the regression for the changed behavior and the
+smallest relevant test set, plus relevant lint and type checks. A checkpoint
+commit does not require rerunning an unchanged full test matrix.
+
+Before declaring a PR or integrated candidate ready, identify the exact source
+commit and required checks for its affected contracts. One integration owner
+verifies interacting changes together. Use successful exact-head CI for checks
+it covers; where CI cannot run, record equivalent local results and untested
+scope. Do not use an intermediate head or one parent stack as validation of the
+final combined source.
+
+For readiness, select the commands below that cover the changed behavior and its
+direct consumers. Explain why each omitted check does not apply; if the impact
+cannot be bounded, run the full list. Required checks must pass on the exact
+final source commit through CI or equivalent local runs. Documentation-only
+changes require repository hygiene and review of the changed instructions and
+links.
 
 ```bash
 python scripts/check_repo_hygiene.py
@@ -129,9 +153,21 @@ python -m mypy src
 python -m pytest -q
 ```
 
-For contract changes also run `python scripts/contract_check.py`. After OpenAPI
-changes run `python scripts/update_openapi_examples.py`; after upstream snapshot
-changes run `python scripts/sync_upstream_docs.py`.
+Run packaging and outside-checkout import checks when package contents, entry
+points, dependency pins or release readiness are affected. Use offline schema,
+artifact, CLI and packaging checks for those contracts. Run
+`python scripts/contract_check.py`, which calls live public Polymarket REST APIs,
+when changing request paths, parameters or response assumptions exercised by its
+live Polymarket probes, their shared HTTP/token-extraction behavior, or the
+checker itself. For other Polymarket REST endpoints, provide endpoint-specific
+contract verification; this script does not cover every endpoint. Offline-only
+schema, artifact, CLI and packaging changes do not require live REST calls.
+After OpenAPI changes run `python scripts/update_openapi_examples.py`; after
+upstream snapshot changes run `python scripts/sync_upstream_docs.py`.
+
+Repeat a broad check only after a change that could invalidate its result, a
+newly identified concrete risk, or a required gate. Label baseline failures,
+skips and infrastructure failures accurately.
 
 Generated datasets, reports, databases, logs, keys, and secrets must remain in
 ignored local directories. No license should be invented or added implicitly.
