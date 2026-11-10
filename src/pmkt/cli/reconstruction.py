@@ -4,7 +4,7 @@ import json
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Annotated, Mapping, Optional
+from typing import Annotated, Any, Mapping, Optional
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -15,6 +15,9 @@ from pmkt.data.book_reconstruction import (
 )
 from pmkt.data.book_reconstruction_streaming import (
     DEFAULT_RECONSTRUCTION_BATCH_ROWS,
+    DEFAULT_DUCKDB_PARITY_MEMORY_LIMIT,
+    DEFAULT_DEPTH_PARITY_BUCKET_COUNT,
+    ParityOptions,
     stream_reconstruct_book_tape,
 )
 from pmkt.data.registry import (
@@ -118,9 +121,18 @@ def publish_streamed_book_tape_reconstruction(
     out_dir: str | Path,
     *,
     venue_book_id: str | None = None,
-    batch_rows: int = DEFAULT_RECONSTRUCTION_BATCH_ROWS,
+    batch_rows: int | None = None,
+    parity_options: ParityOptions | None = None,
 ) -> Mapping[str, str]:
     """Reconstruct and publish bounded Arrow batches atomically."""
+    if parity_options is not None and not isinstance(parity_options, ParityOptions):
+        raise TypeError("parity_options must be ParityOptions")
+    resolved_parity = (
+        parity_options if parity_options is not None else ParityOptions.from_env()
+    )
+    stream_overrides: dict[str, Any] = {"parity_options": resolved_parity}
+    if batch_rows is not None:
+        stream_overrides["batch_rows"] = batch_rows
     destination = Path(out_dir).resolve()
     mismatch_report_path = _parity_mismatch_report_path(destination)
     if destination.exists():
@@ -155,7 +167,7 @@ def publish_streamed_book_tape_reconstruction(
         stream = stream_reconstruct_book_tape(
             manifest,
             venue_book_id=venue_book_id,
-            batch_rows=batch_rows,
+            **stream_overrides,
         )
         for batch in stream:
             for role, record_batch in (
@@ -187,6 +199,9 @@ def publish_streamed_book_tape_reconstruction(
                     path,
                 )
         report = stream.report
+        effective_batch_rows = (
+            batch_rows if batch_rows is not None else report["streaming"]["arrow_batch_rows"]
+        )
         if report.get("status") != "success":
             mismatch_report = {
                 **report,
@@ -194,7 +209,7 @@ def publish_streamed_book_tape_reconstruction(
                     "atomic_directory_publication": False,
                     "destination": str(destination),
                     "incremental_parquet_writer": True,
-                    "batch_rows": batch_rows,
+                    "batch_rows": effective_batch_rows,
                     "reason": "parity_mismatch",
                 },
                 "outputs": {},
@@ -210,7 +225,7 @@ def publish_streamed_book_tape_reconstruction(
                 "atomic_directory_publication": True,
                 "destination": str(destination),
                 "incremental_parquet_writer": True,
-                "batch_rows": batch_rows,
+                "batch_rows": effective_batch_rows,
             },
             "outputs": final_outputs,
         }
@@ -247,16 +262,53 @@ def reconstruct_book_tape_cmd(
         typer.Option("--venue-book-id"),
     ] = None,
     batch_rows: Annotated[
-        int,
-        typer.Option("--batch-rows", min=1),
-    ] = DEFAULT_RECONSTRUCTION_BATCH_ROWS,
+        Optional[int],
+        typer.Option(
+            "--batch-rows", min=1, show_default=str(DEFAULT_RECONSTRUCTION_BATCH_ROWS)
+        ),
+    ] = None,
+    parity_memory_limit: Annotated[
+        Optional[str],
+        typer.Option(
+            "--parity-memory-limit",
+            help=(
+                "DuckDB size string. Omission uses PMKT_DUCKDB_PARITY_MEMORY_LIMIT "
+                "before the shown fallback."
+            ),
+            show_default=str(DEFAULT_DUCKDB_PARITY_MEMORY_LIMIT),
+        ),
+    ] = None,
+    depth_parity_bucket_count: Annotated[
+        Optional[int],
+        typer.Option(
+            "--depth-parity-bucket-count",
+            help=(
+                "Positive depth comparison bucket count. Omission uses "
+                "PMKT_DEPTH_PARITY_BUCKET_COUNT before the shown fallback."
+            ),
+            show_default=str(DEFAULT_DEPTH_PARITY_BUCKET_COUNT),
+        ),
+    ] = None,
 ) -> None:
     """Reconstruct committed book tape for research and audit use only."""
+    overrides: dict[str, Any] = {}
+    if batch_rows is not None:
+        overrides["batch_rows"] = batch_rows
+    resource_overrides: dict[str, Any] = {}
+    if parity_memory_limit is not None:
+        resource_overrides["memory_limit"] = parity_memory_limit
+    if depth_parity_bucket_count is not None:
+        resource_overrides["depth_bucket_count"] = depth_parity_bucket_count
+    if resource_overrides:
+        try:
+            overrides["parity_options"] = ParityOptions.from_env(**resource_overrides)
+        except (TypeError, ValueError) as exc:
+            raise typer.BadParameter(str(exc)) from exc
     outputs = publish_streamed_book_tape_reconstruction(
         manifest,
         out_dir,
         venue_book_id=venue_book_id,
-        batch_rows=batch_rows,
+        **overrides,
     )
     typer.echo(json.dumps(outputs, sort_keys=True))
 

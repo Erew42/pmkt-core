@@ -1029,6 +1029,16 @@ that require an extra may fail at call or import time when that extra is absent;
 the base package does not implicitly install those dependencies.
 
 
+Advanced reconstruction APIs accept
+`pmkt.data.book_reconstruction_streaming.ParityOptions` through `parity_options`.
+Direct construction uses deterministic, validated defaults; `from_env()` resolves
+explicit field overrides before the existing `PMKT_DUCKDB_PARITY_MEMORY_LIMIT`
+and `PMKT_DEPTH_PARITY_BUCKET_COUNT` variables. Omitted reconstruction options
+use this environment-resolution boundary at operation start. The immutable
+result supplies both parity stages and their existing resource-report fields.
+Memory strings use DuckDB's size grammar; depth bucket counts must be positive
+integers. Defaults remain with the named constants beside `ParityOptions`.
+
 Public HTTP defaults are owned by `pmkt._http.DEFAULT_HTTP_TIMEOUT_S` and
 `pmkt.runtime.DEFAULT_HTTP_MAX_ATTEMPTS` (`RequestPolicy` counts the initial
 request). Venue client wrappers inherit omitted common settings. The Data API
