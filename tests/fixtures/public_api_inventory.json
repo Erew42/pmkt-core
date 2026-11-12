@@ -675,6 +675,27 @@
       "tier": "supported"
     },
     {
+      "path": "pmkt.resolution.evm_logs.PolygonLogReader",
+      "tier": "native",
+      "methods": [
+        "ensure_polygon",
+        "get_logs",
+        "iter_logs"
+      ]
+    },
+    {
+      "path": "pmkt.resolution.evm_logs.OrderFilled",
+      "tier": "native"
+    },
+    {
+      "path": "pmkt.resolution.evm_logs.decode_order_filled",
+      "tier": "native"
+    },
+    {
+      "path": "pmkt.resolution.evm_logs.split_block_range",
+      "tier": "native"
+    },
+    {
       "path": "pmkt.records.ResultProvenance",
       "tier": "supported"
     },

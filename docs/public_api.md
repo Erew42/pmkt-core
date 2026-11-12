@@ -856,6 +856,68 @@ unsupported selectors, and HTTP/transport failures propagate with no fallback to
 latest and no added retries. Resolver calls retain their existing latest-state
 behavior and stored resolution schemas.
 
+### Polygon logs and Polymarket `OrderFilled`
+
+`pmkt.resolution.evm_logs` (native tier, imported from the module, not from
+`pmkt.resolution`) reads [`eth_getLogs`](https://ethereum.org/developers/docs/apis/json-rpc/)
+over block ranges and decodes Polymarket's V2 exchange `OrderFilled` event. It
+is synchronous so that a research script can call it in a plain `for` loop;
+`PolygonLogReader` is separate from the async, CTF-bound `PolygonCtfClient` and
+accepts only `eth_chainId` and `eth_getLogs`.
+
+```python
+from pmkt.resolution.evm_logs import ORDER_FILLED_TOPIC, PolygonLogReader, decode_order_filled
+
+with PolygonLogReader("https://polygon.drpc.org") as chain:
+    for piece in chain.iter_logs(
+        96_701_600, 96_701_699, blocks_per_piece=100, topics=[ORDER_FILLED_TOPIC]
+    ):
+        save(piece.first_block, piece.last_block, piece.logs)  # native node dictionaries
+        fills = [decode_order_filled(log) for log in piece.logs]
+```
+
+- `get_logs(from_block, to_block, *, address=None, topics=None)` takes inclusive
+  integer blocks (no tags) and returns the node's log dictionaries unchanged.
+  `address` is one address or a list; `topics` uses the JSON-RPC convention
+  (`None` = any, a list = any of).
+- `iter_logs(..., blocks_per_piece=n)` yields `LogPiece(first_block, last_block,
+  logs)` for consecutive pieces of `n` blocks; the last piece may be shorter.
+  Pieces are requested one at a time as the caller iterates. A piece returns
+  completely or raises; nothing is retried or skipped, and later pieces are not
+  requested after a failure. To resume, call again with `from_block` set to the
+  first block after the last saved piece (the boundaries stay the same).
+  `split_block_range` gives the boundaries without any I/O. The caller chooses
+  the piece size; public endpoints limit the range and response size (a refusal
+  can carry a misleading message), and the node's error propagates as
+  `EvmRpcError`. Responses are buffered whole and each request has an
+  `httpx` timeout (`timeout_s`, default 60 s) but no total deadline or size cap.
+- Each response is checked: every log lies in the requested range and matches the
+  requested addresses and topics, none has `removed: true`, hex fields are well
+  formed, logs are strictly ascending by (block number, log index) with no
+  duplicate, and logs of one block share one block hash. A violation raises
+  `EvmRpcError`. One response cannot show that a node *omitted* logs without an
+  error, so completeness needs an independent check such as a second endpoint or
+  a known total.
+- `decode_order_filled(log)` returns the frozen dataclass `OrderFilled` with exact
+  integers (`block_number`, `log_index`, `transaction_index`, `side`, `token_id`,
+  `maker_amount_filled`, `taker_amount_filled`, `fee`, optional
+  `block_timestamp`), lower-case addresses and hashes, and the order's `builder`
+  and `metadata` bytes32 as hex. Field names are those of the contract's event
+  declaration in [Polymarket/ctf-exchange-v2](https://github.com/Polymarket/ctf-exchange-v2)
+  (`src/exchange/interfaces/ITrading.sol` at commit `ccc0596`). `side` is 0 (`SIDE_BUY`) or 1
+  (`SIDE_SELL`) as seen by `maker`. `maker_amount_filled` and
+  `taker_amount_filled` are the order's gross making and taking amounts as
+  emitted (BUY: collateral then shares; SELL: shares then collateral). `fee` is
+  separate and not netted in. For maker fills, a BUY maker pays making + fee in
+  collateral and a SELL maker receives taking - fee; a taker-order summary's
+  making amount can include input that is later refunded, so the amounts are not
+  wallet transfers. Amounts are base units; both asset types had 6 decimals in
+  the logs checked. The decoder accepts only logs from
+  the three listed Polymarket exchange contracts and exactly the V2 layout, and
+  raises `ValueError` otherwise. It does not classify taker-order summary logs
+  (`taker` equal to the emitting contract). `block_timestamp` comes from the
+  non-standard `blockTimestamp` log field and is `None` when the node omits it.
+
 Both resolvers also expose an ordered typed batch:
 
 ```python
