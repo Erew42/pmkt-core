@@ -887,9 +887,10 @@ with PolygonLogReader("https://polygon.drpc.org") as chain:
   requested after a failure. To resume, call again with `from_block` set to the
   first block after the last saved piece (the boundaries stay the same).
   `split_block_range` gives the boundaries without any I/O. The caller chooses
-  the piece size; public endpoints limit it (one free endpoint accepts 100 blocks
-  and refuses 200 with a misleading error message), and the node's error
-  propagates as `EvmRpcError`.
+  the piece size; public endpoints limit the range and response size (a refusal
+  can carry a misleading message), and the node's error propagates as
+  `EvmRpcError`. Responses are buffered whole and each request has an
+  `httpx` timeout (`timeout_s`, default 60 s) but no total deadline or size cap.
 - Each response is checked: every log lies in the requested range and matches the
   requested addresses and topics, none has `removed: true`, hex fields are well
   formed, logs are strictly ascending by (block number, log index) with no
@@ -903,10 +904,13 @@ with PolygonLogReader("https://polygon.drpc.org") as chain:
   `block_timestamp`), lower-case addresses and hashes, and the order's `builder`
   and `metadata` bytes32 as hex. Field names are those of the contract's event
   declaration in [Polymarket/ctf-exchange-v2](https://github.com/Polymarket/ctf-exchange-v2)
-  (`src/exchange/interfaces/ITrading.sol`). `side` is 0 (`SIDE_BUY`) or 1
-  (`SIDE_SELL`) as seen by `maker`; `maker_amount_filled` is what the maker's
-  order gave up and `taker_amount_filled` what it received. Amounts are base
-  units (6 decimals for USDC and shares). The decoder accepts only logs from
+  (`src/exchange/interfaces/ITrading.sol` at commit `ccc0596`). `side` is 0 (`SIDE_BUY`) or 1
+  (`SIDE_SELL`) as seen by `maker`. `maker_amount_filled` and
+  `taker_amount_filled` are the order's gross making and taking amounts as
+  emitted (BUY: collateral then shares; SELL: shares then collateral); `fee` is
+  separate and not netted in, so they are not the wallet transfers (the contract
+  moves making + fee from a BUY maker and taking - fee to a SELL maker). Amounts
+  are base units; both asset types had 6 decimals in the logs checked. The decoder accepts only logs from
   the three listed Polymarket exchange contracts and exactly the V2 layout, and
   raises `ValueError` otherwise. It does not classify taker-order summary logs
   (`taker` equal to the emitting contract). `block_timestamp` comes from the

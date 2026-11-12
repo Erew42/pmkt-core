@@ -70,12 +70,16 @@ class OrderFilled:
     ``maker`` and ``taker`` are the log's own fields. In the summary log of a
     taker order ``taker`` is the emitting exchange contract; this decoder does
     not classify that. ``side`` is ``SIDE_BUY`` or ``SIDE_SELL`` as seen by
-    ``maker``. ``maker_amount_filled`` is what the maker's order gave up and
-    ``taker_amount_filled`` what it received (USDC and shares both have 6
-    decimals, so base units are millionths). ``fee`` is the raw uint256 as
-    emitted. ``builder`` and ``metadata`` are the order's signed bytes32
-    fields, kept as 0x-prefixed hex. ``block_timestamp`` is the node's
-    non-standard ``blockTimestamp`` (seconds) and is None when it is absent.
+    ``maker``. ``maker_amount_filled`` and ``taker_amount_filled`` are the
+    order's gross making and taking amounts as the contract emits them (BUY:
+    collateral then shares; SELL: shares then collateral); both asset types had
+    6 decimals in the logs checked, so base units are millionths. ``fee`` is
+    reported separately and is not netted into them: the contract moves
+    ``making + fee`` from a BUY maker and ``taking - fee`` to a SELL maker, so
+    the amounts are not the wallet transfers. ``builder`` and ``metadata`` are
+    the order's signed bytes32 fields, kept as 0x-prefixed hex.
+    ``block_timestamp`` is the node's non-standard ``blockTimestamp`` (seconds)
+    and is None when it is absent.
     """
 
     block_number: int
@@ -104,6 +108,11 @@ def split_block_range(
     Every piece has ``blocks_per_piece`` blocks except possibly the last, which
     ends exactly at ``to_block``.
     """
+    _check_pieces(from_block, to_block, blocks_per_piece)
+    return list(_piece_bounds(from_block, to_block, blocks_per_piece))
+
+
+def _check_pieces(from_block: int, to_block: int, blocks_per_piece: int) -> None:
     _check_range(from_block, to_block)
     if (
         isinstance(blocks_per_piece, bool)
@@ -111,10 +120,14 @@ def split_block_range(
         or blocks_per_piece < 1
     ):
         raise ValueError("blocks_per_piece must be a positive integer")
-    return [
-        (first, min(first + blocks_per_piece - 1, to_block))
-        for first in range(from_block, to_block + 1, blocks_per_piece)
-    ]
+
+
+def _piece_bounds(
+    from_block: int, to_block: int, blocks_per_piece: int
+) -> Iterator[tuple[int, int]]:
+    # Lazy, so a very long range with small pieces does not build a huge list.
+    for first in range(from_block, to_block + 1, blocks_per_piece):
+        yield first, min(first + blocks_per_piece - 1, to_block)
 
 
 def _check_range(from_block: int, to_block: int) -> None:
@@ -174,11 +187,13 @@ def _quantity(value: Any, name: str) -> int:
 def _topic_matches(
     log_topics: list[str], topic_filter: list[str | list[str] | None]
 ) -> bool:
+    # As in the node's own filter, a log needs a topic at every filtered
+    # position, including wildcard (None) positions.
+    if len(log_topics) < len(topic_filter):
+        return False
     for index, wanted in enumerate(topic_filter):
         if wanted is None:
             continue
-        if index >= len(log_topics):
-            return False
         if isinstance(wanted, str):
             if log_topics[index] != wanted:
                 return False
@@ -223,6 +238,8 @@ def _validate_logs(
             raw_topics = log.get("topics")
             if not isinstance(raw_topics, list):
                 raise ValueError(f"topics must be a list: {raw_topics!r}")
+            if len(raw_topics) > _MAX_TOPIC_POSITIONS:
+                raise ValueError(f"a log has at most {_MAX_TOPIC_POSITIONS} topics")
             topics = [_hex_data(topic, "topic", size_bytes=32) for topic in raw_topics]
         except ValueError as exc:
             raise EvmRpcError(f"eth_getLogs returned a malformed log: {exc}") from exc
@@ -295,6 +312,10 @@ class PolygonLogReader:
             raise EvmRpcError(str(payload["error"]))
         if "result" not in payload:
             raise EvmRpcError("RPC payload has no result")
+        if payload.get("id") != self._request_id:
+            raise EvmRpcError(
+                f"RPC response id {payload.get('id')!r} does not match request id {self._request_id}"
+            )
         return payload["result"]
 
     def ensure_polygon(self) -> None:
@@ -350,14 +371,16 @@ class PolygonLogReader:
         ``from_block`` set to the first block after the last saved piece; the
         pieces then fall on the same boundaries as before.
         """
-        pieces = split_block_range(from_block, to_block, blocks_per_piece)
+        _check_pieces(from_block, to_block, blocks_per_piece)  # fail now, not at next()
         _address_filter(address)
         _topic_filter(topics)
-        return self._iter_pieces(pieces, address, topics)
+        return self._iter_pieces(
+            _piece_bounds(from_block, to_block, blocks_per_piece), address, topics
+        )
 
     def _iter_pieces(
         self,
-        pieces: list[tuple[int, int]],
+        pieces: Iterator[tuple[int, int]],
         address: str | Sequence[str] | None,
         topics: Sequence[str | Sequence[str] | None] | None,
     ) -> Iterator[LogPiece]:

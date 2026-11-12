@@ -95,11 +95,17 @@ def reader(handler: Any) -> PolygonLogReader:
     return PolygonLogReader("https://rpc.test", transport=httpx.MockTransport(handler))
 
 
+def answer(request: httpx.Request, **fields: Any) -> httpx.Response:
+    """A JSON-RPC reply that echoes the id of the request."""
+    payload = json.loads(request.content)
+    return httpx.Response(200, json={"jsonrpc": "2.0", "id": payload["id"], **fields})
+
+
 def replying(result: Any, requests: list[dict[str, Any]] | None = None) -> Any:
     def handler(request: httpx.Request) -> httpx.Response:
         if requests is not None:
             requests.append(json.loads(request.content))
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": result})
+        return answer(request, result=result)
 
     return handler
 
@@ -212,6 +218,7 @@ def test_ensure_polygon() -> None:
         ([log_at(100, 0, blockHash=None)], "malformed"),
         ([log_at(100, 0, topics="nope")], "malformed"),
         ([log_at(100, 0, blockTimestamp="soon")], "malformed"),
+        ([log_at(100, 0, topics=MAKER_FILL_LOG["topics"] + ["0x" + "00" * 32])], "at most 4 topics"),
         (["not a log"], "non-object"),
         ({"logs": []}, "non-list"),
         (None, "non-list"),
@@ -223,6 +230,25 @@ def test_get_logs_rejects_bad_responses(logs: Any, message: str) -> None:
             chain.get_logs(
                 100, 109, address=EXCHANGE, topics=[ORDER_FILLED_TOPIC, None, MAKER_FILL_LOG["topics"][2]]
             )
+
+
+def test_wildcard_topic_position_still_requires_a_topic_there() -> None:
+    short = log_at(100, 0, topics=[ORDER_FILLED_TOPIC])
+    with reader(replying([short])) as chain:
+        with pytest.raises(EvmRpcError, match="do not match"):
+            chain.get_logs(100, 109, topics=[ORDER_FILLED_TOPIC, None])
+    with reader(replying([short])) as chain:
+        assert chain.get_logs(100, 109, topics=[ORDER_FILLED_TOPIC]) == [short]
+
+
+@pytest.mark.parametrize("reply", [{"id": 9999, "result": []}, {"id": None, "result": []}, {"result": []}])
+def test_response_must_echo_the_request_id(reply: dict[str, Any]) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"jsonrpc": "2.0", **reply})
+
+    with reader(handler) as chain:
+        with pytest.raises(EvmRpcError, match="does not match request id"):
+            chain.get_logs(1, 2)
 
 
 def test_get_logs_accepts_missing_removed_and_missing_block_timestamp() -> None:
@@ -244,9 +270,7 @@ def test_get_logs_reports_node_errors_and_http_failures_without_retry() -> None:
 
     def refuse(request: httpx.Request) -> httpx.Response:
         requests.append(1)
-        return httpx.Response(
-            200, json={"error": {"code": 35, "message": "ranges over 10000 blocks"}}
-        )
+        return answer(request, error={"code": 35, "message": "ranges over 10000 blocks"})
 
     with reader(refuse) as chain:
         with pytest.raises(EvmRpcError, match="35"):
@@ -262,7 +286,7 @@ def test_get_logs_reports_node_errors_and_http_failures_without_retry() -> None:
 
     def no_result(request: httpx.Request) -> httpx.Response:
         requests.append(1)
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1})
+        return answer(request)
 
     with reader(no_result) as chain:
         with pytest.raises(EvmRpcError, match="no result"):
@@ -305,7 +329,7 @@ def test_iter_logs_requests_pieces_lazily_with_bounds() -> None:
         requests.append(payload)
         query = payload["params"][0]
         first = int(query["fromBlock"], 16)
-        return httpx.Response(200, json={"result": [log_at(first, 0)]})
+        return answer(request, result=[log_at(first, 0)])
 
     with reader(handler) as chain:
         pieces = chain.iter_logs(100, 111, blocks_per_piece=5, address=EXCHANGE)
@@ -333,8 +357,8 @@ def test_iter_logs_failing_piece_raises_and_later_pieces_are_not_requested() -> 
         first = int(query["fromBlock"], 16)
         requests.append(first)
         if first == 105:
-            return httpx.Response(200, json={"error": {"code": -32000, "message": "boom"}})
-        return httpx.Response(200, json={"result": []})
+            return answer(request, error={"code": -32000, "message": "boom"})
+        return answer(request, result=[])
 
     with reader(handler) as chain:
         saved: list[tuple[int, int]] = []
@@ -344,6 +368,16 @@ def test_iter_logs_failing_piece_raises_and_later_pieces_are_not_requested() -> 
 
     assert saved == [(100, 104)]
     assert requests == [100, 105]  # 110 and 115 were never requested, 105 never retried
+
+
+def test_iter_logs_does_not_materialize_piece_boundaries() -> None:
+    requests: list[dict[str, Any]] = []
+    with reader(replying([], requests)) as chain:
+        # 10**15 pieces: a list of bounds would exhaust memory, a lazy iterator does not.
+        pieces = chain.iter_logs(0, 10**15, blocks_per_piece=1)
+        first = next(pieces)
+    assert (first.first_block, first.last_block) == (0, 0)
+    assert len(requests) == 1
 
 
 def test_iter_logs_resume_keeps_piece_boundaries() -> None:
