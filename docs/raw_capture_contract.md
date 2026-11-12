@@ -184,16 +184,21 @@ verified. Files must remain immutable throughout a read.
 
 `read_session(session, verify=True)` reads the discovered pairs in chunk order,
 checking identity, `previous_chunk_sha256` and sequence continuity between
-adjacent chunks. Missing chunk numbers (including an archived prefix) emit
-`RawCaptureGapWarning` **before** the next chunk's frames, then reading resumes.
+adjacent chunks. Missing chunk numbers (including an archived prefix) yield a
+`ChunkGap` in the stream **before** the next chunk's frames, then reading
+resumes. `ChunkGap` is not a recorded envelope. It gives the missing chunk range
+(`first_missing`, `last_missing`), `next_chunk`, the sequences on either side
+(`previous_last_frame_seq` is null for a missing prefix) and
+`missing_frame_count`, which is exact for recorded frames. Book state from
+before a gap is unreliable: reset it and wait for fresh baselines.
 The hash/sequence link across absent chunks cannot be verified. The next
 available chunk must still name a predecessor hash, and its first sequence must
 advance by at least one frame per missing chunk, since sealed chunks are never
-empty. Callers may promote that warning to an error
-with Python's warning filters. Adjacent bad links raise `RawCaptureError`.
+empty. Adjacent bad links raise `RawCaptureError`.
 A missing tail cannot be inferred from available chunks; inspect incomplete
 paths and session metadata separately. `verify=False` skips integrity and chain
-checks/warnings, while still requiring published pairs and typed envelopes.
+checks, while still requiring published pairs and typed envelopes and still
+yielding `ChunkGap`.
 Only discovery metadata and the current frame are retained, never a whole
 session's frames.
 
@@ -205,16 +210,21 @@ list separators/whitespace), never reserialized JSON. Scalars/null are also
 parsed values; empty lists yield nothing. Non-JSON text yields `parsed=False`,
 `value=None` and the original text. Every other envelope passes through as a
 `RawFrame`, so diagnostics, sent subscriptions and control frames remain visible.
+`ChunkGap` items also pass through unchanged.
 For example (with an existing `session` path):
 
 ```python
-from pmkt.streaming.raw_reader import (VenueMessage, iter_venue_messages,
-    list_session_chunks, load_session_metadata, read_session)
+from pmkt.streaming.raw_reader import (ChunkGap, VenueMessage,
+    iter_venue_messages, list_session_chunks, load_session_metadata,
+    read_session)
 metadata = load_session_metadata(session)
 chunks = list_session_chunks(session)
 print("Incomplete evidence:", chunks.incomplete)
 for item in iter_venue_messages(read_session(session)):
-    if isinstance(item, VenueMessage):
+    if isinstance(item, ChunkGap):
+        print("Missing chunks:", item.first_missing, item.last_missing,
+              "frames lost:", item.missing_frame_count)
+    elif isinstance(item, VenueMessage):
         print(item.frame.connection_generation, item.batch_index, item.value)
     else:
         print("Control/diagnostic:", item.frame_type, item.payload_raw)

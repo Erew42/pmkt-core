@@ -728,7 +728,7 @@
       "tier": "advanced"
     },
     {
-      "path": "pmkt.streaming.raw_reader.RawCaptureGapWarning",
+      "path": "pmkt.streaming.raw_reader.ChunkGap",
       "tier": "advanced"
     },
     {

@@ -13,8 +13,8 @@ import pytest
 from pmkt.exchanges.polymarket.ws import apply_market_message
 from pmkt.streaming.raw_capture import ChunkWriter
 from pmkt.streaming.raw_reader import (
+    ChunkGap,
     RawCaptureError,
-    RawCaptureGapWarning,
     RawFrame,
     VenueMessage,
     iter_venue_messages,
@@ -222,26 +222,29 @@ def test_adjacent_chunks_must_link(writer, tmp_path, break_kind):
 
 
 @pytest.mark.parametrize("missing", [1, 2])
-def test_archived_prefix_or_middle_warns_and_resumes(writer, tmp_path, missing):
+@pytest.mark.parametrize("verify", [True, False])
+def test_archived_prefix_or_middle_yields_gap_then_resumes(
+    writer, tmp_path, missing, verify
+):
     for _ in range(3):
         writer.write("text", "{}", 1)
         writer.seal()
     path = tmp_path / f"chunk_{missing:06d}.jsonl.gz"
     path.unlink()
     manifest_path(path).unlink()
-    with pytest.warns(
-        RawCaptureGapWarning, match=f"missing chunks {missing}..{missing}"
-    ):
-        frames = list(read_session(tmp_path))
-    assert [frame.local_frame_seq for frame in frames] == [
-        i for i in (1, 2, 3) if i != missing
-    ]
-    with pytest.warns(RawCaptureGapWarning):
-        source = read_session(tmp_path)
-        # Warning precedes the first frame after the gap.
-        while next(source).local_frame_seq != missing + 1:
-            pass
-    source.close()
+    items = list(read_session(tmp_path, verify=verify))
+    # The gap sits exactly where the chunk was, before the next chunk's frames.
+    assert [
+        "gap" if isinstance(item, ChunkGap) else item.local_frame_seq for item in items
+    ] == (["gap", 2, 3] if missing == 1 else [1, "gap", 3])
+    [gap] = [item for item in items if isinstance(item, ChunkGap)]
+    assert (gap.first_missing, gap.last_missing) == (missing, missing)
+    assert gap.next_chunk == tmp_path / f"chunk_{missing + 1:06d}.jsonl.gz"
+    assert gap.previous_last_frame_seq == (None if missing == 1 else 1)
+    assert gap.next_first_frame_seq == missing + 1
+    assert gap.missing_frame_count == 1
+    # Passed through unchanged by the message decoder.
+    assert gap in list(iter_venue_messages(items))
 
 
 def test_message_decoding_preserves_exact_text_and_diagnostics(writer, tmp_path):
@@ -366,18 +369,42 @@ def test_non_json_constants_are_unparsed(writer, tmp_path, payload):
     assert not message.parsed and message.text == payload
 
 
-def test_missing_chunk_warning_can_be_promoted_to_error(writer, tmp_path):
-    import warnings
-
-    writer.index = 1
+def test_gap_counts_every_missing_chunk_and_frame(writer, tmp_path):
+    writer.index = 3
     writer.seq = 5
-    writer.previous = "0" * 64  # As if chunk 1 was sealed and archived.
+    writer.previous = "0" * 64  # As if chunks 1-3 were sealed and archived.
     writer.write("text", "{}", 1)
     writer.seal()
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", RawCaptureGapWarning)
-        with pytest.raises(RawCaptureGapWarning, match="missing chunks 1..1"):
-            next(read_session(tmp_path))
+    gap = next(read_session(tmp_path))
+    assert isinstance(gap, ChunkGap)
+    assert (gap.first_missing, gap.last_missing) == (1, 3)
+    assert gap.previous_last_frame_seq is None
+    assert gap.missing_frame_count == 5
+
+
+def test_reconstruction_resets_books_at_a_gap(writer, tmp_path):
+    book = {
+        "event_type": "book",
+        "asset_id": "A",
+        "market": "m",
+        "bids": [{"price": "0.4", "size": "2"}],
+        "asks": [],
+    }
+    writer.write("text", json.dumps(book), 1)
+    writer.seal()
+    writer.write("text", json.dumps(dict(book, asset_id="B")), 1)
+    writer.seal()
+    writer.write("text", json.dumps(dict(book, asset_id="C")), 1)
+    writer.seal()
+    (tmp_path / "chunk_000002.jsonl.gz").unlink()
+    manifest_path(tmp_path / "chunk_000002.jsonl.gz").unlink()
+    states = {}
+    for item in iter_venue_messages(read_session(tmp_path)):
+        if isinstance(item, ChunkGap):
+            states.clear()  # Same generation, but the books are stale.
+        elif isinstance(item, VenueMessage):
+            apply_market_message(states, item.value)
+    assert set(states) == {"C"}
 
 
 # Deep enough to exhaust the recursive JSON decoder on every supported Python.

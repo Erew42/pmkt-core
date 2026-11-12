@@ -14,7 +14,6 @@ import gzip
 import hashlib
 import json
 import re
-import warnings
 import zlib
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -24,10 +23,6 @@ from typing import Any
 
 class RawCaptureError(ValueError):
     """A capture cannot be decoded or fails a declared integrity check."""
-
-
-class RawCaptureGapWarning(UserWarning):
-    """Predecessors are absent; frames after this break may lack baselines."""
 
 
 @dataclass(frozen=True)
@@ -63,6 +58,29 @@ class VenueMessage:
     text: str
     batch_index: int | None = None
     parsed: bool = True
+
+
+@dataclass(frozen=True)
+class ChunkGap:
+    """Chunks ``first_missing..last_missing`` are absent from the session.
+
+    read_session yields this in-band, before the frames of ``next_chunk``.
+    It is not a recorded envelope. Book state from before the gap is unreliable:
+    reset it and wait for fresh baselines. ``previous_last_frame_seq`` is None
+    when the gap is a missing prefix that starts at chunk 1.
+    """
+
+    first_missing: int
+    last_missing: int
+    next_chunk: Path
+    previous_last_frame_seq: int | None
+    next_first_frame_seq: int
+
+    @property
+    def missing_frame_count(self) -> int:
+        # Sequences are session-wide and consecutive, so this count is exact
+        # for recorded frames (frames dropped during a disk pause never got one).
+        return self.next_first_frame_seq - (self.previous_last_frame_seq or 0) - 1
 
 
 # The writer numbers chunks from 1 with ``{index:06d}``, so a long session
@@ -265,14 +283,17 @@ def _read_chunk(chunk: SealedChunk, *, verify: bool) -> Iterator[RawFrame]:
                 )
 
 
-def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFrame]:
-    """Stream existing chunks; warn before a missing prefix/middle, then resume.
+def read_session(
+    session: str | Path, *, verify: bool = True
+) -> Iterator[RawFrame | ChunkGap]:
+    """Stream existing chunks, yielding a ChunkGap where chunk numbers are absent.
 
     Adjacent chunks must link hashes and sequences. Across absent chunk numbers
     the link cannot be verified, but the next chunk must name a predecessor and
     its sequence must advance by at least one frame per missing chunk. A
     session cannot change venue or recording_id. Incomplete artefacts are only
-    reported by list_session_chunks. Warnings can be promoted to errors by callers.
+    reported by list_session_chunks. ChunkGap is yielded even with verify=False,
+    since it describes the data rather than checking it.
     """
     # Chunk numbers start at 1, so starting previous_index at 0 makes a missing
     # chunk_000001 (an archived prefix) count as a gap like any other.
@@ -281,8 +302,8 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
     for chunk in list_session_chunks(session).chunks:
         index = int(chunk.path.name.split("_")[1].split(".")[0])
         manifest = chunk.manifest
+        missing = index != previous_index + 1
         if verify:
-            missing = index != previous_index + 1
             # Identity and forward progress are checked against the last chunk
             # that was present, even across a gap. The exact hash and sequence
             # links below are checked only between adjacent chunk numbers.
@@ -312,12 +333,6 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
                     raise RawCaptureError(
                         f"{chunk.path}: local_frame_seq too low for missing chunks"
                     )
-                warnings.warn(
-                    f"{chunk.path}: missing chunks {previous_index + 1}..{index - 1}; "
-                    "predecessor chain and baselines unavailable",
-                    RawCaptureGapWarning,
-                    stacklevel=2,
-                )
             else:
                 expected_hash = previous.manifest["sha256"] if previous else None
                 if manifest["previous_chunk_sha256"] != expected_hash:
@@ -328,6 +343,18 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
                     raise RawCaptureError(
                         f"{chunk.path}: local_frame_seq discontinuity between chunks"
                     )
+        if missing:
+            # In-band, so a consumer cannot miss it the way a filtered warning
+            # can be missed. It comes after the manifest checks, before any frame.
+            yield ChunkGap(
+                first_missing=previous_index + 1,
+                last_missing=index - 1,
+                next_chunk=chunk.path,
+                previous_last_frame_seq=(
+                    previous.manifest["last_frame_seq"] if previous else None
+                ),
+                next_first_frame_seq=manifest["first_frame_seq"],
+            )
         yield from _read_chunk(chunk, verify=verify)
         previous, previous_index = chunk, index
 
@@ -337,9 +364,9 @@ def _reject_json_constant(value: str) -> Any:
 
 
 def iter_venue_messages(
-    frames: Iterable[RawFrame],
-) -> Iterator[VenueMessage | RawFrame]:
-    """Decode received text; pass every other frame through unchanged.
+    frames: Iterable[RawFrame | ChunkGap],
+) -> Iterator[VenueMessage | RawFrame | ChunkGap]:
+    """Decode received text; pass every other frame and ChunkGap through unchanged.
 
     Non-JSON text becomes VenueMessage(parsed=False, value=None). Valid JSON
     scalars (including null) are parsed=True. Lists yield one message per element
@@ -348,7 +375,11 @@ def iter_venue_messages(
     """
     decoder = json.JSONDecoder(parse_constant=_reject_json_constant)
     for frame in frames:
-        if frame.frame_type != "text" or frame.direction != "received":
+        if (
+            isinstance(frame, ChunkGap)
+            or frame.frame_type != "text"
+            or frame.direction != "received"
+        ):
             yield frame
             continue
         text = frame.payload_raw
