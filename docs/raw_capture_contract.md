@@ -161,6 +161,70 @@ memory, so removing an already archived predecessor does not break subsequent
 seals. A new process starts a new recording ID, sequence and hash chain; order
 session directory names chronologically. There is no cross-session chain.
 
+## Reading sealed chunks
+
+The standard-library-only `pmkt.streaming.raw_reader` reads existing sessions
+without installing the streaming extra. `list_session_chunks(session)` returns
+`SessionChunks`: numerically ordered `SealedChunk` pairs (path and manifest dict)
+and an `incomplete` tuple of paths. Unpaired chunks, orphan manifests, `.part`
+and `.tmp` files are reported there and never decoded as sealed chunks. Other
+session files are ignored. `load_session_metadata(session)` returns plain dicts
+keyed by filename: required `PROVENANCE.json`, plus `FINAL.json` and `READY.json`
+when present. Unknown metadata/manifest fields, including legacy disclaimers,
+are retained without interpretation; unknown envelope fields are ignored.
+
+`read_chunk(path, verify=True)` streams frozen `RawFrame` envelopes. It checks
+compressed SHA-256 and byte size before yielding, then frame count, first/last
+sequence, consecutive sequences within the chunk, and envelope schema, venue
+and recording identity against the manifest. Exhaust the iterator for all
+checks: counts and endpoints are only known at EOF. `RawCaptureError` describes
+malformed captures, unreadable files and verification mismatches. MD5,
+manifest time bounds, generation summaries and disclaimer assertions are not
+verified. Files must remain immutable throughout a read.
+
+`read_session(session, verify=True)` reads the discovered pairs in chunk order,
+checking identity, `previous_chunk_sha256` and sequence continuity between
+adjacent chunks. Missing chunk numbers (including an archived prefix) emit
+`RawCaptureGapWarning` **before** the next chunk's frames, then reading resumes.
+The hash/sequence link across absent chunks cannot be verified; available
+sequences must still move forward. Callers may promote that warning to an error
+with Python's warning filters. Adjacent bad links raise `RawCaptureError`.
+A missing tail cannot be inferred from available chunks; inspect incomplete
+paths and session metadata separately. `verify=False` skips integrity and chain
+checks/warnings, while still requiring published pairs and typed envelopes.
+Only discovery metadata and the current frame are retained, never a whole
+session's frames.
+
+`iter_venue_messages(frames)` yields `VenueMessage` for received `text` frames:
+`frame` retains provenance, `value` is parsed JSON, `text` is the exact payload
+for a single value, and `batch_index` is null. A JSON list yields one message per
+element, with its zero-based index and exact element text (excluding surrounding
+list separators/whitespace), never reserialized JSON. Scalars/null are also
+parsed values; empty lists yield nothing. Non-JSON text yields `parsed=False`,
+`value=None` and the original text. Every other envelope passes through as a
+`RawFrame`, so diagnostics, sent subscriptions and control frames remain visible.
+For example (with an existing `session` path):
+
+```python
+from pmkt.streaming.raw_reader import (VenueMessage, iter_venue_messages,
+    list_session_chunks, load_session_metadata, read_session)
+metadata = load_session_metadata(session)
+chunks = list_session_chunks(session)
+print("Incomplete evidence:", chunks.incomplete)
+for item in iter_venue_messages(read_session(session)):
+    if isinstance(item, VenueMessage):
+        print(item.frame.connection_generation, item.batch_index, item.value)
+    else:
+        print("Control/diagnostic:", item.frame_type, item.payload_raw)
+```
+
+Verification establishes local artifact integrity and ordering, not network
+completeness, valid order-book baselines, exchange ordering or accurate arrival
+times. Receive times retain the caveats above. Reconstruction consumers must
+handle diagnostics and missing chunks, and reset state on connection-generation
+changes before applying new baselines. No collector merging, normalized tables
+or CLI command is provided by this reader.
+
 ## Session files and failure semantics
 
 `PROVENANCE.json` is written once and contains `venue`, `instance`, `url`,

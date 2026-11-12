@@ -722,6 +722,50 @@
       "methods": [
         "from_env"
       ]
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.RawCaptureError",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.RawCaptureGapWarning",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.RawFrame",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.SealedChunk",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.SessionChunks",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.VenueMessage",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.list_session_chunks",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.load_session_metadata",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.read_chunk",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.read_session",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.iter_venue_messages",
+      "tier": "advanced"
     }
   ]
 }
