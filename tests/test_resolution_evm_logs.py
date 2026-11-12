@@ -241,7 +241,10 @@ def test_wildcard_topic_position_still_requires_a_topic_there() -> None:
         assert chain.get_logs(100, 109, topics=[ORDER_FILLED_TOPIC]) == [short]
 
 
-@pytest.mark.parametrize("reply", [{"id": 9999, "result": []}, {"id": None, "result": []}, {"result": []}])
+@pytest.mark.parametrize(
+    "reply",
+    [{"id": 9999, "result": []}, {"id": None, "result": []}, {"result": []}, {"id": True, "result": []}],
+)
 def test_response_must_echo_the_request_id(reply: dict[str, Any]) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(200, json={"jsonrpc": "2.0", **reply})

@@ -907,10 +907,12 @@ with PolygonLogReader("https://polygon.drpc.org") as chain:
   (`src/exchange/interfaces/ITrading.sol` at commit `ccc0596`). `side` is 0 (`SIDE_BUY`) or 1
   (`SIDE_SELL`) as seen by `maker`. `maker_amount_filled` and
   `taker_amount_filled` are the order's gross making and taking amounts as
-  emitted (BUY: collateral then shares; SELL: shares then collateral); `fee` is
-  separate and not netted in, so they are not the wallet transfers (the contract
-  moves making + fee from a BUY maker and taking - fee to a SELL maker). Amounts
-  are base units; both asset types had 6 decimals in the logs checked. The decoder accepts only logs from
+  emitted (BUY: collateral then shares; SELL: shares then collateral). `fee` is
+  separate and not netted in. For maker fills, a BUY maker pays making + fee in
+  collateral and a SELL maker receives taking - fee; a taker-order summary's
+  making amount can include input that is later refunded, so the amounts are not
+  wallet transfers. Amounts are base units; both asset types had 6 decimals in
+  the logs checked. The decoder accepts only logs from
   the three listed Polymarket exchange contracts and exactly the V2 layout, and
   raises `ValueError` otherwise. It does not classify taker-order summary logs
   (`taker` equal to the emitting contract). `block_timestamp` comes from the

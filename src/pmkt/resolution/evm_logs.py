@@ -74,9 +74,11 @@ class OrderFilled:
     order's gross making and taking amounts as the contract emits them (BUY:
     collateral then shares; SELL: shares then collateral); both asset types had
     6 decimals in the logs checked, so base units are millionths. ``fee`` is
-    reported separately and is not netted into them: the contract moves
-    ``making + fee`` from a BUY maker and ``taking - fee`` to a SELL maker, so
-    the amounts are not the wallet transfers. ``builder`` and ``metadata`` are
+    reported separately and is not netted into them. For maker fills, the
+    collateral a BUY maker pays is ``making + fee`` and a SELL maker receives
+    ``taking - fee``. A taker-order summary's making amount can include input
+    that is later refunded, so it need not equal what the wallet spent or sold.
+    The amounts are not wallet transfers. ``builder`` and ``metadata`` are
     the order's signed bytes32 fields, kept as 0x-prefixed hex.
     ``block_timestamp`` is the node's non-standard ``blockTimestamp`` (seconds)
     and is None when it is absent.
@@ -312,9 +314,11 @@ class PolygonLogReader:
             raise EvmRpcError(str(payload["error"]))
         if "result" not in payload:
             raise EvmRpcError("RPC payload has no result")
-        if payload.get("id") != self._request_id:
+        response_id = payload.get("id")
+        # ``True == 1`` in Python, but a JSON-RPC id is never a boolean.
+        if isinstance(response_id, bool) or response_id != self._request_id:
             raise EvmRpcError(
-                f"RPC response id {payload.get('id')!r} does not match request id {self._request_id}"
+                f"RPC response id {response_id!r} does not match request id {self._request_id}"
             )
         return payload["result"]
 
