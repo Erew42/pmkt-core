@@ -1,4 +1,12 @@
-"""Streaming reads of sealed public raw WebSocket captures (no venue I/O)."""
+"""Streaming reads of sealed public raw WebSocket captures (no venue I/O).
+
+Layout written by ``raw_capture.ChunkWriter``: one session directory per
+process holds ``chunk_NNNNNN.jsonl.gz`` files, each with a sibling
+``.manifest.json``. The writer seals a chunk in this order: close the gzip
+stream, hash the compressed ``.part`` file, rename it to its final name, then
+write the manifest atomically through a ``.tmp`` file. So a chunk without a
+manifest is a crash between rename and manifest, and is never read here.
+"""
 
 from __future__ import annotations
 
@@ -57,6 +65,9 @@ class VenueMessage:
     parsed: bool = True
 
 
+# The writer numbers chunks from 1 with ``{index:06d}``, so a long session
+# goes from chunk_999999 to chunk_1000000. Hence "6 or more digits" here, and
+# the canonical-name check in _sealed_chunk rejects extra zero padding.
 _CHUNK_NAME = re.compile(r"chunk_([0-9]{6,})\.jsonl\.gz\Z")
 
 
@@ -72,6 +83,7 @@ def _object(path: Path) -> dict[str, Any]:
 
 def _field(obj: dict[str, Any], key: str, kind: type, source: Path) -> Any:
     value = obj.get(key)
+    # Exact type match: isinstance would accept True/False as an int field.
     if type(value) is not kind:
         raise RawCaptureError(f"{source}: {key} must be {kind.__name__}")
     return value
@@ -91,6 +103,9 @@ def _sealed_chunk(path: Path) -> SealedChunk:
         _field(manifest, key, str, manifest_path)
     for key in ("size_bytes", "frame_count", "first_frame_seq", "last_frame_seq"):
         _field(manifest, key, int, manifest_path)
+    # The key must be present. Its value is null only on a session's first
+    # chunk, and otherwise names the previous chunk's compressed SHA-256.
+    # read_session checks the actual link.
     if "previous_chunk_sha256" not in manifest or (
         manifest["previous_chunk_sha256"] is not None
         and not isinstance(manifest["previous_chunk_sha256"], str)
@@ -130,6 +145,7 @@ def list_session_chunks(session: str | Path) -> SessionChunks:
             chunk_name = name.removesuffix(".manifest.json")
             if _CHUNK_NAME.fullmatch(chunk_name) and chunk_name not in files:
                 incomplete.append(path)
+    # Sort numerically: as strings, chunk_1000000 would sort before chunk_999999.
     chunks.sort(key=lambda chunk: int(chunk.path.name.split("_")[1].split(".")[0]))
     return SessionChunks(tuple(chunks), tuple(sorted(incomplete)))
 
@@ -181,6 +197,10 @@ def _read_chunk(chunk: SealedChunk, *, verify: bool) -> Iterator[RawFrame]:
     first = last = None
     try:
         with path.open("rb") as compressed:
+            # Hash the whole compressed file before decompressing anything, so
+            # a corrupt or altered chunk yields no frames at all. This reads the
+            # file twice. Seeking back assumes the file does not change in
+            # between, which is the documented immutability requirement.
             if verify:
                 digest, size = hashlib.sha256(), 0
                 while block := compressed.read(1024 * 1024):
@@ -218,11 +238,16 @@ def _read_chunk(chunk: SealedChunk, *, verify: bool) -> Iterator[RawFrame]:
                             raise RawCaptureError(
                                 f"{path}: line {line_number}: local_frame_seq is not consecutive"
                             )
+                    # Endpoints and the count are tracked even when verify is
+                    # off, but only compared with the manifest after EOF.
                     if first is None:
                         first = frame.local_frame_seq
                     last = frame.local_frame_seq
                     count += 1
                     yield frame
+    # gzip.BadGzipFile is an OSError. A truncated stream raises EOFError and
+    # bad deflate data raises zlib.error. Invalid UTF-8 surfaces as
+    # UnicodeError while lines are iterated, outside the per-line try above.
     except (OSError, EOFError, UnicodeError, zlib.error) as exc:
         raise RawCaptureError(
             f"{path}: cannot read compressed envelopes: {exc}"
@@ -247,6 +272,8 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
     session cannot change venue or recording_id. Incomplete artefacts are only
     reported by list_session_chunks. Warnings can be promoted to errors by callers.
     """
+    # Chunk numbers start at 1, so starting previous_index at 0 makes a missing
+    # chunk_000001 (an archived prefix) count as a gap like any other.
     previous: SealedChunk | None = None
     previous_index = 0
     for chunk in list_session_chunks(session).chunks:
@@ -254,6 +281,9 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
         manifest = chunk.manifest
         if verify:
             missing = index != previous_index + 1
+            # Identity and forward progress are checked against the last chunk
+            # that was present, even across a gap. The exact hash and sequence
+            # links below are checked only between adjacent chunk numbers.
             if previous is not None:
                 for key in ("venue", "recording_id"):
                     if manifest[key] != previous.manifest[key]:
@@ -314,6 +344,11 @@ def iter_venue_messages(
         if not isinstance(value, list):
             yield VenueMessage(frame, value, text)
             continue
+        # Find each element's exact source text without reserializing. The
+        # whole text already parsed as a list, so the first "[" is its opening
+        # bracket. For each element: skip JSON whitespace (exactly these four
+        # characters), let raw_decode return where the element ends, then step
+        # over the following separator, which is "," or the closing "]".
         offset = text.index("[") + 1
         for index, element in enumerate(value):
             while text[offset] in " \t\r\n":
