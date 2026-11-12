@@ -74,7 +74,8 @@ _CHUNK_NAME = re.compile(r"chunk_([0-9]{6,})\.jsonl\.gz\Z")
 def _object(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, ValueError) as exc:
+    # RecursionError: pathologically nested JSON (never written by our writer).
+    except (OSError, UnicodeError, ValueError, RecursionError) as exc:
         raise RawCaptureError(f"{path}: cannot read JSON object: {exc}") from exc
     if not isinstance(value, dict):
         raise RawCaptureError(f"{path}: expected a JSON object")
@@ -217,7 +218,7 @@ def _read_chunk(chunk: SealedChunk, *, verify: bool) -> Iterator[RawFrame]:
                 for line_number, line in enumerate(source, 1):
                     try:
                         frame = _frame(json.loads(line), path)
-                    except (ValueError, TypeError) as exc:
+                    except (ValueError, TypeError, RecursionError) as exc:
                         raise RawCaptureError(
                             f"{path}: line {line_number}: {exc}"
                         ) from exc
@@ -268,7 +269,8 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
     """Stream existing chunks; warn before a missing prefix/middle, then resume.
 
     Adjacent chunks must link hashes and sequences. Across absent chunk numbers
-    the link cannot be verified, but sequences must still move forward. A
+    the link cannot be verified, but the next chunk must name a predecessor and
+    its sequence must advance by at least one frame per missing chunk. A
     session cannot change venue or recording_id. Incomplete artefacts are only
     reported by list_session_chunks. Warnings can be promoted to errors by callers.
     """
@@ -296,6 +298,20 @@ def read_session(session: str | Path, *, verify: bool = True) -> Iterator[RawFra
             else:
                 expected_seq = 1
             if missing:
+                # Only chunk 1 has no predecessor, and every sealed chunk holds
+                # at least one frame. So after a gap the chunk must still name a
+                # predecessor, and its sequence must have advanced by at least
+                # one frame per missing chunk.
+                if manifest["previous_chunk_sha256"] is None:
+                    raise RawCaptureError(
+                        f"{chunk.path}: previous_chunk_sha256 is null after chunk 1"
+                    )
+                if manifest["first_frame_seq"] < expected_seq + (
+                    index - previous_index - 1
+                ):
+                    raise RawCaptureError(
+                        f"{chunk.path}: local_frame_seq too low for missing chunks"
+                    )
                 warnings.warn(
                     f"{chunk.path}: missing chunks {previous_index + 1}..{index - 1}; "
                     "predecessor chain and baselines unavailable",
@@ -338,7 +354,9 @@ def iter_venue_messages(
         text = frame.payload_raw
         try:
             value = decoder.decode(text)
-        except ValueError:
+        # Deeply nested text exhausts the recursive decoder. Keep it unparsed,
+        # like any other non-JSON text, so replay continues with the next frame.
+        except (ValueError, RecursionError):
             yield VenueMessage(frame, None, text, parsed=False)
             continue
         if not isinstance(value, list):

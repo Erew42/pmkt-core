@@ -186,8 +186,10 @@ verified. Files must remain immutable throughout a read.
 checking identity, `previous_chunk_sha256` and sequence continuity between
 adjacent chunks. Missing chunk numbers (including an archived prefix) emit
 `RawCaptureGapWarning` **before** the next chunk's frames, then reading resumes.
-The hash/sequence link across absent chunks cannot be verified; available
-sequences must still move forward. Callers may promote that warning to an error
+The hash/sequence link across absent chunks cannot be verified. The next
+available chunk must still name a predecessor hash, and its first sequence must
+advance by at least one frame per missing chunk, since sealed chunks are never
+empty. Callers may promote that warning to an error
 with Python's warning filters. Adjacent bad links raise `RawCaptureError`.
 A missing tail cannot be inferred from available chunks; inspect incomplete
 paths and session metadata separately. `verify=False` skips integrity and chain

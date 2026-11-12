@@ -371,9 +371,59 @@ def test_missing_chunk_warning_can_be_promoted_to_error(writer, tmp_path):
 
     writer.index = 1
     writer.seq = 5
+    writer.previous = "0" * 64  # As if chunk 1 was sealed and archived.
     writer.write("text", "{}", 1)
     writer.seal()
     with warnings.catch_warnings():
         warnings.simplefilter("error", RawCaptureGapWarning)
         with pytest.raises(RawCaptureGapWarning, match="missing chunks 1..1"):
             next(read_session(tmp_path))
+
+
+# Deep enough to exhaust the recursive JSON decoder on every supported Python.
+DEEP = "[" * 100_000 + "]" * 100_000
+
+
+def test_deeply_nested_text_is_unparsed_and_replay_continues(writer, tmp_path):
+    writer.write("text", DEEP[:-1] + "x", 1)
+    writer.write("text", '{"next": 1}', 1)
+    writer.seal()
+    first, second = iter_venue_messages(read_session(tmp_path))
+    assert not first.parsed and first.value is None
+    assert second.parsed and second.value == {"next": 1}
+
+
+def test_deeply_nested_artifact_json_has_specific_error(writer, tmp_path):
+    (tmp_path / "PROVENANCE.json").write_text(DEEP)
+    with pytest.raises(RawCaptureError, match="PROVENANCE.json"):
+        load_session_metadata(tmp_path)
+    writer.write("text", "{}", 1)
+    writer.seal()
+    path = list_session_chunks(tmp_path).chunks[0].path
+    [row] = [asdict(frame) for frame in read_chunk(path)]
+    line = json.dumps(row)[:-1] + ',"extra":' + DEEP + "}\n"
+    compressed = gzip.compress(line.encode(), mtime=0)
+    path.write_bytes(compressed)
+    edit_manifest(
+        path, sha256=hashlib.sha256(compressed).hexdigest(), size_bytes=len(compressed)
+    )
+    with pytest.raises(RawCaptureError, match="line 1"):
+        list(read_chunk(path))
+
+
+def test_chunk_after_gap_must_name_a_predecessor(writer, tmp_path):
+    writer.index = 1  # Chunk 1 missing, yet chunk 2 claims to be first.
+    writer.write("text", "{}", 1)
+    writer.seal()
+    with pytest.raises(RawCaptureError, match="null after chunk 1"):
+        list(read_session(tmp_path))
+
+
+def test_sequence_must_cover_missing_chunks(writer, tmp_path):
+    writer.write("text", "{}", 1)
+    writer.seal()
+    writer.index += 1  # Skip a chunk number without any frames in between.
+    writer.write("text", "{}", 1)
+    writer.seal()
+    with pytest.raises(RawCaptureError, match="too low for missing chunks"):
+        list(read_session(tmp_path))
