@@ -61,6 +61,11 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
   manifests. It is separate from normalized `recording.v1`; collector receive
   times are not network arrival times, and a local hash chain does not prove
   network losslessness. See the [artifact contract](raw_capture_contract.md).
+- **Copy.** One machine's raw capture of the same feeds that other machines also
+  recorded. `pmkt.streaming.copy_merge` merges copies by message content (Kalshi
+  ignoring per-connection `sid`, `seq`, `sending_ts_ms`) into one stream ordered
+  by venue time; Kalshi snapshots, which carry no venue time, are placed by
+  their exchange `clock`. See [copy_merge.md](copy_merge.md).
 - **Topbook, depth.** `topbook.v1`: best bid/ask per instrument. `depth.v1`: one
   row per level of a full-book snapshot (`is_delta` is always false).
   `recording.v1` equivalents: `recording_topbook.v1`, `recording_book_snapshots.v1`
