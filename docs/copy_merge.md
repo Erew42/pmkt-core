@@ -71,8 +71,9 @@ receive time; memory holds the lateness window, not the recording.
    and a third `a c b`, the result is `a c b d e`. Streams are ranked by how
    many messages of the group they hold (ties: smaller copy, then connection
    name); that rank decides disagreements and free choices (below). Messages
-   without venue time that share a placement millisecond and scope are ordered
-   the same way.
+   without venue time placed at the same millisecond and scope are ordered in
+   the same sort, together with the timed messages there, by each stream's
+   input order.
 4. **Full books are checkpoints.** Polymarket `book` and Kalshi
    `orderbook_snapshot` have `checkpoint=True` and are placed at their own
    timestamp like any message. Where no stream's order decides between a full
@@ -112,7 +113,8 @@ receive time; memory holds the lateness window, not the recording.
   one market share a scope and keep their received order.
 - **Disagreement inside a timestamp** (two streams order the same messages
   differently): constraints are added stream by stream in rank order, and one
-  that contradicts those already added is skipped. The higher-ranked order wins;
+  that contradicts those already added is skipped (only that one: the stream's
+  next constraint still starts from the skipped message). The higher-ranked order wins;
   the occurrence is still attached to its message. Each skipped constraint is
   counted in `stats.order_conflicts`, with up to 20 examples in
   `stats.conflict_examples`. `CopyMerge(strict_order=True)` raises

@@ -233,6 +233,45 @@ def test_order_evidence_from_all_streams_is_combined():
     assert stats.order_conflicts == 0
 
 
+def test_a_rejected_order_constraint_does_not_invent_another():
+    a, b, c, d, e = (change(T0, "0.40", size) for size in "12345")
+    # vm1's b -> a contradicts pc; skipping it must leave vm1's a -> c, not
+    # create b -> c (which would contradict vm3's c -> b).
+    streams = [stream("pc", [a, b, d, e]), stream("vm1", [b, a, c]), stream("vm3", [a, c, b])]
+    merged, stats = merge(streams)
+    assert contents(merged) == [a, c, b, d, e]
+    assert stats.order_conflicts == 1
+
+
+def test_repeats_match_by_occurrence_number_with_or_without_other_content():
+    x, y, z = change(T0, "0.40", "1"), change(T0, "0.40", "2"), change(T0, "0.40", "3")
+    for extra in ([], [stream("vm3", [z])]):
+        # vm1's x is the first x of the group, so its order contradicts pc's
+        # whether or not an unrelated stream is present.
+        merged, stats = merge([stream("pc", [x, y, x]), stream("vm1", [y, x])] + extra)
+        assert contents(merged)[:3] == [x, y, x]
+        assert stats.order_conflicts == 1
+        assert [m.copies for m in merged[:3]] == [("pc", "vm1"), ("pc", "vm1"), ("pc",)]
+
+
+def test_untimed_and_timed_messages_of_one_millisecond_are_ordered_together():
+    # Kalshi snapshots without ts_ms are placed at sending_ts_ms. Here a
+    # snapshot at T is followed by a delta stamped T: the received order holds.
+    snap = {"type": "orderbook_snapshot", "sid": 1, "seq": 1, "sending_ts_ms": T0,
+            "msg": {"market_ticker": "K", "yes_dollars_fp": [["0.40", "5.00"]], "no_dollars_fp": []}}
+    later = {**snap, "seq": 3, "sending_ts_ms": T0 + 1,
+             "msg": {**snap["msg"], "yes_dollars_fp": [["0.40", "3.00"]]}}
+    change_ = delta(T0, "0.40", "-2.00", seq=2)
+    merged, _ = merge(
+        [stream("pc", [(T0 + 5, snap), (T0 + 6, change_), (T0 + 7, later)], connection="kalshi_00")],
+        venue="kalshi",
+    )
+    assert contents(merged) == [snap, change_, later]
+    assert merged[0].venue_ts_ms is None and merged[1].venue_ts_ms == T0
+    result = check_merged_books("kalshi", merged)
+    assert (result.compared, result.equal) == (1, 1)
+
+
 def test_snapshot_follows_a_change_of_its_timestamp_held_only_by_another_copy():
     # Copy "a" reconnected and holds only the snapshot (size 3, including the
     # delta); copy "m" holds only the delta 5 -> 3. Whatever the copy names, the

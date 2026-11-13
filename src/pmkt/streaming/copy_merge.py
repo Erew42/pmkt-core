@@ -235,6 +235,10 @@ def _order(origin: Origin) -> tuple[Any, ...]:
     )
 
 
+# One pending timed occurrence: key, message, origin, reconnect flag, input index.
+_Item = tuple[MessageKey, Any, Origin, bool, int]
+
+
 class _Entry:
     """One merged message being built: its content and matched occurrences."""
 
@@ -330,10 +334,11 @@ def _order_nodes(
         for node, origin in sequence:
             if previous is not None and node not in successors[previous]:
                 if _reaches(successors, node, previous):
+                    # Skip only this constraint; the next one starts from node.
                     on_conflict(stream, origin)
-                    continue
-                successors[previous].add(node)
-                indegree[node] += 1
+                else:
+                    successors[previous].add(node)
+                    indegree[node] += 1
             previous = node
     by_key = {(bool(is_checkpoint(node)), rank[node]): node for node in rank}
     ready = [key for key, node in by_key.items() if indegree[node] == 0]
@@ -351,19 +356,6 @@ def _order_nodes(
     if len(order) != len(rank):  # pragma: no cover - edges never form a cycle
         raise AssertionError("cycle in merge order constraints")
     return order, choices
-
-
-def _is_subsequence(short: list[bytes], long: list[bytes]) -> list[int] | None:
-    """Leftmost positions of ``short`` inside ``long``, or None."""
-    positions, start = [], 0
-    for item in short:
-        try:
-            start = long.index(item, start)
-        except ValueError:
-            return None
-        positions.append(start)
-        start += 1
-    return positions
 
 
 class CopyMerge:
@@ -400,7 +392,9 @@ class CopyMerge:
         self._started = False
         # Pending timed groups keyed (venue_ts_ms, scope): per stream, the
         # digests in received order plus one _Entry list per stream.
-        self._groups: dict[tuple[int, str], dict[Stream, list[tuple[MessageKey, Any, Origin, bool]]]] = {}
+        # Pending timed groups keyed (venue_ts_ms, scope): per stream, the
+        # occurrences in received order with their input index.
+        self._groups: dict[tuple[int, str], dict[Stream, list[_Item]]] = {}
         self._untimed: dict[bytes, list[_Untimed]] = {}
         # (order_ms, scope, rank, id, ref): rank 0 = timed group, 1 = untimed.
         self._heap: list[tuple[int, str, int, int, Any]] = []
@@ -497,7 +491,7 @@ class CopyMerge:
             group = self._groups[group_key] = {}
             heapq.heappush(self._heap, (key.venue_ts_ms, key.scope, 0, 0, group_key))
         group.setdefault(stream, []).append(
-            (key, occurrence.message, origin, occurrence.reconnect_snapshot)
+            (key, occurrence.message, origin, occurrence.reconnect_snapshot, index)
         )
         self._grow()
 
@@ -572,55 +566,31 @@ class CopyMerge:
         heap = self._heap
         while heap and (limit is None or heap[0][0] < limit):
             order_ms, scope, rank, heap_id, ref = heapq.heappop(heap)
-            if rank == 0:
-                for entry in self._resolve(ref, self._groups.pop(ref)):
+            # Everything placed at this (millisecond, scope) is ordered
+            # together: the timed group (rank 0) and untimed messages (rank 1).
+            group = None
+            batch: list[_Untimed] = []
+            while True:
+                if rank == 0:
+                    group = self._groups.pop(ref)
+                elif ref.heap_id == heap_id:  # else superseded by an earlier placement
+                    batch.append(ref)
+                if not heap or heap[0][:2] != (order_ms, scope):
+                    break
+                order_ms, scope, rank, heap_id, ref = heapq.heappop(heap)
+            for entry in self._resolve((order_ms, scope), group or {}, batch):
+                if isinstance(entry, _Untimed):
+                    siblings = self._untimed[entry.key.digest]
+                    siblings.remove(entry)
+                    if not siblings:
+                        del self._untimed[entry.key.digest]
+                    self._pending -= len(entry.origins)
+                    self.stats.untimed_messages += 1
+                    record = _Emitted(entry.order_ms, order_ms, set(entry.streams))
+                    self._remember(entry.key.digest, order_ms, record)
+                else:
                     self._remember(entry.key.digest, order_ms, None)
-                    yield self._message(entry, order_ms, late=False)
-                continue
-            if ref.heap_id != heap_id:
-                continue  # superseded by an earlier placement of the same entry
-            # Untimed messages of one scope at the same millisecond are ordered
-            # together, like a timed group, by every stream's received order.
-            batch = [ref]
-            while heap and heap[0][:3] == (order_ms, scope, 1):
-                _, _, _, other_id, other = heapq.heappop(heap)
-                if other.heap_id == other_id:
-                    batch.append(other)
-            for entry in self._order_untimed(order_ms, scope, batch):
-                siblings = self._untimed[entry.key.digest]
-                siblings.remove(entry)
-                if not siblings:
-                    del self._untimed[entry.key.digest]
-                self._pending -= len(entry.origins)
-                self.stats.untimed_messages += 1
-                self._remember(
-                    entry.key.digest,
-                    order_ms,
-                    _Emitted(entry.order_ms, order_ms, set(entry.streams)),
-                )
                 yield self._message(entry, order_ms, late=False)
-
-    def _order_untimed(
-        self, order_ms: int, scope: str, batch: list[_Untimed]
-    ) -> list[_Untimed]:
-        if len(batch) == 1:
-            return batch
-        per_stream: dict[Stream, list[tuple[int, _Untimed, Origin]]] = {}
-        for entry in batch:
-            for stream, index, origin in entry.positions:
-                per_stream.setdefault(stream, []).append((index, entry, origin))
-        streams = sorted(per_stream, key=lambda stream: (-len(per_stream[stream]), stream))
-        sequences = [
-            (stream, [(entry, origin) for _, entry, origin in sorted(per_stream[stream], key=lambda item: item[0])])
-            for stream in streams
-        ]
-        order, choices = _order_nodes(
-            sequences,
-            lambda entry: entry.key.kind == self._checkpoint_kind,
-            lambda stream, origin: self._conflict((order_ms, scope), stream, origin),
-        )
-        self.stats.ambiguous_choices += choices
-        return order
 
     def _remember(self, digest: bytes, until_ms: int, record: _Emitted | None) -> None:
         if record is None:
@@ -665,50 +635,53 @@ class CopyMerge:
     def _resolve(
         self,
         group_key: tuple[int, str],
-        group: dict[Stream, list[tuple[MessageKey, Any, Origin, bool]]],
+        group: dict[Stream, list[_Item]],
+        untimed: list[_Untimed],
     ) -> list[_Entry]:
-        """Union of one (timestamp, scope) group, keeping every stream's order.
+        """Union of everything placed at one (millisecond, scope), in order.
 
-        Streams are ranked by message count, then by (copy, connection). The
-        k-th occurrence of a content in one stream is the same message as the
-        k-th in another, so a content is kept as often as the stream holding it
-        most often. The order is a topological sort of all streams' received
-        orders (see :func:`_order_nodes`).
+        A timed message is identified by (digest, k): the k-th occurrence of a
+        content in one stream is the same message as the k-th in another, so a
+        content is kept as often as the stream holding it most often. Untimed
+        messages were already matched across streams by time. Streams are
+        ranked by how many of these messages they hold, then by
+        (copy, connection), and the order is a topological sort of all
+        streams' received orders (see :func:`_order_nodes`).
         """
         for items in group.values():
             self._pending -= len(items)
-        streams = sorted(group, key=lambda stream: (-len(group[stream]), stream))
-        base = [
-            _Entry(key, message, origin, reconnect)
-            for key, message, origin, reconnect in group[streams[0]]
-        ]
-        # Fast path: every other stream holds a subsequence of the base.
-        digests = [entry.key.digest for entry in base]
-        matches = []
-        for stream in streams[1:]:
-            positions = _is_subsequence([key.digest for key, *_ in group[stream]], digests)
-            if positions is None:
-                break
-            matches.append((positions, group[stream]))
-        else:
-            for positions, items in matches:
-                for index, (_, message, origin, reconnect) in zip(positions, items):
-                    base[index].attach(message, origin, reconnect)
-            return base
-        entries: dict[tuple[bytes, int], _Entry] = {}
-        sequences = []
-        for stream in streams:
+        entries: dict[Any, _Entry] = {}
+        per_stream: dict[Stream, list[tuple[int, Any, Origin]]] = {}
+        for stream, items in group.items():
             seen: Counter[bytes] = Counter()
-            sequence = []
-            for key, message, origin, reconnect in group[stream]:
+            sequence = per_stream.setdefault(stream, [])
+            for key, message, origin, reconnect, index in items:
                 node = (key.digest, seen[key.digest])
                 seen[key.digest] += 1
                 if node in entries:
                     entries[node].attach(message, origin, reconnect)
                 else:
                     entries[node] = _Entry(key, message, origin, reconnect)
-                sequence.append((node, origin))
-            sequences.append((stream, sequence))
+                sequence.append((index, node, origin))
+        for entry in untimed:
+            entries[entry] = entry
+            for stream, index, origin in entry.positions:
+                per_stream.setdefault(stream, []).append((index, entry, origin))
+        streams = sorted(per_stream, key=lambda stream: (-len(per_stream[stream]), stream))
+        sequences = []
+        for stream in streams:
+            sequence = per_stream[stream]
+            if untimed:
+                sequence.sort(key=lambda item: item[0])
+            sequences.append((stream, [(node, origin) for _, node, origin in sequence]))
+        # Fast path: every stream follows the top-ranked stream's order.
+        top = {node: position for position, (node, _) in enumerate(sequences[0][1])}
+        if all(
+            all(node in top for node, _ in sequence)
+            and all(top[a] < top[b] for (a, _), (b, _) in zip(sequence, sequence[1:]))
+            for _, sequence in sequences[1:]
+        ):
+            return [entries[node] for node, _ in sequences[0][1]]
         order, choices = _order_nodes(
             sequences,
             lambda node: entries[node].key.kind == self._checkpoint_kind,
