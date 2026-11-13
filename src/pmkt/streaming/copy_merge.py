@@ -27,7 +27,7 @@ import hashlib
 import heapq
 import itertools
 import json
-from collections import Counter, deque
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -160,13 +160,16 @@ class MergeStats:
     repeats_merged: int = 0
     untimed_messages: int = 0
     late_messages: int = 0
-    # Late or untimed occurrences dropped because their content was already emitted.
+    # Of late_messages: venue time more than lateness_ms ahead of receipt.
+    future_messages: int = 0
+    # Occurrences dropped because their content was already emitted.
     repeats_after_emit: int = 0
-    # Occurrences dropped because their stream ordered them differently.
+    # Order constraints of a stream that contradicted higher-ranked streams and
+    # were ignored (the occurrence itself is still attached to its message).
     order_conflicts: int = 0
-    # Gaps where two streams each held messages the other lacked; their
-    # relative order is a convention (base stream first).
-    ambiguous_insertions: int = 0
+    # Times when more than one message could come next inside a group, so the
+    # order between them is a convention (see docs/copy_merge.md).
+    ambiguous_choices: int = 0
     clock_steps_back: int = 0
     max_pending_occurrences: int = 0
     late_by_copy: Counter[str] = field(default_factory=Counter)
@@ -255,7 +258,7 @@ class _Entry:
 class _Untimed(_Entry):
     """A pending message without venue time, matched across streams by time."""
 
-    __slots__ = ("order_ms", "streams", "heap_id")
+    __slots__ = ("order_ms", "streams", "heap_id", "positions")
 
     def __init__(
         self,
@@ -267,42 +270,87 @@ class _Untimed(_Entry):
         order_ms: int,
         stream: Stream,
         heap_id: int,
+        index: int,
     ) -> None:
         super().__init__(key, message, origin, reconnect)
         self.order_ms = order_ms
         self.streams = {stream}
         self.heap_id = heap_id
+        # (stream, input index, origin) of every occurrence, for ordering.
+        self.positions = [(stream, index, origin)]
 
 
+class _Emitted:
+    """Remembered untimed message: its matching time and the streams it absorbed."""
 
-def _align(a: list[bytes], b: list[bytes]) -> list[tuple[int | None, int | None]]:
-    """Longest-common-subsequence alignment with a fixed tie rule.
+    __slots__ = ("at", "order_ms", "streams")
 
-    Returns pairs in order: (i, j) matched, (i, None) only in ``a``, (None, j)
-    only in ``b``. Equal elements are always matched (that is optimal); on a
-    tie the ``a`` element is skipped first.
+    def __init__(self, at: int, order_ms: int, streams: set[Stream]) -> None:
+        self.at, self.order_ms, self.streams = at, order_ms, streams
+
+
+def _reaches(successors: dict[Any, set[Any]], start: Any, target: Any) -> bool:
+    stack, seen = [start], {start}
+    while stack:
+        node = stack.pop()
+        if node == target:
+            return True
+        for following in successors[node]:
+            if following not in seen:
+                seen.add(following)
+                stack.append(following)
+    return False
+
+
+def _order_nodes(
+    sequences: list[tuple[Stream, list[tuple[Any, Origin]]]],
+    is_checkpoint: Any,
+    on_conflict: Any,
+) -> tuple[list[Any], int]:
+    """One order of all nodes that keeps every stream's order where possible.
+
+    ``sequences`` are the streams in rank order, each a list of (node, origin)
+    in received order. Each stream adds "follows" constraints between its
+    consecutive nodes; a constraint that would contradict the constraints of
+    higher-ranked streams (a cycle) is skipped and reported through
+    ``on_conflict(stream, origin)``. The nodes are then sorted topologically.
+    When several nodes could come next, a non-checkpoint comes before a
+    checkpoint (a full book includes the changes stamped with its timestamp),
+    then the node first seen in the highest-ranked stream. Returns the order
+    and the number of such choices with more than one candidate.
     """
-    n, m = len(a), len(b)
-    lcs = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        row, below, ai = lcs[i], lcs[i + 1], a[i]
-        for j in range(m - 1, -1, -1):
-            row[j] = below[j + 1] + 1 if ai == b[j] else max(below[j], row[j + 1])
-    ops: list[tuple[int | None, int | None]] = []
-    i = j = 0
-    while i < n and j < m:
-        if a[i] == b[j]:
-            ops.append((i, j))
-            i, j = i + 1, j + 1
-        elif lcs[i + 1][j] >= lcs[i][j + 1]:
-            ops.append((i, None))
-            i += 1
-        else:
-            ops.append((None, j))
-            j += 1
-    ops.extend((k, None) for k in range(i, n))
-    ops.extend((None, k) for k in range(j, m))
-    return ops
+    rank: dict[Any, tuple[int, int]] = {}
+    for stream_rank, (_, sequence) in enumerate(sequences):
+        for position, (node, _) in enumerate(sequence):
+            rank.setdefault(node, (stream_rank, position))
+    successors: dict[Any, set[Any]] = {node: set() for node in rank}
+    indegree = dict.fromkeys(rank, 0)
+    for stream, sequence in sequences:
+        previous = None
+        for node, origin in sequence:
+            if previous is not None and node not in successors[previous]:
+                if _reaches(successors, node, previous):
+                    on_conflict(stream, origin)
+                    continue
+                successors[previous].add(node)
+                indegree[node] += 1
+            previous = node
+    by_key = {(bool(is_checkpoint(node)), rank[node]): node for node in rank}
+    ready = [key for key, node in by_key.items() if indegree[node] == 0]
+    heapq.heapify(ready)
+    order, choices = [], 0
+    while ready:
+        if len(ready) > 1:
+            choices += 1
+        node = by_key[heapq.heappop(ready)]
+        order.append(node)
+        for following in successors[node]:
+            indegree[following] -= 1
+            if indegree[following] == 0:
+                heapq.heappush(ready, (bool(is_checkpoint(following)), rank[following]))
+    if len(order) != len(rank):  # pragma: no cover - edges never form a cycle
+        raise AssertionError("cycle in merge order constraints")
+    return order, choices
 
 
 def _is_subsequence(short: list[bytes], long: list[bytes]) -> list[int] | None:
@@ -326,7 +374,7 @@ class CopyMerge:
     ``untimed_match_ms``: matching distance for messages without venue time.
     ``retention_ms``: how long emitted content is remembered for late repeats.
     ``strict_order``: raise :class:`CopyMergeError` when two streams order the
-    same messages differently inside one timestamp, instead of counting it.
+    same messages differently inside one group, instead of counting it.
     """
 
     def __init__(
@@ -358,10 +406,11 @@ class CopyMerge:
         self._heap: list[tuple[int, str, int, int, Any]] = []
         self._ids = itertools.count(1)
         self._pending = 0
-        # Emitted content remembered for retention_ms of order time.
+        # Emitted content, remembered until the watermark is retention_ms past
+        # the later of its order time and its own (venue or sending) time.
         self._emitted_timed: dict[bytes, int] = {}
-        self._emitted_untimed: dict[bytes, list[tuple[int, frozenset[Stream]]]] = {}
-        self._expiry: deque[tuple[int, bytes, tuple[int, frozenset[Stream]] | None]] = deque()
+        self._emitted_untimed: dict[bytes, list[_Emitted]] = {}
+        self._expiry: list[tuple[int, int, bytes, _Emitted | None]] = []
 
     # -- driver ---------------------------------------------------------------
 
@@ -370,11 +419,11 @@ class CopyMerge:
         if self._started:
             raise RuntimeError("a CopyMerge instance runs only once")
         self._started = True
-        for occurrence, received in self._interleave(streams):
+        for index, (occurrence, received) in enumerate(self._interleave(streams)):
             watermark = received // 1000 - self.lateness_ms
             yield from self._flush(watermark)
             self._expire(watermark)
-            yield from self._add(occurrence, watermark)
+            yield from self._add(occurrence, received // 1000, watermark, index)
         yield from self._flush(None)
 
     def _interleave(
@@ -417,19 +466,29 @@ class CopyMerge:
 
     # -- adding occurrences ----------------------------------------------------
 
-    def _add(self, occurrence: Occurrence, watermark: int) -> Iterator[MergedMessage]:
+    def _add(
+        self, occurrence: Occurrence, received_ms: int, watermark: int, index: int
+    ) -> Iterator[MergedMessage]:
         key = message_key(self.venue, occurrence.message)
         stream = (occurrence.copy, occurrence.connection)
         origin = occurrence.origin()
         self.stats.occurrences += 1
         if key.venue_ts_ms is None:
-            yield from self._add_untimed(key, stream, occurrence, origin, watermark)
+            yield from self._add_untimed(
+                key, stream, occurrence, origin, received_ms, watermark, index
+            )
             return
-        if key.venue_ts_ms < watermark:
+        # A venue time far ahead of receipt (a wrong clock) would stay pending
+        # until the receive clock caught up; handle it like a late message so
+        # that memory stays bounded by the lateness window.
+        future = key.venue_ts_ms > received_ms + self.lateness_ms
+        if key.venue_ts_ms < watermark or future or key.digest in self._emitted_timed:
+            # The last case: content placed early as a future message.
             if key.digest in self._emitted_timed:
                 self.stats.repeats_after_emit += 1
                 return
-            self._remember(key.digest, watermark, None)
+            self._remember(key.digest, max(watermark, key.venue_ts_ms), None)
+            self.stats.future_messages += future
             yield self._late(key, occurrence, origin, watermark)
             return
         group_key = (key.venue_ts_ms, key.scope)
@@ -448,14 +507,17 @@ class CopyMerge:
         stream: Stream,
         occurrence: Occurrence,
         origin: Origin,
+        received_ms: int,
         watermark: int,
+        index: int,
     ) -> Iterator[MergedMessage]:
-        at = key.sent_ms if key.sent_ms is not None else occurrence.received_us // 1000
+        at = key.sent_ms if key.sent_ms is not None else received_ms
         tolerance = self.untimed_match_ms
         for pending in self._untimed.get(key.digest, ()):
             if stream not in pending.streams and abs(at - pending.order_ms) <= tolerance:
                 pending.attach(occurrence.message, origin, occurrence.reconnect_snapshot)
                 pending.streams.add(stream)
+                pending.positions.append((stream, index, origin))
                 self._grow()
                 if watermark <= at < pending.order_ms:
                     pending.order_ms, pending.heap_id = at, next(self._ids)
@@ -463,13 +525,18 @@ class CopyMerge:
                         self._heap, (at, key.scope, 1, pending.heap_id, pending)
                     )
                 return
-        for emitted_at, streams in self._emitted_untimed.get(key.digest, ()):
-            if stream not in streams and abs(at - emitted_at) <= tolerance:
+        for emitted in self._emitted_untimed.get(key.digest, ()):
+            if stream not in emitted.streams and abs(at - emitted.at) <= tolerance:
+                # Already emitted: this stream's occurrence is absorbed, so a
+                # second one from the same stream is a genuine repeat.
+                emitted.streams.add(stream)
                 self.stats.repeats_after_emit += 1
                 return
-        if at < watermark:
-            self._remember(key.digest, watermark, frozenset({stream}))
+        future = at > received_ms + self.lateness_ms
+        if at < watermark or future:
+            self._remember(key.digest, max(watermark, at), _Emitted(at, watermark, {stream}))
             self.stats.untimed_messages += 1
+            self.stats.future_messages += future
             yield self._late(key, occurrence, origin, watermark)
             return
         entry = _Untimed(
@@ -480,6 +547,7 @@ class CopyMerge:
             order_ms=at,
             stream=stream,
             heap_id=next(self._ids),
+            index=index,
         )
         self._untimed.setdefault(key.digest, []).append(entry)
         heapq.heappush(self._heap, (at, key.scope, 1, entry.heap_id, entry))
@@ -511,32 +579,62 @@ class CopyMerge:
                 continue
             if ref.heap_id != heap_id:
                 continue  # superseded by an earlier placement of the same entry
-            siblings = self._untimed[ref.key.digest]
-            siblings.remove(ref)
-            if not siblings:
-                del self._untimed[ref.key.digest]
-            self._pending -= len(ref.origins)
-            self.stats.untimed_messages += 1
-            self._remember(ref.key.digest, order_ms, frozenset(ref.streams))
-            yield self._message(ref, order_ms, late=False)
+            # Untimed messages of one scope at the same millisecond are ordered
+            # together, like a timed group, by every stream's received order.
+            batch = [ref]
+            while heap and heap[0][:3] == (order_ms, scope, 1):
+                _, _, _, other_id, other = heapq.heappop(heap)
+                if other.heap_id == other_id:
+                    batch.append(other)
+            for entry in self._order_untimed(order_ms, scope, batch):
+                siblings = self._untimed[entry.key.digest]
+                siblings.remove(entry)
+                if not siblings:
+                    del self._untimed[entry.key.digest]
+                self._pending -= len(entry.origins)
+                self.stats.untimed_messages += 1
+                self._remember(
+                    entry.key.digest,
+                    order_ms,
+                    _Emitted(entry.order_ms, order_ms, set(entry.streams)),
+                )
+                yield self._message(entry, order_ms, late=False)
 
-    def _remember(
-        self, digest: bytes, order_ms: int, streams: frozenset[Stream] | None
-    ) -> None:
-        if streams is None:
-            self._emitted_timed[digest] = order_ms
-            self._expiry.append((order_ms, digest, None))
+    def _order_untimed(
+        self, order_ms: int, scope: str, batch: list[_Untimed]
+    ) -> list[_Untimed]:
+        if len(batch) == 1:
+            return batch
+        per_stream: dict[Stream, list[tuple[int, _Untimed, Origin]]] = {}
+        for entry in batch:
+            for stream, index, origin in entry.positions:
+                per_stream.setdefault(stream, []).append((index, entry, origin))
+        streams = sorted(per_stream, key=lambda stream: (-len(per_stream[stream]), stream))
+        sequences = [
+            (stream, [(entry, origin) for _, entry, origin in sorted(per_stream[stream], key=lambda item: item[0])])
+            for stream in streams
+        ]
+        order, choices = _order_nodes(
+            sequences,
+            lambda entry: entry.key.kind == self._checkpoint_kind,
+            lambda stream, origin: self._conflict((order_ms, scope), stream, origin),
+        )
+        self.stats.ambiguous_choices += choices
+        return order
+
+    def _remember(self, digest: bytes, until_ms: int, record: _Emitted | None) -> None:
+        if record is None:
+            self._emitted_timed[digest] = until_ms
         else:
-            record = (order_ms, streams)
             self._emitted_untimed.setdefault(digest, []).append(record)
-            self._expiry.append((order_ms, digest, record))
+        heapq.heappush(self._expiry, (until_ms, next(self._ids), digest, record))
 
     def _expire(self, watermark: int) -> None:
         limit = watermark - self.retention_ms
         while self._expiry and self._expiry[0][0] < limit:
-            order_ms, digest, record = self._expiry.popleft()
+            until_ms, _, digest, record = heapq.heappop(self._expiry)
             if record is None:
-                if self._emitted_timed.get(digest) == order_ms:
+                if self._emitted_timed.get(digest) == until_ms:
                     del self._emitted_timed[digest]
                 continue
             records = self._emitted_untimed[digest]
@@ -571,78 +669,53 @@ class CopyMerge:
     ) -> list[_Entry]:
         """Union of one (timestamp, scope) group, keeping every stream's order.
 
-        The stream with the most messages (ties: smallest copy/connection) is
-        the base. Each other stream is aligned to the merged list by longest
-        common subsequence; its unmatched messages are inserted at their
-        aligned place, after the base's own unmatched messages in the same gap.
-        A content may then appear at most as often as in the stream holding it
-        most often; surplus insertions are order disagreements and are dropped.
+        Streams are ranked by message count, then by (copy, connection). The
+        k-th occurrence of a content in one stream is the same message as the
+        k-th in another, so a content is kept as often as the stream holding it
+        most often. The order is a topological sort of all streams' received
+        orders (see :func:`_order_nodes`).
         """
         for items in group.values():
             self._pending -= len(items)
         streams = sorted(group, key=lambda stream: (-len(group[stream]), stream))
-        merged = [
+        base = [
             _Entry(key, message, origin, reconnect)
             for key, message, origin, reconnect in group[streams[0]]
         ]
+        # Fast path: every other stream holds a subsequence of the base.
+        digests = [entry.key.digest for entry in base]
+        matches = []
         for stream in streams[1:]:
-            items = group[stream]
-            a = [entry.key.digest for entry in merged]
-            b = [key.digest for key, _, _, _ in items]
-            positions = _is_subsequence(b, a)
-            if positions is not None:
+            positions = _is_subsequence([key.digest for key, *_ in group[stream]], digests)
+            if positions is None:
+                break
+            matches.append((positions, group[stream]))
+        else:
+            for positions, items in matches:
                 for index, (_, message, origin, reconnect) in zip(positions, items):
-                    merged[index].attach(message, origin, reconnect)
-                continue
-            merged = self._fold(group_key, stream, merged, items, a, b)
-        return merged
-
-    def _fold(
-        self,
-        group_key: tuple[int, str],
-        stream: Stream,
-        merged: list[_Entry],
-        items: list[tuple[MessageKey, Any, Origin, bool]],
-        a: list[bytes],
-        b: list[bytes],
-    ) -> list[_Entry]:
-        have, want = Counter(a), Counter(b)
-        allowed = {d: want[d] - have[d] for d in want if want[d] > have[d]}
-        result: list[_Entry] = []
-        only_a: list[int] = []
-        only_b: list[int] = []
-
-        def close_gap() -> None:
-            kept = []
-            for j in only_b:
-                digest = b[j]
-                if allowed.get(digest, 0) > 0:
-                    allowed[digest] -= 1
-                    kept.append(j)
+                    base[index].attach(message, origin, reconnect)
+            return base
+        entries: dict[tuple[bytes, int], _Entry] = {}
+        sequences = []
+        for stream in streams:
+            seen: Counter[bytes] = Counter()
+            sequence = []
+            for key, message, origin, reconnect in group[stream]:
+                node = (key.digest, seen[key.digest])
+                seen[key.digest] += 1
+                if node in entries:
+                    entries[node].attach(message, origin, reconnect)
                 else:
-                    self._conflict(group_key, stream, items[j][2])
-            if only_a and kept:
-                self.stats.ambiguous_insertions += 1
-            result.extend(merged[i] for i in only_a)
-            for j in kept:
-                key, message, origin, reconnect = items[j]
-                result.append(_Entry(key, message, origin, reconnect))
-            only_a.clear()
-            only_b.clear()
-
-        for i, j in _align(a, b):
-            if i is not None and j is not None:
-                close_gap()
-                _, message, origin, reconnect = items[j]
-                merged[i].attach(message, origin, reconnect)
-                result.append(merged[i])
-            elif i is not None:
-                only_a.append(i)
-            else:
-                assert j is not None
-                only_b.append(j)
-        close_gap()
-        return result
+                    entries[node] = _Entry(key, message, origin, reconnect)
+                sequence.append((node, origin))
+            sequences.append((stream, sequence))
+        order, choices = _order_nodes(
+            sequences,
+            lambda node: entries[node].key.kind == self._checkpoint_kind,
+            lambda stream, origin: self._conflict(group_key, stream, origin),
+        )
+        self.stats.ambiguous_choices += choices
+        return [entries[node] for node in order]
 
     def _conflict(self, group_key: tuple[int, str], stream: Stream, origin: Origin) -> None:
         self.stats.order_conflicts += 1
@@ -668,68 +741,66 @@ def session_occurrences(
     copy: str,
     connection: str,
     session: str,
-    items: Iterable[VenueMessage | RawFrame | ChunkGap],
+    frames: Iterable[RawFrame | ChunkGap],
     *,
     coverage: CoverageTracker | None = None,
 ) -> Iterator[Occurrence]:
-    """Occurrences of one session from ``raw_reader.iter_venue_messages`` output.
+    """Occurrences of one session from ``raw_reader.read_session`` output.
 
-    Every decoded venue message (any JSON value) becomes an occurrence; text
-    that is not JSON is only counted on ``coverage``. A Polymarket ``book`` is a
-    reconnect snapshot when it is the first book of its ``asset_id`` since the
-    generation's last sent subscription; every Kalshi ``orderbook_snapshot`` is.
+    Every frame is shown to ``coverage`` before it is decoded (an empty JSON
+    list still proves the connection was alive). Every decoded venue message
+    (any JSON value) becomes an occurrence; text that is not JSON is only
+    counted on ``coverage``. A Polymarket ``book`` is a reconnect snapshot when
+    it is the first book of its ``asset_id`` since the generation's last sent
+    subscription; every Kalshi ``orderbook_snapshot`` is.
     """
-    frame_id: tuple[int, int] | None = None
-    received_us = 0
     books_seen: set[Any] = set()
     generation: int | None = None
-    for item in items:
-        if isinstance(item, ChunkGap):
+    for frame in frames:
+        if isinstance(frame, ChunkGap):
             if coverage is not None:
                 coverage.chunk_gap()
             continue
-        frame = item.frame if isinstance(item, VenueMessage) else item
-        if (frame.connection_generation, frame.local_frame_seq) != frame_id:
-            frame_id = (frame.connection_generation, frame.local_frame_seq)
-            received_us = utc_microseconds(frame.received_utc)
-            if frame.connection_generation != generation:
-                generation = frame.connection_generation
-                books_seen.clear()
-            if frame.frame_type == "subscription":
-                books_seen.clear()
-            if coverage is not None:
-                coverage.frame(
-                    received_us, frame.connection_generation, frame.frame_type, frame.direction
-                )
-        if not isinstance(item, VenueMessage):
-            continue
-        if not item.parsed:
-            if coverage is not None:
-                coverage.unparsed_text()
-            continue
-        value = item.value
-        reconnect = False
-        if isinstance(value, dict):
-            if frame.venue == "kalshi":
-                reconnect = value.get("type") == "orderbook_snapshot"
-                sid, seq = value.get("sid"), value.get("seq")
-                if coverage is not None and type(sid) is int and type(seq) is int:
-                    coverage.sequence(sid, seq)
-            elif value.get("event_type") == "book":
-                asset = value.get("asset_id")
-                reconnect = asset not in books_seen
-                books_seen.add(asset)
-        yield Occurrence(
-            copy,
-            connection,
-            session,
-            frame.connection_generation,
-            frame.local_frame_seq,
-            item.batch_index,
-            received_us,
-            value,
-            reconnect,
-        )
+        received_us = utc_microseconds(frame.received_utc)
+        if frame.connection_generation != generation:
+            generation = frame.connection_generation
+            books_seen.clear()
+        if frame.frame_type == "subscription":
+            books_seen.clear()
+        if coverage is not None:
+            coverage.frame(
+                received_us, frame.connection_generation, frame.frame_type, frame.direction
+            )
+        for item in iter_venue_messages((frame,)):
+            if not isinstance(item, VenueMessage):
+                continue
+            if not item.parsed:
+                if coverage is not None:
+                    coverage.unparsed_text()
+                continue
+            value = item.value
+            reconnect = False
+            if isinstance(value, dict):
+                if frame.venue == "kalshi":
+                    reconnect = value.get("type") == "orderbook_snapshot"
+                    sid, seq = value.get("sid"), value.get("seq")
+                    if coverage is not None and type(sid) is int and type(seq) is int:
+                        coverage.sequence(sid, seq)
+                elif value.get("event_type") == "book":
+                    asset = value.get("asset_id")
+                    reconnect = asset not in books_seen
+                    books_seen.add(asset)
+            yield Occurrence(
+                copy,
+                connection,
+                session,
+                frame.connection_generation,
+                frame.local_frame_seq,
+                item.batch_index,
+                received_us,
+                value,
+                reconnect,
+            )
 
 
 def connection_occurrences(
@@ -746,12 +817,11 @@ def connection_occurrences(
     appended to it once that session has been read completely.
     """
     for path in sorted((Path(s) for s in sessions), key=lambda p: p.name):
-        tracker = CoverageTracker(copy, connection, path.name)
-        frames = iter_venue_messages(read_session(path, verify=verify))
+        tracker = CoverageTracker(copy, connection, path.name) if coverage is not None else None
         yield from session_occurrences(
-            copy, connection, path.name, frames, coverage=tracker
+            copy, connection, path.name, read_session(path, verify=verify), coverage=tracker
         )
-        if coverage is not None:
+        if coverage is not None and tracker is not None:
             coverage.append(tracker.finish())
 
 
