@@ -94,23 +94,30 @@ snapshot at its sending time would put it after deltas stamped earlier but not
 included in it, and a replay would then overwrite those deltas.
 
 The rule: a snapshot with a positive `clock` C comes after every delta of its
-market with clock at or below C and before every delta with a higher clock.
-It is implemented in streaming form:
+market with clock at or below C, before every delta with a higher clock, and
+after the market's clock-placed snapshots with a lower clock. Snapshots taken
+on different connections a moment apart differ in clock (it is exchange-wide)
+even when the book did not change, so their order matters only when the book
+changed while no copy received the deltas, for example during a venue-wide
+disconnect; then the newer book must be the one that stays. It is implemented
+in streaming form:
 
 - When the snapshot arrives, it is held per market. Every group of the market
   before the flush point is already emitted.
-- While the merge emits that market's groups in time order, the snapshot goes
-  into the first group that holds a delta with a clock above C, before that
-  delta and after the group's deltas with clock at or below C. Its `order_ms`
-  is that group's millisecond.
-- If no such group comes before its sending time, it is placed at its sending
-  time, ordered against the deltas of that millisecond by clock.
+- While the merge emits that market's messages in time order, the snapshot
+  goes into the first millisecond that holds a delta or a clock-placed
+  snapshot with a clock above C, before it and after that millisecond's
+  deltas with clock at or below C. Its `order_ms` is that millisecond.
+- If none comes before its sending time, it is placed at its sending time,
+  ordered against the book messages of that millisecond by clock.
+- Within a millisecond, these clock pairs (snapshot against delta, and
+  snapshot against snapshot) are added before any received-order constraint.
 
 Which group a snapshot joins depends only on its own arrival and its market's
 messages, so the result is the same however markets are split across runs.
 Each pending snapshot waits at most until its sending time passes the flush
 point, so memory stays bounded by the lateness window, plus one clock per
-market seen.
+market and one per stream and market.
 
 Fallbacks, counted in `stats.snapshot_clock_fallbacks` by reason; such a
 snapshot is placed at its sending time as an untimed message (see the
@@ -122,9 +129,14 @@ conventions):
   wrong if it is the empty book of a determined market, so it stays at its
   sending time.
 - `missing`: no integer `clock`.
-- `decreased`: a clock below the clock of the last book message of its market
-  already emitted, such as after exchange maintenance (Kalshi documents that
-  the clock may decrease then) or a snapshot that arrived after its place.
+- `decreased`: a clock below the clock of the last book message of the
+  market that its own stream received before it, or below the last one
+  already emitted. Kalshi documents that the clock may decrease during
+  maintenance and that clocks are not comparable across it. A reset is
+  detected from each stream's own received order, including messages still
+  buffered in the merge, and from the emitted stream. Not detected: a stream
+  whose first message for the market comes after a reset while another
+  copy's pre-reset messages are still buffered.
 
 `stats.snapshots_by_clock` counts the snapshots placed by clock. Late snapshots
 (older than `lateness_ms` on arrival) follow the late rule and are in neither
@@ -137,11 +149,11 @@ the clock only places snapshots. A Kalshi snapshot that does carry `ts_ms` is
 treated like other timed messages.
 
 **Limit: real-time subscriptions only.** The rule relies on the documented
-`clock` semantics of real-time subscriptions. Conflated subscriptions
-(`update_interval_ms`) have different rules and are not supported: neither
-deduplication nor ordering is defined for them, and `session_occurrences`
-raises `CopyMergeError` on a sent Kalshi subscription with
-`update_interval_ms`. The core raw recorder subscribes in real time
+`clock` semantics of real-time subscriptions. Conflated subscriptions (a
+nonzero `update_interval_ms`) have different rules and are not supported:
+neither deduplication nor ordering is defined for them, and
+`session_occurrences` raises `CopyMergeError` on a sent Kalshi command with a
+nonzero `update_interval_ms`. An omitted field and 0 both mean real time. The core raw recorder subscribes in real time
 (`channels`, `market_tickers`, `use_yes_price`). Callers that build
 `Occurrence`s from another store must check this themselves.
 
@@ -185,7 +197,7 @@ otherwise:
   their own time (venue time, or sending time for untimed messages, including a
   Kalshi snapshot placed earlier by its clock), so a copy with a clock far
   behind costs digest memory in proportion to its error (visible in `stats.future_messages`). For Kalshi, one
-  clock per market seen is kept.
+  clock per market and one per stream and market are kept.
 
 ## Conventions chosen here (owner to confirm)
 
@@ -196,7 +208,8 @@ otherwise:
 - **Constraint priority.** Inside one group, "a before b" constraints are
   added in this order, and one that would contradict those already added (a
   cycle) is skipped:
-  1. Kalshi clock order between snapshots and deltas (never skipped).
+  1. Kalshi clock order of snapshots against deltas and against each other
+     (never skipped).
   2. For each stream in rank order, the order of its consecutive book changes
      (Polymarket `price_change` and `book`; Kalshi `orderbook_delta` and
      `orderbook_snapshot`), skipping the other messages between them.

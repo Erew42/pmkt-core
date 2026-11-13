@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.streaming import raw_capture
 from pmkt.streaming.copy_coverage import (
     CoverageTracker,
@@ -796,3 +797,69 @@ def test_clock_placed_snapshot_is_remembered_from_its_sending_time():
     # Dropped as repeats: b's snapshot and b's delta at T+300 (its group was
     # flushed by then).
     assert merged[0].copies == ("a",) and stats.repeats_after_emit == 2
+
+
+def final_yes_book(merged):
+    """The Yes book after replaying a merged Kalshi stream of one ticker."""
+    state = KalshiOrderBookState("K")
+    for m in merged:
+        if m.kind == "orderbook_snapshot":
+            state.apply_snapshot(m.message)
+        elif m.kind == "orderbook_delta":
+            state.apply_delta(m.message)
+    return {str(price): str(size) for price, size in state.yes_bids.items()}
+
+
+def test_snapshots_of_one_market_are_ordered_by_clock():
+    # Both snapshots join the group of the delta with clock 30. Copy a holds
+    # more of the group, but the older book (clock 10) must still come first.
+    b = stream("b", [(T0 + 151, ksnap(T0 + 150, [("0.50", "10")], 10))], connection="kalshi_00")
+    a = stream("a", [(T0 + 161, ksnap(T0 + 160, [("0.50", "20")], 20)),
+                     (T0 + 171, delta(T0 + 100, "0.50", "1", clock=30, sent=T0 + 170))],
+               connection="kalshi_00")
+    merged, stats = merge([a, b], venue="kalshi")
+    assert [_clock_of(m) for m in merged] == [10, 20, 30]
+    assert all(m.order_ms == T0 + 100 and not m.late for m in merged)
+    assert final_yes_book(merged) == {"0.50": "21"}
+    # Across batches: the newer book was sent first (T+140), the older at
+    # T+150, with no delta between them; the older one is pulled forward.
+    b = stream("b", [(T0 + 151, ksnap(T0 + 150, [("0.50", "10")], 10))], connection="kalshi_00")
+    a = stream("a", [(T0 + 141, ksnap(T0 + 140, [("0.50", "20")], 20))], connection="kalshi_00")
+    merged, _ = merge([a, b], venue="kalshi")
+    assert [(_clock_of(m), m.order_ms - T0) for m in merged] == [(10, 140), (20, 140)]
+    assert final_yes_book(merged) == {"0.50": "20"}
+
+
+def _clock_of(message):
+    return message.message["msg"]["clock"]
+
+
+def test_clock_reset_is_detected_from_the_streams_own_order_while_buffered():
+    # Clock 1 after clock 101 on the same connection: a reset (maintenance).
+    # The pre-reset delta is still pending when the snapshot arrives.
+    a = stream("a", [(T0 + 91, ksnap(T0 + 90, [("0.50", "10")], 100)),
+                     (T0 + 111, delta(T0 + 100, "0.50", "5", clock=101, sent=T0 + 105)),
+                     (T0 + 201, ksnap(T0 + 200, [("0.50", "15")], 1, seq=3))],
+               connection="kalshi_00")
+    merged, stats = merge([a], venue="kalshi")
+    assert [(_clock_of(m), m.order_ms - T0) for m in merged] == [(100, 90), (101, 100), (1, 200)]
+    assert final_yes_book(merged) == {"0.50": "15"}
+    assert stats.snapshot_clock_fallbacks == {"decreased": 1} and stats.order_conflicts == 0
+
+
+def test_explicit_real_time_subscription_is_accepted(tmp_path, monkeypatch):
+    def subscribe(interval):
+        return json.dumps({"id": 1, "cmd": "subscribe", "params": {
+            "channels": ["orderbook_delta"], "market_tickers": ["K"], "update_interval_ms": interval}})
+
+    real_time = tmp_path / "pc" / "kalshi_00" / "20261103T000000Z_ffff0001"
+    record(real_time, monkeypatch, "kalshi", [
+        (T0, "subscription", subscribe(0), 1, "sent"),
+        text(T0 + 10, ksnap(T0 + 9, [("0.40", "1")], 4)),
+    ])
+    assert len(list(connection_occurrences("pc", "kalshi_00", [real_time]))) == 1
+    for interval in (100, 1000):
+        conflated = tmp_path / "pc" / f"kalshi_{interval}" / "20261103T000000Z_ffff0002"
+        record(conflated, monkeypatch, "kalshi", [(T0, "subscription", subscribe(interval), 1, "sent")])
+        with pytest.raises(CopyMergeError, match="conflated"):
+            list(connection_occurrences("pc", f"kalshi_{interval}", [conflated]))

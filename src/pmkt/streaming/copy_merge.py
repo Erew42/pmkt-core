@@ -210,7 +210,8 @@ class MergeStats:
     # Kalshi snapshots placed by their clock, and those placed at their
     # sending time instead, by reason: "zero" (clock 0, an empty book),
     # "missing" (no integer clock) or "decreased" (clock below the last book
-    # message of the market already emitted). Late snapshots are in neither.
+    # message of the market its own stream received, or already emitted: a
+    # reset). Late snapshots are in neither.
     snapshots_by_clock: int = 0
     snapshot_clock_fallbacks: Counter[str] = field(default_factory=Counter)
     # Emitted Kalshi deltas whose clock is below the previous emitted delta of
@@ -493,6 +494,9 @@ class CopyMerge:
         # snapshot (one small entry per market seen).
         self._clocked: dict[str, list[_Untimed]] = {}
         self._last_clock: dict[str, tuple[int, bool]] = {}
+        # Kalshi: the clock of the last book message each stream received per
+        # market, to detect a clock reset from the stream's own order.
+        self._stream_clock: dict[tuple[Stream, str], int] = {}
         # (order_ms, scope, rank, id, ref): rank 0 = timed group, 1 = untimed.
         self._heap: list[tuple[int, str, int, int, Any]] = []
         self._ids = itertools.count(1)
@@ -564,9 +568,15 @@ class CopyMerge:
         stream = (occurrence.copy, occurrence.connection)
         origin = occurrence.origin()
         self.stats.occurrences += 1
+        received_clock = None
+        if self.venue == "kalshi" and key.kind in self._book_change_kinds:
+            received_clock = self._stream_clock.get((stream, key.scope))
+            clock = _clock(occurrence.message)
+            if clock:
+                self._stream_clock[(stream, key.scope)] = clock
         if key.venue_ts_ms is None:
             yield from self._add_untimed(
-                key, stream, occurrence, origin, received_ms, watermark, index
+                key, stream, occurrence, origin, received_ms, watermark, index, received_clock
             )
             return
         # A venue time far ahead of receipt (a wrong clock) would stay pending
@@ -601,7 +611,10 @@ class CopyMerge:
         received_ms: int,
         watermark: int,
         index: int,
+        received_clock: int | None = None,
     ) -> Iterator[MergedMessage]:
+        """``received_clock``: Kalshi clock of the last book message of this
+        market that this stream received before this occurrence."""
         at = key.sent_ms if key.sent_ms is not None else received_ms
         tolerance = self.untimed_match_ms
         for pending in self._untimed.get(key.digest, ()):
@@ -641,18 +654,22 @@ class CopyMerge:
             index=index,
         )
         if self.venue == "kalshi" and key.kind == "orderbook_snapshot":
-            entry.clock = self._snapshot_clock(key.scope, occurrence.message)
+            entry.clock = self._snapshot_clock(key.scope, occurrence.message, received_clock)
             if entry.clock is not None:
                 self._clocked.setdefault(key.scope, []).append(entry)
         self._untimed.setdefault(key.digest, []).append(entry)
         heapq.heappush(self._heap, (at, key.scope, 1, entry.heap_id, entry))
         self._grow()
 
-    def _snapshot_clock(self, scope: str, message: Any) -> int | None:
+    def _snapshot_clock(
+        self, scope: str, message: Any, received_clock: int | None
+    ) -> int | None:
         """The clock that places this Kalshi snapshot, or None to place it at sending time.
 
-        Decided when the snapshot arrives, from its content and the market's
-        already emitted messages, which do not depend on other markets.
+        Decided when the snapshot arrives, from its content, the market's
+        already emitted messages and the clock its own stream last received
+        for the market (a lower clock means a reset, e.g. maintenance, even if
+        the older messages are still buffered). None depends on other markets.
         """
         clock = _clock(message)
         last = self._last_clock.get(scope)
@@ -660,7 +677,9 @@ class CopyMerge:
             reason = "missing"
         elif clock == 0:
             reason = "zero"
-        elif last is not None and clock < last[0]:
+        elif (last is not None and clock < last[0]) or (
+            received_clock is not None and clock < received_clock
+        ):
             reason = "decreased"
         else:
             self.stats.snapshots_by_clock += 1
@@ -699,8 +718,8 @@ class CopyMerge:
                 if not heap or heap[0][:2] != (order_ms, scope):
                     break
                 order_ms, scope, rank, heap_id, ref = heapq.heappop(heap)
-            if group is not None and scope in self._clocked:
-                batch.extend(self._placed_by_clock(scope, group, batch))
+            if scope in self._clocked:
+                batch.extend(self._placed_by_clock(scope, group or {}, batch))
             if group is None and not batch:
                 # Only superseded placements of messages emitted earlier.
                 continue
@@ -729,11 +748,11 @@ class CopyMerge:
     def _placed_by_clock(
         self, scope: str, group: dict[Stream, list[_Item]], batch: list[_Untimed]
     ) -> list[_Untimed]:
-        """Pending snapshots of ``scope`` that belong in this timed group.
+        """Pending snapshots of ``scope`` that belong in this batch.
 
-        A snapshot goes into the first group of its market (in merged order)
-        that holds a delta with a higher clock, before that delta. If no such
-        group comes before its sending time, it stays at its sending time.
+        A snapshot goes into the first batch of its market (in merged order)
+        that holds a delta or a clock-placed snapshot with a higher clock,
+        before it. If none comes before its sending time, it stays there.
         """
         clocks = [
             clock
@@ -741,6 +760,7 @@ class CopyMerge:
             for key, message, *_ in items
             if key.kind == "orderbook_delta" and (clock := _clock(message)) is not None
         ]
+        clocks.extend(entry.clock for entry in batch if entry.clock is not None)
         if not clocks:
             return []
         newest = max(clocks)
@@ -881,7 +901,12 @@ class CopyMerge:
     def _clock_pairs(
         entries: dict[Any, _Entry], untimed: list[_Untimed]
     ) -> list[tuple[Any, Any]]:
-        """Kalshi clock order: each delta with clock <= a snapshot's clock before it, others after."""
+        """Kalshi clock order of the clock-placed snapshots of one market.
+
+        Each delta with a clock at or below a snapshot's clock comes before it,
+        others after it, and snapshots come in increasing clock order. All
+        these snapshots passed the reset checks, so their clocks are comparable.
+        """
         snapshots = [entry for entry in untimed if entry.clock is not None]
         if not snapshots:
             return []
@@ -890,12 +915,19 @@ class CopyMerge:
             for node, entry in entries.items()
             if entry.key.kind == "orderbook_delta" and (clock := _clock(entry.message)) is not None
         ]
-        return [
+        pairs: list[tuple[Any, Any]] = [
             (node, snapshot) if clock <= snapshot.clock else (snapshot, node)
             for snapshot in snapshots
             if snapshot.clock is not None
             for node, clock in deltas
         ]
+        pairs.extend(
+            (lower, higher)
+            for lower in snapshots
+            for higher in snapshots
+            if lower.clock is not None and higher.clock is not None and lower.clock < higher.clock
+        )
+        return pairs
 
     def _conflict(
         self, group_key: tuple[int, str], stream: Stream, origin: Origin, book_pair: bool
@@ -924,6 +956,21 @@ class CopyMerge:
 # -- reading the raw recorder ----------------------------------------------------
 
 
+def _conflated(payload: str) -> bool:
+    """Whether a sent Kalshi command asks for conflated updates.
+
+    Kalshi treats an omitted ``update_interval_ms`` and 0 as real time. A
+    payload that is not JSON counts as conflated if it names the field.
+    """
+    try:
+        command = json.loads(payload)
+    except ValueError:
+        return "update_interval_ms" in payload
+    params = command.get("params") if isinstance(command, dict) else None
+    interval = params.get("update_interval_ms") if isinstance(params, dict) else None
+    return interval is not None and interval != 0
+
+
 def session_occurrences(
     copy: str,
     connection: str,
@@ -942,8 +989,8 @@ def session_occurrences(
     since the generation's last sent subscription.
 
     Kalshi snapshots are placed by ``clock``, which holds only for real-time
-    subscriptions; a sent subscription with ``update_interval_ms`` (conflated
-    mode) raises :class:`CopyMergeError`.
+    subscriptions; a sent subscription with a nonzero ``update_interval_ms``
+    (conflated mode) raises :class:`CopyMergeError`.
     """
     books_seen: set[Any] = set()
     generation: int | None = None
@@ -958,7 +1005,7 @@ def session_occurrences(
             books_seen.clear()
         if frame.frame_type == "subscription":
             books_seen.clear()
-            if frame.venue == "kalshi" and "update_interval_ms" in frame.payload_raw:
+            if frame.venue == "kalshi" and _conflated(frame.payload_raw):
                 raise CopyMergeError(
                     f"{copy}/{connection}/{session}: conflated Kalshi subscription "
                     "(update_interval_ms) is not supported by the clock placement"
