@@ -1,0 +1,445 @@
+"""Merging recorded copies: small hand-checkable inputs for each merge rule."""
+
+from __future__ import annotations
+
+import itertools
+import json
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from pmkt.streaming import raw_capture
+from pmkt.streaming.copy_coverage import (
+    CoverageTracker,
+    uncovered_intervals,
+    utc_microseconds,
+)
+from pmkt.streaming.copy_merge import (
+    CopyMerge,
+    CopyMergeError,
+    Occurrence,
+    connection_occurrences,
+    discover_sessions,
+    message_key,
+)
+from pmkt.streaming.copy_merge_books import check_merged_books
+from pmkt.streaming.raw_capture import ChunkWriter
+
+T0 = 1_793_673_000_000  # 2026-11-03T02:30:00Z in milliseconds
+
+
+# -- message builders ------------------------------------------------------------
+
+
+def change(ts, price, size, *, market="M", token="yes", side="BUY"):
+    """One Polymarket price_change setting one level, as the venue states it."""
+    return {
+        "market": market,
+        "price_changes": [
+            {"asset_id": token, "price": price, "size": size, "side": side, "hash": "h"}
+        ],
+        "timestamp": str(ts),
+        "event_type": "price_change",
+    }
+
+
+def book(ts, bids, asks=(), *, market="M", token="yes"):
+    return {
+        "market": market,
+        "asset_id": token,
+        "timestamp": str(ts),
+        "hash": f"book-{ts}",
+        "bids": [{"price": p, "size": s} for p, s in bids],
+        "asks": [{"price": p, "size": s} for p, s in asks],
+        "event_type": "book",
+    }
+
+
+def delta(ts, price, amount, *, sid=1, seq=1, sent=None, ticker="K"):
+    return {
+        "type": "orderbook_delta",
+        "sid": sid,
+        "seq": seq,
+        "msg": {
+            "market_ticker": ticker,
+            "clock": ts,
+            "price_dollars": price,
+            "delta_fp": amount,
+            "side": "yes",
+            "ts_ms": ts,
+        },
+        "sending_ts_ms": ts + 5 if sent is None else sent,
+    }
+
+
+def stream(copy, messages, *, connection="polymarket_00", lag_ms=20, session="s1"):
+    """Occurrences of one stream; each message received ``lag_ms`` after its time.
+
+    ``messages`` items are a message or a (received_ms, message) pair.
+    """
+    out = []
+    for seq, item in enumerate(messages, 1):
+        received, message = item if isinstance(item, tuple) else (None, item)
+        if received is None:
+            key = message_key("kalshi" if "type" in message else "polymarket", message)
+            received = (key.venue_ts_ms or key.sent_ms) + lag_ms
+        out.append(
+            Occurrence(copy, connection, session, 1, seq, None, received * 1000, message)
+        )
+    return out
+
+
+def merge(streams, venue="polymarket", **options):
+    merger = CopyMerge(venue, **options)
+    return list(merger.merge(streams)), merger.stats
+
+
+def contents(merged):
+    return [m.message for m in merged]
+
+
+# -- rule 1: union by content ------------------------------------------------------
+
+
+def test_identical_copies_give_each_message_once_with_both_copies():
+    messages = [change(T0, "0.40", "10"), change(T0 + 1, "0.41", "5"), book(T0 + 2, [("0.41", "5")])]
+    merged, stats = merge([stream("pc", messages), stream("vm1", messages, lag_ms=45)])
+    assert contents(merged) == messages
+    assert all(m.copies == ("pc", "vm1") for m in merged)
+    # The earlier receive time wins, and only that copy's origin is "first".
+    assert [m.first_copy for m in merged] == ["pc", "pc", "pc"]
+    assert merged[0].first_received_us == (T0 + 20) * 1000
+    assert len(merged[0].occurrences) == 2
+    assert stats.messages == 3 and stats.repeats_merged == 3
+    assert stats.order_conflicts == stats.ambiguous_insertions == 0
+
+
+def test_hole_in_one_copy_is_filled_from_another():
+    messages = [change(T0 + i * 1000, f"0.{40 + i}", "1") for i in range(6)]
+    with_hole = messages[:2] + messages[4:]
+    merged, _ = merge([stream("pc", with_hole), stream("vm1", messages)])
+    assert contents(merged) == messages
+    assert [m.copies for m in merged] == [("pc", "vm1")] * 2 + [("vm1",)] * 2 + [("pc", "vm1")] * 2
+
+
+def test_exact_repeats_keep_their_multiplicity():
+    tick = {"market": "M", "asset_id": "yes", "old_tick_size": "0.01",
+            "new_tick_size": "0.001", "timestamp": str(T0), "event_type": "tick_size_change"}
+    x = change(T0 + 5, "0.40", "10")
+    # pc received the tick-size change twice (the venue sends it twice) and x
+    # twice; vm1 lost one of each. The merge keeps the maximum: two of each.
+    merged, stats = merge([stream("pc", [tick, tick, x, x]), stream("vm1", [tick, x])])
+    assert contents(merged) == [tick, tick, x, x]
+    assert [m.copies for m in merged] == [("pc", "vm1"), ("pc",), ("pc", "vm1"), ("pc",)]
+    assert stats.order_conflicts == 0
+
+
+def test_same_market_on_two_connections_of_one_copy_is_kept_once():
+    # The Yes-token and No-token connections both receive the market's changes.
+    messages = [change(T0, "0.40", "10"), change(T0 + 3, "0.60", "4", token="no", side="SELL")]
+    merged, _ = merge(
+        [
+            stream("vm1", messages, connection="polymarket_00"),
+            stream("vm1", messages, connection="polymarket_02", lag_ms=21),
+        ]
+    )
+    assert contents(merged) == messages
+    assert [m.copies for m in merged] == [("vm1",), ("vm1",)]
+    assert [{o.connection for o in m.occurrences} for m in merged] == [
+        {"polymarket_00", "polymarket_02"}
+    ] * 2
+
+
+def test_kalshi_identity_ignores_per_connection_fields():
+    a = [delta(T0, "0.40", "5.00", sid=1, seq=10, sent=T0 + 4), delta(T0 + 7, "0.41", "-2.00", sid=1, seq=11)]
+    b = [delta(T0, "0.40", "5.00", sid=3, seq=900, sent=T0 + 9), delta(T0 + 7, "0.41", "-2.00", sid=3, seq=901)]
+    merged, stats = merge(
+        [stream("pc", a, connection="kalshi_00"), stream("vm1", b, connection="kalshi_00", lag_ms=10)],
+        venue="kalshi",
+    )
+    assert [m.copies for m in merged] == [("pc", "vm1")] * 2
+    # The output keeps the envelope of the earliest-received occurrence.
+    assert merged[0].message["seq"] == 900 and merged[0].first_copy == "vm1"
+    assert stats.messages == 2
+    # A different inner message is a different message.
+    other = delta(T0, "0.40", "6.00")
+    assert message_key("kalshi", other).digest != message_key("kalshi", a[0]).digest
+
+
+# -- rules 2 and 3: order ----------------------------------------------------------
+
+
+def test_order_is_by_venue_time_not_receive_time():
+    early, late = change(T0, "0.40", "1", market="A"), change(T0 + 50, "0.40", "2", market="B")
+    # Received in the opposite order (B arrived first).
+    merged, _ = merge([stream("pc", [(T0 + 100, late), (T0 + 120, early)])])
+    assert contents(merged) == [early, late]
+    assert [m.order_ms for m in merged] == [T0, T0 + 50]
+
+
+def test_shared_timestamp_keeps_received_order_complete_in_one_copy_partial_in_other():
+    # Four changes in one millisecond; 1 and 3 set the same level to different
+    # sizes, so their order decides the book. pc has the whole group, vm1 lost
+    # the first message, vm3 lost the middle, vm4 the last.
+    group = [
+        change(T0, "0.40", "10"),
+        change(T0, "0.39", "7"),
+        change(T0, "0.40", "0"),
+        change(T0, "0.38", "3"),
+    ]
+    partials = {"vm1": group[1:], "vm3": [group[0], group[1], group[3]], "vm4": group[:3]}
+    streams = [stream("pc", group)] + [stream(copy, part) for copy, part in partials.items()]
+    merged, stats = merge(streams)
+    assert contents(merged) == group
+    assert stats.order_conflicts == stats.ambiguous_insertions == 0
+    assert merged[0].copies == ("pc", "vm3", "vm4")
+
+
+def test_group_split_between_copies_is_joined_in_order():
+    group = [change(T0, "0.40", str(size)) for size in (1, 2, 3, 4)]
+    # Neither copy holds the whole group: pc has 1,2,3 and vm1 has 2,3,4.
+    merged, stats = merge([stream("pc", group[:3]), stream("vm1", group[1:])])
+    assert contents(merged) == group
+    assert stats.ambiguous_insertions == 0
+
+
+def test_order_disagreement_inside_a_timestamp_is_counted_and_base_order_wins():
+    x, y, z = (change(T0, "0.40", size) for size in ("1", "2", "3"))
+    merged, stats = merge([stream("pc", [x, y, z]), stream("vm1", [y, x])])
+    # pc holds more of the group, so its order is the base.
+    assert contents(merged) == [x, y, z]
+    assert stats.order_conflicts == 1
+    assert stats.conflict_examples[0]["copy"] == "vm1"
+    assert merged[0].copies == ("pc",)  # vm1's conflicting x is not attached
+    with pytest.raises(CopyMergeError, match="disagree"):
+        merge([stream("pc", [x, y, z]), stream("vm1", [y, x])], strict_order=True)
+
+
+def test_messages_each_copy_lacks_in_one_gap_are_ordered_by_convention():
+    a, b, c, d = (change(T0, "0.40", size) for size in ("1", "2", "3", "4"))
+    # pc: a b d, vm1: a c d. The order of b and c is unknown; base first.
+    merged, stats = merge([stream("pc", [a, b, d]), stream("vm1", [a, c, d])])
+    assert contents(merged) == [a, b, c, d]
+    assert stats.ambiguous_insertions == 1 and stats.order_conflicts == 0
+
+
+def test_input_order_and_scope_split_do_not_change_the_output():
+    def copy_streams():
+        pc = [change(T0, "0.40", "1", market="A"), change(T0, "0.50", "1", market="B"),
+              change(T0, "0.41", "2", market="A"), book(T0 + 3, [("0.41", "2")], market="A")]
+        vm1 = [change(T0, "0.50", "1", market="B"), change(T0, "0.40", "1", market="A"),
+               change(T0 + 9, "0.51", "6", market="B")]
+        vm3 = [change(T0, "0.41", "2", market="A"), change(T0 + 9, "0.51", "6", market="B")]
+        return {"pc": pc, "vm1": vm1, "vm3": vm3}
+
+    def run(order, keep=None):
+        data = copy_streams()
+        streams = [
+            stream(copy, [m for m in data[copy] if keep is None or m["market"] == keep])
+            for copy in order
+        ]
+        return [(m.content_digest, m.copies, m.order_ms) for m in merge(streams)[0]]
+
+    reference = run(["pc", "vm1", "vm3"])
+    for order in itertools.permutations(["pc", "vm1", "vm3"]):
+        assert run(list(order)) == reference
+    # Cross-market order inside a millisecond is by scope (A before B), so
+    # merging each market alone and interleaving by (order_ms, scope) agrees
+    # (no message here is late).
+    split = sorted(run(["pc", "vm1", "vm3"], "A") + run(["pc", "vm1", "vm3"], "B"),
+                   key=lambda row: row[2])
+    assert sorted(reference, key=lambda row: row[2]) == split
+
+
+# -- rule 4: reconnect snapshots and late messages --------------------------------
+
+
+def test_reconnect_snapshot_is_placed_at_its_own_timestamp():
+    before = change(T0, "0.40", "10")
+    after = change(T0 + 1_000, "0.39", "5")
+    snapshot = book(T0, [("0.40", "10")])
+    # vm1 reconnects; the venue's snapshot carries the time of the last change
+    # (T0) and arrives 3 s later, after pc already received ``after``.
+    pc = stream("pc", [before, after])
+    vm1 = stream("vm1", [(T0 + 3_000, snapshot)])
+    vm1 = [Occurrence(**{**_fields(o), "reconnect_snapshot": True}) for o in vm1]
+    merged, stats = merge([pc, vm1])
+    assert contents(merged) == [before, snapshot, after]
+    assert merged[1].checkpoint and merged[1].reconnect_snapshot and not merged[1].late
+    assert stats.late_messages == 0
+
+
+def _fields(occurrence):
+    return {name: getattr(occurrence, name) for name in Occurrence.__slots__}
+
+
+def test_snapshot_older_than_lateness_is_flagged_late_and_kept_once():
+    quiet = book(T0, [("0.40", "10")])
+    later = change(T0 + 200_000, "0.39", "5")
+    # Both copies reconnect long after the token last changed (T0): each gets
+    # the same snapshot, 150 s and 170 s after its timestamp.
+    merged, stats = merge(
+        [
+            stream("pc", [(T0 + 150_000, quiet), later]),
+            stream("vm1", [(T0 + 170_000, quiet)]),
+        ],
+        lateness_ms=60_000,
+    )
+    assert contents(merged) == [quiet, later]
+    first = merged[0]
+    assert first.late and first.venue_ts_ms == T0
+    # Placed where the merge could still place it: receive time minus lateness.
+    assert first.order_ms == T0 + 150_000 - 60_000
+    assert stats.late_messages == 1 and stats.repeats_after_emit == 1
+    assert stats.late_by_copy == {"pc": 1}
+
+
+def test_untimed_kalshi_messages_match_by_content_and_sending_time():
+    def lifecycle(sid, seq, sent):
+        return {"type": "market_lifecycle_v2", "sid": sid, "seq": seq,
+                "msg": {"market_ticker": "K", "event_type": "settled", "settled_ts": 1},
+                "sending_ts_ms": sent}
+
+    pc = stream("pc", [lifecycle(3, 1, T0), lifecycle(3, 2, T0 + 300)], connection="kalshi_00")
+    vm1 = stream("vm1", [lifecycle(5, 7, T0 + 2)], connection="kalshi_00")
+    merged, stats = merge([pc, vm1], venue="kalshi")
+    # pc received it twice (a venue repeat), vm1 once: kept twice.
+    assert [m.copies for m in merged] == [("pc", "vm1"), ("pc",)]
+    assert [m.order_ms for m in merged] == [T0, T0 + 300]
+    assert all(m.venue_ts_ms is None for m in merged)
+    assert stats.untimed_messages == 2
+
+
+# -- coverage ---------------------------------------------------------------------
+
+
+def _utc(ms):
+    return (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ms)).isoformat()
+
+
+def record(root, monkeypatch, venue, frames, *, seal_after=()):
+    """Write a session with ChunkWriter; frames are (ms, frame_type, payload, generation, direction)."""
+    root.mkdir(parents=True)
+    writer = ChunkWriter(root, "rec-" + root.name, venue, root.parent.name)
+    times = iter([_utc(ms) for ms, *_ in frames])
+    monkeypatch.setattr(raw_capture, "utc", lambda: next(times))
+    for index, (_, frame_type, payload, generation, direction) in enumerate(frames):
+        writer.write(frame_type, payload, generation, direction)
+        if index in seal_after:
+            writer.seal()
+    writer.seal()
+
+
+def text(ms, message, generation=1):
+    return (ms, "text", json.dumps(message, separators=(",", ":")), generation, "received")
+
+
+def test_recordings_with_a_hole_in_every_copy_report_uncovered_time(tmp_path, monkeypatch):
+    sub = '{"assets_ids":["yes"],"type":"market"}'
+    c = [change(T0 + i * 1_000, "0.40", str(i + 1)) for i in range(10)]
+    snap = book(T0 + 6_500, [("0.40", "7")])
+    # pc: connected 0-4 s, transport error, reconnects at 6.5 s (snapshot).
+    record(tmp_path / "pc" / "polymarket_00" / "20261103T000000Z_aaaa0001", monkeypatch, "polymarket", [
+        (T0 - 100, "subscription", sub, 1, "sent"),
+        *[text(T0 + i * 1_000 + 20, c[i]) for i in range(5)],
+        (T0 + 4_500, "transport_error", "ConnectionClosed", 1, "local"),
+        (T0 + 6_000, "subscription", sub, 2, "sent"),
+        text(T0 + 6_600, snap, 2),
+        *[text(T0 + i * 1_000 + 20, c[i], 2) for i in range(7, 10)],
+    ])
+    # vm1: chunk 2 (c[3]..c[6]) is lost.
+    vm1 = tmp_path / "vm1" / "polymarket_00" / "20261103T000000Z_bbbb0001"
+    record(vm1, monkeypatch, "polymarket", [
+        (T0 - 100, "subscription", sub, 1, "sent"),
+        *[text(T0 + i * 1_000 + 40, c[i]) for i in range(10)],
+    ], seal_after=(3, 7))
+    (vm1 / "chunk_000002.jsonl.gz").unlink()
+    (vm1 / "chunk_000002.jsonl.gz.manifest.json").unlink()
+
+    coverage = []
+    found = discover_sessions({"vm1": tmp_path / "vm1", "pc": tmp_path / "pc"})
+    streams = [
+        connection_occurrences(copy, connection, sessions, coverage=coverage)
+        for (copy, connection), sessions in found.items()
+    ]
+    merged, stats = merge(streams)
+    # c[5] and c[6] were sent while neither copy was connected.
+    assert contents(merged) == c[:5] + [snap] + c[7:]
+    assert merged[5].reconnect_snapshot and merged[5].copies == ("pc",)
+    assert [m.copies for m in merged[:5]] == [("pc", "vm1")] * 3 + [("pc",)] * 2
+
+    by_copy = {s.copy: s for s in coverage}
+    us = 1_000
+    assert [(i.start_us, i.end_us, i.end_reason) for i in by_copy["pc"].intervals] == [
+        ((T0 + 20) * us, (T0 + 4_020) * us, "transport_error"),
+        ((T0 + 6_600) * us, (T0 + 9_020) * us, "session_end"),
+    ]
+    assert [(i.start_us, i.end_us, i.end_reason, i.start_reason) for i in by_copy["vm1"].intervals] == [
+        ((T0 + 40) * us, (T0 + 2_040) * us, "chunk_gap", "session_start"),
+        ((T0 + 7_040) * us, (T0 + 9_040) * us, "session_end", "after_gap"),
+    ]
+    assert by_copy["vm1"].chunk_gaps == 1 and by_copy["pc"].transport_errors == 1
+    holes = uncovered_intervals(
+        [i for s in coverage for i in s.intervals], T0 * us, (T0 + 10_000) * us
+    )
+    assert holes == [
+        (T0 * us, (T0 + 20) * us),
+        ((T0 + 4_020) * us, (T0 + 6_600) * us),
+        ((T0 + 9_040) * us, (T0 + 10_000) * us),
+    ]
+
+
+def test_kalshi_sequence_gap_splits_coverage():
+    tracker = CoverageTracker("pc", "kalshi_00", "s1")
+    for ms, seq in ((0, 1), (10, 2), (20, 5), (30, 6)):
+        tracker.frame(ms * 1_000, 1, "text", "received")
+        tracker.sequence(1, seq)
+    tracker.frame(40_000, 2, "text", "received")
+    tracker.sequence(1, 1)  # new generation restarts the counter
+    result = tracker.finish()
+    assert [(i.start_us, i.end_us, i.end_reason) for i in result.intervals] == [
+        (0, 10_000, "seq_gap"),
+        (20_000, 30_000, "new_generation"),
+        (40_000, 40_000, "session_end"),
+    ]
+    assert result.seq_gaps == 1
+
+
+def test_utc_microseconds_is_exact():
+    assert utc_microseconds("2026-11-03T02:34:43.273921+00:00") == 1_793_673_283_273_921
+
+
+# -- book check -------------------------------------------------------------------
+
+
+def test_book_check_rebuilds_books_and_compares_snapshots():
+    messages = [
+        book(T0, [("0.40", "10")], [("0.60", "5")]),
+        change(T0 + 1, "0.40", "0"),
+        change(T0 + 1, "0.41", "3"),
+        book(T0 + 1, [("0.41", "3")], [("0.60", "5")]),
+        book(T0 + 2, [("0.41", "4")], [("0.60", "5")]),  # wrong on purpose
+    ]
+    merged, _ = merge([stream("pc", messages)])
+    result = check_merged_books("polymarket", merged)
+    assert (result.full_books, result.compared, result.equal) == (3, 2, 1)
+    assert result.mismatch_examples[0]["differing_levels"] == 1
+
+    snapshot = {"type": "orderbook_snapshot", "sid": 1, "seq": 1, "sending_ts_ms": T0,
+                "msg": {"market_ticker": "K", "yes_dollars_fp": [["0.40", "5.00"]], "no_dollars_fp": [], "ts_ms": T0}}
+    again = {**snapshot, "seq": 3, "msg": {**snapshot["msg"], "yes_dollars_fp": [["0.40", "3.00"]], "ts_ms": T0 + 9}}
+    merged, _ = merge(
+        [stream("pc", [snapshot, delta(T0 + 5, "0.40", "-2.00", seq=2), again], connection="kalshi_00")],
+        venue="kalshi",
+    )
+    result = check_merged_books("kalshi", merged)
+    assert (result.full_books, result.compared, result.equal) == (2, 1, 1)
+
+
+def test_streams_must_be_unique_and_consistent():
+    x = change(T0, "0.40", "1")
+    with pytest.raises(CopyMergeError, match="two input streams"):
+        merge([stream("pc", [x]), stream("pc", [x])])
+    mixed = stream("pc", [x]) + stream("vm1", [change(T0 + 1, "0.40", "2")])
+    with pytest.raises(CopyMergeError, match="yielded an occurrence"):
+        merge([mixed])
