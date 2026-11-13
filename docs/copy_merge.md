@@ -182,8 +182,9 @@ otherwise:
   time on either side of the receive clock (messages stamped further ahead are
   handled as late); `stats.max_pending_occurrences` reports the peak. Digests of
   emitted messages are kept for `retention_ms` past the later of their place and
-  their own time, so a copy with a clock far behind costs digest memory in
-  proportion to its error (visible in `stats.future_messages`). For Kalshi, one
+  their own time (venue time, or sending time for untimed messages, including a
+  Kalshi snapshot placed earlier by its clock), so a copy with a clock far
+  behind costs digest memory in proportion to its error (visible in `stats.future_messages`). For Kalshi, one
   clock per market seen is kept.
 
 ## Conventions chosen here (owner to confirm)

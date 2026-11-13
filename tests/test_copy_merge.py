@@ -779,3 +779,20 @@ def test_preferred_copies_decide_remaining_disagreements_and_free_choices():
         CopyMerge("polymarket", preferred_copies=("a", "a"))
     with pytest.raises(ValueError, match="distinct"):
         CopyMerge("polymarket", preferred_copies="ab")
+
+
+def test_clock_placed_snapshot_is_remembered_from_its_sending_time():
+    # b's copy of the snapshot (placed by clock at T+100, sent at T+150/151)
+    # arrives when the flush point is past the placement plus retention but
+    # not past the sending time plus retention: it is the same message.
+    snap = ksnap(T0 + 150, [("0.50", "5")], 5)
+    first, last = delta(T0 + 100, "0.50", "3", clock=6), delta(T0 + 300, "0.50", "3", clock=7, seq=3)
+    a = stream("a", [(T0 + 160, snap), (T0 + 400, last)], connection="kalshi_00")
+    b = stream("b", [(T0 + 105, first), (T0 + 215, {**snap, "sending_ts_ms": T0 + 151}),
+                     (T0 + 401, {**last, "sid": 2})], connection="kalshi_00")
+    merged, stats = merge([a, b], venue="kalshi", lateness_ms=100, retention_ms=10)
+    assert [(m.kind, m.order_ms - T0) for m in merged] == [
+        ("orderbook_snapshot", 100), ("orderbook_delta", 100), ("orderbook_delta", 300)]
+    # Dropped as repeats: b's snapshot and b's delta at T+300 (its group was
+    # flushed by then).
+    assert merged[0].copies == ("a",) and stats.repeats_after_emit == 2

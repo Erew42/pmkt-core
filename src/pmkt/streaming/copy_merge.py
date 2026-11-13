@@ -718,9 +718,10 @@ class CopyMerge:
                     self._pending -= len(entry.origins)
                     self.stats.untimed_messages += 1
                     # Matching later occurrences uses the sending time, even
-                    # when the clock placed the snapshot earlier.
+                    # when the clock placed the snapshot earlier; so does
+                    # retention, which runs from the later of the two.
                     record = _Emitted(entry.order_ms, order_ms, set(entry.streams))
-                    self._remember(entry.key.digest, order_ms, record)
+                    self._remember(entry.key.digest, max(order_ms, entry.order_ms), record)
                 else:
                     self._remember(entry.key.digest, order_ms, None)
                 yield self._message(entry, order_ms, late=False)
