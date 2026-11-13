@@ -26,7 +26,7 @@ streams = [
 merger = CopyMerge("polymarket")
 for message in merger.merge(streams):
     message.order_ms, message.kind, message.scope, message.message
-    message.copies, message.origin, message.late, message.checkpoint
+    message.copies, message.origin, message.late, message.snapshot_class
 print(merger.stats)  # complete once the iterator is exhausted
 holes = uncovered_intervals(
     [i for s in coverage if s.connection in {"polymarket_00", "polymarket_02"} for i in s.intervals],
@@ -52,9 +52,10 @@ receive time; memory holds the lateness window, not the recording.
    content in one stream is the same message as the k-th in another, so a
    content is kept as many times as the stream holding it most often received
    it: a venue repeat survives and a copy of it in a second stream does not add
-   one. A market received on
-   two connections of one copy (Polymarket Yes/No split) is two streams and is
-   merged like two copies.
+   one. When streams miss different repeats (one stream has the first of three
+   equal messages, another the second and third), that count is a lower bound
+   on what the venue sent. A market received on two connections of one copy
+   (Polymarket Yes/No split) is two streams and is merged like two copies.
 2. **Order by venue time.** Polymarket `timestamp`; Kalshi `msg.ts_ms`. Each
    merged message carries the earliest receive time over its occurrences
    (`origin`, `first_received_us`, `first_copy`) and all occurrences
@@ -64,23 +65,98 @@ receive time; memory holds the lateness window, not the recording.
    grouped by (venue timestamp, scope); scope is the Polymarket `market`
    (condition id, which covers both tokens of a `price_change`) and the Kalshi
    `market_ticker` (or `event_ticker`). Each stream's received order inside the
-   group becomes "follows" constraints between its consecutive messages, and the
-   group is output in an order that satisfies all of them (a topological sort).
-   So messages are never sorted by content or combined, and the order evidence
-   of all copies is used together: if one copy has `a b d e`, another `a c d`
-   and a third `a c b`, the result is `a c b d e`. Streams are ranked by how
-   many messages of the group they hold (ties: smaller copy, then connection
-   name); that rank decides disagreements and free choices (below). Messages
-   without venue time placed at the same millisecond and scope are ordered in
-   the same sort, together with the timed messages there, by each stream's
-   input order.
+   group becomes "follows" constraints, and the group is output in an order
+   that satisfies all of them (a topological sort). So messages are never
+   sorted by content or combined, and the order evidence of all copies is used
+   together: if one copy has `a b d e`, another `a c d` and a third `a c b`,
+   the result is `a c b d e`. Constraints are added in order of strength (see
+   *Constraint priority* under the conventions): Kalshi clock order, then the
+   order between book changes from every stream, then all other pairs.
+   Messages without venue time placed at the same millisecond and scope are
+   ordered in the same sort, together with the timed messages there, by each
+   stream's input order.
 4. **Full books are checkpoints.** Polymarket `book` and Kalshi
-   `orderbook_snapshot` have `checkpoint=True` and are placed at their own
-   timestamp like any message. Where no stream's order decides between a full
-   book and another message of its group, the other message goes first, since
-   a full book includes the changes stamped with its own timestamp. `reconnect_snapshot=True` marks a book sent in
-   reply to a (re)subscribe: every Kalshi snapshot, and a Polymarket book that is
-   the first of its `asset_id` after the generation's last sent subscription.
+   `orderbook_snapshot` have `checkpoint=True`. A Polymarket book is placed at
+   its own timestamp like any message; where no stream's order decides between
+   it and another message of its group, the other message goes first, since a
+   full book includes the changes stamped with its own timestamp. Kalshi
+   snapshots carry no venue time and are placed by their `clock` (next
+   section). `snapshot_class` tells the kinds of full book apart.
+
+## Kalshi snapshots and `clock`
+
+Kalshi `orderbook_snapshot` messages carry no `ts_ms` (none of 24,670 in the
+2026 recording), only the connection's `sending_ts_ms` and the market's
+exchange `clock`. Kalshi documents the `clock` as the same on every
+connection: a snapshot includes every change with a `clock` at or below its
+own, and the deltas after it on that connection have higher clocks. Placing a
+snapshot at its sending time would put it after deltas stamped earlier but not
+included in it, and a replay would then overwrite those deltas.
+
+The rule: a snapshot with a positive `clock` C comes after every delta of its
+market with clock at or below C and before every delta with a higher clock.
+It is implemented in streaming form:
+
+- When the snapshot arrives, it is held per market. Every group of the market
+  before the flush point is already emitted.
+- While the merge emits that market's groups in time order, the snapshot goes
+  into the first group that holds a delta with a clock above C, before that
+  delta and after the group's deltas with clock at or below C. Its `order_ms`
+  is that group's millisecond.
+- If no such group comes before its sending time, it is placed at its sending
+  time, ordered against the deltas of that millisecond by clock.
+
+Which group a snapshot joins depends only on its own arrival and its market's
+messages, so the result is the same however markets are split across runs.
+Each pending snapshot waits at most until its sending time passes the flush
+point, so memory stays bounded by the lateness window, plus one clock per
+market seen.
+
+Fallbacks, counted in `stats.snapshot_clock_fallbacks` by reason; such a
+snapshot is placed at its sending time as an untimed message (see the
+conventions):
+
+- `zero`: clock 0, which Kalshi sends for a market without a recorded change.
+  Every clock-0 snapshot checked in the recording was an empty book. The rule
+  would move such a snapshot before any pending delta of its market; that is
+  wrong if it is the empty book of a determined market, so it stays at its
+  sending time.
+- `missing`: no integer `clock`.
+- `decreased`: a clock below the clock of the last book message of its market
+  already emitted, such as after exchange maintenance (Kalshi documents that
+  the clock may decrease then) or a snapshot that arrived after its place.
+
+`stats.snapshots_by_clock` counts the snapshots placed by clock. Late snapshots
+(older than `lateness_ms` on arrival) follow the late rule and are in neither
+count. `stats.clock_regressions` counts emitted deltas whose clock is below the
+previous delta of their market, or not above a clock-placed snapshot before
+them: deltas the clock rule could not keep in order, for example after
+maintenance or a delta stamped after the sending time of a snapshot that
+includes it. Deltas among themselves keep their venue-time and received order;
+the clock only places snapshots. A Kalshi snapshot that does carry `ts_ms` is
+treated like other timed messages.
+
+**Limit: real-time subscriptions only.** The rule relies on the documented
+`clock` semantics of real-time subscriptions. Conflated subscriptions
+(`update_interval_ms`) have different rules and are not supported: neither
+deduplication nor ordering is defined for them, and `session_occurrences`
+raises `CopyMergeError` on a sent Kalshi subscription with
+`update_interval_ms`. The core raw recorder subscribes in real time
+(`channels`, `market_tickers`, `use_yes_price`). Callers that build
+`Occurrence`s from another store must check this themselves.
+
+## Snapshot classes
+
+`MergedMessage.snapshot_class` is `None` for messages that are not full books,
+otherwise:
+
+- `reconnect`: in some occurrence, the first full book of its instrument
+  (Polymarket `asset_id`, Kalshi `market_ticker`) after the connection
+  generation's last sent subscription (`reconnect_snapshot=True`). Later Kalshi
+  snapshots are no longer marked reconnect.
+- `empty`: not a reconnect snapshot, and no price levels; Kalshi sends one when
+  a market is determined, before removing it from the subscription.
+- `later`: any other full book, such as a Polymarket `book` after a trade.
 
 ## Guarantees
 
@@ -97,13 +173,18 @@ receive time; memory holds the lateness window, not the recording.
   identical content is merged. Occurrences are dropped only as counted repeats
   of already emitted content (`repeats_after_emit`).
 - **Ordered output.** `order_ms` never decreases. For a message that is not
-  late and has a venue timestamp, `order_ms` is that timestamp.
+  late and has a venue timestamp, `order_ms` is that timestamp. For late
+  messages, untimed messages and Kalshi snapshots, `order_ms` is a processing
+  order (receive time minus `lateness_ms`, sending time, or the millisecond of
+  the group a snapshot joined), not the time of the event; read `venue_ts_ms`
+  and the message's own fields for that.
 - **Bounded memory.** Pending messages cover at most `lateness_ms` of venue
   time on either side of the receive clock (messages stamped further ahead are
   handled as late); `stats.max_pending_occurrences` reports the peak. Digests of
   emitted messages are kept for `retention_ms` past the later of their place and
   their own time, so a copy with a clock far behind costs digest memory in
-  proportion to its error (visible in `stats.future_messages`).
+  proportion to its error (visible in `stats.future_messages`). For Kalshi, one
+  clock per market seen is kept.
 
 ## Conventions chosen here (owner to confirm)
 
@@ -111,14 +192,36 @@ receive time; memory holds the lateness window, not the recording.
   ticker), not by receipt: copies interleave markets differently, so no copy's
   interleaving is authoritative. Kalshi book, trade and lifecycle messages of
   one market share a scope and keep their received order.
+- **Constraint priority.** Inside one group, "a before b" constraints are
+  added in this order, and one that would contradict those already added (a
+  cycle) is skipped:
+  1. Kalshi clock order between snapshots and deltas (never skipped).
+  2. For each stream in rank order, the order of its consecutive book changes
+     (Polymarket `price_change` and `book`; Kalshi `orderbook_delta` and
+     `orderbook_snapshot`), skipping the other messages between them.
+  3. For each stream in rank order, its remaining consecutive pairs (trades,
+     quotes, lifecycle and acknowledgements against anything).
+
+  So trade placements seen by two streams cannot overturn the order of two book
+  changes that a third stream received directly. In the 2026 recording, copies
+  never disagreed on the order of book changes; every disagreement involved a
+  trade.
+- **Stream rank.** Streams are ranked by how many messages of the group they
+  hold, then by the caller's `preferred_copies` (listed copies in list order,
+  unlisted ones after them), then by copy and connection name. The rank decides
+  the disagreements that remain after the evidence above, and free choices. It
+  is a caller policy, not evidence, and core names no machines. For example, a
+  caller who trusts different recorders for each venue runs
+  `CopyMerge("polymarket", preferred_copies=("copy_b", "copy_a", "copy_c"))`
+  and `CopyMerge("kalshi", preferred_copies=("copy_a", "copy_b", "copy_c"))`.
 - **Disagreement inside a timestamp** (two streams order the same messages
-  differently): constraints are added stream by stream in rank order, and one
-  that contradicts those already added is skipped (only that one: the stream's
-  next constraint still starts from the skipped message). The higher-ranked order wins;
-  the occurrence is still attached to its message. Each skipped constraint is
-  counted in `stats.order_conflicts`, with up to 20 examples in
-  `stats.conflict_examples`. `CopyMerge(strict_order=True)` raises
-  `CopyMergeError` instead.
+  differently): only the skipped constraint is lost; the stream's next
+  constraint still starts from the skipped message, and the occurrence is still
+  attached to its message. Each skipped constraint is counted in
+  `stats.order_conflicts`, split into `stats.book_order_conflicts` (between two
+  book changes) and `stats.other_order_conflicts`, with up to 20 examples in
+  `stats.conflict_examples` (`book_changes` tells which).
+  `CopyMerge(strict_order=True)` raises `CopyMergeError` instead.
 - **Free choices** (stream A has `a b d`, stream B has `a c d`: nothing says
   whether `b` or `c` came first): a non-checkpoint comes before a checkpoint,
   then the message first seen in the higher-ranked stream. Each such choice is
@@ -134,9 +237,9 @@ receive time; memory holds the lateness window, not the recording.
   before its arrival does not contradict that token's book. A copy whose clock
   runs ahead by more than `lateness_ms` shows up in `stats.late_by_copy`.
 - **Messages without venue time** (Kalshi `market_lifecycle_v2`,
-  `event_lifecycle`, subscription acknowledgements, and Kalshi snapshots if
-  they lack `ts_ms`) are placed at Kalshi's `sending_ts_ms` (Polymarket: receive
-  time). Occurrences with equal content from different streams within
+  `event_lifecycle`, subscription acknowledgements, and Kalshi snapshots that
+  fall back from the clock rule) are placed at Kalshi's `sending_ts_ms`
+  (Polymarket: receive time). Occurrences with equal content from different streams within
   `untimed_match_ms` (default 5 s) are one message; a second occurrence in the
   same stream is a repeat. Placement uses the earliest sending time, so untimed
   messages of one scope that are closer together than the skew between
@@ -152,7 +255,11 @@ receive time; memory holds the lateness window, not the recording.
   choices) and the order across markets are conventions, not facts.
 - Repeats are matched by count: if a stream lacks the first of two equal
   messages, its occurrence is taken as the first. This affects provenance and,
-  rarely, order constraints, never the number of messages kept.
+  rarely, order constraints. The number kept is the largest count in any one
+  stream, a lower bound on what the venue sent when streams miss different
+  repeats.
+- Kalshi clock placement covers snapshots against deltas of real-time
+  subscriptions only; see its fallbacks and `clock_regressions`.
 - Periods that no copy covered are reported, not represented in the stream: the
   merged stream simply has no messages there, and books rebuilt across such a
   period are wrong until the next full book.

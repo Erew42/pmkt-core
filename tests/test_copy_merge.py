@@ -55,14 +55,14 @@ def book(ts, bids, asks=(), *, market="M", token="yes"):
     }
 
 
-def delta(ts, price, amount, *, sid=1, seq=1, sent=None, ticker="K"):
+def delta(ts, price, amount, *, sid=1, seq=1, sent=None, ticker="K", clock=None):
     return {
         "type": "orderbook_delta",
         "sid": sid,
         "seq": seq,
         "msg": {
             "market_ticker": ticker,
-            "clock": ts,
+            "clock": ts if clock is None else clock,
             "price_dollars": price,
             "delta_fp": amount,
             "side": "yes",
@@ -564,3 +564,218 @@ def test_streams_must_be_unique_and_consistent():
     mixed = stream("pc", [x]) + stream("vm1", [change(T0 + 1, "0.40", "2")])
     with pytest.raises(CopyMergeError, match="yielded an occurrence"):
         merge([mixed])
+
+
+# -- superseded untimed placements --------------------------------------------------
+
+
+def test_untimed_message_moved_earlier_leaves_no_empty_group():
+    # The copy that sent it earlier received it later: the pending message moves
+    # to the earlier sending time, and its first placement must be skipped.
+    x = lifecycle(3, 1, T0 + 100, "created")
+    merged, stats = merge(
+        [
+            stream("a", [(T0 + 110, x)], connection="kalshi_00"),
+            stream("b", [(T0 + 120, {**x, "sid": 5, "sending_ts_ms": T0 + 90})], connection="kalshi_00"),
+        ],
+        venue="kalshi",
+    )
+    assert len(merged) == 1 and merged[0].order_ms == T0 + 90
+    assert merged[0].copies == ("a", "b") and stats.untimed_messages == 1
+
+
+def test_untimed_message_moved_earlier_keeps_its_neighbours():
+    # Other messages share both the old and the new (millisecond, market).
+    x = lifecycle(3, 1, T0 + 100, "created")
+    y = lifecycle(3, 2, T0 + 100, "activated")
+    n = lifecycle(5, 1, T0 + 90, "deactivated")
+    trade = {"type": "trade", "sid": 2, "seq": 1, "sending_ts_ms": T0 + 101,
+             "msg": {"market_ticker": "K", "yes_price_dollars": "0.40", "count_fp": "1.00",
+                     "taker_side": "yes", "ts_ms": T0 + 100}}
+    a = stream("a", [(T0 + 110, x), (T0 + 111, trade), (T0 + 112, y)], connection="kalshi_00")
+    b = stream("b", [(T0 + 115, n), (T0 + 120, {**x, "sid": 5, "seq": 2, "sending_ts_ms": T0 + 90})],
+               connection="kalshi_00")
+    merged, stats = merge([a, b], venue="kalshi")
+    assert [(m.order_ms - T0, m.message["msg"].get("event_type", "trade")) for m in merged] == [
+        (90, "deactivated"), (90, "created"), (100, "trade"), (100, "activated"),
+    ]
+    assert merged[1].copies == ("a", "b") and stats.messages == 4
+
+
+# -- Kalshi snapshots by clock ------------------------------------------------------
+
+
+def ksnap(sent, levels, clock, *, seq=1, sid=1, ticker="K"):
+    """A Kalshi snapshot as recorded: no ts_ms, only the sending time and clock."""
+    body = {"market_ticker": ticker, "yes_dollars_fp": [[p, s] for p, s in levels]}
+    if clock is not None:
+        body["clock"] = clock
+    return {"type": "orderbook_snapshot", "sid": sid, "seq": seq, "sending_ts_ms": sent, "msg": body}
+
+
+def test_snapshot_comes_before_an_earlier_stamped_delta_with_a_higher_clock():
+    # One connection: snapshot (clock 10, sent T+110), then a delta stamped
+    # T+105 with clock 11 (not in the snapshot), then a snapshot with clock 11.
+    first, change_ = ksnap(T0 + 110, [("0.50", "5")], 10), delta(T0 + 105, "0.50", "3", seq=2, clock=11, sent=T0 + 120)
+    second = ksnap(T0 + 200, [("0.50", "8")], 11, seq=3)
+    merged, stats = merge(
+        [stream("a", [(T0 + 111, first), (T0 + 121, change_), (T0 + 201, second)], connection="kalshi_00")],
+        venue="kalshi",
+    )
+    assert contents(merged) == [first, change_, second]
+    assert [m.order_ms - T0 for m in merged] == [105, 105, 200]
+    assert stats.snapshots_by_clock == 2 and stats.clock_regressions == 0
+    assert (check_merged_books("kalshi", merged).compared, check_merged_books("kalshi", merged).equal) == (1, 1)
+
+
+def test_reconnect_snapshot_of_one_copy_sits_between_the_deltas_of_another_by_clock():
+    deltas = [
+        delta(T0 + 100, "0.40", "5", seq=1, clock=5),
+        delta(T0 + 105, "0.40", "2", seq=2, clock=6),
+        delta(T0 + 105, "0.41", "1", seq=3, clock=7),
+        delta(T0 + 108, "0.40", "-1", seq=4, clock=8),
+    ]
+    # Copy b reconnects: its snapshot includes clock 6 and is sent at T+110,
+    # after the deltas with clocks 7 and 8, which it received after it.
+    snap = ksnap(T0 + 110, [("0.40", "7")], 6)
+    a = stream("a", deltas, connection="kalshi_00")
+    b = stream("b", [(T0 + 111, snap), (T0 + 115, {**deltas[2], "sid": 4}), (T0 + 116, {**deltas[3], "sid": 4})],
+               connection="kalshi_00")
+    b = [Occurrence(**{**_fields(o), "reconnect_snapshot": o.message is snap}) for o in b]
+    merged, stats = merge([a, b], venue="kalshi")
+    assert [m.message["msg"] for m in merged] == [m["msg"] for m in deltas[:2] + [snap] + deltas[2:]]
+    assert merged[2].order_ms == T0 + 105 and merged[2].snapshot_class == "reconnect"
+    assert stats.snapshots_by_clock == 1 and stats.order_conflicts == 0
+    # Without its clock the same snapshot would sit at its sending time.
+    unclocked = {**snap, "msg": {k: v for k, v in snap["msg"].items() if k != "clock"}}
+    b2 = [Occurrence(**{**_fields(o), "message": unclocked}) if o.message is snap else o for o in b]
+    merged, stats = merge([a, b2], venue="kalshi")
+    assert [m.message["msg"] for m in merged] == [m["msg"] for m in deltas + [unclocked]]
+    assert stats.snapshot_clock_fallbacks == {"missing": 1}
+
+
+def test_snapshot_clock_fallbacks_are_counted():
+    # Clock 0: an empty book of a market without changes, placed at sending time.
+    empty = ksnap(T0 + 50, [], 0)
+    later = delta(T0 + 10, "0.40", "1", clock=3)
+    merged, stats = merge([stream("a", [(T0 + 60, empty), later], connection="kalshi_00")], venue="kalshi")
+    assert contents(merged) == [later, empty]
+    assert stats.snapshot_clock_fallbacks == {"zero": 1} and stats.snapshots_by_clock == 0
+    assert merged[1].snapshot_class == "empty"
+
+    # A clock below the last emitted delta of the market (e.g. maintenance).
+    old = delta(T0, "0.40", "1", clock=50)
+    snap = ksnap(T0 + 2_000, [("0.40", "1")], 3)
+    after = delta(T0 + 2_005, "0.40", "1", clock=4, seq=2)
+    merged, stats = merge(
+        [stream("a", [old, (T0 + 2_001, snap), after], connection="kalshi_00")],
+        venue="kalshi", lateness_ms=1_000,
+    )
+    assert contents(merged) == [old, snap, after]
+    assert stats.snapshot_clock_fallbacks == {"decreased": 1} and stats.clock_regressions == 1
+
+
+def test_delta_included_in_a_snapshot_but_stamped_after_it_is_counted():
+    snap = ksnap(T0 + 110, [("0.40", "1")], 6)
+    included = delta(T0 + 115, "0.40", "1", clock=6)
+    merged, stats = merge([stream("a", [(T0 + 111, snap), included], connection="kalshi_00")], venue="kalshi")
+    assert contents(merged) == [snap, included]
+    assert stats.clock_regressions == 1
+
+
+def test_clock_placement_does_not_depend_on_other_markets():
+    # With a 10 ms lateness window, J's messages move the flush point past K's
+    # delta before K's snapshot arrives; merging K alone must give the same.
+    k = [(T0 + 105, delta(T0 + 100, "0.40", "1", clock=7)),
+         (T0 + 113, ksnap(T0 + 103, [("0.40", "1")], 6, seq=2)),
+         (T0 + 125, delta(T0 + 120, "0.40", "1", clock=8, seq=3))]
+    j = [(T0 + 111, delta(T0 + 101, "0.30", "1", clock=1, ticker="J")),
+         (T0 + 112, ksnap(T0 + 112, [("0.30", "1")], 1, ticker="J", seq=2)),
+         (T0 + 114, delta(T0 + 110, "0.30", "1", clock=2, ticker="J", seq=3))]
+
+    def rows(*tickers):
+        items = sorted((item for t in tickers for item in {"K": k, "J": j}[t]), key=lambda i: i[0])
+        merged, stats = merge([stream("a", items, connection="kalshi_00")], venue="kalshi", lateness_ms=10)
+        return [(m.scope, m.kind, m.order_ms - T0) for m in merged], stats
+
+    together, stats = rows("K", "J")
+    assert [r for r in together if r[0] == "J"] == [
+        ("J", "orderbook_delta", 101), ("J", "orderbook_snapshot", 110), ("J", "orderbook_delta", 110)]
+    assert stats.snapshot_clock_fallbacks == {"decreased": 1} and stats.snapshots_by_clock == 1
+    for ticker in ("K", "J"):
+        assert [r for r in together if r[0] == ticker] == rows(ticker)[0]
+
+
+def test_kalshi_reconnect_snapshots_are_the_first_per_ticker_after_subscribing(tmp_path, monkeypatch):
+    sub = '{"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["K","J"],"use_yes_price":true}}'
+    session = tmp_path / "pc" / "kalshi_00" / "20261103T000000Z_dddd0001"
+    record(session, monkeypatch, "kalshi", [
+        (T0, "subscription", sub, 1, "sent"),
+        text(T0 + 10, ksnap(T0 + 9, [("0.40", "1")], 4)),
+        text(T0 + 11, ksnap(T0 + 10, [("0.30", "1")], 2, ticker="J", seq=2)),
+        text(T0 + 20, ksnap(T0 + 19, [("0.40", "2")], 5, seq=3)),
+        text(T0 + 30, ksnap(T0 + 29, [], 0, seq=4)),
+        (T0 + 40, "subscription", sub, 1, "sent"),
+        text(T0 + 50, ksnap(T0 + 49, [("0.40", "2")], 5, seq=5)),
+    ])
+    occurrences = list(connection_occurrences("pc", "kalshi_00", [session]))
+    assert [o.reconnect_snapshot for o in occurrences] == [True, True, False, False, True]
+    merged, _ = merge([occurrences], venue="kalshi")
+    assert [m.snapshot_class for m in merged] == ["reconnect", "reconnect", "later", "empty", "reconnect"]
+
+    conflated = tmp_path / "pc" / "kalshi_01" / "20261103T000000Z_eeee0001"
+    record(conflated, monkeypatch, "kalshi", [
+        (T0, "subscription", sub.replace('"use_yes_price"', '"update_interval_ms":500,"use_yes_price"'), 1, "sent"),
+    ])
+    with pytest.raises(CopyMergeError, match="conflated"):
+        list(connection_occurrences("pc", "kalshi_01", [conflated]))
+
+
+# -- book-change order before trade placement ---------------------------------------
+
+
+def test_trade_constraints_cannot_overturn_the_order_of_book_changes():
+    x, y = change(T0, "0.50", "10", side="SELL"), change(T0, "0.50", "20", side="SELL")
+    trade = {"event_type": "last_trade_price", "market": "M", "asset_id": "yes", "price": "0.5",
+             "size": "1", "side": "BUY", "timestamp": str(T0)}
+    # a: x, trade; b: trade, y; together they imply x before y, but c received
+    # y before x, the only direct evidence on the two book changes.
+    merged, stats = merge([stream("a", [x, trade]), stream("b", [trade, y]), stream("c", [y, x])])
+    assert [m.message.get("price_changes", [{}])[0].get("size", "trade") for m in merged] == ["20", "10", "trade"]
+    assert (stats.book_order_conflicts, stats.other_order_conflicts, stats.order_conflicts) == (0, 1, 1)
+    assert stats.conflict_examples[0]["book_changes"] is False
+
+
+def test_disagreeing_book_changes_are_counted_as_book_conflicts():
+    x, y = change(T0, "0.40", "1"), change(T0, "0.40", "2")
+    _, stats = merge([stream("a", [x, y]), stream("b", [y, x])])
+    assert (stats.book_order_conflicts, stats.other_order_conflicts) == (1, 0)
+
+
+# -- caller preference among copies -------------------------------------------------
+
+
+def test_preferred_copies_decide_remaining_disagreements_and_free_choices():
+    x = change(T0, "0.40", "1")
+    trade = {"event_type": "last_trade_price", "market": "M", "asset_id": "yes", "price": "0.4",
+             "size": "1", "side": "BUY", "timestamp": str(T0)}
+    streams = [stream("a", [x, trade]), stream("b", [trade, x])]
+
+    def kinds(**options):
+        return [m.kind for m in merge(streams, **options)[0]]
+
+    assert kinds() == ["price_change", "last_trade_price"]  # name tie-break: a
+    assert kinds(preferred_copies=("b", "a")) == ["last_trade_price", "price_change"]
+    assert kinds(preferred_copies=("b",)) == ["last_trade_price", "price_change"]
+    # A stream holding more of the group still ranks first.
+    y = change(T0, "0.41", "1")
+    fuller = [stream("a", [x, trade, y]), stream("b", [trade, x])]
+    assert [m.kind for m in merge(fuller, preferred_copies=("b",))[0]][:2] == ["price_change", "last_trade_price"]
+    # Book-change order is evidence, not preference.
+    z = change(T0, "0.40", "2")
+    book_streams = [stream("a", [x, z]), stream("b", [z, x])]
+    assert contents(merge(book_streams, preferred_copies=("b",))[0]) == [z, x]
+    with pytest.raises(ValueError, match="distinct"):
+        CopyMerge("polymarket", preferred_copies=("a", "a"))
+    with pytest.raises(ValueError, match="distinct"):
+        CopyMerge("polymarket", preferred_copies="ab")

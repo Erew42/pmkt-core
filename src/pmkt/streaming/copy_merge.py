@@ -11,9 +11,12 @@ The rules and their limits are documented in ``docs/copy_merge.md``; in short:
    k times (the maximum over streams), so genuine venue repeats survive.
 2. Order by venue time: the stream is ordered by the venue's millisecond
    timestamp. Each message keeps its earliest receive time and that copy.
-3. Within one venue timestamp and one market, the received order is kept.
+3. Within one venue timestamp and one market, the received order is kept;
+   the order between book changes is settled before trades and other messages.
 4. Full books (Polymarket ``book``, Kalshi ``orderbook_snapshot``) are flagged
    as checkpoints and placed at their own timestamp like any other message.
+   Kalshi snapshots carry no timestamp; they are placed by their ``clock``,
+   just before the first delta of their market with a higher clock.
 
 Input is a set of streams of :class:`Occurrence`, one stream per
 (copy, connection), each in receive order. They can come from the raw recorder
@@ -28,7 +31,7 @@ import heapq
 import itertools
 import json
 from collections import Counter
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -50,6 +53,19 @@ VENUES = ("polymarket", "kalshi")
 # Kalshi numbers and stamps these per connection; copies differ only here.
 KALSHI_CONNECTION_FIELDS = frozenset({"sid", "seq", "sending_ts_ms"})
 CHECKPOINT_KINDS = {"polymarket": "book", "kalshi": "orderbook_snapshot"}
+# Messages that change a book. Inside one group, their received order is
+# applied before the order of other messages (trades, quotes, lifecycle).
+BOOK_CHANGE_KINDS = {
+    "polymarket": frozenset({"price_change", "book"}),
+    "kalshi": frozenset({"orderbook_delta", "orderbook_snapshot"}),
+}
+# Price-level fields of a full book (Kalshi: inside ``msg``, any spelling).
+_LADDER_FIELDS = {
+    "book": ("bids", "asks"),
+    "orderbook_snapshot": (
+        "yes_dollars_fp", "yes_dollars", "yes", "no_dollars_fp", "no_dollars", "no",
+    ),
+}
 # A message received more than this after its venue timestamp is "late": it is
 # no longer placed at its own timestamp. Two minutes covers ordinary latency and
 # all but the oldest reconnect snapshots (median 2-4 s, 5% at 43 s or more),
@@ -151,6 +167,22 @@ class MergedMessage:
     def first_copy(self) -> str:
         return self.origin.copy
 
+    @property
+    def snapshot_class(self) -> str | None:
+        """None for a message that is not a full book; otherwise one of
+        "reconnect" (first of its instrument after a sent subscription in some
+        occurrence), "empty" (no price levels, e.g. Kalshi's snapshot when a
+        market is determined) or "later" (any other full book)."""
+        if not self.checkpoint:
+            return None
+        if self.reconnect_snapshot:
+            return "reconnect"
+        body = self.message.get("msg") if self.kind == "orderbook_snapshot" else self.message
+        fields = _LADDER_FIELDS.get(self.kind, ())
+        if isinstance(body, dict) and not any(body.get(name) for name in fields):
+            return "empty"
+        return "later"
+
 
 @dataclass
 class MergeStats:
@@ -164,14 +196,27 @@ class MergeStats:
     future_messages: int = 0
     # Occurrences dropped because their content was already emitted.
     repeats_after_emit: int = 0
-    # Order constraints of a stream that contradicted higher-ranked streams and
-    # were ignored (the occurrence itself is still attached to its message).
+    # Order constraints of a stream that contradicted stronger evidence and
+    # were ignored (the occurrence itself is still attached to its message):
+    # the total, and split into pairs of two book changes and all other pairs.
     order_conflicts: int = 0
+    book_order_conflicts: int = 0
+    other_order_conflicts: int = 0
     # Times when more than one message could come next inside a group, so the
     # order between them is a convention (see docs/copy_merge.md).
     ambiguous_choices: int = 0
     clock_steps_back: int = 0
     max_pending_occurrences: int = 0
+    # Kalshi snapshots placed by their clock, and those placed at their
+    # sending time instead, by reason: "zero" (clock 0, an empty book),
+    # "missing" (no integer clock) or "decreased" (clock below the last book
+    # message of the market already emitted). Late snapshots are in neither.
+    snapshots_by_clock: int = 0
+    snapshot_clock_fallbacks: Counter[str] = field(default_factory=Counter)
+    # Emitted Kalshi deltas whose clock is below the previous emitted delta of
+    # their market, or not above a clock-placed snapshot emitted before them
+    # (exchange maintenance, or venue times that disagree with the clock).
+    clock_regressions: int = 0
     late_by_copy: Counter[str] = field(default_factory=Counter)
     conflict_examples: list[dict[str, Any]] = field(default_factory=list)
 
@@ -182,6 +227,13 @@ def _ms(value: Any) -> int | None:
     if isinstance(value, str) and value.isascii() and value.isdigit():
         return int(value)
     return None
+
+
+def _clock(message: Any) -> int | None:
+    """Kalshi ``msg.clock`` of a book message, or None if it has no integer clock."""
+    msg = message.get("msg") if isinstance(message, dict) else None
+    clock = msg.get("clock") if isinstance(msg, dict) else None
+    return clock if type(clock) is int and clock >= 0 else None
 
 
 def _digest(value: Any) -> bytes:
@@ -262,7 +314,7 @@ class _Entry:
 class _Untimed(_Entry):
     """A pending message without venue time, matched across streams by time."""
 
-    __slots__ = ("order_ms", "streams", "heap_id", "positions")
+    __slots__ = ("order_ms", "streams", "heap_id", "positions", "clock")
 
     def __init__(
         self,
@@ -282,6 +334,8 @@ class _Untimed(_Entry):
         self.heap_id = heap_id
         # (stream, input index, origin) of every occurrence, for ordering.
         self.positions = [(stream, index, origin)]
+        # Kalshi snapshot placed by its clock (docs/copy_merge.md), else None.
+        self.clock: int | None = None
 
 
 class _Emitted:
@@ -308,20 +362,29 @@ def _reaches(successors: dict[Any, set[Any]], start: Any, target: Any) -> bool:
 
 def _order_nodes(
     sequences: list[tuple[Stream, list[tuple[Any, Origin]]]],
-    is_checkpoint: Any,
-    on_conflict: Any,
+    is_checkpoint: Callable[[Any], bool],
+    is_book_change: Callable[[Any], bool],
+    fixed: list[tuple[Any, Any]],
+    on_conflict: Callable[[Stream, Origin, bool], None],
 ) -> tuple[list[Any], int]:
     """One order of all nodes that keeps every stream's order where possible.
 
     ``sequences`` are the streams in rank order, each a list of (node, origin)
-    in received order. Each stream adds "follows" constraints between its
-    consecutive nodes; a constraint that would contradict the constraints of
-    higher-ranked streams (a cycle) is skipped and reported through
-    ``on_conflict(stream, origin)``. The nodes are then sorted topologically.
-    When several nodes could come next, a non-checkpoint comes before a
-    checkpoint (a full book includes the changes stamped with its timestamp),
-    then the node first seen in the highest-ranked stream. Returns the order
-    and the number of such choices with more than one candidate.
+    in received order. Constraints ("a before b") are added by strength:
+
+    1. ``fixed``: pairs that must hold (Kalshi clock order); never cycle.
+    2. For each stream in rank order, its consecutive book changes (other
+       messages between them skipped), so that book-change order is settled by
+       the evidence of all streams before any trade is placed.
+    3. For each stream in rank order, its remaining consecutive pairs.
+
+    A constraint of steps 2 or 3 that would form a cycle with those already
+    added is skipped and reported through ``on_conflict(stream, origin,
+    book_pair)``; the stream's next constraint still starts from that node.
+    The nodes are then sorted topologically. When several nodes could come
+    next, a non-checkpoint comes before a checkpoint (a full book includes the
+    changes stamped with its timestamp), then the node first seen in the
+    highest-ranked stream. Returns the order and the number of such choices.
     """
     rank: dict[Any, tuple[int, int]] = {}
     for stream_rank, (_, sequence) in enumerate(sequences):
@@ -329,17 +392,36 @@ def _order_nodes(
             rank.setdefault(node, (stream_rank, position))
     successors: dict[Any, set[Any]] = {node: set() for node in rank}
     indegree = dict.fromkeys(rank, 0)
+
+    def add(before: Any, after: Any) -> bool:
+        if after in successors[before]:
+            return True
+        if _reaches(successors, after, before):
+            return False
+        successors[before].add(after)
+        indegree[after] += 1
+        return True
+
+    for before, after in fixed:
+        if not add(before, after):  # pragma: no cover - clock pairs are acyclic
+            raise AssertionError("cycle in fixed merge order constraints")
     for stream, sequence in sequences:
         previous = None
         for node, origin in sequence:
-            if previous is not None and node not in successors[previous]:
-                if _reaches(successors, node, previous):
-                    # Skip only this constraint; the next one starts from node.
-                    on_conflict(stream, origin)
-                else:
-                    successors[previous].add(node)
-                    indegree[node] += 1
+            if not is_book_change(node):
+                continue
+            if previous is not None and not add(previous, node):
+                on_conflict(stream, origin, True)
             previous = node
+    for stream, sequence in sequences:
+        previous, previous_book = None, False
+        for node, origin in sequence:
+            book = is_book_change(node)
+            # Pairs of two book changes were added (or rejected) above.
+            if previous is not None and not (book and previous_book):
+                if not add(previous, node):
+                    on_conflict(stream, origin, False)
+            previous, previous_book = node, book
     by_key = {(bool(is_checkpoint(node)), rank[node]): node for node in rank}
     ready = [key for key, node in by_key.items() if indegree[node] == 0]
     heapq.heapify(ready)
@@ -367,6 +449,10 @@ class CopyMerge:
     ``retention_ms``: how long emitted content is remembered for late repeats.
     ``strict_order``: raise :class:`CopyMergeError` when two streams order the
     same messages differently inside one group, instead of counting it.
+    ``preferred_copies``: the caller's preference among copies, most preferred
+    first. Inside a group it ranks streams after the number of the group's
+    messages they hold and before the copy name; it decides only what the
+    clock, book-change order and the other streams leave open.
     """
 
     def __init__(
@@ -377,25 +463,36 @@ class CopyMerge:
         untimed_match_ms: int = DEFAULT_UNTIMED_MATCH_MS,
         retention_ms: int = DEFAULT_RETENTION_MS,
         strict_order: bool = False,
+        preferred_copies: Sequence[str] = (),
     ) -> None:
         if venue not in VENUES:
             raise ValueError(f"unsupported venue: {venue!r}")
         if lateness_ms <= 0 or untimed_match_ms < 0 or retention_ms < 0:
             raise ValueError("lateness_ms must be positive; other windows non-negative")
+        if isinstance(preferred_copies, str) or len(set(preferred_copies)) != len(
+            preferred_copies
+        ):
+            raise ValueError("preferred_copies must be a sequence of distinct copy names")
         self.venue = venue
         self.lateness_ms = lateness_ms
         self.untimed_match_ms = untimed_match_ms
         self.retention_ms = retention_ms
         self.strict_order = strict_order
+        self.preferred_copies = tuple(preferred_copies)
+        self._preference = {copy: i for i, copy in enumerate(self.preferred_copies)}
         self.stats = MergeStats()
         self._checkpoint_kind = CHECKPOINT_KINDS[venue]
+        self._book_change_kinds = BOOK_CHANGE_KINDS[venue]
         self._started = False
-        # Pending timed groups keyed (venue_ts_ms, scope): per stream, the
-        # digests in received order plus one _Entry list per stream.
         # Pending timed groups keyed (venue_ts_ms, scope): per stream, the
         # occurrences in received order with their input index.
         self._groups: dict[tuple[int, str], dict[Stream, list[_Item]]] = {}
         self._untimed: dict[bytes, list[_Untimed]] = {}
+        # Kalshi: pending snapshots placed by clock, per market; and per market
+        # the clock of the last emitted book message and whether it was a
+        # snapshot (one small entry per market seen).
+        self._clocked: dict[str, list[_Untimed]] = {}
+        self._last_clock: dict[str, tuple[int, bool]] = {}
         # (order_ms, scope, rank, id, ref): rank 0 = timed group, 1 = untimed.
         self._heap: list[tuple[int, str, int, int, Any]] = []
         self._ids = itertools.count(1)
@@ -543,9 +640,33 @@ class CopyMerge:
             heap_id=next(self._ids),
             index=index,
         )
+        if self.venue == "kalshi" and key.kind == "orderbook_snapshot":
+            entry.clock = self._snapshot_clock(key.scope, occurrence.message)
+            if entry.clock is not None:
+                self._clocked.setdefault(key.scope, []).append(entry)
         self._untimed.setdefault(key.digest, []).append(entry)
         heapq.heappush(self._heap, (at, key.scope, 1, entry.heap_id, entry))
         self._grow()
+
+    def _snapshot_clock(self, scope: str, message: Any) -> int | None:
+        """The clock that places this Kalshi snapshot, or None to place it at sending time.
+
+        Decided when the snapshot arrives, from its content and the market's
+        already emitted messages, which do not depend on other markets.
+        """
+        clock = _clock(message)
+        last = self._last_clock.get(scope)
+        if clock is None:
+            reason = "missing"
+        elif clock == 0:
+            reason = "zero"
+        elif last is not None and clock < last[0]:
+            reason = "decreased"
+        else:
+            self.stats.snapshots_by_clock += 1
+            return clock
+        self.stats.snapshot_clock_fallbacks[reason] += 1
+        return None
 
     def _grow(self) -> None:
         self._pending += 1
@@ -578,19 +699,70 @@ class CopyMerge:
                 if not heap or heap[0][:2] != (order_ms, scope):
                     break
                 order_ms, scope, rank, heap_id, ref = heapq.heappop(heap)
+            if group is not None and scope in self._clocked:
+                batch.extend(self._placed_by_clock(scope, group, batch))
+            if group is None and not batch:
+                # Only superseded placements of messages emitted earlier.
+                continue
             for entry in self._resolve((order_ms, scope), group or {}, batch):
                 if isinstance(entry, _Untimed):
                     siblings = self._untimed[entry.key.digest]
                     siblings.remove(entry)
                     if not siblings:
                         del self._untimed[entry.key.digest]
+                    if entry.clock is not None:
+                        clocked = self._clocked[scope]
+                        clocked.remove(entry)
+                        if not clocked:
+                            del self._clocked[scope]
                     self._pending -= len(entry.origins)
                     self.stats.untimed_messages += 1
+                    # Matching later occurrences uses the sending time, even
+                    # when the clock placed the snapshot earlier.
                     record = _Emitted(entry.order_ms, order_ms, set(entry.streams))
                     self._remember(entry.key.digest, order_ms, record)
                 else:
                     self._remember(entry.key.digest, order_ms, None)
                 yield self._message(entry, order_ms, late=False)
+
+    def _placed_by_clock(
+        self, scope: str, group: dict[Stream, list[_Item]], batch: list[_Untimed]
+    ) -> list[_Untimed]:
+        """Pending snapshots of ``scope`` that belong in this timed group.
+
+        A snapshot goes into the first group of its market (in merged order)
+        that holds a delta with a higher clock, before that delta. If no such
+        group comes before its sending time, it stays at its sending time.
+        """
+        clocks = [
+            clock
+            for items in group.values()
+            for key, message, *_ in items
+            if key.kind == "orderbook_delta" and (clock := _clock(message)) is not None
+        ]
+        if not clocks:
+            return []
+        newest = max(clocks)
+        placed = []
+        for entry in self._clocked[scope]:
+            if entry.clock is not None and entry.clock < newest and entry not in batch:
+                entry.heap_id = 0  # its entry at the sending time is now superseded
+                placed.append(entry)
+        return placed
+
+    def _track_clock(self, entry: _Entry) -> None:
+        """Count Kalshi deltas emitted out of clock order (``clock_regressions``)."""
+        scope = entry.key.scope
+        if entry.key.kind == "orderbook_delta":
+            clock = _clock(entry.message)
+            if clock is None:
+                return
+            last = self._last_clock.get(scope)
+            if last is not None and (clock < last[0] or (last[1] and clock == last[0])):
+                self.stats.clock_regressions += 1
+            self._last_clock[scope] = (clock, False)
+        elif isinstance(entry, _Untimed) and entry.clock is not None:
+            self._last_clock[scope] = (entry.clock, True)
 
     def _remember(self, digest: bytes, until_ms: int, record: _Emitted | None) -> None:
         if record is None:
@@ -617,6 +789,8 @@ class CopyMerge:
         self.stats.messages += 1
         self.stats.repeats_merged += len(origins) - 1
         key = entry.key
+        if self.venue == "kalshi" and key.kind in self._book_change_kinds:
+            self._track_clock(entry)
         return MergedMessage(
             kind=key.kind,
             scope=key.scope,
@@ -644,9 +818,10 @@ class CopyMerge:
         content in one stream is the same message as the k-th in another, so a
         content is kept as often as the stream holding it most often. Untimed
         messages were already matched across streams by time. Streams are
-        ranked by how many of these messages they hold, then by
-        (copy, connection), and the order is a topological sort of all
-        streams' received orders (see :func:`_order_nodes`).
+        ranked by how many of these messages they hold, then by the caller's
+        ``preferred_copies``, then by (copy, connection). The order is a
+        topological sort of the Kalshi clock pairs and all streams' received
+        orders (see :func:`_order_nodes`).
         """
         for items in group.values():
             self._pending -= len(items)
@@ -667,16 +842,25 @@ class CopyMerge:
             entries[entry] = entry
             for stream, index, origin in entry.positions:
                 per_stream.setdefault(stream, []).append((index, entry, origin))
-        streams = sorted(per_stream, key=lambda stream: (-len(per_stream[stream]), stream))
+        unlisted = len(self._preference)
+        streams = sorted(
+            per_stream,
+            key=lambda stream: (
+                -len(per_stream[stream]),
+                self._preference.get(stream[0], unlisted),
+                stream,
+            ),
+        )
         sequences = []
         for stream in streams:
             sequence = per_stream[stream]
             if untimed:
                 sequence.sort(key=lambda item: item[0])
             sequences.append((stream, [(node, origin) for _, node, origin in sequence]))
+        fixed = self._clock_pairs(entries, untimed)
         # Fast path: every stream follows the top-ranked stream's order.
         top = {node: position for position, (node, _) in enumerate(sequences[0][1])}
-        if all(
+        if not fixed and all(
             all(node in top for node, _ in sequence)
             and all(top[a] < top[b] for (a, _), (b, _) in zip(sequence, sequence[1:]))
             for _, sequence in sequences[1:]
@@ -685,13 +869,41 @@ class CopyMerge:
         order, choices = _order_nodes(
             sequences,
             lambda node: entries[node].key.kind == self._checkpoint_kind,
-            lambda stream, origin: self._conflict(group_key, stream, origin),
+            lambda node: entries[node].key.kind in self._book_change_kinds,
+            fixed,
+            lambda stream, origin, book: self._conflict(group_key, stream, origin, book),
         )
         self.stats.ambiguous_choices += choices
         return [entries[node] for node in order]
 
-    def _conflict(self, group_key: tuple[int, str], stream: Stream, origin: Origin) -> None:
+    @staticmethod
+    def _clock_pairs(
+        entries: dict[Any, _Entry], untimed: list[_Untimed]
+    ) -> list[tuple[Any, Any]]:
+        """Kalshi clock order: each delta with clock <= a snapshot's clock before it, others after."""
+        snapshots = [entry for entry in untimed if entry.clock is not None]
+        if not snapshots:
+            return []
+        deltas = [
+            (node, clock)
+            for node, entry in entries.items()
+            if entry.key.kind == "orderbook_delta" and (clock := _clock(entry.message)) is not None
+        ]
+        return [
+            (node, snapshot) if clock <= snapshot.clock else (snapshot, node)
+            for snapshot in snapshots
+            if snapshot.clock is not None
+            for node, clock in deltas
+        ]
+
+    def _conflict(
+        self, group_key: tuple[int, str], stream: Stream, origin: Origin, book_pair: bool
+    ) -> None:
         self.stats.order_conflicts += 1
+        if book_pair:
+            self.stats.book_order_conflicts += 1
+        else:
+            self.stats.other_order_conflicts += 1
         example = {
             "venue_ts_ms": group_key[0],
             "scope": group_key[1],
@@ -700,6 +912,7 @@ class CopyMerge:
             "session": origin.session,
             "frame_seq": origin.frame_seq,
             "position": origin.position,
+            "book_changes": book_pair,
         }
         if self.strict_order:
             raise CopyMergeError(f"streams disagree on order inside a timestamp: {example}")
@@ -723,9 +936,13 @@ def session_occurrences(
     Every frame is shown to ``coverage`` before it is decoded (an empty JSON
     list still proves the connection was alive). Every decoded venue message
     (any JSON value) becomes an occurrence; text that is not JSON is only
-    counted on ``coverage``. A Polymarket ``book`` is a reconnect snapshot when
-    it is the first book of its ``asset_id`` since the generation's last sent
-    subscription; every Kalshi ``orderbook_snapshot`` is.
+    counted on ``coverage``. A full book is a reconnect snapshot when it is the
+    first of its instrument (Polymarket ``asset_id``, Kalshi ``market_ticker``)
+    since the generation's last sent subscription.
+
+    Kalshi snapshots are placed by ``clock``, which holds only for real-time
+    subscriptions; a sent subscription with ``update_interval_ms`` (conflated
+    mode) raises :class:`CopyMergeError`.
     """
     books_seen: set[Any] = set()
     generation: int | None = None
@@ -740,6 +957,11 @@ def session_occurrences(
             books_seen.clear()
         if frame.frame_type == "subscription":
             books_seen.clear()
+            if frame.venue == "kalshi" and "update_interval_ms" in frame.payload_raw:
+                raise CopyMergeError(
+                    f"{copy}/{connection}/{session}: conflated Kalshi subscription "
+                    "(update_interval_ms) is not supported by the clock placement"
+                )
         if coverage is not None:
             coverage.frame(
                 received_us, frame.connection_generation, frame.frame_type, frame.direction
@@ -755,7 +977,11 @@ def session_occurrences(
             reconnect = False
             if isinstance(value, dict):
                 if frame.venue == "kalshi":
-                    reconnect = value.get("type") == "orderbook_snapshot"
+                    msg = value.get("msg")
+                    if value.get("type") == "orderbook_snapshot" and isinstance(msg, dict):
+                        ticker = msg.get("market_ticker")
+                        reconnect = ticker not in books_seen
+                        books_seen.add(ticker)
                     sid, seq = value.get("sid"), value.get("seq")
                     if coverage is not None and type(sid) is int and type(seq) is int:
                         coverage.sequence(sid, seq)
