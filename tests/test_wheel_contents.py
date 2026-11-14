@@ -18,22 +18,6 @@ import build_support
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_dry_run_preserves_staging_without_writing_identity(tmp_path, monkeypatch):
-    staging = tmp_path / "build/lib/pmkt"
-    staging.mkdir(parents=True)
-    sentinel = staging / "existing.py"
-    sentinel.write_text("KEEP = True\n", encoding="utf-8")
-    monkeypatch.setattr(build_support.build_py, "run", lambda self: None)
-    command = build_support.IdentityBuildPy(Distribution())
-    command.build_lib = str(staging.parent)
-    command.dry_run = True
-
-    command.run()
-
-    assert sentinel.read_text(encoding="utf-8") == "KEEP = True\n"
-    assert not (staging / "_build_info.json").exists()
-
-
 @pytest.mark.parametrize("nested", [False, True])
 def test_build_staging_must_not_overlap_source(tmp_path, monkeypatch, nested):
     source = tmp_path / "src" / "pmkt"

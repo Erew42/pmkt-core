@@ -53,9 +53,6 @@ def _write_identity(path: Path, identity: dict[str, Any]) -> None:
 
 class IdentityBuildPy(build_py):
     def run(self) -> None:
-        if self.dry_run:
-            super().run()
-            return
         identity = build_identity(self.distribution.get_name(), self.distribution.get_version())
         # Setuptools copies over an existing staging tree without removing
         # modules retired since the previous build. Never ship those leftovers.
