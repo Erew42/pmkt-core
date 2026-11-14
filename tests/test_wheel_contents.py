@@ -9,8 +9,30 @@ import zipfile
 from email.parser import Parser
 from pathlib import Path
 
+import pytest
+from setuptools import Distribution
+
+import build_support
+
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_build_staging_must_not_overlap_source(tmp_path, monkeypatch, nested):
+    source = tmp_path / "src" / "pmkt"
+    source.mkdir(parents=True)
+    sentinel = source / "keep.py"
+    sentinel.write_text("KEEP = True\n", encoding="utf-8")
+    monkeypatch.setattr(build_support, "ROOT", tmp_path)
+    monkeypatch.setattr(build_support, "build_identity", lambda *args: {})
+    command = build_support.IdentityBuildPy(Distribution())
+    command.build_lib = str(source / "nested" if nested else source.parent)
+
+    with pytest.raises(ValueError, match="must not overlap"):
+        command.run()
+
+    assert sentinel.read_text(encoding="utf-8") == "KEEP = True\n"
 
 FORBIDDEN_WHEEL_PREFIXES = (
     "pmkt_trading/",
@@ -54,6 +76,10 @@ def _build_wheel(output_dir: Path) -> Path:
 
 
 def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
+    # Rebuilding in the same checkout must not resurrect retired private code.
+    stale = ROOT / "build/lib/pmkt/market_structure/retired.py"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("RETIRED = True\n", encoding="utf-8")
     wheel = _build_wheel(tmp_path)
 
     with zipfile.ZipFile(wheel) as archive:
@@ -70,6 +96,7 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
 
     assert forbidden == []
     assert "pmkt/py.typed" in names
+    assert "pmkt/cli/raw_inspection.py" in names
     assert "pmkt/text/taxonomy_data/token_aliases.json" in names
     assert metadata["Name"] == "pmkt"
     assert metadata["Version"] == "0.2.0"

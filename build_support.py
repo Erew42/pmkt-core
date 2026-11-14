@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,15 @@ def _write_identity(path: Path, identity: dict[str, Any]) -> None:
 class IdentityBuildPy(build_py):
     def run(self) -> None:
         identity = build_identity(self.distribution.get_name(), self.distribution.get_version())
+        # Setuptools copies over an existing staging tree without removing
+        # modules retired since the previous build. Never ship those leftovers.
+        staging = Path(self.build_lib) / PACKAGE
+        source = (ROOT / "src" / PACKAGE).resolve()
+        target = staging.resolve()
+        if target.is_relative_to(source) or source.is_relative_to(target):
+            raise ValueError("build output must not overlap the source package")
+        if staging.exists():
+            shutil.rmtree(staging)
         super().run()
         _write_identity(Path(self.build_lib) / PACKAGE / "_build_info.json", identity)
 
