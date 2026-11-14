@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import fcntl
 import os
 from pathlib import Path
 import signal
@@ -11,6 +10,8 @@ import time
 
 import httpx
 import pytest
+
+fcntl = pytest.importorskip("fcntl", reason="wallet registry exports require POSIX file locks")
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:

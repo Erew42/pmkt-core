@@ -344,7 +344,12 @@ def test_root_rejects_symlinks_at_every_level(tmp_path, link_depth):
     target.mkdir()
     link = tmp_path.joinpath(*parts[: link_depth + 1])
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(target, target_is_directory=True)
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) == 1314:
+            pytest.skip("Windows symlink creation requires Developer Mode or privilege")
+        raise
     runs_root = tmp_path / "ancestor/runs"
     with pytest.raises(ValueError, match="non-symlink"):
         rr.validate_root(runs_root / "run1/instance", runs_root)

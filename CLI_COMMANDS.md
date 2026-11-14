@@ -226,6 +226,7 @@ command or require account credentials.
 ## Research scripts
 
 `python scripts/collect_polymarket_wallets_rpc.py --output data/wallet-registry`
-collects a wallet registry from public Polygon RPC trade events. See
+collects a wallet registry from public Polygon RPC trade events on POSIX hosts.
+Native Windows is unsupported; use Linux/WSL. See
 [the collection and evidence contract](docs/wallet_registry_rpc.md) for its
 options, RPC pacing, exports, resumability and coverage limits.

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import json
 import os
@@ -14,6 +13,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+
+fcntl = pytest.importorskip("fcntl", reason="wallet registry exports require POSIX file locks")
 
 SCRIPTS_DIR = Path(__file__).resolve().parents[1] / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
