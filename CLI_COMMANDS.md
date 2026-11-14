@@ -94,6 +94,14 @@ installed version.
 
 ## Capture and reconstruction commands
 
+- `inspect-raw-capture SESSION`: verify all sealed raw WebSocket chunks and
+  print a JSON summary of frames, connection generations, local events, missing
+  chunks/recorded frames and incomplete files. Reads one file inventory and
+  streams envelopes without decoding venue payloads. Exits nonzero on corruption,
+  an empty capture, missing/incomplete files, or recorded sequence/disk-pause gaps.
+  Counts cover the observed sealed files only; neither a missing suffix nor
+  network losslessness can be established. Inspect immutable files; collector
+  state files are not used as completeness evidence.
 - `collect-books` / `stream-books`: collect or stream public Polymarket books.
 - `collect-kalshi-books` / `stream-kalshi-books`: collect or stream Kalshi
   books. Only `stream-kalshi-books` takes read auth, through
