@@ -3,6 +3,27 @@
 Updated: 2026-11-15. This record separates established changes, intentional
 behavior and unresolved investigation candidates.
 
+## Second review (read this first)
+
+A second reviewer re-checked these findings. No core source was changed.
+
+| Finding | Status |
+| --- | --- |
+| `inspect-raw-capture` | **PR**, with one design question below. |
+| Wheel staging cleanup | **PR**. A real, previously observed leak; pairs with the trading PR. |
+| POSIX platform docs and test skips | **PR**, low priority. Docs plus `importorskip`; the full suite runs in WSL anyway. |
+| Catalog cross-platform tree hash | Parked, as proposed. Conditional; no affected catalog is known. |
+| Duplicate footer reads | Parked, as proposed. About 0.05–0.10 s demonstrated. |
+
+Design question for the inspection PR: the command exits 1 for verification
+failures, but also for a valid capture that has recorded gaps. Those include
+a missing `chunk_000001`, which `read_session` deliberately treats as an
+archived prefix, and local `seq_gap`/`disk_pause_gap` events. A session whose
+early chunks were moved off disk after mirroring therefore always "fails". A
+separate exit code (for example 2 for "verified, with recorded gaps") would
+keep the report usable in scripts. Decide this before opening the PR; it is
+not implemented.
+
 ## Revisions and scope
 
 - Investigation branch: `feat/capture-diagnostics-20261114`.
