@@ -21,8 +21,16 @@ a missing `chunk_000001`, which `read_session` deliberately treats as an
 archived prefix, and local `seq_gap`/`disk_pause_gap` events. A session whose
 early chunks were moved off disk after mirroring therefore always "fails". A
 separate exit code (for example 2 for "verified, with recorded gaps") would
-keep the report usable in scripts. Decide this before opening the PR; it is
-not implemented.
+keep the report usable in scripts.
+
+Decided by the owner and implemented: exit 0 means verified with no recorded
+gaps. Exit 1 means verification failed, the session is missing, or there are
+no sealed chunks. Exit 2 means the present chunks verify but there are missing
+chunks (including an archived prefix alone), incomplete `.part` files, or
+recorded `seq_gap`/`disk_pause_gap` events. `CLI_COMMANDS.md` and
+`test_raw_inspection.py` cover each case. Tests: `test_raw_inspection.py`,
+`test_raw_reader.py` and `test_cli.py` (75 passed, Windows, Python 3.10.11),
+plus ruff, mypy (131 files) and hygiene.
 
 ## Revisions and scope
 

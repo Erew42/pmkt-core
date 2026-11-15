@@ -46,7 +46,7 @@ def test_inspection_reports_missing_prefix_and_middle_and_unsealed_files(tmp_pat
 
     result = CliRunner().invoke(app, ["inspect-raw-capture", str(tmp_path)])
 
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     report = json.loads(result.output)
     assert report["frame_count"] == 2
     assert report["missing_chunk_count"] == 2
@@ -56,12 +56,12 @@ def test_inspection_reports_missing_prefix_and_middle_and_unsealed_files(tmp_pat
 
 
 @pytest.mark.parametrize("event", ["seq_gap", "disk_pause_gap"])
-def test_recorded_loss_events_return_nonzero(tmp_path, event):
+def test_recorded_loss_events_return_verified_with_gaps(tmp_path, event):
     writer = ChunkWriter(tmp_path, "capture", "kalshi", "kalshi_00")
     writer.write(event, "{}", 1, "local")
     writer.seal()
     result = CliRunner().invoke(app, ["inspect-raw-capture", str(tmp_path)])
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert json.loads(result.output)["local_event_counts"] == {event: 1}
 
 
@@ -89,3 +89,20 @@ def test_empty_and_missing_sessions_are_not_successful(tmp_path):
     missing = CliRunner().invoke(app, ["inspect-raw-capture", str(tmp_path / "absent")])
     assert missing.exit_code == 1
     assert "cannot list session" in missing.output
+
+
+def test_archived_prefix_alone_is_verified_with_gaps(tmp_path):
+    writer = ChunkWriter(tmp_path, "capture", "kalshi", "kalshi_00")
+    for generation in (1, 2):
+        writer.write("text", "{}", generation)
+        writer.seal()
+    chunk = tmp_path / "chunk_000001.jsonl.gz"
+    chunk.unlink()
+    chunk.with_name(chunk.name + ".manifest.json").unlink()
+
+    result = CliRunner().invoke(app, ["inspect-raw-capture", str(tmp_path)])
+
+    assert result.exit_code == 2
+    report = json.loads(result.output)
+    assert report["verified_present_chunks"] is True
+    assert [g["first_missing"] for g in report["chunk_gaps"]] == [1]
