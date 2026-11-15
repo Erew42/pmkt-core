@@ -98,9 +98,9 @@ installed version.
   print a JSON summary of frames, connection generations, local events, missing
   chunks/recorded frames and incomplete files. Reads one file inventory and
   streams envelopes without decoding venue payloads. Exits 1 on corruption, a
-  missing session or an empty capture; exits 2 when the present chunks verify but
+  missing session or an empty capture; exits 3 when the present chunks verify but
   chunks are missing (including an archived prefix), files are incomplete, or
-  sequence/disk-pause gaps were recorded.
+  sequence/disk-pause gaps were recorded. Usage errors keep the CLI's exit 2.
   Counts cover the observed sealed files only; neither a missing suffix nor
   network losslessness can be established. Inspect immutable files; collector
   state files are not used as completeness evidence.

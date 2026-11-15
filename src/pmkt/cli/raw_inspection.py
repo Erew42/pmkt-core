@@ -10,6 +10,9 @@ import typer
 
 from pmkt.streaming.raw_reader import RawCaptureError, inspect_session
 
+# The CLI already exits 2 on usage errors, so recorded gaps use another code.
+VERIFIED_WITH_GAPS_EXIT_CODE = 3
+
 
 def inspect_raw_capture(
     session: Annotated[Path, typer.Argument(help="Raw capture session directory.")],
@@ -17,7 +20,7 @@ def inspect_raw_capture(
     """Verify sealed chunks and print counts, gaps and incomplete files as JSON.
 
     Exit 0: verified, no recorded gaps. Exit 1: verification failed or nothing
-    to verify. Exit 2: verified, with missing chunks (including an archived
+    to verify. Exit 3: verified, with missing chunks (including an archived
     prefix), incomplete files, or recorded sequence/disk-pause gaps.
     """
     try:
@@ -34,4 +37,4 @@ def inspect_raw_capture(
         or report["local_event_counts"].get("seq_gap", 0)
         or report["local_event_counts"].get("disk_pause_gap", 0)
     ):
-        raise typer.Exit(2)
+        raise typer.Exit(VERIFIED_WITH_GAPS_EXIT_CODE)

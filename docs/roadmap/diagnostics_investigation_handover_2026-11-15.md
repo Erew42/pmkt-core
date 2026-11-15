@@ -25,12 +25,16 @@ keep the report usable in scripts.
 
 Decided by the owner and implemented: exit 0 means verified with no recorded
 gaps. Exit 1 means verification failed, the session is missing, or there are
-no sealed chunks. Exit 2 means the present chunks verify but there are missing
+no sealed chunks. Exit 3 means the present chunks verify but there are missing
 chunks (including an archived prefix alone), incomplete `.part` files, or
-recorded `seq_gap`/`disk_pause_gap` events. `CLI_COMMANDS.md` and
-`test_raw_inspection.py` cover each case. Tests: `test_raw_inspection.py`,
-`test_raw_reader.py` and `test_cli.py` (75 passed, Windows, Python 3.10.11),
-plus ruff, mypy (131 files) and hygiene.
+recorded `seq_gap`/`disk_pause_gap` events. The owner first chose 2, then
+chose 3 after a later review: `pmkt` already exits 2 on usage errors (a
+missing or unknown argument) and when optional feature dependencies are
+missing (`cli/entrypoint.py`). `CLI_COMMANDS.md` and `test_raw_inspection.py`
+cover each case, including a usage error keeping exit 2. Tests at the exit-2
+commit: `test_raw_inspection.py`, `test_raw_reader.py` and `test_cli.py`
+(75 passed, Windows, Python 3.10.11), plus ruff, mypy (131 files) and
+hygiene.
 
 ## Revisions and scope
 
