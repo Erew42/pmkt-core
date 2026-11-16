@@ -6,10 +6,29 @@ from pmkt.data.io import (
     StreamingParquetSink,
     ParquetSink,
     read_parquet_segment_manifest,
+    _write_json_atomic,
 )
 
 
 pytestmark = pytest.mark.asyncio
+
+
+@pytest.mark.parametrize("error", [PermissionError, KeyboardInterrupt])
+async def test_atomic_json_replace_failure_cleans_temporary_file(tmp_path, monkeypatch, error):
+    from pmkt.data import io
+
+    path = tmp_path / "summary.json"
+    _write_json_atomic(path, {"previous": True})
+    original_bytes = path.read_bytes()
+
+    def fail_replace(*args):
+        raise error("injected replacement failure")
+
+    monkeypatch.setattr(io.os, "replace", fail_replace)
+    with pytest.raises(error, match="injected"):
+        _write_json_atomic(path, {"new": True})
+    assert path.read_bytes() == original_bytes
+    assert not path.with_name("summary.json.tmp").exists()
 
 
 async def test_parquet_sink_creates_empty_file_with_columns(tmp_path) -> None:

@@ -69,6 +69,7 @@ async def test_cache_summary_interruption_preserves_existing_file(tmp_path, monk
             kalshi_client=FakeKalshiClient(),
         )
     assert summary_path.read_bytes() == original_bytes
+    assert not summary_path.with_name("summary.json.tmp").exists()
 
 
 class FakeGamma:
