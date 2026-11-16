@@ -1,6 +1,8 @@
 import asyncio
 import json
 from decimal import Decimal
+import time
+from types import SimpleNamespace
 
 import pytest
 from websockets.protocol import State
@@ -149,6 +151,62 @@ def feed(venue, connections, instruments=("a",), **kwargs):
         retry_backoff=0.01,
         **kwargs,
     )
+
+
+def synthetic_feed(venue, instruments=("a", "b")):
+    f = ManagedBookFeed(instruments, venue=venue, auth=Auth())
+    shard = f._shards[0]
+    shard.restart = False
+    shard.sid = 7
+    shard.connected = shard.alive = time.monotonic()
+    shard.client = SimpleNamespace(
+        is_connected=True,
+        heartbeat_diagnostics=lambda: {
+            "inbound_age_seconds": 0.0, "heartbeat_error_type": None,
+        },
+    )
+    shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
+    return f, shard
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_ingest_does_not_scan_unrelated_books(venue):
+    f, shard = synthetic_feed(venue)
+    scans = []
+
+    class ObservedBooks(dict):
+        def __iter__(self):
+            scans.append("iter")
+            return super().__iter__()
+
+        def items(self):
+            scans.append("items")
+            return super().items()
+
+    if venue == "polymarket":
+        shard.books.polymarket = ObservedBooks(shard.books.polymarket)
+    else:
+        shard.books.kalshi = ObservedBooks(shard.books.kalshi)
+    f._ingest(shard, snapshot(venue), 1)
+    f._ingest(shard, delta(venue), 2)
+    assert scans == []
+    assert f.book("a").bids[0][1] == Decimal("0.30")
+    assert f.health("b").reason == "no_initial_snapshot"
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_ingest_does_not_schedule_unused_supervisor_health(venue, monkeypatch):
+    f, shard = synthetic_feed(venue)
+    calls = []
+    monkeypatch.setattr(shard.health, "record_message", lambda **kwargs: calls.append("message"))
+    monkeypatch.setattr(shard.health, "record_book", lambda **kwargs: calls.append("book"))
+    f._ingest(shard, snapshot(venue), 1)
+    f._ingest(shard, delta(venue), 2)
+    assert calls == []
+    health = f.health("a")
+    assert health.usable and health.reason is None
+    assert health.reconnect_count == health.error_count == 0
+    assert f.book("a").bids[0][1] == Decimal("0.30")
 
 
 async def ready(f, connections, venue):

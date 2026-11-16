@@ -39,9 +39,11 @@ owning asyncio loop; this is not a thread-safe service.
 
 `instruments` is the normalized, deduplicated subscription tuple. `shard_size`
 defaults to 200. `LiveFeedSupervisor` validates the subscription plan, groups the
-shards, and records connection and per-instrument book health. This workflow does
-not apply the supervisor's legacy price/message-age staleness policy to quiet
-books. `VenueBooks`, the recorder's existing snapshot/delta adapter, is reused;
+shards, and records connection state and counters. The managed feed derives
+per-instrument health from its book state and receipt clocks, without scheduling
+the supervisor's legacy price/message-age staleness deadlines for each update.
+Quiet books remain usable while transport liveness holds.
+`VenueBooks`, the recorder's existing snapshot/delta adapter, is reused;
 `WebSocketMessagePump` now shares persistent receive and cancellation handling
 with the recorder. `WebSocketRetryBudget` supplies retry handling with unlimited
 attempts and a 30-second delay cap. Retry delays grow by `retry_backoff` (default

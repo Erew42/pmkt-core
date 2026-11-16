@@ -302,14 +302,15 @@ class ManagedBookFeed:
         shard.updates.pop(instrument, None)
         shard.source_timestamps.pop(instrument, None)
 
-    def _check_books(self, shard: _Shard) -> None:
+    def _check_books(self, shard: _Shard, *, recovery_only: bool = False) -> None:
         if shard.restart or shard.health.connection_state != "connected":
             return
         now = time.monotonic()
         states = (
             shard.books.polymarket if self.venue == "polymarket" else shard.books.kalshi
         )
-        for instrument, state in states.items():
+        for instrument in shard.recovery if recovery_only else states:
+            state = states[instrument]
             if instrument in shard.resolved or "market_resolved" in state.quality_flags:
                 continue
             recovery = shard.recovery.get(instrument)
@@ -614,7 +615,10 @@ class ManagedBookFeed:
         raise ConnectionError("malformed_frame")
 
     def _ingest(self, shard: _Shard, message: dict[str, Any], count: int) -> None:
-        self._check_books(shard)
+        # The recovery task checks missing initial snapshots every 50 ms. Ingress
+        # only needs to latch existing deadlines before applying a late repair.
+        if shard.recovery:
+            self._check_books(shard, recovery_only=True)
         kind = message.get("event_type") or message.get("type")
         if kind == "error":
             raise ConnectionError("subscription_error")
@@ -676,7 +680,8 @@ class ManagedBookFeed:
                 shard.metadata_revisions[instrument] = shard.metadata_revisions.get(instrument, 0) + 1
         views = shard.books.apply(message, count)
         now = time.monotonic()
-        shard.health.record_message(now_monotonic_ns=time.monotonic_ns())
+        # Public health is derived from book state and the clocks below. The
+        # supervisor supplies connection counters, not per-instrument age gates.
         if self.venue == "kalshi":
             shard.alive = now
         for view in views:
@@ -684,14 +689,6 @@ class ManagedBookFeed:
                 view.instrument_id
                 if self.venue == "polymarket"
                 else view.instrument_id.removesuffix(":YES")
-            )
-            shard.health.record_book(
-                instrument=instrument,
-                valid_state=view.quote_valid,
-                book_integrity_valid=view.integrity_valid,
-                initial_snapshot_received=view.initialized,
-                quality_flags=view.quality_flags,
-                now_monotonic_ns=time.monotonic_ns(),
             )
             if self.venue == "polymarket":
                 market = str(shard.books.polymarket[instrument].market or "")
