@@ -287,7 +287,10 @@ A Kalshi orderbook sequence jump on one subscription SID writes a local
 `seq_gap` with `{"sid": ..., "expected": ..., "got": ...}`. It reconnects for
 fresh snapshots at most once per `gap_reconnect_min_interval` seconds (library
 default `GAP_RECONNECT_MIN_INTERVAL`, CLI `--gap-reconnect-min-interval`). Gaps
-within that interval are recorded and logged only. The disk thresholds are
+within that interval are recorded and logged, and leave a reconnect pending.
+The next supervisor wake after the interval expires reconnects even without
+another gap or incoming frame. Any replacement connection clears that pending
+reconnect because it establishes fresh baselines. The disk thresholds are
 `low_free` (`LOW_FREE`, CLI `--low-free`) and `critical_free` (`CRITICAL_FREE`, CLI
 `--critical-free`), both in bytes, with `0 <= critical_free <= low_free`.
 Below the low threshold, disk state is `low`: warning only, recording continues.

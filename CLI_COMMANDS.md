@@ -100,7 +100,8 @@ installed version.
   Optional overrides are `--chunk-seconds`, `--gzip-level`, `--lag-warn-ms`,
   `--low-free` (warning only, in bytes), `--critical-free` (pause writing and
   count dropped frames, in bytes), and `--gap-reconnect-min-interval` (seconds
-  between Kalshi gap reconnects). Omitted options use the recorder's named
+  between Kalshi gap reconnects; a suppressed gap reconnects after the interval
+  expires, even without another gap). Omitted options use the recorder's named
   library defaults. Events use standard logging at INFO on stderr; journal JSON
   formatting belongs downstream. Install `pmkt[streaming,uvloop]` for optional uvloop;
   otherwise it uses asyncio. Deadline completion exits zero; partial stops exit

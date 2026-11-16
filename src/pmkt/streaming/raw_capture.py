@@ -85,7 +85,7 @@ SUPERVISE_SECONDS = 1.0
 # Tolerate brief heartbeat stalls (25 s Polymarket, 60 s Kalshi) before reconnecting.
 RECEIVE_TIMEOUTS = {"polymarket": 25, "kalshi": 60}
 # After a Kalshi sequence gap, reconnect for fresh snapshots at most once per
-# interval; intervening gaps are recorded and logged only, avoiding reconnect churn.
+# interval; intervening gaps defer a reconnect until that interval expires.
 GAP_RECONNECT_MIN_INTERVAL = 300
 # Level 6 roughly halves CPU (owner laptop, Polymarket/Kalshi: 13/6 vs 29/14 us
 # per frame at level 9). Recompressing tests/fixtures/raw_capture/{venue}_00.jsonl.gz
@@ -866,8 +866,20 @@ async def capture_raw_ws(
 
         async def transport():
             backoff, last_gap_reconnect = backoff_start, float("-inf")
+            gap_reconnect_owed = False
+
+            def reconnect_gap_if_due(now: float) -> None:
+                nonlocal last_gap_reconnect
+                if gap_reconnect_owed and now - last_gap_reconnect >= gap_reconnect_min_interval:
+                    last_gap_reconnect = now
+                    counters["gap_reconnects"] += 1
+                    raise ForcedReconnect(
+                        "kalshi sequence gap; reconnecting for fresh snapshots"
+                    )
+
             while not stop.is_set() and time.monotonic() < deadline:
                 tracker.reset(tracker.generation + 1)
+                gap_reconnect_owed = False  # Any replacement connection gets fresh baselines.
                 force.clear()
                 opened, was_ready = time.monotonic(), False
                 try:
@@ -889,7 +901,7 @@ async def capture_raw_ws(
                         next_ping = status["last_activity"] + POLYMARKET_PING_SECONDS
 
                         async def receive():
-                            nonlocal backoff, was_ready, last_gap_reconnect
+                            nonlocal backoff, was_ready, gap_reconnect_owed
                             received = 0
                             while True:
                                 raw = await ws.recv()
@@ -944,15 +956,8 @@ async def capture_raw_ws(
                                         **tracker.gap,
                                     )
                                     tracker.gap = None
-                                    if (
-                                        time.monotonic() - last_gap_reconnect
-                                        >= gap_reconnect_min_interval
-                                    ):
-                                        last_gap_reconnect = time.monotonic()
-                                        counters["gap_reconnects"] += 1
-                                        raise ForcedReconnect(
-                                            "kalshi sequence gap; reconnecting for fresh snapshots"
-                                        )
+                                    gap_reconnect_owed = True
+                                    reconnect_gap_if_due(time.monotonic())
                                 # Buffered recv() calls may not suspend; let timers and signals run during bursts.
                                 received += 1
                                 if received == RECEIVE_YIELD_FRAMES:
@@ -980,6 +985,7 @@ async def capture_raw_ws(
                                         "disk pause ended; reconnecting for fresh baselines"
                                     )
                                 now = time.monotonic()
+                                reconnect_gap_if_due(now)
                                 if venue == "polymarket" and now >= next_ping:
                                     await ws.send("PING")
                                     writer.write(
