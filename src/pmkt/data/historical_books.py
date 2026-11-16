@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
-import math
+from datetime import datetime, timedelta, timezone
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +55,16 @@ class HistoricalBackfillResult:
     capabilities: pd.DataFrame
     summary: dict[str, Any]
 
+
+
+_NS_PER_SECOND = 1_000_000_000
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def _epoch_ns(value: datetime) -> int:
+    """Exact Unix nanoseconds, including a pandas Timestamp's nanosecond part."""
+    micros = (value - _UNIX_EPOCH) // timedelta(microseconds=1)
+    return micros * 1000 + int(getattr(value, "nanosecond", 0))
 
 def venue_history_capability_matrix(*, checked_at_utc: str | None = None) -> pd.DataFrame:
     checked_at_utc = checked_at_utc or utc_now_iso()
@@ -521,17 +531,19 @@ async def _backfill_kalshi_trades(
             if cutoff is None:
                 raise ValueError("historical cutoff must contain a valid trades_created_ts")
             cutoff_text = cutoff.isoformat()
-            cutoff_ts = cutoff.timestamp()
-            if start_ts is None or start_ts < cutoff_ts:
+            # Integer nanoseconds keep sub-microsecond cutoffs exact; float
+            # seconds would round them onto a whole-second start.
+            cutoff_ns = _epoch_ns(cutoff)
+            if start_ts is None or start_ts * _NS_PER_SECOND < cutoff_ns:
                 # Bracket the cutoff strictly with integer bounds. The venue
                 # may compare exact timestamps rather than whole-second buckets.
-                historical_end = math.floor(cutoff_ts) + 1
+                historical_end = cutoff_ns // _NS_PER_SECOND + 1
                 ranges.append((
                     "/historical/trades", start_ts,
                     min(end_ts, historical_end) if end_ts is not None else historical_end,
                 ))
-            if end_ts is None or end_ts >= cutoff_ts:
-                live_start = math.ceil(cutoff_ts) - 1
+            if end_ts is None or end_ts * _NS_PER_SECOND >= cutoff_ns:
+                live_start = -(-cutoff_ns // _NS_PER_SECOND) - 1
                 ranges.append((
                     "/markets/trades",
                     max(start_ts, live_start) if start_ts is not None else live_start,

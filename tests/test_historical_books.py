@@ -744,3 +744,38 @@ async def test_backfill_rejects_nonpositive_kalshi_period_interval_before_fetch(
         await backfill_venue_history(
             "kalshi", ["KXTEST"], start_ts=0, end_ts=60, period_interval=value,
             kalshi_client=_FailIfCalled())
+
+
+@pytest.mark.asyncio
+async def test_kalshi_trade_cutoff_keeps_sub_microsecond_precision():
+    # 100 s plus 100 ns: float seconds would round the cutoff onto the start
+    # second and skip historical storage for a trade at exactly 100 s.
+    calls = []
+
+    class FakeKalshi:
+        async def historical_cutoff(self):
+            return {"trades_created_ts": "1970-01-01T00:01:40.000000100Z"}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        def page(self, historical, params):
+            calls.append((historical, params))
+            ts = 100 if historical else 101
+            included = params["min_ts"] <= ts <= params["max_ts"]
+            trades = [{"trade_id": str(ts), "ticker": "A", "yes_price": 42, "count": 1,
+                       "created_time": datetime.fromtimestamp(ts, timezone.utc).isoformat()}]
+            return {"trades": trades if included else [], "cursor": ""}
+
+        async def historical_trades(self, **params):
+            return self.page(True, params)
+
+        async def trades(self, **params):
+            return self.page(False, params)
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=100, end_ts=110, kalshi_client=FakeKalshi(),
+    )
+    assert set(result.trades["venue_trade_id"]) == {"100", "101"}
+    assert [historical for historical, _ in calls] == [True, False]
+    assert result.summary["trade_partitions"][0]["complete"] is True
