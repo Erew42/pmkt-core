@@ -35,6 +35,39 @@ from pmkt.resolution.terminal_labels import (
 )
 
 
+@pytest.mark.asyncio
+async def test_cache_summary_interruption_preserves_existing_file(tmp_path, monkeypatch) -> None:
+    polymarket_path = tmp_path / "polymarket.parquet"
+    kalshi_path = tmp_path / "kalshi.parquet"
+    _write_polymarket(polymarket_path, [])
+    _write_kalshi(kalshi_path, [])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text('{"previous": true}', encoding="utf-8")
+    original_bytes = summary_path.read_bytes()
+    original_open = Path.open
+
+    def interrupt(path, mode="r", *args, **kwargs):
+        if "w" in mode and "summary.json" in path.name:
+            with original_open(path, mode, *args, **kwargs) as handle:
+                handle.write('{"interrupted":')
+            raise KeyboardInterrupt("interrupted summary write")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        await cache_module.resolve_market_resolution_cache(
+            polymarket_markets_path=polymarket_path,
+            kalshi_markets_path=kalshi_path,
+            output_dir=output_dir,
+            gamma_client=FakeGamma(),
+            clob_client=FakeClob(),
+            kalshi_client=FakeKalshiClient(),
+        )
+    assert summary_path.read_bytes() == original_bytes
+
+
 class FakeGamma:
     async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
         return {}

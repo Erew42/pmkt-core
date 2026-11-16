@@ -13,6 +13,7 @@ from typing import Any
 import pandas as pd
 
 from pmkt.data.canonical import market_resolution_row
+from pmkt.data.io import _write_json_atomic
 from pmkt.data.registry import MARKET_RESOLUTION_COLUMNS, MARKET_RESOLUTION_SCHEMA_VERSION
 from pmkt.data.storage.parquet import write_parquet
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
@@ -686,9 +687,7 @@ async def resolve_market_resolution_cache(
         strict=True,
     )
     summary = _summary(rows, output_path=output_path)
-    summary_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _write_json_atomic(summary_path, summary)
     return {**summary, "summary_path": str(summary_path)}
 
 

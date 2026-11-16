@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import contextlib
+import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +17,7 @@ def write_parquet(
     coerce: bool = False,
     strict: bool = False,
 ) -> Path:
-    """Write a DataFrame to parquet. Requires pyarrow."""
+    """Atomically publish a DataFrame as parquet. Requires pyarrow."""
     if not overwrite and path.exists():
         raise FileExistsError(f"{path} already exists")
     if schema is not None:
@@ -27,7 +30,19 @@ def write_parquet(
             if not report.ok:
                 raise ValueError("; ".join(report.errors))
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(path, index=False)
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    try:
+        df.to_parquet(temp_path, index=False)
+        with temp_path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink(missing_ok=True)
     return path
 
 
