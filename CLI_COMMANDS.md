@@ -67,6 +67,9 @@ installed version.
   failed segments publish nothing. A resumed segment is not individually
   authoritative even when it exhausts the cursor. Stitching and chain
   verification are part of the catalog-import follow-up.
+- `ingest-kalshi-markets --complete`: follow cursors through empty pages until
+  the cursor is exhausted. Repeated or cyclic cursors fail without publishing;
+  bounded scans with a continuation cursor retain incomplete evidence manifests.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.

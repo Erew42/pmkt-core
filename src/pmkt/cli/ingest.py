@@ -718,6 +718,7 @@ async def _ingest_kalshi_markets_async(
     stop_reason = "not_started"
     errors: list[str] = []
     page_limit: int | None = None if complete else max_pages
+    seen_cursors: set[str] = set()
     try:
         async with AsyncKalshiClient( config=PmktConfig.from_env()) as kalshi:
             while True:
@@ -732,10 +733,8 @@ async def _ingest_kalshi_markets_async(
                 page_observed_at = _utc_now_iso()
                 page_count += 1
                 page_markets = page.get("markets")
-                if not isinstance(page_markets, list) or not page_markets:
-                    stop_reason = "empty_page"
-                    final_cursor = page.get("cursor") or None
-                    break
+                if not isinstance(page_markets, list):
+                    raise ValueError("Kalshi market page must contain a markets list")
                 accepted_page: list[dict[str, object]] = []
                 for market in page_markets:
                     if not isinstance(market, dict):
@@ -762,6 +761,9 @@ async def _ingest_kalshi_markets_async(
                     stop_reason = "cursor_exhausted"
                     break
                 cursor = str(next_cursor)
+                if cursor in seen_cursors:
+                    raise RuntimeError("Kalshi market pagination cursor repeated")
+                seen_cursors.add(cursor)
     except Exception as exc:
         stop_reason = "error"
         errors.append(f"{type(exc).__name__}: {exc}")
@@ -782,7 +784,7 @@ async def _ingest_kalshi_markets_async(
     if evidence_writer is not None:
         evidence_path, evidence_count, evidence_manifest_path = (
             evidence_writer.finish(
-                collection_complete=stop_reason in {"empty_page", "cursor_exhausted"},
+                collection_complete=stop_reason == "cursor_exhausted",
                 stop_reason=stop_reason,
                 continuation_cursor=final_cursor,
                 collection_errors=tuple(errors),
