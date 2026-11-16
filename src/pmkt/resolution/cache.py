@@ -166,12 +166,12 @@ def _stable_snapshot_sort_json(row: dict[str, Any]) -> str:
 def _parsed_timestamp_ns(value: Any) -> int:
     if _is_missing(value):
         return -1
-    canonical = parse_utc_timestamp(value)
-    if canonical is not None:
-        try:
+    try:
+        canonical = parse_utc_timestamp(value)
+        if canonical is not None:
             return int(pd.Timestamp(canonical).value)
-        except (OverflowError, ValueError):
-            return -1
+    except (OverflowError, ValueError):
+        return -1
     # Preserve the historical treatment of naive dates, numeric nanoseconds,
     # and malformed values outside the canonical explicit-offset contract.
     parsed = pd.to_datetime(value, utc=True, errors="coerce")

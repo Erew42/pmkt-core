@@ -101,6 +101,12 @@ def test_cache_unique_rows_computes_each_sort_key_once(monkeypatch) -> None:
     assert sorted(calls) == list(range(5))
 
 
+@pytest.mark.parametrize("value", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+def test_cache_timestamp_sort_matches_scalar_pandas_on_utc_overflow(value) -> None:
+    assert pd.isna(pd.to_datetime(value, utc=True, errors="coerce"))
+    assert cache_module._parsed_timestamp_ns(value) == -1
+
+
 def test_cache_timestamp_sort_matches_scalar_pandas_on_randomized_rows(monkeypatch) -> None:
     import random
     from datetime import datetime, timezone
@@ -113,6 +119,7 @@ def test_cache_timestamp_sort_matches_scalar_pandas_on_randomized_rows(monkeypat
         "2026-01-01t00:00:00z", "2026-01-01", "2026-01-01 00:00:00",
         "1969-12-31T23:59:59.999999999Z", "1500-01-01T00:00:00Z",
         "2500-01-01T00:00:00Z", 0, 1, -1, 1_700_000_000_000_000_000,
+        "0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00",
         datetime(2026, 1, 1), datetime(2026, 1, 1, tzinfo=timezone.utc),
         pd.Timestamp("2026-01-01T00:00:00.123456789Z"),
     ]
