@@ -663,10 +663,7 @@ async def resolve_market_resolution_cache(
                     rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)
                 else:
                     rows_by_pair[pair] = row
-            elif _is_cache_conflict(existing_row) and str(row.get("resolution_state")) not in {
-                STATE_DISPUTED,
-                STATE_INCONSISTENT,
-            }:
+            elif _is_cache_conflict(existing_row):
                 rows_by_pair[pair] = _carry_forward_final(existing_row, row)
             elif _canonical_final_conflict(existing_row, row):
                 rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)

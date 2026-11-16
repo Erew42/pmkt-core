@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +23,14 @@ from pmkt.resolution.models import (
     RESULT_TYPE_SCALAR,
     RESULT_TYPE_UNKNOWN,
     Payout,
+    STATE_DISPUTED,
     STATE_FINAL,
     STATE_INCONSISTENT,
     STATE_METADATA_ONLY,
     STATE_OPEN,
     STATE_UNAVAILABLE,
     ResolutionRecord,
+    SourceObservation,
 )
 from pmkt.resolution.terminal_labels import (
     is_authoritative_final_resolution,
@@ -1084,9 +1087,11 @@ async def test_cache_refresh_accepts_equivalent_zero_scalar_terminals(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_state", [STATE_FINAL, STATE_DISPUTED, STATE_INCONSISTENT])
 async def test_cache_refresh_preserves_existing_cache_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    refresh_state: str,
 ) -> None:
     polymarket_path = tmp_path / "polymarket.parquet"
     kalshi_path = tmp_path / "kalshi.parquet"
@@ -1126,7 +1131,15 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
 
         async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
             market_key = market.ticker
-            return _final_record("kalshi", market_key, "no")
+            return replace(
+                _final_record("kalshi", market_key, "no"),
+                resolution_state=refresh_state,
+                confidence=(CONFIDENCE_CANONICAL if refresh_state == STATE_FINAL
+                            else CONFIDENCE_INCONSISTENT),
+                source_observations=[SourceObservation(
+                    source=f"refresh:{refresh_state}", confidence=CONFIDENCE_INCONSISTENT,
+                )],
+            )
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
 
@@ -1160,6 +1173,25 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
     assert row["confidence"] == CONFIDENCE_INCONSISTENT
     assert row["error_type"] == "MarketResolutionCacheConflict"
     assert row["resolver_version"] == "market_resolution_resolver.v2"
+    assert any(
+        item["source"] == f"refresh:{refresh_state}"
+        for item in cache_module._decode_observations(row["source_observations_json"])
+    )
+
+    # The conflict must survive a disk reload and a subsequent clean final.
+    refresh_state = STATE_FINAL
+    await cache_module.resolve_market_resolution_cache(
+        polymarket_markets_path=polymarket_path,
+        kalshi_markets_path=kalshi_path,
+        output_dir=output_dir,
+        refresh=True,
+        gamma_client=FakeGamma(),
+        clob_client=FakeClob(),
+        kalshi_client=FakeKalshiClient(),
+    )
+    [reloaded] = pd.read_parquet(output_dir / "market_resolutions.parquet").to_dict("records")
+    assert reloaded["error_type"] == "MarketResolutionCacheConflict"
+    assert reloaded["resolution_state"] == STATE_INCONSISTENT
 
 
 @pytest.mark.asyncio
