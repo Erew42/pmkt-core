@@ -74,7 +74,11 @@ installed version.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
 - `backfill-venue-history`: fetch public venue history. Kalshi trade backfills
-  require positive `--max-trade-pages` and `--trade-limit`. The persisted summary's
+  read `trades_created_ts` once and split the requested interval between
+  `/historical/trades` and `/markets/trades`. Both cursors must be exhausted for
+  completion; an unavailable or malformed cutoff emits a fetch-error gap.
+  Positive `--max-trade-pages` and `--trade-limit` bound the total pages per
+  instrument across both endpoints and the rows per page. The persisted summary's
   `trade_partitions` reports completeness, stop reason, pages, rows and continuation
   cursor per instrument. Page caps, repeated/cyclic cursors, and fetch/parse
   failures leave the requested interval incomplete and emit a trade gap with

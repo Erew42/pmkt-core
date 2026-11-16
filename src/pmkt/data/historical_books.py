@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import math
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,7 +21,7 @@ from pmkt.data.canonical import (
     venue_history_capability_row,
 )
 from pmkt.data.storage.parquet import write_parquet
-from pmkt.data.time import isoformat_source_timestamp, utc_now_iso
+from pmkt.data.time import isoformat_source_timestamp, parse_utc_timestamp, utc_now_iso
 from pmkt.data.types import parse_float, parse_int
 
 from pmkt.data.normalize_kalshi_trade import _kalshi_yes_price, _first_positive_float
@@ -509,18 +510,50 @@ async def _backfill_kalshi_trades(
     gaps: list[dict[str, Any]] = []
     partitions: list[dict[str, Any]] = []
     seen_trade_keys: set[tuple[str, str]] = set()
+    ranges: list[tuple[str, int | None, int | None]] = []
+    cutoff_text: str | None = None
+    cutoff_error = ""
+    if instruments:
+        try:
+            cutoff_payload = await client.historical_cutoff()
+            cutoff = parse_utc_timestamp(_as_mapping(cutoff_payload).get("trades_created_ts"))
+            if cutoff is None:
+                raise ValueError("historical cutoff must contain a valid trades_created_ts")
+            cutoff_text = cutoff.isoformat()
+            cutoff_ts = cutoff.timestamp()
+            if start_ts is None or start_ts < cutoff_ts:
+                historical_end = math.ceil(cutoff_ts) - 1
+                ranges.append((
+                    "/historical/trades", start_ts,
+                    min(end_ts, historical_end) if end_ts is not None else historical_end,
+                ))
+            if end_ts is None or end_ts >= cutoff_ts:
+                live_start = math.floor(cutoff_ts)
+                ranges.append((
+                    "/markets/trades",
+                    max(start_ts, live_start) if start_ts is not None else live_start,
+                    end_ts,
+                ))
+        except Exception as exc:
+            cutoff_error = f"{type(exc).__name__}: {exc}"
     for ticker in instruments:
         cursor: str | None = None
         seen_cursors: set[str] = set()
         pages = 0
         row_start = len(rows)
-        reason = ""
-        while True:
+        reason = cutoff_error
+        stop_reason = "fetch_error"
+        endpoint = "/historical/cutoff"
+        range_index = 0
+        exhausted_endpoints: list[str] = []
+        while ranges:
+            endpoint, range_start, range_end = ranges[range_index]
             try:
-                payload = await client.historical_trades(
+                fetch = client.historical_trades if endpoint == "/historical/trades" else client.trades
+                payload = await fetch(
                     ticker=ticker.split(":", 1)[0],
-                    min_ts=start_ts,
-                    max_ts=end_ts,
+                    min_ts=range_start,
+                    max_ts=range_end,
                     limit=limit,
                     cursor=cursor,
                 )
@@ -548,8 +581,17 @@ async def _backfill_kalshi_trades(
             cursor_value = _as_mapping(payload).get("cursor")
             cursor = str(cursor_value).strip() if cursor_value else None
             if not cursor:
-                stop_reason = "cursor_exhausted"
-                break
+                exhausted_endpoints.append(endpoint)
+                if range_index + 1 == len(ranges):
+                    stop_reason = "cursor_exhausted"
+                    break
+                range_index += 1
+                endpoint = ranges[range_index][0]
+                seen_cursors.clear()
+                if pages >= max_pages:
+                    stop_reason = "page_limit"
+                    break
+                continue
             if cursor in seen_cursors:
                 stop_reason = "repeated_cursor"
                 break
@@ -566,6 +608,9 @@ async def _backfill_kalshi_trades(
             "row_count": len(rows) - row_start,
             "max_pages": max_pages,
             "limit": limit,
+            "endpoint": endpoint,
+            "exhausted_endpoints": exhausted_endpoints,
+            "trades_created_ts": cutoff_text,
         }
         partitions.append(partition)
         if not partition["complete"]:
@@ -578,7 +623,7 @@ async def _backfill_kalshi_trades(
                 end_ts=end_ts,
                 status="fetch_error" if stop_reason == "fetch_error" else "truncated",
                 reason=reason or stop_reason,
-                endpoint="/historical/trades",
+                endpoint=endpoint,
                 row_count=len(rows) - row_start,
                 raw_json=partition,
             ))
