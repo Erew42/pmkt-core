@@ -76,6 +76,72 @@ class FakeGamma:
         return {}
 
 
+def test_cache_sort_avoids_scalar_pandas_for_canonical_timestamps(monkeypatch) -> None:
+    def reject_scalar_parser(*args, **kwargs):
+        raise AssertionError("canonical timestamps should use the fast parser")
+
+    monkeypatch.setattr(pd, "to_datetime", reject_scalar_parser)
+    assert cache_module._parsed_timestamp_ns("2026-01-01T01:00:00.123456789+01:00") == (
+        pd.Timestamp("2026-01-01T00:00:00.123456789Z").value
+    )
+
+
+def test_cache_unique_rows_computes_each_sort_key_once(monkeypatch) -> None:
+    original_key = cache_module._latest_row_sort_key
+    calls = []
+
+    def counted_key(row):
+        calls.append(row["snapshot"])
+        return original_key(row)
+
+    monkeypatch.setattr(cache_module, "_latest_row_sort_key", counted_key)
+    frame = pd.DataFrame({"market_key": ["A"] * 5, "snapshot": range(5)})
+    cache_module._unique_market_rows(frame, "market_key")
+    assert sorted(calls) == list(range(5))
+
+
+def test_cache_timestamp_sort_matches_scalar_pandas_on_randomized_rows(monkeypatch) -> None:
+    import random
+    from datetime import datetime, timezone
+
+    values = [
+        None, pd.NA, pd.NaT, float("nan"), "", "bad", "NaT", "2026-02-30",
+        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.123456789Z",
+        "2025-12-31T23:00:00-01:00", "2026-01-01T02:00:00+02",
+        "2026-01-01T02:00:00.123456+0200", " 2026-01-01T00:00:00Z ",
+        "2026-01-01t00:00:00z", "2026-01-01", "2026-01-01 00:00:00",
+        "1969-12-31T23:59:59.999999999Z", "1500-01-01T00:00:00Z",
+        "2500-01-01T00:00:00Z", 0, 1, -1, 1_700_000_000_000_000_000,
+        datetime(2026, 1, 1), datetime(2026, 1, 1, tzinfo=timezone.utc),
+        pd.Timestamp("2026-01-01T00:00:00.123456789Z"),
+    ]
+
+    def legacy_timestamp(value):
+        if cache_module._is_missing(value):
+            return -1
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        return -1 if pd.isna(parsed) else int(parsed.value)
+
+    for value in values:
+        assert cache_module._parsed_timestamp_ns(value) == legacy_timestamp(value), repr(value)
+    rng = random.Random(401)
+    rows = [
+        {"platform": rng.choice(["kalshi", "polymarket"]), "market_key": str(rng.randrange(12)),
+         **{column: rng.choice(values) for column in cache_module._SNAPSHOT_FRESHNESS_TIMESTAMP_COLUMNS}}
+        for _ in range(120)
+    ]
+    rng.shuffle(rows)
+    frame = pd.DataFrame(rows)
+    with monkeypatch.context() as context:
+        context.setattr(cache_module, "_parsed_timestamp_ns", legacy_timestamp)
+        expected_order = [cache_module._stable_json(row) for row in cache_module._sort_resolution_rows(rows)]
+        expected_unique = [cache_module._stable_json(row)
+                           for row in cache_module._unique_market_rows(frame, "market_key")]
+    assert [cache_module._stable_json(row) for row in cache_module._sort_resolution_rows(rows)] == expected_order
+    assert [cache_module._stable_json(row)
+            for row in cache_module._unique_market_rows(frame, "market_key")] == expected_unique
+
+
 class FakeClob:
     async def clob_market_info(self, condition_id: str, *, expiry=None) -> dict[str, Any]:
         return {}
