@@ -57,10 +57,12 @@ receive time; memory holds the lateness window, not the recording.
    on what the venue sent. A market received on two connections of one copy
    (Polymarket Yes/No split) is two streams and is merged like two copies.
 2. **Order by venue time.** Polymarket `timestamp`; Kalshi `msg.ts_ms`. Each
-   merged message carries the earliest receive time over its occurrences
-   (`origin`, `first_received_us`, `first_copy`) and all occurrences
-   (`occurrences`, `copies`). Receive times of different machines are not
-   combined otherwise.
+   merged message lists the occurrences attached before emission
+   (`occurrences`, `copies`) and identifies the earliest of those
+   (`origin`, `first_received_us`, `first_copy`). Duplicates received after
+   emission are counted in `stats.repeats_after_emit`. This can happen within
+   the lateness window when a Kalshi snapshot is placed earlier by its clock.
+   Use the raw recordings for complete recorder-by-recorder attribution.
 3. **Inside one venue timestamp, the received order is kept.** Messages are
    grouped by (venue timestamp, scope); scope is the Polymarket `market`
    (condition id, which covers both tokens of a `price_change`) and the Kalshi
