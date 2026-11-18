@@ -93,10 +93,11 @@ own, and the deltas after it on that connection have higher clocks. Placing a
 snapshot at its sending time would put it after deltas stamped earlier but not
 included in it, and a replay would then overwrite those deltas.
 
-The rule: a snapshot with a positive `clock` C comes after every delta of its
-market with clock at or below C, before every delta with a higher clock, and
-after the market's clock-placed snapshots with a lower clock. Snapshots taken
-on different connections a moment apart differ in clock (it is exchange-wide)
+Within one clock epoch, a snapshot with a positive `clock` C comes after
+every delta of its market with clock at or below C, before every delta with
+a higher clock, and after the market's clock-placed snapshots with a lower
+clock. Snapshots taken on different connections a moment apart differ in
+clock (it is exchange-wide)
 even when the book did not change, so their order matters only when the book
 changed while no copy received the deltas, for example during a venue-wide
 disconnect; then the newer book must be the one that stays. It is implemented
@@ -106,8 +107,9 @@ in streaming form:
   before the flush point is already emitted.
 - While the merge emits that market's messages in time order, the snapshot
   goes into the first millisecond that holds a delta or a clock-placed
-  snapshot with a clock above C, before it and after that millisecond's
-  deltas with clock at or below C. Its `order_ms` is that millisecond.
+  snapshot in the same epoch with a clock above C. It goes before those
+  messages and after the same epoch's deltas with clock at or below C.
+  Its `order_ms` is that millisecond.
 - If none comes before its sending time, it is placed at its sending time,
   ordered against the book messages of that millisecond by clock.
 - Within a millisecond, these clock pairs (snapshot against delta, and
@@ -116,8 +118,9 @@ in streaming form:
 Which group a snapshot joins depends only on its own arrival and its market's
 messages, so the result is the same however markets are split across runs.
 Each pending snapshot waits at most until its sending time passes the flush
-point, so memory stays bounded by the lateness window, plus one clock per
-market and one per stream and market.
+point, so memory stays bounded by the lateness window, plus the current
+epoch and last emitted clock per market and the last observed clock and
+epoch per stream and market.
 
 Fallbacks, counted in `stats.snapshot_clock_fallbacks` by reason; such a
 snapshot is placed at its sending time as an untimed message (see the
@@ -129,14 +132,15 @@ conventions):
   wrong if it is the empty book of a determined market, so it stays at its
   sending time.
 - `missing`: no integer `clock`.
-- `decreased`: a clock below the clock of the last book message of the
-  market that its own stream received before it, or below the last one
-  already emitted. Kalshi documents that the clock may decrease during
-  maintenance and that clocks are not comparable across it. A reset is
-  detected from each stream's own received order, including messages still
-  buffered in the merge, and from the emitted stream. Not detected: a stream
-  whose first message for the market comes after a reset while another
-  copy's pre-reset messages are still buffered.
+- `decreased`: a snapshot that starts a new clock epoch on its stream, or
+  whose clock is below the last emitted clock in the same epoch. Kalshi
+  documents that clocks may reset during maintenance. A decrease between
+  positive book clocks in a stream's received order starts an epoch for that
+  stream, including across reconnects and while the older messages are still
+  buffered. A stream stays in its epoch across reconnects with increasing
+  clocks. Copies that see a decrease join the latest epoch, as does a copy
+  with no earlier clock for the market. If no copy sees the decrease, the
+  merge may compare clocks across the reset.
 
 `stats.snapshots_by_clock` counts the snapshots placed by clock. Late snapshots
 (older than `lateness_ms` on arrival) follow the late rule and are in neither
@@ -196,8 +200,9 @@ otherwise:
   emitted messages are kept for `retention_ms` past the later of their place and
   their own time (venue time, or sending time for untimed messages, including a
   Kalshi snapshot placed earlier by its clock), so a copy with a clock far
-  behind costs digest memory in proportion to its error (visible in `stats.future_messages`). For Kalshi, one
-  clock per market and one per stream and market are kept.
+  behind costs digest memory in proportion to its error (visible in
+  `stats.future_messages`). For Kalshi, clock tracking keeps constant state
+  per market and per stream and market.
 
 ## Conventions chosen here (owner to confirm)
 

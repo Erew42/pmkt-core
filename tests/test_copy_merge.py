@@ -847,6 +847,37 @@ def test_clock_reset_is_detected_from_the_streams_own_order_while_buffered():
     assert stats.snapshot_clock_fallbacks == {"decreased": 1} and stats.order_conflicts == 0
 
 
+@pytest.mark.parametrize("post_reconnect_delta", [False, True])
+def test_reconnect_snapshot_stays_after_buffered_messages_from_before_a_clock_reset(
+    tmp_path, monkeypatch, post_reconnect_delta,
+):
+    sub = json.dumps({"id": 1, "cmd": "subscribe", "params": {
+        "channels": ["orderbook_delta"], "market_tickers": ["K"], "use_yes_price": True}})
+    session = tmp_path / "a" / "kalshi_00" / "20261103T000000Z_dddd0001"
+    frames = [
+        (T0 + 89, "subscription", sub, 1, "sent"),
+        text(T0 + 91, ksnap(T0 + 90, [("0.50", "10")], 100), generation=1),
+        text(T0 + 111, delta(T0 + 100, "0.50", "5", clock=101, seq=2, sent=T0 + 105), generation=1),
+        (T0 + 199, "subscription", sub, 2, "sent"),
+        text(T0 + 201, ksnap(T0 + 200, [("0.50", "15")], 1, sid=2), generation=2),
+        text(T0 + 211, delta(T0 + 205, "0.50", "2", clock=2, sid=2, seq=2), generation=2),
+        (T0 + 219, "subscription", sub, 3, "sent"),
+        text(T0 + 221, ksnap(T0 + 220, [("0.50", "40")], 4, sid=3), generation=3),
+    ]
+    if post_reconnect_delta:
+        # Clock placement still applies within the new epoch, including
+        # this delta stamped earlier than the snapshot's sending time.
+        frames.append(text(T0 + 226, delta(T0 + 216, "0.50", "3", clock=5, sid=3, seq=2), generation=3))
+    record(session, monkeypatch, "kalshi", frames)
+    merged, _ = merge([connection_occurrences("a", "kalshi_00", [session])], venue="kalshi")
+
+    assert [_clock_of(m) for m in merged] == [100, 101, 1, 2, 4] + ([5] if post_reconnect_delta else [])
+    assert final_yes_book(merged) == {"0.50": "43" if post_reconnect_delta else "40"}
+    check = check_merged_books("kalshi", merged)
+    assert (check.compared, check.equal, check.reconnect_compared) == (2, 1, 2)
+    assert [m["order_ms"] - T0 for m in check.mismatch_examples] == [216 if post_reconnect_delta else 220]
+
+
 def test_explicit_real_time_subscription_is_accepted(tmp_path, monkeypatch):
     def subscribe(interval):
         return json.dumps({"id": 1, "cmd": "subscribe", "params": {
