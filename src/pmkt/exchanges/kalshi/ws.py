@@ -24,14 +24,15 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
-from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels, snapshot_ladder
+from pmkt import _native
+from pmkt.exchanges._ws_book import decimal_levels, encode_message, local_state, sync_ladder
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     _wire_frames,
-    DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
-    DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
+    DEFAULT_RECONNECT_ATTEMPTS as DEFAULT_RECONNECT_ATTEMPTS,
+    DEFAULT_RECONNECT_BACKOFF_SECONDS as DEFAULT_RECONNECT_BACKOFF_SECONDS,
     _UNSET_RECONNECTS,
-    WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
+    WS_TRANSPORT_LIMITS as WS_TRANSPORT_LIMITS,
     WebSocketTransportSettings,
     WebSocketRetryBudget,
     is_transport_teardown_race,
@@ -448,9 +449,7 @@ class KalshiOrderBookState:
 
     @property
     def book_integrity_valid(self) -> bool:
-        return self.initial_snapshot_received and not (
-            self.quality_flags - {"empty_bid", "empty_ask"}
-        )
+        return _native.book_integrity(self.initial_snapshot_received, list(self.quality_flags))
 
     def snapshot(self, *, event_type: str | None = None) -> KalshiBookSnapshot:
         yes_bid = max(self.yes_bids) if self.yes_bids else None
@@ -487,132 +486,49 @@ class KalshiOrderBookState:
             initial_snapshot_received=self.initial_snapshot_received,
         )
 
-    def apply_snapshot(self, message: dict[str, Any]) -> KalshiBookSnapshot:
+    def _apply(self, message: dict[str, Any], event_type: str) -> KalshiBookSnapshot:
         msg = _message_payload(message)
-        ticker = msg.get("market_ticker") or self.market_ticker
-        self.market_ticker = str(ticker)
-        market_id = msg.get("market_id")
-        if market_id is not None:
-            self.market_id = str(market_id)
-        self.timestamp = (
-            msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
+        ticker = str(msg.get("market_ticker") or self.market_ticker)
+        snapshot = event_type == "orderbook_snapshot"
+        state = _native.update_local_book(
+            "kalshi", ticker,
+            local_state(
+                {} if snapshot else self.yes_bids, {} if snapshot else self.no_bids,
+                self.initial_snapshot_received, self.quality_flags,
+                sid=self.sid, seq=self.last_seq,
+            ),
+            encode_message({
+                "type": event_type, "msg": {**msg, "market_ticker": ticker},
+                "sid": _parse_int(message.get("sid")), "seq": _parse_int(message.get("seq")),
+            }),
+            use_yes_price=self.use_yes_price,
         )
-        yes = snapshot_ladder(msg, "yes_dollars_fp", "yes_dollars", "yes")
-        no = snapshot_ladder(msg, "no_dollars_fp", "no_dollars", "no")
-        self.yes_bids = decimal_levels(yes)
-        self.no_bids = decimal_levels(no)
-        self.initial_snapshot_received = True
-        self.valid_state = True
-        self.quality_flags.clear()
-        self.sid = None
-        self.last_seq = None
-        self._apply_sequence(message.get("sid"), message.get("seq"))
-        flags = self._sequence_flags()
-        if not all(well_formed_levels(side, allow_missing=True) for side in (yes, no)):
-            flags.add("malformed_book")
-        self._refresh_validity(preserve=flags)
-        self.last_event_type = "orderbook_snapshot"
-        return self.snapshot(event_type="orderbook_snapshot")
+        if snapshot:
+            self.yes_bids = decimal_levels(state["first"])
+            self.no_bids = decimal_levels(state["second"])
+        else:
+            sync_ladder(self.yes_bids, state["first"])
+            sync_ladder(self.no_bids, state["second"])
+        self.market_ticker = ticker
+        if msg.get("market_id") is not None:
+            self.market_id = str(msg["market_id"])
+        self.timestamp = msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
+        self.sid, self.last_seq = state["sid"], state["seq"]
+        self.initial_snapshot_received = state["initialized"]
+        self.valid_state = state["valid"]
+        self.quality_flags = set(state["flags"])
+        self.last_event_type = event_type
+        return self.snapshot(event_type=event_type)
+
+    def apply_snapshot(self, message: dict[str, Any]) -> KalshiBookSnapshot:
+        return self._apply(message, "orderbook_snapshot")
 
     def apply_delta(self, message: dict[str, Any]) -> KalshiBookSnapshot:
-        msg = _message_payload(message)
-        ticker = msg.get("market_ticker") or self.market_ticker
-        self.market_ticker = str(ticker)
-        market_id = msg.get("market_id")
-        if market_id is not None:
-            self.market_id = str(market_id)
-        self.timestamp = (
-            msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
-        )
-        if not self.initial_snapshot_received:
-            self.valid_state = False
-            self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
-        self._apply_sequence(message.get("sid"), message.get("seq"))
-        side = str(msg.get("side") or "").lower()
-        price = finite_decimal(next((msg[key] for key in ("price_dollars", "price") if key in msg), None))
-        delta = finite_decimal(next((msg[key] for key in ("delta_fp", "delta", "size_delta") if key in msg), None))
-        if (side not in {"yes", "no"} or price is None or delta is None or finite_decimal(price) is None
-                or finite_decimal(delta) is None or not 0 <= price <= 1):
-            self.quality_flags.add("malformed_book")
-        else:
-            levels = self.yes_bids if side == "yes" else self.no_bids
-            next_size = levels.get(price, Decimal(0)) + delta
-            if next_size < 0:
-                self.quality_flags.add("malformed_book")
-            if next_size <= 0:
-                levels.pop(price, None)
-            else:
-                levels[price] = next_size
-        self._refresh_validity(preserve=self._persistent_flags())
-        self.last_event_type = "orderbook_delta"
-        return self.snapshot(event_type="orderbook_delta")
-
-    def _apply_sequence(self, sid: Any, seq: Any) -> None:
-        sid_i = _parse_int(sid)
-        seq_i = _parse_int(seq)
-        if sid_i is None or seq_i is None:
-            self.valid_state = False
-            self.quality_flags.add("missing_sequence")
-            return
-
-        if self.sid is None:
-            self.sid = sid_i
-        elif sid_i != self.sid:
-            self.valid_state = False
-            self.quality_flags.add("sid_changed")
-
-        # ``seq`` advances for the whole subscription, not independently for
-        # each market.  Forward jumps are therefore expected when messages for
-        # multiple markets are interleaved; the collector checks contiguous
-        # subscription-level sequence before dispatching to market states.
-        if self.last_seq is not None and seq_i <= self.last_seq:
-            self.valid_state = False
-            self.quality_flags.add("seq_gap")
-
-        self.last_seq = seq_i
+        return self._apply(message, "orderbook_delta")
 
     def mark_sequence_gap(self) -> None:
         self.valid_state = False
         self.quality_flags.add("seq_gap")
-
-    def _sequence_flags(self) -> set[str]:
-        return self.quality_flags.intersection(
-            {"missing_sequence", "seq_gap", "sid_changed"}
-        )
-
-    def _persistent_flags(self) -> set[str]:
-        return self.quality_flags.intersection(
-            {
-                "malformed_book",
-                "delta_before_snapshot",
-                "missing_sequence",
-                "no_initial_snapshot",
-                "reconnect",
-                "seq_gap",
-                "sid_changed",
-            }
-        )
-
-    def _refresh_validity(self, *, preserve: set[str] | None = None) -> None:
-        flags = set(preserve or set())
-        if not self.initial_snapshot_received:
-            flags.add("no_initial_snapshot")
-        if not self.yes_bids:
-            flags.add("empty_bid")
-        if not self.no_bids:
-            flags.add("empty_ask")
-        yes_bid = max(self.yes_bids) if self.yes_bids else None
-        yes_ask = (
-            min(self.no_bids)
-            if self.use_yes_price and self.no_bids
-            else Decimal(1) - max(self.no_bids)
-            if self.no_bids
-            else None
-        )
-        if yes_bid is not None and yes_ask is not None and yes_bid > yes_ask:
-            flags.update({"crossed_book", "negative_spread"})
-        self.quality_flags = flags
-        self.valid_state = self.initial_snapshot_received and not flags
 
 
 def _state_for(
@@ -672,7 +588,8 @@ def _connect_with_headers(
     # See WS_TRANSPORT_LIMITS: the 1 MiB max_size default is a hard ceiling on
     # universe size, and the 16-frame max_queue default puts ordinary commit
     # latency onto the transport flow-control path.
-    return cast(Any, websockets.connect)(
+    connect: Any = websockets.connect
+    return connect(
         url,
         **{header_kw: headers},
         **(transport_settings or WebSocketTransportSettings()).as_connect_kwargs(),
@@ -887,7 +804,7 @@ class AsyncKalshiWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int | None = cast(Any, _UNSET_RECONNECTS),
+        max_reconnects: int | None = cast("int | None", _UNSET_RECONNECTS),
         reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         on_decode_error: DecodeErrorCallback | None = None,

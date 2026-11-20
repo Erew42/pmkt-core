@@ -4,7 +4,8 @@ use crate::wire::Change;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Ordered by published spelling. This is the vocabulary for book evidence.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum QualityFlag {
     CrossedBook,
     DeltaBeforeSnapshot,
@@ -56,6 +57,26 @@ pub enum Integrity {
     AwaitingSnapshot,
     Impaired,
     Intact,
+}
+
+impl Integrity {
+    pub fn from_observation(initialized: bool, flags: &Flags) -> Self {
+        if !initialized {
+            Self::AwaitingSnapshot
+        } else if flags.iter().all(|f| {
+            matches!(
+                f,
+                QualityFlag::EmptyBid
+                    | QualityFlag::EmptyAsk
+                    | QualityFlag::NewMarket
+                    | QualityFlag::MarketResolved
+            )
+        }) {
+            Self::Intact
+        } else {
+            Self::Impaired
+        }
+    }
 }
 
 /// Subscription sequence spans instruments. Forward jumps in a single instrument

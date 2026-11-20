@@ -143,6 +143,10 @@ impl ShardFeed {
         self.0.transport()
     }
 
+    fn poll_transport(&mut self, now_ns: u64) -> Option<String> {
+        self.0.poll_transport(now_ns).map(str::to_owned)
+    }
+
     #[pyo3(signature = (shard_id, generation, frame, now_ns, *, detach=true))]
     fn ingest<'py>(
         &mut self,

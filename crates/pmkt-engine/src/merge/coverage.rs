@@ -210,7 +210,7 @@ pub(crate) fn received_us(s: &str) -> Result<i64> {
         .map(|v| v.timestamp_micros())
         .map_err(|e| Error::Invalid(format!("invalid receive timestamp {s}: {e}")))
 }
-fn conflated(raw: &str) -> bool {
+pub fn conflated_subscription(raw: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return raw.contains("update_interval_ms");
     };
@@ -256,7 +256,10 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             self.books.clear();
             self.generation = Some(f.connection_generation);
         }
-        if f.frame_type == "subscription" && f.venue == Venue::Kalshi && conflated(&f.payload_raw) {
+        if f.frame_type == "subscription"
+            && f.venue == Venue::Kalshi
+            && conflated_subscription(&f.payload_raw)
+        {
             return Err(Error::Invalid(
                 "conflated Kalshi subscription (update_interval_ms)".into(),
             ));

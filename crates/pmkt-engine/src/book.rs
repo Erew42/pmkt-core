@@ -89,6 +89,17 @@ pub struct Book {
     tick: Option<D>,
     minimum: Option<D>,
 }
+/// Mutable legacy WebSocket state supplied by the caller on each application.
+#[derive(Default)]
+pub struct BookState {
+    pub levels: (Ladder, Ladder),
+    pub initialized: bool,
+    pub flags: Flags,
+    pub sequence: Sequence,
+    pub hash: Option<String>,
+    pub tick: Option<D>,
+}
+
 impl Book {
     pub fn new(mode: BookMode, instrument: impl Into<String>) -> Self {
         Self {
@@ -108,6 +119,18 @@ impl Book {
     }
     pub fn mode(&self) -> BookMode {
         self.mode
+    }
+    pub fn restore(&mut self, state: BookState) {
+        (self.first, self.second) = state.levels;
+        self.integrity = Integrity::from_observation(state.initialized, &state.flags);
+        self.flags = state.flags;
+        self.sequence = state.sequence;
+        self.hash = state.hash;
+        self.tick = state.tick;
+    }
+
+    pub fn apply_update(&mut self, update: &Update) {
+        self.apply(update, SequenceCheck::Connection);
     }
     pub fn instrument(&self) -> &str {
         &self.instrument
@@ -145,10 +168,10 @@ impl Book {
     pub fn venue_hash(&self) -> Option<&str> {
         self.hash.as_deref()
     }
-    pub(crate) fn best_native_bid(&self) -> Option<D> {
+    pub fn best_native_bid(&self) -> Option<D> {
         self.first.last_key_value().map(|(p, _)| *p)
     }
-    fn best_right(&self) -> Option<Quote> {
+    pub fn best_right(&self) -> Option<Quote> {
         let level = if matches!(
             self.mode,
             BookMode::Kalshi {
@@ -205,7 +228,6 @@ impl Book {
         }
     }
     fn refresh(&mut self) {
-        self.flags.retain(|f| !f.dynamic());
         let bid = self.best_native_bid();
         let ask = self.best_right().map(|q| {
             if matches!(
@@ -220,6 +242,11 @@ impl Book {
                 q.price
             }
         });
+        self.refresh_quotes(bid, ask);
+    }
+
+    pub fn refresh_quotes(&mut self, bid: Option<D>, ask: Option<D>) {
+        self.flags.retain(|f| !f.dynamic());
         if bid.is_none() {
             self.flags.insert(F::EmptyBid);
         }
@@ -233,18 +260,7 @@ impl Book {
                 self.flags.insert(F::CrossedBook);
             }
         }
-        if self.initialized() {
-            self.integrity = if self.flags.iter().all(|f| {
-                matches!(
-                    f,
-                    F::EmptyBid | F::EmptyAsk | F::NewMarket | F::MarketResolved
-                )
-            }) {
-                Integrity::Intact
-            } else {
-                Integrity::Impaired
-            };
-        }
+        self.integrity = Integrity::from_observation(self.initialized(), &self.flags);
     }
     fn fault(&mut self, flag: F) {
         self.flags.insert(flag);

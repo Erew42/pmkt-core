@@ -331,6 +331,13 @@ impl ShardFeed {
             _ => None,
         }
     }
+    pub fn poll_transport(&mut self, now_ns: u64) -> Option<&str> {
+        self.check_liveness(now_ns);
+        match &self.connection {
+            Connection::Disconnected(reason) => Some(reason),
+            _ => None,
+        }
+    }
     fn ingest_with<T>(
         &mut self,
         shard_id: &str,

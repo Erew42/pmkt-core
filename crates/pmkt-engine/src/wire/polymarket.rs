@@ -19,16 +19,19 @@ pub fn decode(message: &Value) -> Result<Event> {
         action,
     };
     Ok(match kind {
-        Some("book") => Event::Books(vec![update(
-            asset.ok_or_else(|| Error::Invalid("missing_book_identity".into()))?,
-            Action::Snapshot(Snapshot {
-                first: levels(message.get("bids"), false),
-                second: levels(message.get("asks"), false),
-                hash: text(message.get("hash")),
-                tick: Metadata::read(message.get("tick_size")),
-                minimum: Metadata::read(message.get("min_order_size")),
-            }),
-        )]),
+        Some("book") => {
+            let [bids, asks] = snapshot_sides(Venue::Polymarket, message);
+            Event::Books(vec![update(
+                asset.ok_or_else(|| Error::Invalid("missing_book_identity".into()))?,
+                Action::Snapshot(Snapshot {
+                    first: levels(bids, false),
+                    second: levels(asks, false),
+                    hash: text(message.get("hash")),
+                    tick: Metadata::read(message.get("tick_size")),
+                    minimum: Metadata::read(message.get("min_order_size")),
+                }),
+            )])
+        }
         Some("price_change") => {
             let invalid = || Error::Invalid("malformed_price_changes".into());
             let changes = message["price_changes"].as_array().ok_or_else(invalid)?;
