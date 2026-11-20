@@ -70,7 +70,7 @@ def record_raw_ws(
     lag_warn_ms: Annotated[Optional[float], typer.Option(help="Warn above this sampled exchange-lag median in milliseconds; uses the recorder default when omitted.", min=0)] = None,
     low_free: Annotated[Optional[int], typer.Option(help="Warn below this many free disk bytes; recording continues.", min=0)] = None,
     critical_free: Annotated[Optional[int], typer.Option(help="Pause writing below this many free disk bytes and count dropped frames.", min=0)] = None,
-    gap_reconnect_min_interval: Annotated[Optional[float], typer.Option(help="Minimum seconds between Kalshi gap reconnects; intervening gaps are recorded and logged only.", min=0)] = None,
+    gap_reconnect_min_interval: Annotated[Optional[float], typer.Option(help="Minimum seconds between Kalshi gap reconnects; intervening gaps defer a reconnect until the interval expires.", min=0)] = None,
 ) -> None:
     """Capture verbatim public WebSocket frames in gzip JSONL chunks (POSIX)."""
     logging.basicConfig(level=logging.INFO)

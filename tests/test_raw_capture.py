@@ -1220,6 +1220,125 @@ async def test_buffered_kalshi_gap_reconnects_immediately_and_throttles_later_ga
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continued_traffic", [False, True])
+async def test_suppressed_kalshi_gap_reconnects_when_cooldown_expires_without_another_gap(
+    tmp_path, monkeypatch, continued_traffic
+):
+    handlers = capture_signals(monkeypatch)
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+    snapshot = (
+        '{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"K"}}'
+    )
+    gap = '{"type":"orderbook_delta","sid":1,"seq":4,"msg":{"market_ticker":"K"}}'
+    trade = '{"type":"trade","msg":{"market_ticker":"K"}}'
+    calls = []
+
+    class SuppressedGap(FakeFeed):
+        async def recv(self):
+            if self.received == 1:
+                clock.offset = 299  # Suppress this generation's gap reconnect.
+            elif self.received == 2:
+                assert len(calls) == 2  # The interval must still be respected.
+                clock.offset = 301
+            return await super().recv()
+
+    feeds = [
+        FakeFeed([snapshot, gap]),
+        SuppressedGap([snapshot, gap] + ([trade] if continued_traffic else [])),
+        FakeFeed([snapshot], on_exhausted=lambda: handlers[signal.SIGTERM]()),
+    ]
+
+    def connector(url, **kwargs):
+        calls.append(kwargs)
+        if len(calls) > 1:
+            assert feeds[len(calls) - 2].closed
+        return feeds[len(calls) - 1]
+
+    root = tmp_path / "runs/run1/kalshi_00"
+    await asyncio.wait_for(
+        rr.capture_raw_ws(
+            root,
+            end_in(600),
+            "kalshi",
+            market_list(tmp_path, "kalshi", ["K"]),
+            runs_root=tmp_path / "runs",
+            auth=FakeProvider(),
+            connector=connector,
+            **FAST,
+        ),
+        timeout=3,
+    )
+    [session] = root.iterdir()
+    final = json.loads((session / "FINAL.json").read_text())
+    assert final["seq_gaps"] == 2
+    assert final["gap_reconnects"] == final["reconnects"] == 2
+    assert final["ready_generations"] == len(calls) == 3
+    assert all(feed.closed and len(feed.recv_tasks) == 1 for feed in feeds)
+    assert [
+        call["additional_headers"]["X-Synthetic-Signature"] for call in calls
+    ] == ["sig-1", "sig-2", "sig-3"]
+
+
+@pytest.mark.asyncio
+async def test_pending_gap_reconnect_is_cleared_by_an_unrelated_reconnect(
+    tmp_path, monkeypatch
+):
+    handlers = capture_signals(monkeypatch)
+    clock = CaptureClock()
+    monkeypatch.setattr(rr, "time", clock)
+    snapshot = (
+        '{"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"K"}}'
+    )
+    gap = '{"type":"orderbook_delta","sid":1,"seq":4,"msg":{"market_ticker":"K"}}'
+
+    class DisconnectAfterGap(FakeFeed):
+        async def recv(self):
+            if self.received == 1:
+                clock.offset = 299
+            elif self.received == 2:
+                raise ConnectionError("synthetic unrelated disconnect")
+            return await super().recv()
+
+    class Replacement(FakeFeed):
+        async def recv(self):
+            clock.offset = 301
+            if self.received == 1:
+                # Give supervision time to notice any incorrectly retained debt.
+                await asyncio.sleep(3 * FAST["supervise_seconds"])
+                handlers[signal.SIGTERM]()
+            return await super().recv()
+
+    feeds = [FakeFeed([snapshot, gap]), DisconnectAfterGap([snapshot, gap]), Replacement([snapshot])]
+    connections = []
+
+    def connector(url, **kwargs):
+        feed = feeds[len(connections)]
+        connections.append(feed)
+        return feed
+
+    root = tmp_path / "runs/run1/kalshi_00"
+    await asyncio.wait_for(
+        rr.capture_raw_ws(
+            root,
+            end_in(600),
+            "kalshi",
+            market_list(tmp_path, "kalshi", ["K"]),
+            runs_root=tmp_path / "runs",
+            auth=FakeProvider(),
+            connector=connector,
+            **FAST,
+        ),
+        timeout=3,
+    )
+    [session] = root.iterdir()
+    final = json.loads((session / "FINAL.json").read_text())
+    assert final["seq_gaps"] == 2 and final["gap_reconnects"] == 1
+    assert final["reconnects"] == 2 and len(connections) == 3
+    assert all(feed.closed for feed in feeds)
+
+
+@pytest.mark.asyncio
 async def test_kalshi_gap_reconnect_resumes_after_cooldown_with_fresh_signatures(
     tmp_path, monkeypatch
 ):
