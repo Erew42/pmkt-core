@@ -1,142 +1,306 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
-use crate::merge::{
-    CopyMerge, MergeOptions, MergeStats, MergedMessage, SessionCoverage, SessionOccurrences, Stream,
-};
 use crate::{
     Error, Result, Venue,
     book::{BookMode, VenueBooks},
-    capture::{CaptureItem, SealedChunk, list_session_chunks},
+    capture::{CaptureItem, SealedChunk, SessionChunks, list_session_chunks},
     health::Integrity,
-    merge::received_us,
+    merge::{
+        CopyMerge, EndReason, MergeOptions, MergeStats, MergedMessage, SessionCoverage,
+        SessionOccurrences, Stream, received_us, uncovered_intervals,
+    },
     wire::{self, Event},
 };
 use chrono::DateTime;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
-// A sidecar-verified individual chunk can be replayed even when its predecessor
-// is archived. Session inputs additionally verify inter-chunk links and gaps.
+// Pin the manifests once. A single chunk may have an archived predecessor.
+enum Input {
+    Chunk(SealedChunk),
+    Session(SessionChunks),
+}
 type CaptureFrames = Box<dyn Iterator<Item = Result<CaptureItem>>>;
-fn input(path: &Path) -> Result<(Option<Venue>, CaptureFrames)> {
-    if path.is_file() {
-        let chunk = SealedChunk::open(path)?;
-        return Ok((
-            Some(chunk.manifest.venue),
-            Box::new(chunk.frames(true)?.map(|f| f.map(CaptureItem::Frame))),
-        ));
+impl Input {
+    fn open(path: &Path) -> Result<Self> {
+        if path.is_file() {
+            Ok(Self::Chunk(SealedChunk::open(path)?))
+        } else {
+            Ok(Self::Session(list_session_chunks(path)?))
+        }
     }
-    let chunks = list_session_chunks(path)?;
-    Ok((
-        chunks.chunks.first().map(|c| c.manifest.venue),
-        Box::new(chunks.read(true)),
-    ))
+    fn venue(&self) -> Option<Venue> {
+        match self {
+            Self::Chunk(chunk) => Some(chunk.manifest.venue),
+            Self::Session(session) => session.chunks.first().map(|chunk| chunk.manifest.venue),
+        }
+    }
+    fn frames(&self) -> Result<CaptureFrames> {
+        match self {
+            Self::Chunk(chunk) => Ok(Box::new(
+                chunk.frames(true)?.map(|f| f.map(CaptureItem::Frame)),
+            )),
+            Self::Session(session) => Ok(Box::new(session.clone().read(true))),
+        }
+    }
+}
+
+struct Receipt<'a> {
+    utc: &'a str,
+    us: i64,
+    monotonic_ns: u64,
+    sequence: u64,
+    recording_id: &'a str,
+}
+
+struct ReconstructDriver<F> {
+    books: VenueBooks,
+    count: u64,
+    last_utc: BTreeMap<String, i64>,
+    batch: QuoteBatchBuilder,
+    target_rows: usize,
+    emit: F,
+}
+impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
+    fn new(venue: Venue, version: Version, target_rows: usize, emit: F) -> Self {
+        let mode = match venue {
+            Venue::Polymarket => BookMode::Polymarket,
+            Venue::Kalshi => BookMode::kalshi(),
+        };
+        Self {
+            books: VenueBooks::new(mode, std::iter::empty::<String>()),
+            count: 0,
+            last_utc: BTreeMap::new(),
+            batch: QuoteBatchBuilder::new(version),
+            target_rows,
+            emit,
+        }
+    }
+    fn message<'a>(
+        &mut self,
+        message: &Value,
+        frame: &Receipt<'_>,
+        position: Option<usize>,
+        subscriptions: impl Iterator<Item = &'a BTreeSet<String>> + Clone,
+    ) -> Result<()> {
+        self.count += 1;
+        let venue = self.books.mode().venue();
+        for id in self
+            .books
+            .complementary
+            .expired_instruments(self.count, frame.monotonic_ns)
+        {
+            self.books.reset_book(&id);
+        }
+        let event = wire::decode(venue, message)?;
+        if matches!(event, Event::SubscriptionError) {
+            self.books.reset();
+            return Ok(());
+        }
+        let discover = subscriptions.clone().next().is_none();
+        let subscribed = |id: &str| subscriptions.clone().any(|ids| ids.contains(id));
+        match &event {
+            Event::Books(updates) => {
+                for u in updates {
+                    if (discover || subscribed(&u.instrument))
+                        && self.books.get(&u.instrument).is_none()
+                    {
+                        self.books.subscribe(u.instrument.clone());
+                    }
+                }
+            }
+            Event::Lifecycle {
+                instruments,
+                resolved,
+                ..
+            } => {
+                for id in instruments {
+                    if subscribed(id) {
+                        self.books.subscribe(id.clone());
+                    } else if discover && *resolved {
+                        // Broadcast lifecycle messages do not establish a book subscription.
+                        // Keep terminal evidence if a later book identifies this asset.
+                        self.books.remember_resolution(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let sequence = i64::try_from(frame.sequence)
+            .map_err(|_| Error::Invalid("frame sequence exceeds int64".into()))?;
+        let mono = i64::try_from(frame.monotonic_ns)
+            .map_err(|_| Error::Invalid("receive clock exceeds int64".into()))?;
+        let mut reference = format!("{}:{sequence}", frame.recording_id);
+        if let Some(i) = position {
+            reference.push_str(&format!(":{i}"));
+        }
+        for item in self.books.apply_event(event, self.count) {
+            let book = self.books.get(&item.instrument).expect("touched book");
+            // The top and all depth rows of one observation share one adjusted clock.
+            let adjusted;
+            let (clock, utc) = match self.last_utc.get(&item.instrument) {
+                Some(prev) if *prev >= frame.us => {
+                    let clock = prev
+                        .checked_add(1)
+                        .ok_or_else(|| Error::Invalid("receive timestamp overflow".into()))?;
+                    adjusted = DateTime::from_timestamp_micros(clock)
+                        .and_then(utc_text)
+                        .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
+                    (clock, adjusted.as_str())
+                }
+                _ => (frame.us, frame.utc),
+            };
+            self.last_utc.insert(item.instrument.clone(), clock);
+            self.batch.push(
+                book,
+                Receive {
+                    run_id: Some(frame.recording_id),
+                    source: Some("ws"),
+                    utc,
+                    monotonic_ns: Some(mono),
+                    local_sequence: Some(sequence),
+                    raw_event_ref: Some(&reference),
+                    quote_age_ms: None,
+                },
+                true,
+            )?;
+            if venue == Venue::Polymarket
+                && book.integrity() == Integrity::Impaired
+                && !self
+                    .books
+                    .complementary
+                    .defer(&item.instrument, self.count, frame.monotonic_ns)
+            {
+                self.books.reset_book(&item.instrument);
+            }
+        }
+        if self.batch.row_count() >= self.target_rows {
+            let empty = QuoteBatchBuilder::new(self.batch.version);
+            (self.emit)(std::mem::replace(&mut self.batch, empty).finish()?)?;
+        }
+        Ok(())
+    }
+    fn finish(mut self) -> Result<()> {
+        if self.batch.row_count() > 0 {
+            (self.emit)(self.batch.finish()?)?;
+        }
+        Ok(())
+    }
 }
 
 /// Merge redundant sessions in venue order and keep the winning frame's original
-/// receive coordinates. Each input is one independently captured connection.
+/// causal coordinates. A receive-time hole breaks continuity only if no copy spans it.
 pub fn reconstruct_merged(
     venue: Venue,
     mut sessions: Vec<(String, String, PathBuf)>,
     version: Version,
     target_rows: usize,
-    mut emit: impl FnMut(QuoteBatches) -> Result<()>,
+    emit: impl FnMut(QuoteBatches) -> Result<()>,
     mut on_message: impl FnMut(&MergedMessage) -> Result<()>,
 ) -> Result<(MergeStats, Vec<SessionCoverage>)> {
     if target_rows == 0 {
         return Err(Error::Invalid("batch row target must be positive".into()));
     }
     sessions.sort();
+    let multiple = sessions.len() > 1;
     let mut streams = BTreeMap::<_, Vec<_>>::new();
+    let mut coverage = Vec::new();
     for (copy, connection, path) in sessions {
-        let (source_venue, frames) = input(&path)?;
-        if source_venue.is_some_and(|v| v != venue) {
+        let input = Input::open(&path)?;
+        if input.venue().is_some_and(|v| v != venue) {
             return Err(Error::Invalid(
                 "cannot merge sessions from different venues".into(),
             ));
         }
-        let session = if path.is_file() {
-            path.parent().unwrap_or(&path)
-        } else {
-            &path
+        let session = match input {
+            Input::Chunk(_) => path.parent().unwrap_or(&path),
+            Input::Session(_) => &path,
         };
         let name = session.file_name().and_then(|p| p.to_str()).unwrap_or("");
         let stream = Stream::new(copy, connection);
-        streams
-            .entry(stream.clone())
-            .or_default()
-            .push(SessionOccurrences::new(stream, name, frames));
+        let occurrences = || -> Result<_> {
+            Ok(SessionOccurrences::new(
+                stream.clone(),
+                name,
+                input.frames()?,
+            ))
+        };
+        // Venue ordering can emit before a different copy has finished proving
+        // coverage. Scan the same sealed inputs first, retaining only intervals.
+        if multiple {
+            let mut scan = occurrences()?;
+            scan.try_for_each(|item| item.map(drop))?;
+            coverage.push(scan.finish());
+        }
+        let source = occurrences()?;
+        streams.entry(stream).or_default().push(source);
     }
-    let mode = match venue {
-        Venue::Polymarket => BookMode::Polymarket,
-        Venue::Kalshi => BookMode::kalshi(),
-    };
-    let mut books = VenueBooks::new(mode, std::iter::empty::<String>());
-    let mut batch = QuoteBatchBuilder::new(version);
-    let mut count = 0;
+    if multiple {
+        let spans = coverage
+            .iter()
+            .flat_map(|c| &c.intervals)
+            .map(|i| (i.start_us, i.end_us));
+        if let (Some(start), Some(end)) = (
+            spans.clone().map(|i| i.0).min(),
+            spans.clone().map(|i| i.1).max(),
+        ) {
+            let holes = uncovered_intervals(spans, start, end)?;
+            for (source, report) in streams.values_mut().flatten().zip(&coverage) {
+                source.coverage_periods = report
+                    .intervals
+                    .iter()
+                    .map(|i| holes.partition_point(|&(_, end)| end <= i.start_us))
+                    .collect();
+            }
+        }
+    }
+    let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
+    let mut period = None;
     let mut kalshi_basis = None;
     let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
         streams
             .values_mut()
             .map(|sessions| sessions.iter_mut().flatten()),
         |m| {
-            count += 1;
             on_message(&m)?;
+            let origin = m.origin();
+            if period
+                .replace(origin.coverage_period)
+                .is_some_and(|old| old != origin.coverage_period)
+            {
+                driver.books.reset();
+            }
             if venue == Venue::Kalshi
                 && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
             {
-                for origin in &m.occurrences {
-                    let basis = origin.use_yes_price;
-                    if *kalshi_basis.get_or_insert(basis) != basis {
+                for o in &m.occurrences {
+                    if *kalshi_basis.get_or_insert(o.use_yes_price) != o.use_yes_price {
                         return Err(Error::Invalid(
                             "cannot merge Kalshi books on different price bases".into(),
                         ));
                     }
                 }
-                books.set_kalshi_price_mode(m.origin().use_yes_price);
+                driver.books.set_kalshi_price_mode(origin.use_yes_price);
             }
-            let event = wire::decode(venue, &m.message)?;
-            if let Event::Books(updates) = &event {
-                for update in updates {
-                    books.subscribe(update.instrument.clone());
-                }
-            }
-            let origin = m.origin();
-            let seq = i64::try_from(origin.frame_seq)
-                .map_err(|_| Error::Invalid("frame sequence exceeds int64".into()))?;
-            let mono = i64::try_from(origin.received_monotonic_ns)
-                .map_err(|_| Error::Invalid("receive clock exceeds int64".into()))?;
-            let mut reference = format!("{}:{seq}", origin.recording_id);
-            if let Some(position) = origin.position {
-                reference.push_str(&format!(":{position}"));
-            }
-            let receive = Receive {
-                run_id: Some(&origin.recording_id),
-                source: Some("ws"),
-                utc: &origin.received_utc,
-                monotonic_ns: Some(mono),
-                local_sequence: Some(seq),
-                raw_event_ref: Some(&reference),
-                quote_age_ms: None,
-            };
-            for item in books.apply_event(event, count) {
-                batch.push(
-                    books.get(&item.instrument).expect("subscribed book"),
-                    receive,
-                    true,
-                )?;
-            }
-            if batch.row_count() >= target_rows {
-                emit(std::mem::replace(&mut batch, QuoteBatchBuilder::new(version)).finish()?)?;
-            }
-            Ok(())
+            driver.message(
+                &m.message,
+                &Receipt {
+                    utc: &origin.received_utc,
+                    us: origin.received_us,
+                    monotonic_ns: origin.received_monotonic_ns,
+                    sequence: origin.frame_seq,
+                    recording_id: &origin.recording_id,
+                },
+                origin.position,
+                m.occurrences
+                    .iter()
+                    .filter_map(|o| o.subscription.as_deref()),
+            )
         },
     )?;
-    if batch.row_count() > 0 {
-        emit(batch.finish()?)?;
-    }
+    driver.finish()?;
     Ok((
         stats,
         streams
@@ -154,149 +318,66 @@ pub fn reconstruct_session(
     path: impl AsRef<Path>,
     version: Version,
     target_rows: usize,
-    mut emit: impl FnMut(QuoteBatches) -> Result<()>,
+    emit: impl FnMut(QuoteBatches) -> Result<()>,
 ) -> Result<()> {
     if target_rows == 0 {
         return Err(Error::Invalid("batch row target must be positive".into()));
     }
-    let (venue, frames) = input(path.as_ref())?;
-    let Some(venue) = venue else {
+    let input = Input::open(path.as_ref())?;
+    let Some(venue) = input.venue() else {
         return Ok(());
     };
-    let mode = match venue {
-        Venue::Polymarket => BookMode::Polymarket,
-        Venue::Kalshi => BookMode::kalshi(),
-    };
-    let mut books = VenueBooks::new(mode, std::iter::empty::<String>());
+    let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut generation = None;
-    let mut subscription_known = false;
-    let mut batch = QuoteBatchBuilder::new(version);
-    let mut count = 0;
-    let mut last_utc: BTreeMap<String, i64> = BTreeMap::new();
-    for item in frames {
+    let mut subscription = wire::RecordedSubscription::default();
+    for item in input.frames()? {
         let f = match item? {
             CaptureItem::Gap(_) => {
-                books.reset();
+                driver.books.reset();
                 continue;
             }
             CaptureItem::Frame(f) => f,
         };
-        if generation != Some(f.connection_generation) {
-            if generation.is_some() {
-                books.reset();
-            }
-            generation = Some(f.connection_generation);
+        if generation
+            .replace(f.connection_generation)
+            .is_some_and(|g| g != f.connection_generation)
+        {
+            driver.books.reset();
         }
         if f.frame_type == "subscription" && f.direction == "sent" {
             let command: Value = serde_json::from_str(&f.payload_raw)?;
-            let instruments = match f.venue {
-                Venue::Polymarket => command["assets_ids"].as_array(),
-                Venue::Kalshi => {
-                    let Some(mode) = wire::kalshi::subscription_basis(&command)? else {
-                        continue;
-                    };
-                    books.set_kalshi_price_mode(mode);
-                    command["params"]["market_tickers"].as_array()
+            subscription.record(venue, &command)?;
+            if let Some(basis) = subscription.kalshi_basis {
+                driver.books.set_kalshi_price_mode(basis);
+            }
+            if let Some(ids) = &subscription.instruments {
+                for id in ids.iter() {
+                    driver.books.subscribe(id.clone());
                 }
+            }
+            continue;
+        }
+        if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
+            driver.books.reset();
+            continue;
+        }
+        if f.direction == "received" && f.frame_type == "text" {
+            let receipt = Receipt {
+                utc: &f.received_utc,
+                us: received_us(&f.received_utc)?,
+                monotonic_ns: f.received_monotonic_ns,
+                sequence: f.local_frame_seq,
+                recording_id: &f.recording_id,
             };
-            if let Some(ids) = instruments {
-                for id in ids.iter().filter_map(Value::as_str) {
-                    books.subscribe(id.to_owned());
-                }
-                subscription_known = true;
-            }
-            continue;
-        }
-        if (f.direction == "local"
-            && matches!(f.frame_type.as_str(), "transport_error" | "disk_pause_gap"))
-            || f.frame_type == "ws_close"
-        {
-            books.reset();
-            continue;
-        }
-        if f.direction != "received" || f.frame_type != "text" {
-            continue;
-        }
-        let us = received_us(&f.received_utc)?;
-        let sequence = i64::try_from(f.local_frame_seq)
-            .map_err(|_| Error::Invalid("frame sequence exceeds int64".into()))?;
-        let mono = i64::try_from(f.received_monotonic_ns)
-            .map_err(|_| Error::Invalid("receive clock exceeds int64".into()))?;
-        for m in wire::live_messages(f.payload_raw.as_bytes())? {
-            count += 1;
-            // Only a recorded transport boundary invalidates unrelated books.
-            // A silent corrective deadline belongs to its affected instrument.
-            for id in books
-                .complementary
-                .expired_instruments(count, f.received_monotonic_ns)
-            {
-                books.reset_book(&id);
-            }
-            let event = wire::decode(f.venue, &m.value)?;
-            if matches!(event, Event::SubscriptionError) {
-                books.reset();
-                continue;
-            }
-            if !subscription_known && let Event::Books(updates) = &event {
-                for u in updates {
-                    if books.get(&u.instrument).is_none() {
-                        books.subscribe(u.instrument.clone());
-                    }
-                }
-            }
-            let reference = match m.position {
-                Some(i) => format!("{}:{sequence}:{i}", f.recording_id),
-                None => format!("{}:{sequence}", f.recording_id),
-            };
-            let touched = books.apply_event(event, count);
-            let mut reset = vec![];
-            for item in touched {
-                let book = books.get(&item.instrument).unwrap();
-                // Keep one causal receive coordinate for this book's top and depth rows.
-                let clock = match last_utc.get(&item.instrument) {
-                    Some(prev) if *prev >= us => prev
-                        .checked_add(1)
-                        .ok_or_else(|| Error::Invalid("receive timestamp overflow".into()))?,
-                    _ => us,
-                };
-                let utc = if clock == us {
-                    f.received_utc.clone()
-                } else {
-                    DateTime::from_timestamp_micros(clock)
-                        .and_then(utc_text)
-                        .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?
-                };
-                let receive = Receive {
-                    run_id: Some(&f.recording_id),
-                    source: Some("ws"),
-                    utc: &utc,
-                    monotonic_ns: Some(mono),
-                    local_sequence: Some(sequence),
-                    raw_event_ref: Some(&reference),
-                    // Capture records receipt, but not when the live quote was observed.
-                    quote_age_ms: None,
-                };
-                batch.push(book, receive, true)?;
-                last_utc.insert(item.instrument.clone(), clock);
-                if f.venue == Venue::Polymarket
-                    && book.integrity() == Integrity::Impaired
-                    && !books
-                        .complementary
-                        .defer(&item.instrument, count, f.received_monotonic_ns)
-                {
-                    reset.push(item.instrument);
-                }
-            }
-            for id in reset {
-                books.reset_book(&id);
-            }
-            if batch.row_count() >= target_rows {
-                emit(std::mem::replace(&mut batch, QuoteBatchBuilder::new(version)).finish()?)?;
+            for m in wire::live_messages(f.payload_raw.as_bytes())? {
+                driver.message(
+                    &m.value,
+                    &receipt,
+                    m.position,
+                    subscription.instruments.as_deref().into_iter(),
+                )?;
             }
         }
     }
-    if batch.row_count() > 0 {
-        emit(batch.finish()?)?;
-    }
-    Ok(())
+    driver.finish()
 }

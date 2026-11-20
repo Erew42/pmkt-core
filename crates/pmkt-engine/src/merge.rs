@@ -38,6 +38,11 @@ pub struct Origin {
     pub recording_id: String,
     pub received_monotonic_ns: u64,
     pub use_yes_price: bool,
+    /// Contiguous coverage period containing this occurrence, used during replay.
+    #[serde(skip)]
+    pub coverage_period: usize,
+    #[serde(skip)]
+    pub subscription: Option<std::sync::Arc<BTreeSet<String>>>,
 }
 impl Origin {
     fn rank(&self) -> (i64, &Stream, &str, u64, Option<usize>) {

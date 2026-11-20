@@ -464,6 +464,9 @@ impl VenueBooks {
     pub fn resolved(&self, id: &str) -> bool {
         self.resolved.contains(id)
     }
+    pub(crate) fn remember_resolution(&mut self, id: &str) {
+        self.resolved.insert(id.to_owned());
+    }
     pub fn reset_book(&mut self, id: &str) {
         if let Some(book) = self.books.get_mut(id) {
             *book = Book::new(self.mode, id);

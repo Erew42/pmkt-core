@@ -69,7 +69,7 @@ pub enum CaptureItem {
     Frame(RawFrame),
     Gap(ChunkGap),
 }
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionChunks {
     pub chunks: Vec<SealedChunk>,
     pub incomplete: Vec<PathBuf>,

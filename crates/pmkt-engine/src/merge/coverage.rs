@@ -23,10 +23,21 @@ pub enum EndReason {
     NewGeneration,
     TransportError,
     DiskPauseGap,
+    WsClose,
     ChunkGap,
     #[serde(rename = "seq_gap")]
     SequenceGap,
     SessionEnd,
+}
+impl EndReason {
+    pub(crate) fn transport_boundary(kind: &str, direction: &str) -> Option<Self> {
+        match (kind, direction) {
+            ("ws_close", _) => Some(Self::WsClose),
+            ("disk_pause_gap", "local") => Some(Self::DiskPauseGap),
+            ("transport_error", "local") => Some(Self::TransportError),
+            _ => None,
+        }
+    }
 }
 #[derive(serde::Serialize, Clone, Debug)]
 pub struct Interval {
@@ -94,22 +105,7 @@ impl CoverageTracker {
             self.generation = Some(generation);
             self.seqs.clear();
         }
-        if direction == "local" {
-            match kind {
-                "transport_error" => {
-                    self.report.counts.transport_errors += 1;
-                    self.end(EndReason::TransportError, None);
-                }
-                "disk_pause_gap" => {
-                    self.report.counts.disk_pause_markers += 1;
-                    self.end(EndReason::DiskPauseGap, None);
-                    self.window = Window::Closed(StartReason::AfterGap);
-                    self.seqs.clear();
-                }
-                "seq_gap" => self.report.counts.seq_gap_markers += 1,
-                _ => {}
-            }
-        } else if direction.starts_with("received") {
+        if direction.starts_with("received") {
             self.frame_us = Some(us);
             match &mut self.window {
                 Window::Closed(reason) => {
@@ -125,6 +121,18 @@ impl CoverageTracker {
                     *last = (*last).max(us);
                 }
             }
+        }
+        // A received close is evidence up to the close frame itself.
+        if let Some(reason) = EndReason::transport_boundary(kind, direction) {
+            self.report.counts.transport_errors += u64::from(reason == EndReason::TransportError);
+            self.report.counts.disk_pause_markers += u64::from(reason == EndReason::DiskPauseGap);
+            self.end(reason, None);
+            if reason != EndReason::TransportError {
+                self.window = Window::Closed(StartReason::AfterGap);
+                self.seqs.clear();
+            }
+        } else if direction == "local" && kind == "seq_gap" {
+            self.report.counts.seq_gap_markers += 1;
         }
     }
     pub fn sequence(&mut self, sid: i64, seq: i64) {
@@ -215,22 +223,26 @@ fn conflated(raw: &str) -> bool {
     }
 }
 pub struct SessionOccurrences<I> {
+    // Empty for independent replay. Otherwise map local intervals to the
+    // continuous periods formed by the union of all redundant sources.
+    pub(crate) coverage_periods: Vec<usize>,
     source: I,
     tracker: CoverageTracker,
     generation: Option<u64>,
     books: BTreeSet<String>,
-    use_yes_price: bool,
+    subscription: wire::RecordedSubscription,
     pending: std::vec::IntoIter<Occurrence>,
     done: bool,
 }
 impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     pub fn new(stream: Stream, session: impl Into<String>, source: I) -> Self {
         Self {
+            coverage_periods: vec![],
             source,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
             books: BTreeSet::new(),
-            use_yes_price: true,
+            subscription: wire::RecordedSubscription::default(),
             pending: vec![].into_iter(),
             done: false,
         }
@@ -249,13 +261,11 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                 "conflated Kalshi subscription (update_interval_ms)".into(),
             ));
         }
-        if f.venue == Venue::Kalshi
-            && f.frame_type == "subscription"
+        if f.frame_type == "subscription"
             && f.direction == "sent"
             && let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
-            && let Some(basis) = wire::kalshi::subscription_basis(&command)?
         {
-            self.use_yes_price = basis;
+            self.subscription.record(f.venue, &command)?;
         }
         self.tracker
             .frame(us, f.connection_generation, &f.frame_type, &f.direction);
@@ -291,7 +301,13 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     received_utc: f.received_utc.clone(),
                     recording_id: f.recording_id.clone(),
                     received_monotonic_ns: f.received_monotonic_ns,
-                    use_yes_price: self.use_yes_price,
+                    use_yes_price: self.subscription.kalshi_basis.unwrap_or(true),
+                    subscription: self.subscription.instruments.clone(),
+                    coverage_period: if self.coverage_periods.is_empty() {
+                        self.tracker.report.intervals.len()
+                    } else {
+                        self.coverage_periods[self.tracker.report.intervals.len()]
+                    },
                 },
                 message: v,
                 reconnect_snapshot,

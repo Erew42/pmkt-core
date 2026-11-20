@@ -12,6 +12,7 @@ import pytest
 
 from pmkt import _native
 from pmkt.data.registry import arrow_schema, get_table_spec
+from pmkt.data.validation import validate_frame
 from pmkt.streaming import managed_feed
 from pmkt.streaming.copy_merge import CopyMerge, session_occurrences
 from pmkt.streaming.raw_capture import ChunkWriter
@@ -417,3 +418,110 @@ def test_merge_continues_one_connection_across_sessions_and_honors_price_basis(
     top = pa.table(merged["topbook"])
     assert top["raw_event_ref"].to_pylist() == ["first:2"] * 2 + ["second:2"] * 2
     assert top["best_ask_dollars"].to_pylist() == [0.6, 0.7] * 2
+
+
+def write_poly_session(path, monkeypatch, frames):
+    from pmkt.streaming import raw_capture
+
+    path.mkdir()
+    writer = ChunkWriter(path, path.name, "polymarket", "conn")
+    for micros, kind, direction, message in frames:
+        utc = f"2023-11-14T22:13:20.{micros:06}+00:00"
+        monkeypatch.setattr(raw_capture, "utc", lambda: utc)
+        writer.write(kind, json.dumps(message), 1, direction)
+    writer.seal()
+    return path.name, "conn", path
+
+
+@pytest.mark.parametrize("backup", ["absent", "interrupted", "continuous"])
+@pytest.mark.parametrize("marker,direction", [
+    ("disk_pause_gap", "local"),
+    ("transport_error", "local"),
+    ("ws_close", "received_control_base64"),
+])
+def test_merged_coverage_resets_only_across_uncovered_holes(
+    tmp_path, monkeypatch, marker, direction, backup
+):
+    book = snapshot("polymarket")
+    change = dict(delta("polymarket"), timestamp="1700000000001")
+    sources = [write_poly_session(tmp_path / "a", monkeypatch, [
+        (100, "text", "received", book),
+        (200, marker, direction, ""),
+        (300, "text", "received", change),
+    ])]
+    if backup != "absent":
+        # Control frames alone can establish continuous redundant coverage.
+        backup_frames = [(90, "ws_pong", "received_control_base64", "")]
+        if backup == "interrupted":
+            backup_frames.append((190, "transport_error", "local", ""))
+        backup_frames.append((310, "ws_pong", "received_control_base64", ""))
+        sources.append(write_poly_session(tmp_path / "b", monkeypatch, backup_frames))
+    merged = _native.merge_raw_captures("polymarket", sources, target_rows=1)
+    top = pa.table(merged["topbook"]).to_pylist()
+    depth = pa.table(merged["depth"]).to_pylist()
+    covered = backup == "continuous"
+    assert [row["valid_state"] for row in top] == [True, covered]
+    assert sum(row["local_sequence"] == 3 for row in depth) == (2 if covered else 0)
+    if not covered:
+        assert {"no_initial_snapshot", "delta_before_snapshot"} <= set(top[1]["quality_flags"])
+        expected = reconstruct_raw_capture(sources[0][2])
+        assert (top, depth) == tuple(table.to_pylist() for table in expected)
+
+
+def test_merged_emission_keys_survive_batch_and_clock_step(tmp_path, monkeypatch):
+    book = dict(snapshot("polymarket", "12345"), market="0xabc", hash="abcd")
+    change = dict(delta("polymarket", "12345"), market="0xabc", timestamp="1700000000001")
+    change["price_changes"][0].update(hash="def0", previous_hash="abcd")
+    source = write_poly_session(tmp_path / "a", monkeypatch, [
+        (500, "text", "received", [book, change]),
+        (200, "text", "received", dict(book, timestamp="1700000000002")),
+    ])
+    merged = _native.merge_raw_captures("polymarket", [source], target_rows=1)
+    expected = reconstruct_raw_capture(source[2])
+    for name, oracle in zip(("topbook", "depth"), expected):
+        table = pa.table(merged[name])
+        assert table.equals(oracle)
+        report = validate_frame(table.to_pandas(), f"{name}.v2", strict=True)
+        assert report.ok, report.errors
+        times = [f"2023-11-14T22:13:20.{us:06}+00:00" for us in (500, 501, 502)]
+        if name == "topbook":
+            assert table["raw_event_ref"].to_pylist() == ["a:1:0", "a:1:1", "a:2"]
+            assert table["received_at_utc"].to_pylist() == times
+        else:
+            assert table["received_at_utc"].to_pylist() == [utc for utc in times for _ in range(2)]
+
+
+def test_merged_resolution_before_initial_book(tmp_path, monkeypatch):
+    source = write_poly_session(tmp_path / "a", monkeypatch, [
+        (100, "subscription", "sent", {"assets_ids": ["a"]}),
+        (200, "text", "received", {
+            "event_type": "market_resolved", "assets_ids": ["a", "b"], "market": "condition",
+            "timestamp": "1699999999999",
+        }),
+        (300, "text", "received", snapshot("polymarket")),
+    ])
+    merged = _native.merge_raw_captures("polymarket", [source], target_rows=1)
+    top, depth = (pa.table(merged[name]) for name in ("topbook", "depth"))
+    expected = reconstruct_raw_capture(source[2])
+    assert top.equals(expected[0]) and depth.equals(expected[1])
+    assert top["raw_event_ref"].to_pylist() == ["a:2", "a:3"]
+    assert top["valid_state"].to_pylist() == [False, False]
+    assert all("market_resolved" in flags for flags in top["quality_flags"].to_pylist())
+
+
+def test_broadcast_lifecycle_in_a_chunk_without_subscription(tmp_path, monkeypatch):
+    source = write_poly_session(tmp_path / "a", monkeypatch, [
+        (100, "text", "received", {
+            "event_type": "new_market", "assets_ids": ["other"], "timestamp": "1699999999998",
+        }),
+        (200, "text", "received", {
+            "event_type": "market_resolved", "assets_ids": ["a", "b"], "timestamp": "1699999999999",
+        }),
+        (300, "text", "received", snapshot("polymarket")),
+    ])
+    merged = _native.merge_raw_captures("polymarket", [source])
+    for top in (pa.table(merged["topbook"]), reconstruct_raw_capture(source[2])[0]):
+        assert top["raw_event_ref"].to_pylist() == ["a:3"]
+        assert top["instrument_id"].to_pylist() == ["a"]
+        assert top["valid_state"].to_pylist() == [False]
+        assert top["quality_flags"].to_pylist() == [["market_resolved"]]
