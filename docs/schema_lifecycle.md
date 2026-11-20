@@ -36,7 +36,7 @@ That decision did not end or weaken the freeze for any remaining contract.
 | `instrument.v1` | `provisional_unintegrated` | Retire unless a future proposal supplies a writer, stable identity and update semantics, a persistence location, and consumer joins. |
 | `market_taxonomy_evidence.v1` | `active_experiment` | Retain. It has hash-pinned retained research data, but still needs a tracked producer/reader workflow and artifact-level schema, grain, key, and provenance metadata. |
 | Paper-canary contract family (six schemas) | retired in 0.2 | Removed atomically under the tracked family retirement packet. The remaining `execution_deferred` contracts stay frozen. |
-| Committed book tape (five schemas) | retired | Removed the event, level, and control schemas together after the capture and reconstruction code was removed in `907ce11`. |
+| Committed book tape (five schemas) | retired | Removed together after the capture and reconstruction code was removed in `907ce11`. See the [family retirement packet](schema_retirements/book_tape_family.md). |
 
 The pre-split evidence baseline (`historical_evidence_as_of` in the catalog)
 found no snapshot-v2, `market_match.v1`, `event.v1`, `market.v1`, or
