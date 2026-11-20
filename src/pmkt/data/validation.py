@@ -12,19 +12,14 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from pmkt.data.canonical import canonical_fixed_decimal
 from pmkt.data.books import UNRESOLVED_BOOK_FAILURE_FLAGS
-from pmkt.data.schemas import topbook_evidence_id
 from pmkt.data.types import parse_int
 from pmkt.data.registry import TableSpec, get_table_spec, infer_table_spec
 from pmkt.data.registry import (
     CONTRACT_EVIDENCE_SCHEMA_VERSION,
     CO_RESOLUTION_OBSERVATION_SCHEMA_VERSION,
     CO_RESOLUTION_SCORE_SCHEMA_VERSION,
-    BOOK_TAPE_CONTROL_SCHEMA_VERSION,
-    BOOK_TAPE_EVENT_SCHEMA_VERSION,
     INTEGRITY_SCHEMA_VERSIONS,
-    BOOK_TAPE_LEVEL_SCHEMA_VERSION,
     KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
     KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION_V2,
     MARKET_TAXONOMY_EVIDENCE_SCHEMA_VERSION,
@@ -32,7 +27,6 @@ from pmkt.data.registry import (
     POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
     POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION_V2,
     STREAM_LIFECYCLE_SCHEMA_VERSION,
-    TOPBOOK_SCHEMA_VERSION,
     TRADE_SCHEMA_VERSION,
 )
 
@@ -44,9 +38,6 @@ _UTC_TIMESTAMP_RE = re.compile(
     r"(?P<offset>Z|\+00(?::?00)?)$"
 )
 _UNIX_EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
-_BOOK_RECOVERY_EVIDENCE_ROLES = frozenset(
-    {"tape_event", "topbook_main", "topbook_checkpoint"}
-)
 _INTEGER_BOUNDS = {
     "int32": (-(1 << 31), (1 << 31) - 1),
     "int64": (-(1 << 63), (1 << 63) - 1),
@@ -106,15 +97,6 @@ class SchemaValidationReport:
         messages.extend(self.dtype_errors)
         messages.extend(self.invariant_errors)
         return tuple(messages)
-
-
-@dataclass(frozen=True)
-class BookTapeBundleValidationReport:
-    errors: tuple[str, ...] = ()
-
-    @property
-    def ok(self) -> bool:
-        return not self.errors
 
 
 def validate_frame(
@@ -468,7 +450,7 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
     errors: list[str] = []
     errors.extend(_price_invariant_errors(df, spec))
     errors.extend(_flag_token_errors(df, spec))
-    if spec.version in {"topbook.v2", "depth.v2", "book_tape_event.v2"} and "book_integrity_valid" in df:
+    if spec.version in {"topbook.v2", "depth.v2"} and "book_integrity_valid" in df:
         broken = _quality_flag_series(df).map(
             lambda value: bool(set(_flags(value)) & UNRESOLVED_BOOK_FAILURE_FLAGS)
         )
@@ -515,31 +497,6 @@ def _invariant_errors(df: pd.DataFrame, spec: TableSpec) -> list[str]:
         errors.extend(_co_resolution_observation_invariant_errors(df))
     if spec.version == CO_RESOLUTION_SCORE_SCHEMA_VERSION:
         errors.extend(_co_resolution_score_invariant_errors(df))
-    if spec.version in {BOOK_TAPE_EVENT_SCHEMA_VERSION, "book_tape_event.v2"} and _has_columns(
-        df,
-        "event_kind",
-        "epoch_id",
-        "checkpoint_reason",
-        "side_counts_json",
-        "reconstructible",
-    ):
-        errors.extend(_book_tape_event_invariant_errors(df))
-    if spec.version == BOOK_TAPE_LEVEL_SCHEMA_VERSION and _has_columns(
-        df,
-        "venue",
-        "source_side",
-        "price_key",
-        "price_dollars",
-    ):
-        errors.extend(_book_tape_level_invariant_errors(df))
-    if spec.version in {BOOK_TAPE_CONTROL_SCHEMA_VERSION, "book_tape_control.v2"} and _has_columns(
-        df,
-        "control_type",
-        "valid_after",
-        "evidence_role",
-        "evidence_id",
-    ):
-        errors.extend(_book_tape_control_invariant_errors(df))
     if spec.version == STREAM_LIFECYCLE_SCHEMA_VERSION and _has_columns(
         df,
         "venue",
@@ -565,9 +522,6 @@ def _has_columns(df: pd.DataFrame, *columns: str) -> bool:
 
 
 _LOWER_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_FIXED_DECIMAL_RE = re.compile(r"^(?:0|1)(?:\.\d+)?$")
-_POLYMARKET_TAPE_SIDES = {"bid", "ask"}
-_KALSHI_TAPE_SIDES = {"yes", "no"}
 _POLYMARKET_LIFECYCLE_EVENTS = {
     "new_market",
     "market_resolved",
@@ -623,216 +577,6 @@ def _trade_invariant_errors(df: pd.DataFrame) -> list[str]:
             "trade capture coordinate: "
             f"row {df.index[position]} is incomplete; missing {missing}"
         )
-    return errors
-
-def _book_tape_event_invariant_errors(df: pd.DataFrame) -> list[str]:
-    errors = _nonnegative_errors(
-        df,
-        (
-            "received_at_monotonic_ns",
-            "local_sequence",
-            "subsequence",
-            "expected_level_row_count",
-        ),
-    )
-    errors.extend(_explicit_utc_errors(df, ("received_at_utc", "exchange_at_utc")))
-    errors.extend(
-        _sha256_errors(
-            df,
-            (
-                "event_id",
-                "epoch_id",
-                "post_book_hash",
-                "raw_event_hash",
-                "event_payload_hash",
-            ),
-        )
-    )
-    errors.extend(_canonical_json_errors(df, "quality_flags_json", list, required=True))
-    kind = df["event_kind"].fillna("").astype(str)
-    checkpoint = kind.eq("checkpoint")
-    delta = kind.eq("delta")
-    epoch_present = _bool_mask(df["epoch_id"], _present_text)
-    reason_present = _bool_mask(df["checkpoint_reason"], _present_text)
-    side_counts_present = _bool_mask(df["side_counts_json"], _present_text)
-    reconstructible = _bool_mask(
-        df["reconstructible"], lambda value: _parse_bool(value) is True
-    )
-    checkpoint_missing_epoch = checkpoint & ~epoch_present
-    checkpoint_missing_reason = checkpoint & ~reason_present
-    checkpoint_missing_sides = checkpoint & ~side_counts_present
-    delta_with_reason = delta & reason_present
-    delta_with_sides = delta & side_counts_present
-    if "book_integrity_valid" in df.columns:
-        integrity = _parsed_bool_mask(df["book_integrity_valid"])
-        if bool((integrity != reconstructible).any()):
-            errors.append("book_integrity_valid must agree with reconstructible")
-    reconstructible_missing_epoch = reconstructible & ~epoch_present
-    side_errors_by_position: dict[int, list[str]] = {}
-    for position in (checkpoint & side_counts_present).to_numpy().nonzero()[0]:
-        row_errors = _checkpoint_side_count_errors(df.iloc[position].to_dict())
-        if row_errors:
-            side_errors_by_position[int(position)] = row_errors
-    failing = (
-        checkpoint_missing_epoch
-        | checkpoint_missing_reason
-        | checkpoint_missing_sides
-        | delta_with_reason
-        | delta_with_sides
-        | reconstructible_missing_epoch
-    ).to_numpy()
-    failing_positions = set(int(position) for position in failing.nonzero()[0])
-    failing_positions.update(side_errors_by_position)
-    for position in sorted(failing_positions):
-        if bool(checkpoint.iloc[position]):
-            if bool(checkpoint_missing_epoch.iloc[position]):
-                errors.append("epoch_id: checkpoint requires an epoch id")
-            if bool(checkpoint_missing_reason.iloc[position]):
-                errors.append("checkpoint_reason: checkpoint requires a reason")
-            if bool(checkpoint_missing_sides.iloc[position]):
-                errors.append(
-                    "side_counts_json: checkpoint requires explicit side counts"
-                )
-            else:
-                errors.extend(side_errors_by_position.get(position, ()))
-        elif bool(delta.iloc[position]):
-            if bool(delta_with_reason.iloc[position]):
-                errors.append(
-                    "checkpoint_reason: delta must not declare a checkpoint reason"
-                )
-            if bool(delta_with_sides.iloc[position]):
-                errors.append(
-                    "side_counts_json: delta must not declare checkpoint side counts"
-                )
-        if bool(reconstructible_missing_epoch.iloc[position]):
-            errors.append("epoch_id: reconstructible event requires an open epoch")
-    return errors
-
-def _checkpoint_side_count_errors(row: Mapping[str, Any]) -> list[str]:
-    value = _decoded_json(row.get("side_counts_json"))
-    if not isinstance(value, Mapping):
-        return ["side_counts_json: checkpoint value must be a JSON object"]
-    venue = str(row.get("venue") or "")
-    expected_sides = (
-        _POLYMARKET_TAPE_SIDES if venue == "polymarket" else _KALSHI_TAPE_SIDES
-    )
-    keys = {str(key) for key in value}
-    errors: list[str] = []
-    if keys != expected_sides:
-        errors.append(
-            "side_counts_json: "
-            f"{venue} checkpoint sides must equal {sorted(expected_sides)}"
-        )
-        return errors
-    counts: list[int] = []
-    for side in sorted(expected_sides):
-        raw = value.get(side)
-        parsed = _parse_strict_float(raw)
-        if (
-            isinstance(raw, bool)
-            or parsed is None
-            or not parsed.is_integer()
-            or parsed < 0
-        ):
-            errors.append(
-                f"side_counts_json: side {side} count must be a nonnegative integer"
-            )
-            continue
-        counts.append(int(parsed))
-    expected_count = row.get("expected_level_row_count")
-    parsed_expected = _parse_strict_float(expected_count)
-    if (
-        len(counts) == len(expected_sides)
-        and parsed_expected is not None
-        and parsed_expected.is_integer()
-    ):
-        if sum(counts) != int(parsed_expected):
-            errors.append(
-                "side_counts_json: side counts do not equal expected level row count"
-            )
-    return errors
-
-
-def _book_tape_level_invariant_errors(df: pd.DataFrame) -> list[str]:
-    errors = _nonnegative_errors(
-        df,
-        ("price_dollars", "size_after_contracts", "level_ordinal"),
-    )
-    errors.extend(_sha256_errors(df, ("event_id", "epoch_id")))
-    venues = df["venue"].fillna("").astype(str)
-    sides = df["source_side"].fillna("").astype(str)
-    side_valid = (venues.eq("polymarket") & sides.isin(_POLYMARKET_TAPE_SIDES)) | (
-        ~venues.eq("polymarket") & sides.isin(_KALSHI_TAPE_SIDES)
-    )
-    keys = df["price_key"].fillna("").astype(str)
-    canonical_key = keys.str.fullmatch(_FIXED_DECIMAL_RE).fillna(False)
-    parsed_prices = df["price_dollars"].map(_parse_strict_float)
-    expected_keys = parsed_prices.map(
-        lambda value: canonical_fixed_decimal(value) if value is not None else None
-    )
-    disagreement = canonical_key & parsed_prices.notna() & keys.ne(expected_keys)
-    failing = (~side_valid | ~canonical_key | disagreement).to_numpy()
-    for position in failing.nonzero()[0]:
-        if not bool(side_valid.iloc[position]):
-            errors.append(
-                f"source_side: {venues.iloc[position]} "
-                f"does not allow {sides.iloc[position]!r}"
-            )
-        if not bool(canonical_key.iloc[position]):
-            errors.append("price_key: value is not a canonical fixed decimal in [0, 1]")
-            continue
-        if bool(disagreement.iloc[position]):
-            errors.append("price_key: value disagrees with price_dollars")
-    return errors
-
-def _book_tape_control_invariant_errors(df: pd.DataFrame) -> list[str]:
-    errors = _nonnegative_errors(
-        df, ("received_at_monotonic_ns", "local_sequence", "subsequence")
-    )
-    errors.extend(_explicit_utc_errors(df, ("received_at_utc", "exchange_at_utc")))
-    errors.extend(_sha256_errors(df, ("control_id", "epoch_id", "evidence_id")))
-    errors.extend(_canonical_json_errors(df, "quality_flags_json", list, required=True))
-    control_type = df["control_type"].fillna("").astype(str)
-    valid_after = _bool_mask(
-        df["valid_after"], lambda value: _parse_bool(value) is True
-    )
-    recovered = control_type.eq("book_recovered")
-    role_present = _bool_mask(df["evidence_role"], _present_text)
-    id_present = _bool_mask(df["evidence_id"], _present_text)
-    role_valid = df["evidence_role"].fillna("").astype(str).isin(
-        _BOOK_RECOVERY_EVIDENCE_ROLES
-    )
-    intact_after = (
-        _parsed_bool_mask(df["book_integrity_after"])
-        if "book_integrity_after" in df.columns else valid_after
-    )
-    recovered_invalid = recovered & ~intact_after
-    recovered_missing_reference = recovered & ~(role_present & id_present)
-    recovered_invalid_role = recovered & role_present & id_present & ~role_valid
-    invalidated_valid = control_type.eq("book_invalidated") & (valid_after | intact_after)
-    ended_valid = control_type.eq("stream_ended") & (valid_after | intact_after)
-    failing = (
-        recovered_invalid
-        | recovered_missing_reference
-        | recovered_invalid_role
-        | invalidated_valid
-        | ended_valid
-    ).to_numpy()
-    for position in failing.nonzero()[0]:
-        if bool(recovered.iloc[position]):
-            if bool(recovered_invalid.iloc[position]):
-                errors.append("valid_after: book_recovered must open valid state")
-            if bool(recovered_missing_reference.iloc[position]):
-                errors.append("evidence reference: book_recovered requires role and id")
-            elif bool(recovered_invalid_role.iloc[position]):
-                errors.append(
-                    "evidence_role: book_recovered must reference tape_event, "
-                    "topbook_main, or topbook_checkpoint"
-                )
-        elif bool(invalidated_valid.iloc[position]):
-            errors.append("valid_after: book_invalidated must close valid state")
-        elif bool(ended_valid.iloc[position]):
-            errors.append("valid_after: stream_ended must close valid state")
     return errors
 
 def _stream_lifecycle_invariant_errors(df: pd.DataFrame) -> list[str]:
@@ -992,372 +736,14 @@ def _decoded_json(value: Any) -> Any:
 
 def resolve_evidence_schema(frame: pd.DataFrame, legacy_version: str) -> str:
     newer = INTEGRITY_SCHEMA_VERSIONS.get(legacy_version)
-    if newer is not None:
-        field = "book_integrity_after" if legacy_version == BOOK_TAPE_CONTROL_SCHEMA_VERSION else "book_integrity_valid"
-        if field in frame.columns:
-            return newer
+    if newer is not None and "book_integrity_valid" in frame.columns:
+        return newer
     return legacy_version
 
 
 def coerce_book_evidence_frame(frame: pd.DataFrame, legacy_version: str) -> pd.DataFrame:
     """Normalize supported book evidence without dropping explicit integrity."""
     return coerce_frame(frame, resolve_evidence_schema(frame, legacy_version))
-
-
-def validate_book_tape_bundle(
-    events: pd.DataFrame,
-    levels: pd.DataFrame,
-    controls: pd.DataFrame | None = None,
-    *,
-    expected_encoding_version: str | None = None,
-) -> BookTapeBundleValidationReport:
-    """Validate strict tape schemas plus event/level/control relationships."""
-    errors: list[str] = []
-    for frame, version in (
-        (events, BOOK_TAPE_EVENT_SCHEMA_VERSION),
-        (levels, BOOK_TAPE_LEVEL_SCHEMA_VERSION),
-    ):
-        report = validate_frame(frame, resolve_evidence_schema(frame, version), strict=True)
-        errors.extend(f"{version}: {error}" for error in report.errors)
-    if controls is not None:
-        report = validate_frame(controls, resolve_evidence_schema(controls, BOOK_TAPE_CONTROL_SCHEMA_VERSION), strict=True)
-        errors.extend(
-            f"{BOOK_TAPE_CONTROL_SCHEMA_VERSION}: {error}" for error in report.errors
-        )
-    if errors:
-        return BookTapeBundleValidationReport(tuple(errors))
-
-    for frame, version in (
-        (events, BOOK_TAPE_EVENT_SCHEMA_VERSION),
-        (levels, BOOK_TAPE_LEVEL_SCHEMA_VERSION),
-    ):
-        for column in ("collector_run_id", "event_id"):
-            incompatible = sum(
-                not isinstance(value, str) for value in frame[column].tolist()
-            )
-            if incompatible:
-                errors.append(
-                    f"{version}: {column}: {incompatible} values must be strings"
-                )
-    if errors:
-        return BookTapeBundleValidationReport(tuple(errors))
-
-    if expected_encoding_version is not None:
-        if not _present_text(expected_encoding_version):
-            errors.append(
-                "book_tape_event.v1: expected encoding_version must be non-empty"
-            )
-        else:
-            actual_versions = sorted(
-                {str(value) for value in events["encoding_version"].tolist()}
-            )
-            if any(value != expected_encoding_version for value in actual_versions):
-                errors.append(
-                    "book_tape_event.v1: encoding_version must equal "
-                    f"{expected_encoding_version!r}; found {actual_versions!r}"
-                )
-
-    key_columns = ["collector_run_id", "event_id"]
-    parent_columns = ["venue", "venue_book_id", "epoch_id"]
-    parent_lookup = events.loc[
-        :,
-        [
-            *key_columns,
-            *parent_columns,
-            "expected_level_row_count",
-            "event_kind",
-            "side_counts_json",
-        ],
-    ].rename(
-        columns={
-            column: f"_parent_{column}"
-            for column in (
-                *parent_columns,
-                "expected_level_row_count",
-                "event_kind",
-                "side_counts_json",
-            )
-        }
-    )
-    merged = levels.merge(
-        parent_lookup,
-        on=key_columns,
-        how="left",
-        sort=False,
-        validate="many_to_one",
-        indicator=True,
-    )
-    orphan = merged["_merge"].eq("left_only")
-    for key in merged.loc[orphan, key_columns].itertuples(index=False, name=None):
-        normalized = tuple(str(value) for value in key)
-        errors.append(f"book_tape_level.v1: orphan event foreign key {normalized}")
-    matched = ~orphan
-    for column in parent_columns:
-        child = merged[column].map(_evidence_value)
-        parent = merged[f"_parent_{column}"].map(_evidence_value)
-        mismatch = matched & ~(child.eq(parent) | (child.isna() & parent.isna()))
-        for key in merged.loc[mismatch, key_columns].itertuples(
-            index=False,
-            name=None,
-        ):
-            normalized = tuple(str(value) for value in key)
-            errors.append(
-                f"book_tape_level.v1: {column} disagrees with parent {normalized}"
-            )
-
-    actual_counts = (
-        levels.groupby(key_columns, sort=False, dropna=False)
-        .size()
-        .rename("_actual_level_count")
-        .reset_index()
-    )
-    event_counts = events.merge(
-        actual_counts,
-        on=key_columns,
-        how="left",
-        sort=False,
-        validate="one_to_one",
-    )
-    event_counts["_actual_level_count"] = (
-        event_counts["_actual_level_count"].fillna(0).astype("int64")
-    )
-    expected_counts = (
-        pd.to_numeric(
-            event_counts["expected_level_row_count"],
-            errors="coerce",
-        )
-        .fillna(-1)
-        .astype("int64")
-    )
-    count_mismatch = event_counts["_actual_level_count"].ne(expected_counts)
-    for row in event_counts.loc[
-        count_mismatch,
-        [*key_columns, "expected_level_row_count", "_actual_level_count"],
-    ].itertuples(index=False, name=None):
-        run_id, event_id, expected, actual = row
-        key = (str(run_id), str(event_id))
-        errors.append(
-            f"book_tape_event.v1: {key} expected {int(expected)} levels, "
-            f"found {int(actual)}"
-        )
-
-    checkpoints = events[events["event_kind"].fillna("").astype(str).eq("checkpoint")]
-    checkpoint_records = checkpoints.to_dict("records")
-    checkpoint_keys = {
-        (event["collector_run_id"], event["event_id"])
-        for event in checkpoint_records
-    }
-    actual_sides: dict[tuple[str, str], dict[str, int]] = {}
-    if checkpoint_keys:
-        for run_id, event_id, side in levels[
-            [*key_columns, "source_side"]
-        ].itertuples(index=False, name=None):
-            key = (run_id, event_id)
-            if key not in checkpoint_keys:
-                continue
-            side_text = str(side)
-            counts = actual_sides.setdefault(key, {})
-            counts[side_text] = counts.get(side_text, 0) + 1
-    for event in checkpoint_records:
-        key = (event["collector_run_id"], event["event_id"])
-        declared_counts = _decoded_json(event.get("side_counts_json"))
-        declared = (
-            {str(side): int(count) for side, count in declared_counts.items()}
-            if isinstance(declared_counts, Mapping)
-            else None
-        )
-        actual = actual_sides.get(key, {})
-        if declared is not None and declared != {
-            side: actual.get(side, 0) for side in declared
-        }:
-            errors.append(
-                f"book_tape_event.v1: {key} side counts disagree with level rows"
-            )
-    if controls is not None:
-        errors.extend(_book_control_evidence_errors(controls, tape_events=events))
-    return BookTapeBundleValidationReport(tuple(errors))
-
-
-def validate_book_control_evidence(
-    controls: pd.DataFrame,
-    *,
-    tape_events: pd.DataFrame | None = None,
-    topbook_main: pd.DataFrame | None = None,
-    topbook_checkpoint: pd.DataFrame | None = None,
-) -> BookTapeBundleValidationReport:
-    """Validate recovery controls against their exact physical evidence roles."""
-    errors: list[str] = []
-    for frame, version in (
-        (controls, BOOK_TAPE_CONTROL_SCHEMA_VERSION),
-        (tape_events, BOOK_TAPE_EVENT_SCHEMA_VERSION),
-        (topbook_main, TOPBOOK_SCHEMA_VERSION),
-        (topbook_checkpoint, TOPBOOK_SCHEMA_VERSION),
-    ):
-        if frame is None:
-            continue
-        report = validate_frame(frame, resolve_evidence_schema(frame, version), strict=True)
-        errors.extend(f"{version}: {error}" for error in report.errors)
-    if not errors:
-        errors.extend(
-            _book_control_evidence_errors(
-                controls,
-                tape_events=tape_events,
-                topbook_main=topbook_main,
-                topbook_checkpoint=topbook_checkpoint,
-            )
-        )
-    return BookTapeBundleValidationReport(tuple(errors))
-
-
-def _book_control_evidence_errors(
-    controls: pd.DataFrame,
-    *,
-    tape_events: pd.DataFrame | None = None,
-    topbook_main: pd.DataFrame | None = None,
-    topbook_checkpoint: pd.DataFrame | None = None,
-) -> list[str]:
-    errors: list[str] = []
-    evidence_frames = {
-        "tape_event": tape_events,
-        "topbook_main": topbook_main,
-        "topbook_checkpoint": topbook_checkpoint,
-    }
-    evidence_by_role: dict[str, dict[tuple[str, str], pd.Series]] = {}
-    for role, frame in evidence_frames.items():
-        if frame is None:
-            continue
-        index: dict[tuple[str, str], pd.Series] = {}
-        for _, row in frame.iterrows():
-            evidence_id = (
-                _evidence_text(row.get("event_id"))
-                if role == "tape_event"
-                else topbook_evidence_id(row)
-            )
-            key = (_evidence_text(row.get("collector_run_id")), evidence_id)
-            if key in index:
-                errors.append(f"{role}: duplicate canonical evidence identity {key}")
-            else:
-                index[key] = row
-        evidence_by_role[role] = index
-
-    for _, control in controls.iterrows():
-        role = _evidence_text(control.get("evidence_role"))
-        if not role:
-            continue
-        key = (
-            _evidence_text(control.get("collector_run_id")),
-            _evidence_text(control.get("evidence_id")),
-        )
-        parent = evidence_by_role.get(role, {}).get(key)
-        if parent is None:
-            errors.append(f"book_tape_control.v1: unresolved {role} evidence {key}")
-            continue
-        field_pairs: tuple[tuple[str, str], ...]
-        if role == "tape_event":
-            field_pairs = (
-                ("venue", "venue"),
-                ("venue_market_id", "venue_market_id"),
-                ("venue_book_id", "venue_book_id"),
-                ("epoch_id", "epoch_id"),
-                ("received_at_utc", "received_at_utc"),
-                ("received_at_monotonic_ns", "received_at_monotonic_ns"),
-                ("exchange_at_utc", "exchange_at_utc"),
-                ("local_sequence", "local_sequence"),
-                ("venue_sequence", "venue_sequence"),
-            )
-        else:
-            field_pairs = (
-                ("venue", "exchange"),
-                ("venue_market_id", "venue_market_id"),
-                ("venue_book_id", "instrument_id"),
-                ("received_at_utc", "received_at_utc"),
-                ("received_at_monotonic_ns", "received_at_monotonic_ns"),
-                ("exchange_at_utc", "exchange_ts_utc"),
-                ("local_sequence", "local_sequence"),
-                ("venue_sequence", "venue_sequence"),
-            )
-        for control_field, evidence_field in field_pairs:
-            control_value = _evidence_value(control.get(control_field))
-            evidence_value = _evidence_value(parent.get(evidence_field))
-            if control_field in {"received_at_utc", "exchange_at_utc"}:
-                try:
-                    timestamps_equal = _causal_utc_timestamps_equal(
-                        control_value,
-                        evidence_value,
-                        optional=control_field == "exchange_at_utc",
-                    )
-                except ValueError:
-                    errors.append(
-                        "book_tape_control.v1: "
-                        f"{control_field} or {role} {evidence_field} is not a "
-                        f"valid explicit UTC timestamp for evidence {key}"
-                    )
-                    continue
-                if not timestamps_equal:
-                    errors.append(
-                        "book_tape_control.v1: "
-                        f"{control_field} disagrees with {role} evidence {key}"
-                    )
-                continue
-            if control_field == "venue_sequence":
-                control_value = None if control_value is None else str(control_value)
-                evidence_value = None if evidence_value is None else str(evidence_value)
-            if control_value != evidence_value:
-                errors.append(
-                    "book_tape_control.v1: "
-                    f"{control_field} disagrees with {role} evidence {key}"
-                )
-        if role == "tape_event":
-            expected_subsequence = int(parent.get("subsequence") or 0) + 1
-            if int(control.get("subsequence") or 0) != expected_subsequence:
-                errors.append(
-                    "book_tape_control.v1: subsequence disagrees with "
-                    f"{role} evidence {key}"
-                )
-        elif _evidence_value(control.get("epoch_id")) is not None:
-            errors.append(
-                "book_tape_control.v1: epoch_id must be absent for topbook evidence"
-            )
-        if str(control.get("control_type") or "") != "book_recovered":
-            continue
-        if role == "tape_event":
-            if str(parent.get("event_kind") or "") != "checkpoint":
-                errors.append(
-                    "book_tape_control.v1: recovery evidence must be a checkpoint"
-                )
-            if _parse_bool(parent.get("reconstructible")) is not True:
-                errors.append(
-                    "book_tape_control.v1: recovery evidence must be reconstructible"
-                )
-        parent_validity_field = (
-            "book_integrity_valid" if control.get("schema_version") == "book_tape_control.v2"
-            else "valid_state"
-        )
-        if _parse_bool(parent.get(parent_validity_field)) is not True:
-            errors.append(
-                "book_tape_control.v1: recovery evidence must have valid state"
-            )
-    return errors
-
-
-def _evidence_text(value: Any) -> str:
-    normalized = _evidence_value(value)
-    return "" if normalized is None else str(normalized).strip()
-
-
-def _causal_utc_timestamps_equal(
-    left: Any,
-    right: Any,
-    *,
-    optional: bool,
-) -> bool:
-    left_missing = left is None
-    right_missing = right is None
-    if left_missing or right_missing:
-        if not optional:
-            raise ValueError("required UTC timestamp is absent")
-        return left_missing and right_missing
-    return _utc_epoch_nanoseconds(left) == _utc_epoch_nanoseconds(right)
 
 
 def _utc_epoch_nanoseconds(value: Any) -> int:
@@ -1378,21 +764,6 @@ def _utc_epoch_nanoseconds(value: Any) -> int:
     whole_seconds = delta.days * 86_400 + delta.seconds
     fraction = (match.group("fraction") or "").ljust(9, "0")
     return whole_seconds * 1_000_000_000 + int(fraction or "0")
-
-
-def _evidence_value(value: Any) -> Any:
-    if value is None:
-        return None
-    try:
-        if bool(pd.isna(value)):
-            return None
-    except (TypeError, ValueError):
-        pass
-    if not isinstance(value, (str, bytes, bool, int, float)) and hasattr(value, "item"):
-        value = value.item()
-    if isinstance(value, float) and value.is_integer():
-        return int(value)
-    return value
 
 
 def _contract_evidence_invariant_errors(df: pd.DataFrame) -> list[str]:

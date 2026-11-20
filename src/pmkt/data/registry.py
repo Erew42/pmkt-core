@@ -19,9 +19,6 @@ EVENT_TAXONOMY_PREDICTION_SCHEMA_VERSION = "event_taxonomy_prediction.v1"
 MARKET_RESOLUTION_SCHEMA_VERSION = "market_resolution.v1"
 INSTRUMENT_SCHEMA_VERSION = "instrument.v1"
 TRADE_SCHEMA_VERSION = "trade.v1"
-BOOK_TAPE_EVENT_SCHEMA_VERSION = "book_tape_event.v1"
-BOOK_TAPE_LEVEL_SCHEMA_VERSION = "book_tape_level.v1"
-BOOK_TAPE_CONTROL_SCHEMA_VERSION = "book_tape_control.v1"
 STREAM_LIFECYCLE_SCHEMA_VERSION = "stream_lifecycle.v1"
 CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION = "capture_instrument_evidence.v1"
 MATCH_SCHEMA_VERSION_V1 = "market_match.v1"
@@ -1011,72 +1008,6 @@ RUN_MANIFEST_COLUMNS = [
     "error_type",
     "error_message",
     "notes",
-]
-
-BOOK_TAPE_EVENT_COLUMNS = [
-    "schema_version",
-    "collector_run_id",
-    "event_id",
-    "venue",
-    "venue_market_id",
-    "venue_book_id",
-    "event_kind",
-    "epoch_id",
-    "checkpoint_reason",
-    "received_at_utc",
-    "received_at_monotonic_ns",
-    "exchange_at_utc",
-    "local_sequence",
-    "subsequence",
-    "venue_sequence",
-    "venue_sid",
-    "expected_level_row_count",
-    "side_counts_json",
-    "post_book_hash",
-    "valid_state",
-    "reconstructible",
-    "quality_flags_json",
-    "raw_event_ref",
-    "raw_event_hash",
-    "event_payload_hash",
-    "encoding_version",
-]
-
-BOOK_TAPE_LEVEL_COLUMNS = [
-    "schema_version",
-    "collector_run_id",
-    "event_id",
-    "venue",
-    "venue_book_id",
-    "epoch_id",
-    "source_side",
-    "price_key",
-    "price_dollars",
-    "size_after_contracts",
-    "size_delta_contracts",
-    "level_ordinal",
-]
-
-BOOK_TAPE_CONTROL_COLUMNS = [
-    "schema_version",
-    "collector_run_id",
-    "control_id",
-    "venue",
-    "venue_market_id",
-    "venue_book_id",
-    "control_type",
-    "reason",
-    "valid_after",
-    "received_at_utc",
-    "received_at_monotonic_ns",
-    "exchange_at_utc",
-    "local_sequence",
-    "subsequence",
-    "venue_sequence",
-    "epoch_id",
-    "evidence_role",
-    "evidence_id",
-    "quality_flags_json",
 ]
 
 STREAM_LIFECYCLE_COLUMNS = [
@@ -2842,87 +2773,6 @@ SCHEMA_REGISTRY: dict[str, TableSpec] = {
         primary_key=("match_id", "observed_at_utc"),
         description="Manual-review apparent-edge candidate.",
     ),
-    BOOK_TAPE_EVENT_SCHEMA_VERSION: _typed_table(
-        "book_tape_event",
-        BOOK_TAPE_EVENT_SCHEMA_VERSION,
-        (
-            ("schema_version", "string", False),
-            ("collector_run_id", "string", False),
-            ("event_id", "string", False),
-            ("venue", "string", False, VENUES),
-            ("venue_market_id", "string", False),
-            ("venue_book_id", "string", False),
-            ("event_kind", "string", False, ("checkpoint", "delta")),
-            ("epoch_id", "string", True),
-            ("checkpoint_reason", "string", True, ("startup", "periodic", "reconnect", "resync")),
-            ("received_at_utc", "string", False),
-            ("received_at_monotonic_ns", "int64", False),
-            ("exchange_at_utc", "string", True),
-            ("local_sequence", "int64", False),
-            ("subsequence", "int32", False),
-            ("venue_sequence", "string", True),
-            ("venue_sid", "string", True),
-            ("expected_level_row_count", "int32", False),
-            ("side_counts_json", "large_string", True),
-            ("post_book_hash", "string", True),
-            ("valid_state", "bool", False),
-            ("reconstructible", "bool", False),
-            ("quality_flags_json", "large_string", False),
-            ("raw_event_ref", "string", True),
-            ("raw_event_hash", "string", True),
-            ("event_payload_hash", "string", False),
-            ("encoding_version", "string", False),
-        ),
-        primary_key=("collector_run_id", "event_id"),
-        description="Logical commit header for one venue-native book checkpoint or delta.",
-    ),
-    BOOK_TAPE_LEVEL_SCHEMA_VERSION: _typed_table(
-        "book_tape_level",
-        BOOK_TAPE_LEVEL_SCHEMA_VERSION,
-        (
-            ("schema_version", "string", False),
-            ("collector_run_id", "string", False),
-            ("event_id", "string", False),
-            ("venue", "string", False, VENUES),
-            ("venue_book_id", "string", False),
-            ("epoch_id", "string", True),
-            ("source_side", "string", False, ("bid", "ask", "yes", "no")),
-            ("price_key", "string", False),
-            ("price_dollars", "float64", False),
-            ("size_after_contracts", "float64", False),
-            ("size_delta_contracts", "float64", True),
-            ("level_ordinal", "int32", False),
-        ),
-        primary_key=("collector_run_id", "event_id", "source_side", "price_key"),
-        description="One absolute post-event venue-native price-level mutation.",
-    ),
-    BOOK_TAPE_CONTROL_SCHEMA_VERSION: _typed_table(
-        "book_tape_control",
-        BOOK_TAPE_CONTROL_SCHEMA_VERSION,
-        (
-            ("schema_version", "string", False),
-            ("collector_run_id", "string", False),
-            ("control_id", "string", False),
-            ("venue", "string", False, VENUES),
-            ("venue_market_id", "string", False),
-            ("venue_book_id", "string", False),
-            ("control_type", "string", False, ("book_recovered", "book_invalidated", "stream_ended")),
-            ("reason", "string", False),
-            ("valid_after", "bool", False),
-            ("received_at_utc", "string", False),
-            ("received_at_monotonic_ns", "int64", False),
-            ("exchange_at_utc", "string", True),
-            ("local_sequence", "int64", False),
-            ("subsequence", "int32", False),
-            ("venue_sequence", "string", True),
-            ("epoch_id", "string", True),
-            ("evidence_role", "string", True),
-            ("evidence_id", "string", True),
-            ("quality_flags_json", "large_string", False),
-        ),
-        primary_key=("collector_run_id", "control_id"),
-        description="Validity, epoch, and terminal transition for one venue book.",
-    ),
     STREAM_LIFECYCLE_SCHEMA_VERSION: _typed_table(
         "stream_lifecycle",
         STREAM_LIFECYCLE_SCHEMA_VERSION,
@@ -3044,15 +2894,9 @@ INTEGRITY_SCHEMA_VERSIONS = {
     "depth.v1": "depth.v2",
     "feed_health.v1": "feed_health.v2",
     "capture_instrument_evidence.v1": "capture_instrument_evidence.v2",
-    "book_tape_event.v1": "book_tape_event.v2",
-    "book_tape_control.v1": "book_tape_control.v2",
 }
 for _old_version, _new_version in INTEGRITY_SCHEMA_VERSIONS.items():
-    _extra_fields: tuple[FieldSpec, ...] = (
-        (FieldSpec("book_integrity_after", "bool", False),)
-        if _old_version == BOOK_TAPE_CONTROL_SCHEMA_VERSION
-        else (FieldSpec("book_integrity_valid", "bool", False),)
-    )
+    _extra_fields: tuple[FieldSpec, ...] = (FieldSpec("book_integrity_valid", "bool", False),)
     if _old_version == CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION:
         _extra_fields += (
             FieldSpec("first_snapshot_received_at_utc", "string", True),
@@ -3148,9 +2992,6 @@ __all__ = [
     "MARKET_RESOLUTION_SCHEMA_VERSION",
     "INSTRUMENT_SCHEMA_VERSION",
     "TRADE_SCHEMA_VERSION",
-    "BOOK_TAPE_EVENT_SCHEMA_VERSION",
-    "BOOK_TAPE_LEVEL_SCHEMA_VERSION",
-    "BOOK_TAPE_CONTROL_SCHEMA_VERSION",
     "STREAM_LIFECYCLE_SCHEMA_VERSION",
     "CAPTURE_INSTRUMENT_EVIDENCE_SCHEMA_VERSION",
     "MATCH_SCHEMA_VERSION_V1",
@@ -3193,9 +3034,6 @@ __all__ = [
     "MARKET_RESOLUTION_COLUMNS",
     "INSTRUMENT_COLUMNS",
     "TRADE_COLUMNS",
-    "BOOK_TAPE_EVENT_COLUMNS",
-    "BOOK_TAPE_LEVEL_COLUMNS",
-    "BOOK_TAPE_CONTROL_COLUMNS",
     "STREAM_LIFECYCLE_COLUMNS",
     "MATCH_COLUMNS_V1",
     "MATCH_COLUMNS",

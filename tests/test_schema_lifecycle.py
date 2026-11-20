@@ -48,7 +48,7 @@ def test_lifecycle_catalog_covers_registry_exactly_once() -> None:
     entries = validate_lifecycle_catalog(catalog, registered)
 
     assert set(entries) == set(registered)
-    assert len(entries) == len(registered) == 59
+    assert len(entries) == len(registered) == 54
     assert entries["market_match.v2"]["status"] == "active_core"
     assert entries["market_match.v1"]["status"] == "compatibility_legacy"
     assert entries["instrument.v1"]["status"] == "provisional_unintegrated"
@@ -102,7 +102,7 @@ def test_lifecycle_catalog_rejects_future_candidate_without_evidence() -> None:
     core = next(group for group in catalog["groups"] if group["id"] == "capture_matching_core")
     core["status"] = "removal_candidate"
 
-    with pytest.raises(ValueError, match="removal candidate 'book_tape_control.v1'"):
+    with pytest.raises(ValueError, match="removal candidate 'capture_instrument_evidence.v1'"):
         lifecycle_entries(catalog)
 
 
@@ -273,7 +273,7 @@ def test_schema_inventory_distinguishes_empty_versioned_parquet(tmp_path: Path) 
 def test_schema_inventory_matches_complete_schema_tokens_only(tmp_path: Path) -> None:
     source = _write(
         tmp_path / "src" / "producer.py",
-        'SCHEMA = "book_tape_event.v1"\n',
+        'SCHEMA = "recording_topbook.v1"\n',
     )
 
     report = inventory_schema_usage(
@@ -284,10 +284,10 @@ def test_schema_inventory_matches_complete_schema_tokens_only(tmp_path: Path) ->
     )
 
     expected = [source.relative_to(tmp_path).as_posix()]
-    assert report["schemas"]["book_tape_event.v1"]["text_references"] == {
+    assert report["schemas"]["recording_topbook.v1"]["text_references"] == {
         "source": expected
     }
-    assert report["schemas"]["event.v1"]["text_references"] == {}
+    assert report["schemas"]["topbook.v1"]["text_references"] == {}
 
 
 def test_schema_inventory_cli_fails_closed_on_unreadable_parquet(tmp_path: Path) -> None:
