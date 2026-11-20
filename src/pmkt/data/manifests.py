@@ -7,7 +7,7 @@ import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 import pandas as pd
 
@@ -177,8 +177,15 @@ def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> Path:
 def validate_run_manifest(
     path: str | Path,
     *,
+    exact_artifact_validation: Literal["full", "structure"] = "full",
     path_resolver: Callable[[Path], Path] | None = None,
 ) -> ManifestValidationReport:
+    """Validate a run manifest with the same checks for either historical mode."""
+    if exact_artifact_validation not in ("full", "structure"):
+        raise ValueError(
+            "exact_artifact_validation must be either 'full' or 'structure'"
+        )
+
     manifest_path = Path(path)
     errors: list[str] = []
     warnings: list[str] = []
@@ -198,6 +205,11 @@ def validate_run_manifest(
         return ManifestValidationReport(
             manifest_path=str(manifest_path),
             errors=("manifest root must be a JSON object",),
+        )
+    if "storage_profile" in payload or "dataset_artifacts" in payload:
+        return ManifestValidationReport(
+            manifest_path=str(manifest_path),
+            errors=("retired manifest declares storage_profile or dataset_artifacts",),
         )
 
     if "recording_format" in payload:

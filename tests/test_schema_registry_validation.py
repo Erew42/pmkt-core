@@ -1953,11 +1953,12 @@ def test_validate_match_relation_accepts_settlement_scope_tracking_label() -> No
 
 
 
-def test_stream_lifecycle_enforces_venue_event_mapping() -> None:
+@pytest.mark.parametrize("event_type", ["activated", "metadata_updated"])
+def test_stream_lifecycle_enforces_venue_event_mapping(event_type: str) -> None:
     spec = get_table_spec("stream_lifecycle.v1")
     assert spec.primary_key == ("collector_run_id", "lifecycle_event_id")
     row = _valid_schema_row(spec)
-    row.update(venue="kalshi", event_type="activated")
+    row.update(venue="kalshi", event_type=event_type)
     assert validate_frame(pd.DataFrame([row]), spec, strict=True).ok
 
     row["event_type"] = "new_market"
