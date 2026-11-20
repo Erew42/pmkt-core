@@ -1,7 +1,7 @@
 //! Synchronous shard state for a transport owned by the caller.
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, IdentityEvidence, Touched, UpdateKind, VenueBooks},
+    book::{BookMode, IdentityEvidence, SequenceCheck, Touched, UpdateKind, VenueBooks},
     decimal::ScaledDecimal,
     health::{
         CORRECTIVE_DELTA_GRACE_NS, Flags, Integrity, QualityFlag as F, Recovery, RecoveryReason,
@@ -411,7 +411,10 @@ impl ShardFeed {
                     _ => continue,
                 }
             }
-            for item in self.books.apply_event(event, self.count) {
+            for item in self
+                .books
+                .apply_event(event, self.count, SequenceCheck::Connection)
+            {
                 self.observe(&item, now);
                 observations.push(project(self, &item.instrument)?);
             }

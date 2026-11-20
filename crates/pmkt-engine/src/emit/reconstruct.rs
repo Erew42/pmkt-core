@@ -1,7 +1,7 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, VenueBooks},
+    book::{BookMode, SequenceCheck, VenueBooks},
     capture::{CaptureItem, SealedChunk, SessionChunks, list_session_chunks},
     health::Integrity,
     merge::{
@@ -85,6 +85,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         frame: &Receipt<'_>,
         position: Option<usize>,
         subscriptions: impl Iterator<Item = &'a BTreeSet<String>> + Clone,
+        sequence_check: SequenceCheck,
     ) -> Result<()> {
         self.count += 1;
         let venue = self.books.mode().venue();
@@ -137,7 +138,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         if let Some(i) = position {
             reference.push_str(&format!(":{i}"));
         }
-        for item in self.books.apply_event(event, self.count) {
+        for item in self.books.apply_event(event, self.count, sequence_check) {
             let book = self.books.get(&item.instrument).expect("touched book");
             // The top and all depth rows of one observation share one adjusted clock.
             let adjusted;
@@ -314,6 +315,7 @@ pub fn reconstruct_merged(
                 m.occurrences
                     .iter()
                     .filter_map(|o| o.subscription.as_deref()),
+                SequenceCheck::SourceCoverage,
             )
         },
     )?;
@@ -392,6 +394,7 @@ pub fn reconstruct_session(
                     &receipt,
                     m.position,
                     subscription.instruments.as_deref().into_iter(),
+                    SequenceCheck::Connection,
                 )?;
             }
         }

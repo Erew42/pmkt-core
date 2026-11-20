@@ -12,7 +12,11 @@ use pmkt_engine::{
     },
 };
 use serde_json::{Value, json};
-use std::{fs, path::Path, sync::Arc};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 fn revise(root: &Path, i: u64, f: impl FnOnce(&mut Value)) {
     let p = manifest(root, i);
     let mut m: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
@@ -492,6 +496,77 @@ fn subscribed_but_silent_books_record_the_same_gap_in_both_replays() {
     )
     .unwrap();
     assert_eq!(merged, file);
+}
+
+fn kalshi_sequence_source(
+    copy: &str,
+    sid: i64,
+    offset: usize,
+    micros: [i64; 3],
+    venue_ms: [i64; 3],
+) -> (String, String, PathBuf) {
+    let path = root();
+    let mut frames = vec![];
+    for (i, (micros, ms)) in micros.into_iter().zip(venue_ms).enumerate() {
+        let sequence = offset + i + 1;
+        let ms = 1_735_689_600_000 + ms;
+        let msg = if i == 0 {
+            json!({"type":"orderbook_snapshot","sid":sid,"seq":sequence,
+                    "sending_ts_ms":ms,"msg":{"market_ticker":"K","clock":1,"yes":[[".3","1"]],"no":[[".6","1"]]}})
+        } else {
+            json!({"type":"orderbook_delta","sid":sid,"seq":sequence,"sending_ts_ms":ms+1,"msg":{"market_ticker":"K",
+                    "clock":i+1,"ts_ms":ms,"side":"yes","price":".3","delta":"1"}})
+        };
+        let mut f = raw(i as u64 + 1, 1, "kalshi", msg);
+        f["received_utc"] = json!(format!("2025-01-01T00:00:00.{micros:06}+00:00"));
+        frames.push(f);
+    }
+    seal(&path, 1, &frames, None);
+    (copy.into(), "conn".into(), path)
+}
+
+fn assert_kalshi_sequence_rows(sessions: Vec<(String, String, PathBuf)>, coords: [(i64, i64); 3]) {
+    let mut expected = coords.into_iter().enumerate();
+    reconstruct_merged(
+        Venue::Kalshi,
+        sessions,
+        Version::V2,
+        1,
+        |batch| {
+            let (i, (sid, seq)) = expected.next().unwrap();
+            for rows in [&batch.topbook, &batch.depth] {
+                assert_eq!(rows.num_rows(), 2);
+                assert_book_health(rows, &[], true, true);
+                assert_eq!(column::<Int64Array>(rows, "venue_sid").values(), &[sid; 2]);
+                assert_eq!(
+                    column::<Int64Array>(rows, "venue_sequence").values(),
+                    &[seq; 2]
+                );
+            }
+            assert_eq!(
+                column::<Float64Array>(&batch.depth, "size_contracts").value(0),
+                (i + 1) as f64
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert!(expected.next().is_none());
+}
+
+#[test]
+fn alternating_kalshi_copies_keep_healthy_ladders_and_winning_coordinates() {
+    let times = [0, 10, 20];
+    let a = kalshi_sequence_source("a", 7, 100, [0, 11000, 20000], times);
+    let b = kalshi_sequence_source("b", 81, 0, [1000, 10000, 21000], times);
+    assert_kalshi_sequence_rows(vec![a, b], [(7, 101), (81, 2), (7, 103)]);
+}
+
+#[test]
+fn venue_order_cannot_create_a_gap_in_a_continuous_kalshi_copy() {
+    let a = kalshi_sequence_source("a", 7, 100, [0, 11000, 20000], [0, 20, 10]);
+    assert_kalshi_sequence_rows(vec![a], [(7, 101), (7, 103), (7, 102)]);
 }
 
 #[test]

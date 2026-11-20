@@ -46,6 +46,12 @@ impl BookMode {
         }
     }
 }
+/// A venue-ordered merge has already checked continuity in source receive order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceCheck {
+    Connection,
+    SourceCoverage,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
     pub price: D,
@@ -246,11 +252,15 @@ impl Book {
             self.integrity = Integrity::Impaired;
         }
     }
-    fn apply_sequence(&mut self, s: Sequence) {
+    fn apply_sequence(&mut self, s: Sequence, check: SequenceCheck) {
         let (Some(sid), Some(seq)) = (s.sid, s.seq) else {
             self.flags.insert(F::MissingSequence);
             return;
         };
+        if check == SequenceCheck::SourceCoverage {
+            self.sequence = s;
+            return;
+        }
         if self.sequence.sid.get_or_insert(sid) != &sid {
             self.flags.insert(F::SidChanged);
         }
@@ -265,7 +275,7 @@ impl Book {
             Side::Second => &mut self.second,
         }
     }
-    fn apply(&mut self, update: &Update) {
+    fn apply(&mut self, update: &Update, check: SequenceCheck) {
         if let Some(m) = &update.market {
             self.market = Some(m.clone());
         }
@@ -280,7 +290,7 @@ impl Book {
             self.flags.insert(F::DeltaBeforeSnapshot);
         }
         if let Some(s) = update.sequence {
-            self.apply_sequence(s);
+            self.apply_sequence(s, check);
         }
         match &update.action {
             Action::Snapshot(s) => {
@@ -517,9 +527,18 @@ impl VenueBooks {
         message: &serde_json::Value,
         count: u64,
     ) -> crate::Result<Vec<Touched>> {
-        Ok(self.apply_event(decode(self.mode.venue(), message)?, count))
+        Ok(self.apply_event(
+            decode(self.mode.venue(), message)?,
+            count,
+            SequenceCheck::Connection,
+        ))
     }
-    pub(crate) fn apply_event(&mut self, event: Event, count: u64) -> Vec<Touched> {
+    pub(crate) fn apply_event(
+        &mut self,
+        event: Event,
+        count: u64,
+        check: SequenceCheck,
+    ) -> Vec<Touched> {
         let updates = match event {
             Event::Books(updates) => updates,
             Event::Lifecycle {
@@ -568,10 +587,9 @@ impl VenueBooks {
             });
             *last = u;
             if let Some(s) = u.sequence
-                && (s
-                    .sid
-                    .zip(s.seq)
-                    .is_none_or(|(sid, seq)| self.sequences.gap(sid, seq)))
+                && (s.sid.zip(s.seq).is_none_or(|(sid, seq)| {
+                    check == SequenceCheck::Connection && self.sequences.gap(sid, seq)
+                }))
             {
                 gap = Some(s.sid);
             }
@@ -603,7 +621,7 @@ impl VenueBooks {
             if matches!(u.action, Action::Lifecycle { resolved: true }) {
                 self.resolved.insert(id.clone());
             }
-            book.apply(u);
+            book.apply(u, check);
             if u.action.is_snapshot() && book.integrity() == Integrity::Intact {
                 self.conflicts.remove(id);
             }
