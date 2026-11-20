@@ -442,6 +442,59 @@ fn a_clock_rollback_cannot_move_a_post_gap_delta_into_the_old_ladder() {
 }
 
 #[test]
+fn subscribed_but_silent_books_record_the_same_gap_in_both_replays() {
+    let path = root();
+    let mut sub = raw(1, 1, "polymarket", json!({"assets_ids":["P","silent"]}));
+    sub["direction"] = json!("sent");
+    sub["frame_type"] = json!("subscription");
+    let ms = 1735689600000_i64;
+    let first = raw(2, 1, "polymarket", poly_snapshot(ms));
+    let mut gap = raw(3, 1, "polymarket", json!({}));
+    gap["direction"] = json!("local");
+    gap["frame_type"] = json!("transport_error");
+    let mut delta = raw(
+        4,
+        1,
+        "polymarket",
+        json!({"event_type":"price_change", "market":"M","timestamp":ms+1,
+        "price_changes":[{"asset_id":"silent","price":".3","size":"2","side":"BUY"}]}),
+    );
+    delta["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    seal(&path, 1, &[sub, first, gap, delta], None);
+    let mut file = vec![];
+    reconstruct_session(&path, Version::V2, 1, |b| {
+        file.push(b.topbook);
+        Ok(())
+    })
+    .unwrap();
+    assert_book_health(
+        &file[1],
+        &[
+            "delta_before_snapshot",
+            "empty_ask",
+            "no_initial_snapshot",
+            "reconnect",
+        ],
+        false,
+        false,
+    );
+    let mut merged = vec![];
+    reconstruct_merged(
+        Venue::Polymarket,
+        vec![("a".into(), "c".into(), path)],
+        Version::V2,
+        1,
+        |b| {
+            merged.push(b.topbook);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(merged, file);
+}
+
+#[test]
 fn a_gap_inside_one_frame_resets_before_its_first_merged_message() {
     let a = root();
     let start = raw(

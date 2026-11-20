@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 // Pin the manifests once. A single chunk may have an archived predecessor.
@@ -259,6 +260,7 @@ pub fn reconstruct_merged(
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut period = None;
     let mut kalshi_basis = None;
+    let mut subscriptions = BTreeMap::new();
     let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
         streams
             .values_mut()
@@ -271,6 +273,21 @@ pub fn reconstruct_merged(
                 .is_some_and(|old| old != origin.coverage_period)
             {
                 driver.books.reset();
+            }
+            // Register the whole declared shard, including silent instruments
+            // whose first delta may follow a gap. Origins share the same set
+            // until a new subscription command changes it.
+            for o in &m.occurrences {
+                if let Some(ids) = &o.subscription
+                    && subscriptions
+                        .get(&o.stream)
+                        .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
+                {
+                    for id in ids.iter() {
+                        driver.books.subscribe(id.clone());
+                    }
+                    subscriptions.insert(o.stream.clone(), Arc::clone(ids));
+                }
             }
             if venue == Venue::Kalshi
                 && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
