@@ -70,7 +70,13 @@ def test_verified_capture_to_one_shot_arrow_streams(tmp_path: Path, version: int
     assert info["chunk_gaps"] == []
 
     result = _native.reconstruct_raw_capture(tmp_path, version=version, target_rows=10)
-    top = pa.table(result["topbook"])
+    stream = result["topbook"]
+    with pytest.raises(NotImplementedError, match="requested_schema"):
+        stream.__arrow_c_stream__(requested_schema=object())
+    if hasattr(pa.RecordBatchReader, "from_stream"):
+        with pytest.raises(NotImplementedError, match="requested_schema"):
+            pa.RecordBatchReader.from_stream(stream, schema=pa.schema([("other", pa.int64())]))
+    top = pa.table(stream)
     assert top.num_rows == result["topbook_rows"] > 0
     assert set(top["schema_version"].to_pylist()) == {f"topbook.v{version}"}
     assert ("book_integrity_valid" in top.column_names) == (version == 2)

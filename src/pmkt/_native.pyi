@@ -1,11 +1,12 @@
 from collections.abc import Sequence
 from os import PathLike
 from pathlib import Path
-from typing import Literal, TypedDict, final
+from typing import Literal, NoReturn, TypedDict, final
 
 @final
 class ArrowStream:
     """A one-shot Arrow C stream, consumable by a PyCapsule-aware reader."""
+    def __new__(cls, _private: NoReturn, /) -> ArrowStream: ...
     def __arrow_c_stream__(self, requested_schema: object = None) -> object: ...
 
 class _ChunkGap(TypedDict):

@@ -1,5 +1,9 @@
 use arrow_array::{RecordBatch, RecordBatchIterator, ffi_stream::FFI_ArrowArrayStream};
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyCapsule};
+use pyo3::{
+    exceptions::{PyNotImplementedError, PyValueError},
+    prelude::*,
+    types::PyCapsule,
+};
 
 /// A single transfer of complete engine batches through the Arrow C Stream interface.
 #[pyclass(module = "pmkt._native")]
@@ -28,10 +32,13 @@ impl ArrowStream {
     fn __arrow_c_stream__<'py>(
         &mut self,
         py: Python<'py>,
-        requested_schema: Option<&Bound<'py, PyCapsule>>,
+        requested_schema: Option<&Bound<'py, PyAny>>,
     ) -> PyResult<Bound<'py, PyCapsule>> {
-        // Schema conversion is optional in the protocol. Export the native schema.
-        let _ = requested_schema;
+        if requested_schema.is_some() {
+            return Err(PyNotImplementedError::new_err(
+                "schema casting via requested_schema is not supported",
+            ));
+        }
         let batches = self
             .batches
             .take()
