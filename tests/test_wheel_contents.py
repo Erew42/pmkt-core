@@ -746,7 +746,10 @@ async def invalid_resolution_calls() -> None:
     assert rejected.returncode != 0
     assert "[call-arg]" in rejected.stdout
     assert "[arg-type]" in rejected.stdout
-    assert 'Argument 3 to "ingest" of "ShardFeed" has incompatible type "str"' in rejected.stdout
+    assert (
+        'No overload variant of "ingest" of "ShardFeed" matches argument types '
+        '"str", "int", "str", "int"'
+    ) in rejected.stdout
     assert 'Unexpected keyword argument "ticker" for "PolymarketMarketRef"' in rejected.stdout
     assert 'Argument 2 to "KalshiInstrumentRef" has incompatible type' in rejected.stdout
     assert 'Unexpected keyword argument "unsupported" for "AsyncGammaClient"' in rejected.stdout

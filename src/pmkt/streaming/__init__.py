@@ -1,8 +1,14 @@
 """Live recording plus explicitly requested historical/diagnostic helpers."""
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from typing import Any
+
+def _python_oracle() -> bool:
+    """Internal engine selection for differential tests."""
+    return os.environ.get("PMKT_ORACLE_ENGINE") == "python"
+
 
 _EXPORTS = {
     **dict.fromkeys(("RuntimeFeedProjectionRecorder", "StreamDatasetSpec", "StreamSinkSet", "StreamRunOutputs", "validate_parquet_rotation_config"), "collector"),

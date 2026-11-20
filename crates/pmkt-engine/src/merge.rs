@@ -13,7 +13,7 @@ use identity::ContentId;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
+#[derive(serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
 pub struct Stream {
     pub copy: String,
     pub connection: String,
@@ -26,7 +26,7 @@ impl Stream {
         }
     }
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(serde::Serialize, Clone, Debug, Eq, PartialEq)]
 pub struct Origin {
     pub stream: Stream,
     pub session: String,
@@ -34,6 +34,15 @@ pub struct Origin {
     pub frame_seq: u64,
     pub position: Option<usize>,
     pub received_us: i64,
+    pub received_utc: String,
+    pub recording_id: String,
+    pub received_monotonic_ns: u64,
+    pub use_yes_price: bool,
+    /// Contiguous coverage period containing this occurrence, used during replay.
+    #[serde(skip)]
+    pub coverage_period: usize,
+    #[serde(skip)]
+    pub subscription: Option<std::sync::Arc<BTreeSet<String>>>,
 }
 impl Origin {
     fn rank(&self) -> (i64, &Stream, &str, u64, Option<usize>) {
@@ -52,7 +61,7 @@ pub struct Occurrence {
     pub message: Value,
     pub reconnect_snapshot: bool,
 }
-#[derive(Debug)]
+#[derive(serde::Serialize, Debug)]
 pub struct MergedMessage {
     pub kind: String,
     pub scope: String,
@@ -122,14 +131,14 @@ impl Default for MergeOptions {
         }
     }
 }
-#[derive(Debug)]
+#[derive(serde::Serialize, Debug)]
 pub struct OrderConflict {
     pub scope: String,
     pub order_ms: i64,
     pub origin: Origin,
     pub book_changes: bool,
 }
-#[derive(Debug, Default)]
+#[derive(serde::Serialize, Debug, Default)]
 pub struct MergeStats {
     pub occurrences: u64,
     pub messages: u64,

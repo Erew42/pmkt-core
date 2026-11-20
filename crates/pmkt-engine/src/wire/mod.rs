@@ -4,9 +4,38 @@ pub mod polymarket;
 
 use crate::{Error, Result, Venue, decimal::ScaledDecimal as D};
 use serde_json::{Value, value::RawValue};
-use std::collections::BTreeMap;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 pub type Ladder = BTreeMap<D, D>;
+
+/// Subscription evidence available up to this frame in one captured connection.
+#[derive(Default)]
+pub(crate) struct RecordedSubscription {
+    pub instruments: Option<Arc<BTreeSet<String>>>,
+    pub kalshi_basis: Option<bool>,
+}
+impl RecordedSubscription {
+    pub fn record(&mut self, venue: Venue, command: &Value) -> Result<()> {
+        let ids = match venue {
+            Venue::Polymarket => command["assets_ids"].as_array(),
+            Venue::Kalshi => {
+                let Some(basis) = kalshi::subscription_basis(command)? else {
+                    return Ok(());
+                };
+                self.kalshi_basis = Some(basis);
+                command["params"]["market_tickers"].as_array()
+            }
+        };
+        if let Some(ids) = ids {
+            let instruments = Arc::make_mut(self.instruments.get_or_insert_with(Arc::default));
+            instruments.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug)]
 pub struct WireMessage<'a> {

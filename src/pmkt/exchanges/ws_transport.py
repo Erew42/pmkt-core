@@ -33,15 +33,35 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Generic, TypeVar
 
 
-class WebSocketMessagePump:
+_Frame = TypeVar("_Frame")
+
+
+async def _wire_frames(ws: Any) -> AsyncIterator[bytes]:
+    # websockets' native sockets can deliver text frames directly as UTF-8.
+    # Custom connect factories may supply only the async iterator protocol.
+    from websockets.asyncio.connection import Connection
+
+    if isinstance(ws, Connection):
+        from websockets.exceptions import ConnectionClosedOK
+        try:
+            while True:
+                yield await ws.recv(decode=False)
+        except ConnectionClosedOK:
+            return
+    else:
+        async for frame in ws:
+            yield frame.encode("utf-8") if isinstance(frame, str) else frame
+
+
+class WebSocketMessagePump(Generic[_Frame]):
     """Keep one receive alive across timer wakes; cancel it before iterator close."""
 
-    def __init__(self, iterator: AsyncIterator[dict[str, Any]]) -> None:
+    def __init__(self, iterator: AsyncIterator[_Frame]) -> None:
         self.iterator = iterator
-        self.pending: asyncio.Future[dict[str, Any]] | None = None
+        self.pending: asyncio.Future[_Frame] | None = None
 
     async def wait(self, timeout: float) -> bool:
         if self.pending is None:
@@ -49,7 +69,7 @@ class WebSocketMessagePump:
         done, _ = await asyncio.wait({self.pending}, timeout=max(0.0, timeout))
         return self.pending in done
 
-    def pop(self) -> dict[str, Any]:
+    def pop(self) -> _Frame:
         if self.pending is None:
             raise RuntimeError("no pending receive")
         pending, self.pending = self.pending, None
