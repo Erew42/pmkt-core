@@ -221,8 +221,8 @@ def default_cli_import_timing_specs() -> tuple[CliImportTimingSpec, ...]:
             "pmkt-stream-books-help", ("pmkt", "stream-books", "--help")
         ),
         CliImportTimingSpec(
-            "pmkt-reconstruct-book-tape-help",
-            ("pmkt", "reconstruct-book-tape", "--help"),
+            "pmkt-inspect-raw-capture-help",
+            ("pmkt", "inspect-raw-capture", "--help"),
         ),
     )
 

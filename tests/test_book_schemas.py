@@ -22,7 +22,6 @@ from pmkt.data.schemas import (
     topbook_evidence_id,
 )
 from pmkt.exchanges.kalshi.ws import apply_kalshi_orderbook_message
-from pmkt.streaming.legacy.topbook_emission import topbook_state_fingerprint
 
 
 _FIXTURE_ROOT = Path(__file__).with_name("fixtures")
@@ -420,7 +419,7 @@ def test_legacy_kalshi_policy_ignores_explicit_ask_size_fields() -> None:
     assert [row["ask_size_contracts"] for row in rows] == [5.0, 10.0]
 
 
-def test_corrected_source_lineage_changes_evidence_and_on_change_identity() -> None:
+def test_corrected_source_lineage_changes_evidence_identity() -> None:
     fixture = _load_kalshi_fixture("kalshi_orderbook_yes_price.json")
     states = {}
     snapshots = []
@@ -442,6 +441,3 @@ def test_corrected_source_lineage_changes_evidence_and_on_change_identity() -> N
     legacy_no["best_ask_source"] = "direct"
 
     assert topbook_evidence_id(corrected_no) != topbook_evidence_id(legacy_no)
-    assert topbook_state_fingerprint(corrected_no) != topbook_state_fingerprint(
-        legacy_no
-    )

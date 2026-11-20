@@ -84,7 +84,7 @@ def test_default_import_timing_specs_cover_public_core_commands() -> None:
         ("pmkt", "--help"),
         ("pmkt", "dataset", "--help"),
         ("pmkt", "stream-books", "--help"),
-        ("pmkt", "reconstruct-book-tape", "--help"),
+        ("pmkt", "inspect-raw-capture", "--help"),
     }
 
 

@@ -10,7 +10,6 @@ import typer
 from pmkt.data.manifests import validate_run_manifest
 from pmkt.data.registry import TableSpec, get_table_spec, infer_table_spec, list_table_specs
 from pmkt.data.validation import infer_and_validate_frame, quality_flag_counts, validate_frame
-from pmkt.streaming.legacy.capture_archive import archive_capture
 
 schema_app = typer.Typer(help="Inspect canonical schema registry.")
 dataset_app = typer.Typer(help="Validate and summarize local datasets.")
@@ -147,63 +146,6 @@ def dataset_stats(
         "quality_flag_counts": quality_flag_counts(df),
     }
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
-
-
-@dataset_app.command("archive-run")
-def dataset_archive_run(
-    manifest: Annotated[
-        Path,
-        typer.Argument(
-            help=(
-                "Finalized manifest.json or capture_connection_group.v1.json "
-                "to archive."
-            )
-        ),
-    ],
-    out: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--out",
-            help="Archive output path. Defaults to <run_dir>.pmkt.zip.",
-        ),
-    ] = None,
-    delete_source: Annotated[
-        bool,
-        typer.Option(
-            "--delete-source",
-            help=(
-                "Delete the unpacked run only after exact validation, archive "
-                "verification, and sidecar publication. Restore is required for replay."
-            ),
-        ),
-    ] = False,
-    compress: Annotated[
-        bool,
-        typer.Option(
-            "--compress",
-            help=(
-                "Use low-level DEFLATE. Usually slower with little benefit because "
-                "Parquet payloads are already compressed."
-            ),
-        ),
-    ] = False,
-) -> None:
-    """Collapse a finalized run or connection group into one verified archive."""
-
-    try:
-        result = archive_capture(
-            manifest,
-            archive_path=out,
-            delete_source=delete_source,
-            compress=compress,
-        )
-    except (FileExistsError, OSError, ValueError) as exc:
-        raise typer.BadParameter(str(exc), param_hint="manifest") from exc
-    typer.echo(
-        f"Archived {result.member_count} files to {result.archive_path} "
-        f"({result.unpacked_bytes} unpacked bytes; "
-        f"source_deleted={str(result.source_deleted).lower()})"
-    )
 
 
 __all__ = ["dataset_app", "schema_app"]
