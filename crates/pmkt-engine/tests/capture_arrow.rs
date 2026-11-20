@@ -283,7 +283,7 @@ fn raw_to_arrow_gap_invalidation_and_fresh_snapshot_coordinates() {
     let mut times = vec![];
     for (i, b) in batches.iter().enumerate() {
         assert_eq!(b.topbook.num_rows(), 2);
-        assert_eq!(b.depth.num_rows(), if i == 1 { 1 } else { 2 });
+        assert_eq!(b.depth.num_rows(), if i == 1 { 0 } else { 2 });
         assert_eq!(
             column::<BooleanArray>(&b.topbook, "book_integrity_valid").value(0),
             i != 1
@@ -293,10 +293,13 @@ fn raw_to_arrow_gap_invalidation_and_fresh_snapshot_coordinates() {
             "K:NO"
         );
         times.push(column::<StringArray>(&b.topbook, "received_at_utc").value(0));
-        assert_eq!(
-            column::<StringArray>(&b.depth, "received_at_utc").value(0),
-            times[i]
-        );
+        for utc in column::<StringArray>(&b.depth, "received_at_utc") {
+            assert_eq!(utc, Some(times[i]));
+        }
+        let reference = ["run:1", "run:4:0", "run:4:1"][i];
+        for raw_ref in column::<StringArray>(&b.topbook, "raw_event_ref") {
+            assert_eq!(raw_ref, Some(reference));
+        }
         assert_eq!(
             column::<Int64Array>(&b.topbook, "local_sequence").value(0),
             if i == 0 { 1 } else { 4 }
@@ -311,10 +314,6 @@ fn raw_to_arrow_gap_invalidation_and_fresh_snapshot_coordinates() {
         ]
     );
     let top = &batches[2].topbook;
-    assert_eq!(
-        column::<StringArray>(top, "raw_event_ref").value(0),
-        "run/1/4[1]"
-    );
     assert_eq!(
         column::<StringArray>(top, "best_bid_source").value(1),
         "complement_derived"
@@ -331,6 +330,104 @@ fn raw_to_arrow_gap_invalidation_and_fresh_snapshot_coordinates() {
         column::<StringArray>(top, "exchange_ts_utc").value(0),
         "2025-01-01T00:00:00.100000+00:00"
     );
+}
+
+fn assert_book_health(batch: &RecordBatch, expected: &[&str], valid: bool, intact: bool) {
+    for row in 0..batch.num_rows() {
+        let flags = column::<ListArray>(batch, "quality_flags").value(row);
+        let flags = flags.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(
+            flags.iter().map(Option::unwrap).collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            column::<BooleanArray>(batch, "valid_state").value(row),
+            valid
+        );
+        assert_eq!(
+            column::<BooleanArray>(batch, "book_integrity_valid").value(row),
+            intact
+        );
+    }
+}
+
+#[test]
+fn kalshi_outcomes_share_native_book_health() {
+    let path = root();
+    let snapshot = |seq, no: Value| {
+        raw(
+            seq,
+            1,
+            "kalshi",
+            json!({
+                "type":"orderbook_snapshot","sid":1,"seq":seq,
+                "msg":{"market_ticker":"K","yes_dollars_fp":[["0.40","3"]],"no_dollars_fp":no}
+            }),
+        )
+    };
+    seal(
+        &path,
+        1,
+        &[
+            snapshot(1, json!([["0.40", "2"]])),
+            snapshot(2, json!([["0.39", "2"]])),
+            snapshot(3, json!([])),
+        ],
+        None,
+    );
+    let mut batches = vec![];
+    reconstruct_session(&path, Version::V2, 1, |b| {
+        batches.push(b);
+        Ok(())
+    })
+    .unwrap();
+    let cases: [(&[&str], bool, bool, usize); 3] = [
+        (&[], true, true, 2),
+        (&["crossed_book", "negative_spread"], false, false, 2),
+        (&["empty_ask"], false, true, 1),
+    ];
+    assert_eq!(batches.len(), cases.len());
+    for (batch, (flags, valid, intact, depth_rows)) in batches.iter().zip(cases) {
+        assert_eq!(batch.topbook.num_rows(), 2);
+        assert_eq!(batch.depth.num_rows(), depth_rows);
+        assert_book_health(&batch.topbook, flags, valid, intact);
+        assert_book_health(&batch.depth, flags, valid, intact);
+    }
+}
+
+#[test]
+fn polymarket_replay_emits_depth_once_initialized_and_has_no_live_quote_age() {
+    let path = root();
+    let delta = json!({"event_type":"price_change","price_changes":[
+        {"asset_id":"P","side":"BUY","price":"0.4","size":"3"}
+    ]});
+    let snapshot =
+        json!({"event_type":"book","asset_id":"P","bids":[["0.4","3"]],"asks":[["0.6","2"]]});
+    let tick = json!({"event_type":"tick_size_change","asset_id":"P","new_tick_size":"0.01"});
+    seal(
+        &path,
+        1,
+        &[raw(1, 1, "polymarket", json!([delta, snapshot, tick]))],
+        None,
+    );
+    let mut batches = vec![];
+    reconstruct_session(&path, Version::V2, 1, |b| {
+        batches.push(b);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(batches.len(), 3);
+    assert_book_health(
+        &batches[0].topbook,
+        &["delta_before_snapshot", "empty_ask", "no_initial_snapshot"],
+        false,
+        false,
+    );
+    for (i, b) in batches.iter().enumerate() {
+        assert_eq!(b.depth.num_rows(), if i == 0 { 0 } else { 2 });
+        assert_eq!(b.topbook.num_rows(), 1);
+        assert!(column::<Int64Array>(&b.topbook, "quote_age_ms").is_null(0));
+    }
 }
 #[test]
 fn one_sided_and_empty_native_ladders_have_no_synthetic_depth() {

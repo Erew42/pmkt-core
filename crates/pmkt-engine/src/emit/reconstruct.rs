@@ -1,7 +1,7 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, UpdateKind, VenueBooks},
+    book::{BookMode, VenueBooks},
     capture::{CaptureItem, list_session_chunks},
     health::Integrity,
     merge::received_us,
@@ -121,13 +121,10 @@ pub fn reconstruct_session(
                     }
                 }
             }
-            let reference = format!(
-                "{}/{}/{}{}",
-                f.recording_id,
-                f.connection_generation,
-                f.local_frame_seq,
-                m.position.map_or_else(String::new, |i| format!("[{i}]"))
-            );
+            let reference = match m.position {
+                Some(i) => format!("{}:{sequence}:{i}", f.recording_id),
+                None => format!("{}:{sequence}", f.recording_id),
+            };
             let touched = books.apply_event(event, count);
             let mut reset = vec![];
             for item in touched {
@@ -153,15 +150,10 @@ pub fn reconstruct_session(
                     monotonic_ns: Some(mono),
                     local_sequence: Some(sequence),
                     raw_event_ref: Some(&reference),
-                    quote_age_ms: (f.venue == Venue::Polymarket
-                        && item.kind != UpdateKind::Invalidated)
-                        .then_some(0),
+                    // Capture records receipt, but not when the live quote was observed.
+                    quote_age_ms: None,
                 };
-                batch.push(
-                    book,
-                    receive,
-                    matches!(item.kind, UpdateKind::Snapshot | UpdateKind::Delta),
-                )?;
+                batch.push(book, receive, true)?;
                 last_utc.insert(item.instrument.clone(), clock);
                 if f.venue == Venue::Polymarket
                     && book.integrity() == Integrity::Impaired

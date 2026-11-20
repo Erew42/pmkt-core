@@ -5,7 +5,7 @@ pub use reconstruct::reconstruct_session;
 use crate::{
     Error, Result, ScaledDecimal as D, Venue,
     book::{Book, Quote},
-    health::{Flags, Integrity, QualityFlag as F},
+    health::{Flags, Integrity},
     wire::SourceTime,
 };
 use arrow_array::{
@@ -128,7 +128,6 @@ struct Top {
     mid: Option<f64>,
     spread: Option<f64>,
     bps: Option<f64>,
-    flags: Flags,
 }
 struct Depth {
     base: Arc<Base>,
@@ -193,21 +192,6 @@ impl QuoteBatchBuilder {
                 ),
                 outcome: q.outcome,
             });
-            let mut flags = common.flags.clone();
-            if q.bid.is_none() {
-                flags.insert(F::EmptyBid);
-            }
-            if q.ask.is_none() {
-                flags.insert(F::EmptyAsk);
-            }
-            if let Some((b, a)) = q.bid.zip(q.ask) {
-                if a.price <= b.price {
-                    flags.insert(F::CrossedBook);
-                }
-                if a.price < b.price {
-                    flags.insert(F::NegativeSpread);
-                }
-            }
             let bid_px = q.bid.map(|q| binary(q.price));
             let ask_px = q.ask.map(|q| binary(q.price));
             let pair = bid_px.zip(ask_px);
@@ -225,9 +209,8 @@ impl QuoteBatchBuilder {
                 mid,
                 spread,
                 bps,
-                flags,
             });
-            if !include_depth {
+            if !include_depth || !book.initialized() {
                 continue;
             }
             let mut append = |side, levels: &mut dyn Iterator<Item = (&D, &D)>| -> Result<()> {
@@ -443,12 +426,13 @@ fn top_batch(version: Version, rows: &[Top]) -> Result<RecordBatch> {
     c.add(
         "valid_state",
         false,
-        BooleanArray::from_iter(
-            rows.iter()
-                .map(|r| Some(r.flags.is_empty() && r.base.common.valid)),
-        ),
+        BooleanArray::from_iter(rows.iter().map(|r| Some(r.base.common.valid))),
     );
-    c.add("quality_flags", true, flags(rows.iter().map(|r| &r.flags)));
+    c.add(
+        "quality_flags",
+        true,
+        flags(rows.iter().map(|r| &r.base.common.flags)),
+    );
     c.add(
         "raw_event_ref",
         true,
