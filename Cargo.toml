@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/pmkt-engine"]
+members = ["crates/pmkt-engine", "crates/pmkt-py"]
 resolver = "2"
 
 [workspace.lints.rust]

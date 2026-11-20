@@ -1,0 +1,17 @@
+[package]
+name = "pmkt-py"
+version = "0.2.0"
+edition = "2024"
+publish = false
+
+[lib]
+name = "_native"
+crate-type = ["cdylib"]
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array = { version = "58", features = ["ffi"] }
+pmkt-engine = { path = "../pmkt-engine" }
+pyo3 = { version = "0.28", features = ["abi3-py310"] }
