@@ -60,11 +60,6 @@
       "status": "active_core",
       "summary": "Capture, venue ingestion, matching, tracking, and their persisted provenance contracts.",
       "schemas": [
-        "book_tape_control.v1",
-        "book_tape_control.v2",
-        "book_tape_event.v1",
-        "book_tape_event.v2",
-        "book_tape_level.v1",
         "capture_instrument_evidence.v1",
         "capture_instrument_evidence.v2",
         "contract_evidence.v1",
@@ -313,31 +308,6 @@
       "contract_owner": "pmkt-core",
       "classification": "cross_repository_contract",
       "consumer_policy_owner": "pmkt-trading"
-    },
-    "book_tape_control.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "core_owned",
-      "consumer_policy_owner": null
-    },
-    "book_tape_control.v2": {
-      "contract_owner": "pmkt-core",
-      "classification": "core_owned",
-      "consumer_policy_owner": null
-    },
-    "book_tape_event.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "core_owned",
-      "consumer_policy_owner": null
-    },
-    "book_tape_event.v2": {
-      "contract_owner": "pmkt-core",
-      "classification": "core_owned",
-      "consumer_policy_owner": null
-    },
-    "book_tape_level.v1": {
-      "contract_owner": "pmkt-core",
-      "classification": "core_owned",
-      "consumer_policy_owner": null
     },
     "capture_instrument_evidence.v1": {
       "contract_owner": "pmkt-core",
@@ -604,11 +574,6 @@
     "core": {
       "schemas_with_source_literals": [
         "backtest_report.v1",
-        "book_tape_control.v1",
-        "book_tape_control.v2",
-        "book_tape_event.v1",
-        "book_tape_event.v2",
-        "book_tape_level.v1",
         "capture_instrument_evidence.v2",
         "contract_evidence.v1",
         "convergence_observation.v1",
