@@ -15,6 +15,7 @@ from pmkt.data.registry import arrow_schema, get_table_spec
 from pmkt.streaming import managed_feed
 from pmkt.streaming.copy_merge import CopyMerge, session_occurrences
 from pmkt.streaming.raw_capture import ChunkWriter
+from pmkt.streaming.recording_feed import VenueBooks
 from pmkt.streaming.raw_reader import (
     inspect_session,
     read_session,
@@ -258,6 +259,12 @@ def test_kalshi_price_basis_and_sequence(monkeypatch):
 def test_verified_reconstruction_schema_and_sequence_gap(
     tmp_path, monkeypatch, version
 ):
+    from pmkt.streaming import raw_capture
+
+    stamps = iter(f"2025-01-01T00:00:0{i}+00:00" for i in range(4))
+    monkeypatch.setattr(
+        raw_capture, "utc", lambda: next(stamps, "2025-01-01T00:00:04+00:00")
+    )
     writer = ChunkWriter(tmp_path, "run", "kalshi", "connection")
     s = snapshot("kalshi")
     for msg in (s, delta("kalshi"), delta("kalshi", seq=4), delta("kalshi", seq=5)):
@@ -274,6 +281,39 @@ def test_verified_reconstruction_schema_and_sequence_gap(
     assert top["raw_event_ref"].to_pylist() == [
         f"run:{i}" for i in range(1, 5) for _ in range(2)
     ]
+    oracle = VenueBooks("kalshi", ["a"])
+    top_rows = iter(top.to_pylist())
+    depth_rows = iter(depth.to_pylist())
+    for frame in read_session(tmp_path):
+        (view,) = oracle.apply(json.loads(frame.payload_raw), frame.local_frame_seq)
+        for outcome, side, levels in (
+            ("YES", "yes", view.bids),
+            ("NO", "no", view.asks),
+        ):
+            quote = next(top_rows)
+            assert quote["outcome"] == outcome
+            assert quote["received_at_utc"] == frame.received_utc
+            assert quote["received_at_monotonic_ns"] == frame.received_monotonic_ns
+            assert quote["exchange_ts_utc"] == view.venue_time_utc
+            assert quote["quality_flags"] == list(view.quality_flags)
+            assert quote["valid_state"] == view.quote_valid
+            if version == 2:
+                assert quote["book_integrity_valid"] == view.integrity_valid
+            for index, (price, size) in enumerate(sorted(levels.items(), reverse=True)):
+                level = next(depth_rows)
+                assert (
+                    level["side"],
+                    level["level_index"],
+                    level["price_dollars"],
+                    level["size_contracts"],
+                ) == (
+                    side,
+                    index,
+                    price,
+                    size,
+                )
+                assert level["quality_flags"] == quote["quality_flags"]
+    assert next(top_rows, None) is next(depth_rows, None) is None
     assert top["quote_age_ms"].null_count == 8
     assert top["valid_state"].to_pylist() == [True] * 4 + [False] * 4
     assert all("seq_gap" in flags for flags in top["quality_flags"].to_pylist()[4:])
