@@ -2,7 +2,8 @@ use arrow_array::{
     Array, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType;
-use flate2::{Compression, write::GzEncoder};
+mod capture_fixture;
+use capture_fixture::{column, manifest, name, raw, root, seal, sidecar};
 use pmkt_engine::{
     BookMode, Venue, VenueBooks,
     capture::{CaptureItem, SealedChunk, inspect_session, list_session_chunks, read_session},
@@ -11,66 +12,7 @@ use pmkt_engine::{
     },
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
-
-fn root() -> PathBuf {
-    // Each case owns fresh files under the ignored workspace build tree.
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/capture-fixtures");
-    fs::create_dir_all(&base).unwrap();
-    tempfile::tempdir_in(base).unwrap().keep()
-}
-fn raw(seq: u64, generation: u64, venue: &str, msg: Value) -> Value {
-    json!({"schema":format!("{venue}.public_raw_frame.v1"),"venue":venue,"recording_id":"run","connection_generation":generation,
-        "local_frame_seq":seq,"received_utc":"2025-01-01T00:00:00+00:00","received_monotonic_ns":seq*1_000_000,
-        "frame_type":"text","direction":"received","payload_raw":msg.to_string()})
-}
-fn name(i: u64) -> String {
-    format!("chunk_{i:06}.jsonl.gz")
-}
-fn manifest(root: &Path, i: u64) -> PathBuf {
-    root.join(format!("{}.manifest.json", name(i)))
-}
-fn sidecar(
-    root: &Path,
-    i: u64,
-    venue: &str,
-    run: &str,
-    range: std::ops::RangeInclusive<u64>,
-    prev: Option<&str>,
-) -> String {
-    let bytes = fs::read(root.join(name(i))).unwrap();
-    let sha = format!("{:x}", Sha256::digest(&bytes));
-    let m = json!({"schema":format!("{venue}.public_raw_chunk.v1"),"venue":venue,"recording_id":run,"filename":name(i),"size_bytes":bytes.len(),
-        "sha256":sha,"frame_count":range.end()-range.start()+1,"first_frame_seq":range.start(),"last_frame_seq":range.end(),"previous_chunk_sha256":prev,
-        "future_field":"retained"});
-    fs::write(manifest(root, i), m.to_string()).unwrap();
-    sha
-}
-fn seal(root: &Path, i: u64, frames: &[Value], prev: Option<&str>) -> String {
-    let mut gz = GzEncoder::new(
-        fs::File::create(root.join(name(i))).unwrap(),
-        Compression::fast(),
-    );
-    for f in frames {
-        writeln!(gz, "{f}").unwrap();
-    }
-    gz.finish().unwrap();
-    sidecar(
-        root,
-        i,
-        frames[0]["venue"].as_str().unwrap(),
-        "run",
-        frames[0]["local_frame_seq"].as_u64().unwrap()
-            ..=frames.last().unwrap()["local_frame_seq"].as_u64().unwrap(),
-        prev,
-    )
-}
+use std::{fs, path::Path, sync::Arc};
 fn revise(root: &Path, i: u64, f: impl FnOnce(&mut Value)) {
     let p = manifest(root, i);
     let mut m: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
@@ -189,14 +131,6 @@ fn missing_prefix_invalid_predecessor_and_duplicate_seq_are_checked() {
             .to_string()
             .contains("consecutive")
     );
-}
-fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
-    batch
-        .column_by_name(name)
-        .unwrap()
-        .as_any()
-        .downcast_ref()
-        .unwrap()
 }
 
 #[test]
@@ -476,6 +410,79 @@ fn merged_resolution_before_first_snapshot_is_terminal() {
     assert_eq!(batches.len(), 1);
     assert_book_health(&batches[0].topbook, &["market_resolved"], false, true);
     assert_book_health(&batches[0].depth, &["market_resolved"], false, true);
+}
+
+#[test]
+fn a_clock_rollback_cannot_move_a_post_gap_delta_into_the_old_ladder() {
+    let ms = 1735689600000;
+    let snapshot = raw(1, 1, "polymarket", poly_snapshot(ms));
+    let mut gap = raw(2, 1, "polymarket", json!({}));
+    gap["frame_type"] = json!("transport_error");
+    gap["direction"] = json!("local");
+    let delta = |seq, timestamp| {
+        raw(
+            seq,
+            1,
+            "polymarket",
+            json!({
+                "event_type":"price_change","asset_id":"P","timestamp":timestamp,
+                "price_changes":[{"asset_id":"P","side":"BUY","price":"0.4","size":"5"}]
+            }),
+        )
+    };
+    let mut reopened = delta(3, ms + 2);
+    reopened["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    let rollback = delta(4, ms + 1);
+    let mut pong = snapshot.clone();
+    pong["frame_type"] = json!("ws_pong");
+    pong["direction"] = json!("received_control_base64");
+    let batches = merged_poly(&[snapshot, gap, reopened, rollback], &[pong]);
+    let rows: Vec<_> = batches.iter().map(|b| b.depth.num_rows()).collect();
+    assert_eq!(rows, [2, 0, 0]);
+}
+
+#[test]
+fn a_gap_inside_one_frame_resets_before_its_first_merged_message() {
+    let a = root();
+    let start = raw(
+        1,
+        1,
+        "kalshi",
+        json!({"type":"orderbook_snapshot","sid":7,"seq":1,
+        "msg":{"market_ticker":"K","ts_ms":100,"yes":[[".3","1"]],"no":[[".6","1"]]}}),
+    );
+    let delta = |seq| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,
+        "msg":{"market_ticker":"K","ts_ms":100+seq,"side":"yes","price":".3","delta":"1"}})
+    };
+    let mut batched = raw(2, 1, "kalshi", json!([delta(2), delta(4)]));
+    batched["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    seal(&a, 1, &[start.clone(), batched], None);
+    let b = root();
+    let mut pong = start;
+    pong["direction"] = json!("received_control_base64");
+    pong["frame_type"] = json!("ws_pong");
+    seal(&b, 1, &[pong], None);
+    let mut sessions = vec![("a".into(), "c".into(), a)];
+    for copies in 1..=2 {
+        if copies == 2 {
+            sessions.push(("b".into(), "c".into(), b.clone()));
+        }
+        let mut depth = Vec::new();
+        reconstruct_merged(
+            Venue::Kalshi,
+            sessions.clone(),
+            Version::V2,
+            1,
+            |batch| {
+                depth.push(batch.depth.num_rows());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(depth, [2, 0, 0]);
+    }
 }
 
 #[test]

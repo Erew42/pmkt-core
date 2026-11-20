@@ -276,17 +276,28 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             self.tracker.report.counts.unparsed_text_frames += 1;
             return Ok(());
         };
+        // CoverageTracker puts a sequence loss between the previous frame and
+        // this one, even when a later array element exposes it. Assign the
+        // same resulting local interval to every occurrence of this frame.
+        if f.venue == Venue::Kalshi {
+            for m in &messages {
+                if let Some((sid, seq)) = m.value["sid"].as_i64().zip(m.value["seq"].as_i64()) {
+                    self.tracker.sequence(sid, seq);
+                }
+            }
+        }
+        let interval = self.tracker.report.intervals.len();
+        let coverage_period = if self.coverage_periods.is_empty() {
+            interval
+        } else {
+            self.coverage_periods[interval]
+        };
         let mut events = Vec::with_capacity(messages.len());
         for m in messages {
             let v = m.value;
             let asset = match f.venue {
-                Venue::Kalshi => {
-                    if let Some((sid, seq)) = v["sid"].as_i64().zip(v["seq"].as_i64()) {
-                        self.tracker.sequence(sid, seq);
-                    }
-                    (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
-                        .then(|| &v["msg"]["market_ticker"])
-                }
+                Venue::Kalshi => (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
+                    .then(|| &v["msg"]["market_ticker"]),
                 Venue::Polymarket => (v["event_type"] == "book").then(|| &v["asset_id"]),
             };
             let reconnect_snapshot = asset.is_some_and(|a| self.books.insert(a.to_string()));
@@ -303,11 +314,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     received_monotonic_ns: f.received_monotonic_ns,
                     use_yes_price: self.subscription.kalshi_basis.unwrap_or(true),
                     subscription: self.subscription.instruments.clone(),
-                    coverage_period: if self.coverage_periods.is_empty() {
-                        self.tracker.report.intervals.len()
-                    } else {
-                        self.coverage_periods[self.tracker.report.intervals.len()]
-                    },
+                    coverage_period,
                 },
                 message: v,
                 reconnect_snapshot,
