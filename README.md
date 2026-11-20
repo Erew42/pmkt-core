@@ -108,12 +108,12 @@ Run manifests preserve their existing identity fields and add `pmkt_core_dirty`
 and `pmkt_core_provenance_source`. Caller metadata cannot override observed core
 identity. Dataset schema versions are unchanged.
 
-`validate_run_manifest(path, *, path_resolver=None)` optionally accepts a
-`Callable[[Path], Path]` for legacy dataset references and declared run directories.
-The caller owns any relocation policy. Exact artifact paths must still be
-canonical and contained within the authoritative manifest directory; hashes,
-schemas, counts, and journal bindings are always validated after resolution.
-With no callback, existing path behavior is unchanged.
+`validate_run_manifest` accepts an optional `path_resolver` callback of type
+`Callable[[Path], Path]` for dataset references and declared run directories.
+The caller owns the relocation policy. Declared hashes, schemas, and row counts
+are checked after resolution. Both `exact_artifact_validation` values (`"full"`
+and `"structure"`) perform the same checks. Manifests declaring `storage_profile`
+or `dataset_artifacts` return a validation error.
 
 ## Python API 0.2
 

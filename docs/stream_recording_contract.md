@@ -331,13 +331,10 @@ report = await stream_order_book_data(
 # Or set depth_check_interval_s=None and depth_on_best_price_change=True.
 ```
 
-`recover-stream-run RUN --finalize` detects new SQLite recordings and exports
-committed rows. Without `--finalize` it only inspects committed metadata/counts.
+`pmkt.streaming.export_recording(run_directory)` exports committed rows from a
+stopped SQLite recording, including after an interrupted process.
 `dataset validate-manifest RUN/manifest.json` validates the exported files without
 requiring retained SQLite. An OS-held lock prevents export during live recording.
-Old direct imports of profile/tape reader helpers now use `pmkt.streaming.legacy`.
-The historical producer helpers retained there support conversion and reader
-fixtures; they are not selectable live writers.
 
 This is a recording API migration: old profile, eligibility, durability-backend,
 connection-group and `runtime_projection_recorder` arguments are removed.

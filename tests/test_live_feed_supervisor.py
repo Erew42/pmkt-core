@@ -4,10 +4,13 @@ import random
 from collections import Counter
 
 import pandas as pd
+import pyarrow as pa
 import pytest
 
+from pmkt.data.registry import FEED_HEALTH_SCHEMA_VERSION, arrow_schema, get_table_spec
 from pmkt.data.validation import validate_frame
 from pmkt.streaming.supervisor import (
+    FEED_HEALTH_SCHEMA,
     FeedRecoveryAction,
     FeedShardHealth,
     LiveFeedSupervisor,
@@ -507,6 +510,26 @@ def test_supervisor_can_select_health_and_current_recovery_by_shard() -> None:
             reasons=("hash_mismatch", "book_integrity"),
         )
     ]
+
+
+def test_feed_health_stream_schema_is_the_canonical_registry_schema() -> None:
+    expected = arrow_schema(get_table_spec(FEED_HEALTH_SCHEMA_VERSION))
+
+    assert FEED_HEALTH_SCHEMA.equals(expected, check_metadata=True)
+    assert FEED_HEALTH_SCHEMA.field("quality_flags").type == pa.list_(pa.string())
+    assert FEED_HEALTH_SCHEMA.field("instrument_state_json").type == pa.string()
+    for column in (
+        "local_sequence",
+        "instrument_count",
+        "relation_count",
+        "reconnect_count",
+        "sequence_gap_count",
+        "resync_count",
+        "error_count",
+        "valid_book_count",
+        "invalid_book_count",
+    ):
+        assert FEED_HEALTH_SCHEMA.field(column).type == pa.int64()
 
 
 def test_supervisor_feed_health_rows_validate_as_canonical_schema() -> None:

@@ -8,9 +8,8 @@ installed version.
 ## Command groups
 
 - `schema list|show`: inspect canonical dataset schemas.
-- `dataset validate|validate-manifest|stats|archive-run`: validate and manage
-  local dataset artifacts. `archive-run` writes a verified archive of a
-  finalized run; with `--delete-source` it then deletes the unpacked run.
+- `dataset validate|validate-manifest|stats`: validate and summarize local
+  dataset artifacts.
 - `markets discover-new|refresh-current|promote-history|compact-history|status`:
   maintain a local market catalog. Without `history/LATEST.json`,
   `discover-new` bootstraps from the current snapshot (`LATEST.json`): its
@@ -109,8 +108,6 @@ installed version.
   books. Only `stream-kalshi-books` takes read auth, through
   `--header-provider` and a separately installed provider; core never loads a
   private key.
-- `recover-stream-run`: validate and recover a durable capture run.
-- `reconstruct-book-tape`: reconstruct books from committed capture evidence.
 - `record-raw-ws`: capture verbatim public WebSocket frames for one connection
   and its reconnects in rotating gzip JSONL chunks (POSIX). This uses the separate
   [raw capture contract](docs/raw_capture_contract.md), not `recording.v1`.
@@ -167,12 +164,10 @@ flags are retired. Reports use `complete`, `partial` or `failed`; partial/failed
 CLI runs exit nonzero. Missing eligibility metadata does not downgrade an intact
 book. See [the recording contract](docs/stream_recording_contract.md).
 
-`recover-stream-run` automatically recognizes SQLite recordings: without
-`--finalize` it inspects committed state; with `--finalize` it exports/re-exports
-committed rows. The Python equivalent is
-`pmkt.streaming.export_recording(run_directory)`. An active recorder is locked
-against concurrent export. `dataset validate-manifest` also recognizes the new
-format. Historical profile recovery and `reconstruct-book-tape` remain available.
+Use `pmkt.streaming.export_recording(run_directory)` in Python to export
+committed rows from a stopped SQLite recording. An active recorder is locked
+against concurrent export. `dataset validate-manifest` validates the exported
+`recording.v1` manifest and files.
 
 Recording connection options inherit `WebSocketRetryBudget` and
 `WebSocketTransportSettings` when omitted. Explicit `--max-reconnects 0`
@@ -189,13 +184,6 @@ and negative boolean flags. Raw messages remain off by default.
 the Python API still makes one cycle when both bounds are omitted. Its interval
 and observational age defaults come from `record_topbooks`;
 `--max-stale-seconds` accepts a negative value to disable that age flag.
-
-`reconstruct-book-tape` accepts `--parity-memory-limit` (a DuckDB size string)
-and `--depth-parity-bucket-count` (positive integer). Explicit flags override
-`PMKT_DUCKDB_PARITY_MEMORY_LIMIT` / `PMKT_DEPTH_PARITY_BUCKET_COUNT`; otherwise
-the retained environment names override `ParityOptions` defaults. Values resolve
-when reconstruction starts, rather than on module import, and stay fixed for
-that run. Omitted `--batch-rows` inherits the stream owner's batch default.
 
 `backfill-venue-history` and `compute-features` forward only supplied settings;
 their library APIs own the defaults. History `--fidelity` is Polymarket sampling

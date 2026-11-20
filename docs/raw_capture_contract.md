@@ -346,6 +346,5 @@ link here to distinguish it from normalized recording. Changes to retained
 field names, ordering or semantics require a deliberate compatibility decision.
 
 Deployment, upload/archive verification, market-list construction and credential
-loading belong to downstream operator workflows. This command neither uploads
-nor deletes recordings and does not make `recover-stream-run` or
-`dataset validate-manifest` readers for these raw chunks.
+loading belong to downstream operator workflows. Use `inspect-raw-capture` to
+verify sealed raw chunks and `dataset validate-manifest` to validate local dataset manifests.
