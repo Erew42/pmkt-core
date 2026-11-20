@@ -1,0 +1,29 @@
+[package]
+name = "pmkt-engine"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Read-only public prediction-market book and raw capture engine"
+
+[lints]
+workspace = true
+
+[dependencies]
+arrow-array = "58"
+arrow-schema = "58"
+blake2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+flate2 = "1"
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision", "raw_value"] }
+sha2 = "0.10"
+thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+tempfile = "3"
+
+[[bench]]
+name = "engine_bench"
+harness = false
