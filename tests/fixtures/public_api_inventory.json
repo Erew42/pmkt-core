@@ -787,6 +787,78 @@
     {
       "path": "pmkt.streaming.raw_reader.iter_venue_messages",
       "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.CopyMerge",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.CopyMergeError",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.MergeStats",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.MergedMessage",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.MessageKey",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.Occurrence",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.Origin",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.connection_occurrences",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.discover_sessions",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.message_key",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge.session_occurrences",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_coverage.CoverageInterval",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_coverage.CoverageTracker",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_coverage.SessionCoverage",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_coverage.uncovered_intervals",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_coverage.utc_microseconds",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge_books.BookCheck",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.copy_merge_books.check_merged_books",
+      "tier": "advanced"
     }
   ]
 }

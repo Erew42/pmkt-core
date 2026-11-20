@@ -119,6 +119,7 @@ jobs:
               tests/test_raw_capture_lag.py
               tests/test_raw_capture_tracker.py
               tests/test_raw_reader.py
+              tests/test_copy_merge.py
               tests/test_streaming_collector.py
               tests/test_streaming_measurement.py
               tests/test_ws_transport.py

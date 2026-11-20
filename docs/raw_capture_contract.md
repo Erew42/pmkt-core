@@ -234,8 +234,9 @@ Verification establishes local artifact integrity and ordering, not network
 completeness, valid order-book baselines, exchange ordering or accurate arrival
 times. Receive times retain the caveats above. Reconstruction consumers must
 handle diagnostics and missing chunks, and reset state on connection-generation
-changes before applying new baselines. No collector merging, normalized tables
-or CLI command is provided by this reader.
+changes before applying new baselines. No normalized tables or CLI command is
+provided by this reader. To merge the recordings of several collectors
+(copies), see [copy_merge.md](copy_merge.md).
 
 ## Session files and failure semantics
 
