@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -22,12 +23,14 @@ from pmkt.resolution.models import (
     RESULT_TYPE_SCALAR,
     RESULT_TYPE_UNKNOWN,
     Payout,
+    STATE_DISPUTED,
     STATE_FINAL,
     STATE_INCONSISTENT,
     STATE_METADATA_ONLY,
     STATE_OPEN,
     STATE_UNAVAILABLE,
     ResolutionRecord,
+    SourceObservation,
 )
 from pmkt.resolution.terminal_labels import (
     is_authoritative_final_resolution,
@@ -35,9 +38,116 @@ from pmkt.resolution.terminal_labels import (
 )
 
 
+@pytest.mark.asyncio
+async def test_cache_summary_interruption_preserves_existing_file(tmp_path, monkeypatch) -> None:
+    polymarket_path = tmp_path / "polymarket.parquet"
+    kalshi_path = tmp_path / "kalshi.parquet"
+    _write_polymarket(polymarket_path, [])
+    _write_kalshi(kalshi_path, [])
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    summary_path = output_dir / "summary.json"
+    summary_path.write_text('{"previous": true}', encoding="utf-8")
+    original_bytes = summary_path.read_bytes()
+    original_open = Path.open
+
+    def interrupt(path, mode="r", *args, **kwargs):
+        if "w" in mode and "summary.json" in path.name:
+            with original_open(path, mode, *args, **kwargs) as handle:
+                handle.write('{"interrupted":')
+            raise KeyboardInterrupt("interrupted summary write")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        await cache_module.resolve_market_resolution_cache(
+            polymarket_markets_path=polymarket_path,
+            kalshi_markets_path=kalshi_path,
+            output_dir=output_dir,
+            gamma_client=FakeGamma(),
+            clob_client=FakeClob(),
+            kalshi_client=FakeKalshiClient(),
+        )
+    assert summary_path.read_bytes() == original_bytes
+    assert not summary_path.with_name("summary.json.tmp").exists()
+
+
 class FakeGamma:
     async def market(self, market_id: str, *, expiry=None) -> dict[str, Any]:
         return {}
+
+
+def test_cache_sort_avoids_scalar_pandas_for_canonical_timestamps(monkeypatch) -> None:
+    def reject_scalar_parser(*args, **kwargs):
+        raise AssertionError("canonical timestamps should use the fast parser")
+
+    monkeypatch.setattr(pd, "to_datetime", reject_scalar_parser)
+    assert cache_module._parsed_timestamp_ns("2026-01-01T01:00:00.123456789+01:00") == (
+        pd.Timestamp("2026-01-01T00:00:00.123456789Z").value
+    )
+
+
+def test_cache_unique_rows_computes_each_sort_key_once(monkeypatch) -> None:
+    original_key = cache_module._latest_row_sort_key
+    calls = []
+
+    def counted_key(row):
+        calls.append(row["snapshot"])
+        return original_key(row)
+
+    monkeypatch.setattr(cache_module, "_latest_row_sort_key", counted_key)
+    frame = pd.DataFrame({"market_key": ["A"] * 5, "snapshot": range(5)})
+    cache_module._unique_market_rows(frame, "market_key")
+    assert sorted(calls) == list(range(5))
+
+
+@pytest.mark.parametrize("value", ["0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"])
+def test_cache_timestamp_sort_matches_scalar_pandas_on_utc_overflow(value) -> None:
+    assert pd.isna(pd.to_datetime(value, utc=True, errors="coerce"))
+    assert cache_module._parsed_timestamp_ns(value) == -1
+
+
+def test_cache_timestamp_sort_matches_scalar_pandas_on_randomized_rows(monkeypatch) -> None:
+    import random
+    from datetime import datetime, timezone
+
+    values = [
+        None, pd.NA, pd.NaT, float("nan"), "", "bad", "NaT", "2026-02-30",
+        "2026-01-01T00:00:00Z", "2026-01-01T00:00:00.123456789Z",
+        "2025-12-31T23:00:00-01:00", "2026-01-01T02:00:00+02",
+        "2026-01-01T02:00:00.123456+0200", " 2026-01-01T00:00:00Z ",
+        "2026-01-01t00:00:00z", "2026-01-01", "2026-01-01 00:00:00",
+        "1969-12-31T23:59:59.999999999Z", "1500-01-01T00:00:00Z",
+        "2500-01-01T00:00:00Z", 0, 1, -1, 1_700_000_000_000_000_000,
+        "0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00",
+        datetime(2026, 1, 1), datetime(2026, 1, 1, tzinfo=timezone.utc),
+        pd.Timestamp("2026-01-01T00:00:00.123456789Z"),
+    ]
+
+    def legacy_timestamp(value):
+        if cache_module._is_missing(value):
+            return -1
+        parsed = pd.to_datetime(value, utc=True, errors="coerce")
+        return -1 if pd.isna(parsed) else int(parsed.value)
+
+    for value in values:
+        assert cache_module._parsed_timestamp_ns(value) == legacy_timestamp(value), repr(value)
+    rng = random.Random(401)
+    rows = [
+        {"platform": rng.choice(["kalshi", "polymarket"]), "market_key": str(rng.randrange(12)),
+         **{column: rng.choice(values) for column in cache_module._SNAPSHOT_FRESHNESS_TIMESTAMP_COLUMNS}}
+        for _ in range(120)
+    ]
+    rng.shuffle(rows)
+    frame = pd.DataFrame(rows)
+    with monkeypatch.context() as context:
+        context.setattr(cache_module, "_parsed_timestamp_ns", legacy_timestamp)
+        expected_order = [cache_module._stable_json(row) for row in cache_module._sort_resolution_rows(rows)]
+        expected_unique = [cache_module._stable_json(row)
+                           for row in cache_module._unique_market_rows(frame, "market_key")]
+    assert [cache_module._stable_json(row) for row in cache_module._sort_resolution_rows(rows)] == expected_order
+    assert [cache_module._stable_json(row)
+            for row in cache_module._unique_market_rows(frame, "market_key")] == expected_unique
 
 
 class FakeClob:
@@ -1051,9 +1161,11 @@ async def test_cache_refresh_accepts_equivalent_zero_scalar_terminals(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_state", [STATE_FINAL, STATE_DISPUTED, STATE_INCONSISTENT])
 async def test_cache_refresh_preserves_existing_cache_conflict(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    refresh_state: str,
 ) -> None:
     polymarket_path = tmp_path / "polymarket.parquet"
     kalshi_path = tmp_path / "kalshi.parquet"
@@ -1093,7 +1205,15 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
 
         async def resolve(self, market: KalshiMarketRef, *, snapshot: dict[str, Any]) -> ResolutionRecord:
             market_key = market.ticker
-            return _final_record("kalshi", market_key, "no")
+            return replace(
+                _final_record("kalshi", market_key, "no"),
+                resolution_state=refresh_state,
+                confidence=(CONFIDENCE_CANONICAL if refresh_state == STATE_FINAL
+                            else CONFIDENCE_INCONSISTENT),
+                source_observations=[SourceObservation(
+                    source=f"refresh:{refresh_state}", confidence=CONFIDENCE_INCONSISTENT,
+                )],
+            )
 
     monkeypatch.setattr(cache_module, "KalshiResolutionResolver", FakeKalshiResolver)
 
@@ -1127,6 +1247,25 @@ async def test_cache_refresh_preserves_existing_cache_conflict(
     assert row["confidence"] == CONFIDENCE_INCONSISTENT
     assert row["error_type"] == "MarketResolutionCacheConflict"
     assert row["resolver_version"] == "market_resolution_resolver.v2"
+    assert any(
+        item["source"] == f"refresh:{refresh_state}"
+        for item in cache_module._decode_observations(row["source_observations_json"])
+    )
+
+    # The conflict must survive a disk reload and a subsequent clean final.
+    refresh_state = STATE_FINAL
+    await cache_module.resolve_market_resolution_cache(
+        polymarket_markets_path=polymarket_path,
+        kalshi_markets_path=kalshi_path,
+        output_dir=output_dir,
+        refresh=True,
+        gamma_client=FakeGamma(),
+        clob_client=FakeClob(),
+        kalshi_client=FakeKalshiClient(),
+    )
+    [reloaded] = pd.read_parquet(output_dir / "market_resolutions.parquet").to_dict("records")
+    assert reloaded["error_type"] == "MarketResolutionCacheConflict"
+    assert reloaded["resolution_state"] == STATE_INCONSISTENT
 
 
 @pytest.mark.asyncio

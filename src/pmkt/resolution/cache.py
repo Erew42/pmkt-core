@@ -13,8 +13,10 @@ from typing import Any
 import pandas as pd
 
 from pmkt.data.canonical import market_resolution_row
+from pmkt.data.io import _write_json_atomic
 from pmkt.data.registry import MARKET_RESOLUTION_COLUMNS, MARKET_RESOLUTION_SCHEMA_VERSION
 from pmkt.data.storage.parquet import write_parquet
+from pmkt.data.time import parse_utc_timestamp
 from pmkt.exchanges.kalshi.client import AsyncKalshiClient
 from pmkt.exchanges.polymarket.clob import AsyncClobClient
 from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
@@ -164,6 +166,14 @@ def _stable_snapshot_sort_json(row: dict[str, Any]) -> str:
 def _parsed_timestamp_ns(value: Any) -> int:
     if _is_missing(value):
         return -1
+    try:
+        canonical = parse_utc_timestamp(value)
+        if canonical is not None:
+            return int(pd.Timestamp(canonical).value)
+    except (OverflowError, ValueError):
+        return -1
+    # Preserve the historical treatment of naive dates, numeric nanoseconds,
+    # and malformed values outside the canonical explicit-offset contract.
     parsed = pd.to_datetime(value, utc=True, errors="coerce")
     if pd.isna(parsed):
         return -1
@@ -185,11 +195,13 @@ def _unique_market_rows(df: pd.DataFrame, key_column: str) -> list[dict[str, Any
     if df.empty or key_column not in df.columns:
         return []
     latest_by_key: dict[str, dict[str, Any]] = {}
+    latest_sort_keys: dict[str, tuple[Any, ...]] = {}
     for row in df.dropna(subset=[key_column]).to_dict("records"):
         key = str(row.get(key_column))
-        current = latest_by_key.get(key)
-        if current is None or _latest_row_sort_key(row) > _latest_row_sort_key(current):
+        sort_key = _latest_row_sort_key(row)
+        if key not in latest_by_key or sort_key > latest_sort_keys[key]:
             latest_by_key[key] = row
+            latest_sort_keys[key] = sort_key
     return [latest_by_key[key] for key in sorted(latest_by_key)]
 
 
@@ -281,11 +293,13 @@ def _existing_current_rows(
         if _row_pair(row) in requested_pairs
     ]
     latest_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    latest_sort_keys: dict[tuple[str, str], tuple[Any, ...]] = {}
     for row in rows:
         pair = _row_pair(row)
-        current = latest_by_pair.get(pair)
-        if current is None or _latest_row_sort_key(row) > _latest_row_sort_key(current):
+        sort_key = _latest_row_sort_key(row)
+        if pair not in latest_by_pair or sort_key > latest_sort_keys[pair]:
             latest_by_pair[pair] = row
+            latest_sort_keys[pair] = sort_key
     return latest_by_pair
 
 
@@ -308,11 +322,13 @@ def _existing_legacy_unsafe_rows(
         if _row_pair(row) in requested_pairs
     ]
     latest_by_pair: dict[tuple[str, str], dict[str, Any]] = {}
+    latest_sort_keys: dict[tuple[str, str], tuple[Any, ...]] = {}
     for row in rows:
         pair = _row_pair(row)
-        current = latest_by_pair.get(pair)
-        if current is None or _latest_row_sort_key(row) > _latest_row_sort_key(current):
+        sort_key = _latest_row_sort_key(row)
+        if pair not in latest_by_pair or sort_key > latest_sort_keys[pair]:
             latest_by_pair[pair] = row
+            latest_sort_keys[pair] = sort_key
     return latest_by_pair
 
 
@@ -662,10 +678,7 @@ async def resolve_market_resolution_cache(
                     rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)
                 else:
                     rows_by_pair[pair] = row
-            elif _is_cache_conflict(existing_row) and str(row.get("resolution_state")) not in {
-                STATE_DISPUTED,
-                STATE_INCONSISTENT,
-            }:
+            elif _is_cache_conflict(existing_row):
                 rows_by_pair[pair] = _carry_forward_final(existing_row, row)
             elif _canonical_final_conflict(existing_row, row):
                 rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)
@@ -686,9 +699,7 @@ async def resolve_market_resolution_cache(
         strict=True,
     )
     summary = _summary(rows, output_path=output_path)
-    summary_path.write_text(
-        json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8"
-    )
+    _write_json_atomic(summary_path, summary)
     return {**summary, "summary_path": str(summary_path)}
 
 

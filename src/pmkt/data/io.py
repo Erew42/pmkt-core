@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import contextlib
 import json
 import os
 import time
@@ -46,14 +47,24 @@ def read_parquet_segment_manifest(path: str | Path) -> dict[str, Any] | None:
 
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Publish JSON atomically across process interruption.
+
+    The temporary file is fsynced before replacement, but the parent directory
+    is not: power-loss durability is not guaranteed. Clean up temporary files
+    when Python unwinds, including on KeyboardInterrupt.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_name(path.name + ".tmp")
-    with temp_path.open("w", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, indent=2, sort_keys=True))
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(temp_path, path)
+    try:
+        with temp_path.open("w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2, sort_keys=True))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+    finally:
+        with contextlib.suppress(OSError):
+            temp_path.unlink(missing_ok=True)
 
 
 @runtime_checkable

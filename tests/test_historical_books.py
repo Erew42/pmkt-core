@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 import pandas as pd
 import pytest
 
@@ -7,6 +9,234 @@ from pmkt.data.historical_books import (
     write_historical_backfill_result,
 )
 from pmkt.data.validation import validate_frame
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cutoff", [100, 100.5])
+@pytest.mark.parametrize("comparison", ["inclusive", "exclusive", "bucket"])
+async def test_kalshi_trade_cutoff_preserves_fractional_timestamps(cutoff, comparison):
+    timestamps = [98, 99, 99.5, 100, 100.25, 100.5, 101, 106]
+    calls = []
+
+    class FakeKalshi:
+        async def historical_cutoff(self):
+            return {"trades_created_ts": datetime.fromtimestamp(cutoff, timezone.utc).isoformat()}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        def page(self, historical, params):
+            calls.append((historical, params))
+            trades = []
+            for ts in timestamps:
+                if (ts < cutoff) != historical:
+                    continue
+                filtered_ts = int(ts) if comparison == "bucket" else ts
+                if comparison == "exclusive":
+                    included = params["min_ts"] < filtered_ts < params["max_ts"]
+                else:
+                    included = params["min_ts"] <= filtered_ts <= params["max_ts"]
+                if included:
+                    trades.append({"trade_id": str(ts), "ticker": "A", "yes_price": 42,
+                                   "count": 1, "created_time":
+                                   datetime.fromtimestamp(ts, timezone.utc).isoformat()})
+            return {"trades": trades, "cursor": ""}
+
+        async def historical_trades(self, **params):
+            return self.page(True, params)
+
+        async def trades(self, **params):
+            return self.page(False, params)
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=90, end_ts=110, kalshi_client=FakeKalshi(),
+    )
+    assert set(result.trades["venue_trade_id"]) == {str(ts) for ts in timestamps}
+    assert result.summary["trade_partitions"][0]["complete"] is True
+    assert result.gaps[result.gaps["capability"] == "historical_trades"].empty
+    assert len(calls) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("conflict", [False, True])
+async def test_kalshi_trade_cutoff_deduplicates_identical_cross_source_rows(conflict, monkeypatch):
+    import itertools
+    from pmkt.data import historical_books
+
+    receipts = itertools.count()
+    monkeypatch.setattr(historical_books, "utc_now_iso",
+                        lambda: f"2026-01-01T00:00:00.{next(receipts):06d}Z")
+    duplicate = {"trade_id": "shared", "ticker": "A", "yes_price": 42,
+                 "count": 1, "created_ts": 100}
+
+    class FakeKalshi:
+        async def historical_cutoff(self):
+            return {"trades_created_ts": "1970-01-01T00:01:40Z"}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        async def historical_trades(self, **params):
+            return {"trades": [duplicate], "cursor": ""}
+
+        async def trades(self, **params):
+            return {"trades": [{**duplicate, "trade_id": "new", "created_ts": 106},
+                               {**duplicate, "count": 2 if conflict else 1}], "cursor": ""}
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=90, end_ts=110, kalshi_client=FakeKalshi(),
+        checked_at_utc="2026-01-01T00:00:00Z",
+    )
+    [partition] = result.summary["trade_partitions"]
+    assert partition["complete"] is (not conflict)
+    assert result.trades["venue_trade_id"].tolist() == (["shared"] if conflict else ["shared", "new"])
+    assert partition["row_count"] == len(result.trades)
+    assert validate_frame(result.trades, "trade.v1", strict=True).ok
+    trade_gaps = result.gaps[result.gaps["capability"] == "historical_trades"]
+    assert trade_gaps.empty is (not conflict)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_cutoff", ["1970-01-01T00:01:45Z", None, "error"])
+async def test_kalshi_trade_cutoff_recheck_prevents_false_completeness(final_cutoff, tmp_path):
+    class FakeKalshi:
+        cutoff_calls = 0
+        migrated = False
+
+        async def historical_cutoff(self):
+            self.cutoff_calls += 1
+            if self.cutoff_calls == 1:
+                return {"trades_created_ts": "1970-01-01T00:01:40Z"}
+            if final_cutoff == "error":
+                raise RuntimeError("cutoff unavailable")
+            return {"trades_created_ts": final_cutoff}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        async def historical_trades(self, **params):
+            self.migrated = True
+            return {"trades": [{"trade_id": "old", "yes_price": 42,
+                                "count": 1, "created_ts": 98}], "cursor": ""}
+
+        async def trades(self, **params):
+            # The trade at 102 moved to the archive after its request finished.
+            assert self.migrated
+            return {"trades": [{"trade_id": "recent", "yes_price": 42,
+                                "count": 1, "created_ts": 106}], "cursor": ""}
+
+    fake = FakeKalshi()
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=90, end_ts=110, kalshi_client=fake,
+    )
+    [partition] = result.summary["trade_partitions"]
+    assert partition["complete"] is False
+    assert fake.cutoff_calls == 2
+    assert partition["stop_reason"] == ("cutoff_advanced" if final_cutoff not in {None, "error"}
+                                       else "fetch_error")
+    assert partition["exhausted_endpoints"] == ["/historical/trades", "/markets/trades"]
+    if final_cutoff not in {None, "error"}:
+        assert partition["trades_created_ts_after"] == "1970-01-01T00:01:45+00:00"
+    paths = write_historical_backfill_result(result, tmp_path)
+    trade_gaps = pd.read_parquet(paths["historical_backfill_gaps"])
+    trade_gaps = trade_gaps[trade_gaps["capability"] == "historical_trades"]
+    assert len(trade_gaps) == 1
+    assert trade_gaps.iloc[0]["endpoint"] == "/historical/cutoff"
+    assert set(pd.read_parquet(paths["trades"])["venue_trade_id"]) == {"old", "recent"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("start,end,expected_sources", [
+    (90, 99, ["historical"]),
+    (100, 110, ["live"]),
+    (90, 110, ["historical", "live"]),
+    (90, 100, ["historical", "live"]),
+])
+async def test_kalshi_trades_route_at_cutoff_and_recheck_each_partition(start, end, expected_sources):
+    calls = []
+
+    class FakeKalshi:
+        cutoff_calls = 0
+
+        async def historical_cutoff(self):
+            self.cutoff_calls += 1
+            return {"trades_created_ts": "1970-01-01T00:01:40Z"}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        def page(self, source, params):
+            calls.append((source, params))
+            return {"trades": [{"trade_id": f"{params['ticker']}-{source}",
+                                "ticker": params["ticker"], "yes_price": 42, "count": 1,
+                                "created_ts": 99 if source == "historical" else 100}],
+                    "cursor": ""}
+
+        async def historical_trades(self, **params):
+            return self.page("historical", params)
+
+        async def trades(self, **params):
+            return self.page("live", params)
+
+    fake = FakeKalshi()
+    result = await backfill_venue_history(
+        "kalshi", ["A", "B"], start_ts=start, end_ts=end, kalshi_client=fake,
+    )
+    assert fake.cutoff_calls == 3
+    assert [source for source, _ in calls] == expected_sources * 2
+    for source, params in calls:
+        assert params["min_ts"] == (start if source == "historical" else max(start, 99))
+        assert params["max_ts"] == (min(end, 101) if source == "historical" else end)
+    assert len(result.trades) == len(expected_sources) * 2
+    assert all(part["complete"] for part in result.summary["trade_partitions"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ending", [
+    "exhausted", "page_limit", "boundary_cap", "error", "cutoff_error", "duplicate",
+])
+async def test_kalshi_live_trade_pages_control_completeness(ending):
+    class FakeKalshi:
+        async def historical_cutoff(self):
+            if ending == "cutoff_error":
+                return {}
+            return {"trades_created_ts": "1970-01-01T00:01:40Z"}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        async def historical_trades(self, **params):
+            return {"trades": [{"trade_id": "old", "yes_price": 42, "count": 1,
+                                "created_ts": 99}], "cursor": ""}
+
+        async def trades(self, **params):
+            if ending == "error":
+                raise RuntimeError("live failed")
+            if params["cursor"] is None:
+                return {"trades": [], "cursor": "next"}
+            return {"trades": [{"trade_id": "old" if ending == "duplicate" else "new",
+                                "yes_price": 42, "count": 1,
+                                "created_ts": 100}], "cursor": ""}
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=90, end_ts=110, kalshi_client=FakeKalshi(),
+        max_trade_pages={"page_limit": 2, "boundary_cap": 1}.get(ending, 3),
+    )
+    [partition] = result.summary["trade_partitions"]
+    assert partition["complete"] == (ending == "exhausted")
+    assert len(result.trades) == {"exhausted": 2, "page_limit": 1, "error": 1,
+                                  "cutoff_error": 0, "boundary_cap": 1, "duplicate": 1}[ending]
+    trade_gaps = result.gaps[result.gaps["capability"] == "historical_trades"]
+    assert trade_gaps.empty == (ending == "exhausted")
+    if ending != "exhausted":
+        assert trade_gaps.iloc[0]["endpoint"] == (
+            "/historical/cutoff" if ending == "cutoff_error" else "/markets/trades"
+        )
+
+
+class _HistoricalKalshi:
+    async def historical_cutoff(self):
+        return {"trades_created_ts": "2100-01-01T00:00:00Z"}
 
 
 @pytest.mark.asyncio
@@ -46,7 +276,7 @@ async def test_polymarket_historical_backfill_preserves_price_context_and_book_g
 
 @pytest.mark.asyncio
 async def test_kalshi_historical_backfill_normalizes_candlestick_price_types() -> None:
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_trades(self, **params):
             assert params["ticker"] == "KXTEST"
             return {
@@ -120,7 +350,7 @@ async def test_kalshi_historical_backfill_normalizes_candlestick_price_types() -
 
 @pytest.mark.asyncio
 async def test_kalshi_historical_backfill_skips_empty_price_ohlc_maps() -> None:
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_market_candlesticks(self, ticker, **params):
             assert ticker == "KXTEST"
             return {
@@ -154,7 +384,7 @@ async def test_kalshi_historical_backfill_skips_empty_price_ohlc_maps() -> None:
 
 @pytest.mark.asyncio
 async def test_kalshi_historical_backfill_emits_gap_for_unparseable_candle() -> None:
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_market_candlesticks(self, ticker, **params):
             assert ticker == "KXTEST"
             return {
@@ -191,7 +421,7 @@ async def test_kalshi_historical_backfill_emits_gap_for_unparseable_candle() -> 
 
 @pytest.mark.asyncio
 async def test_kalshi_historical_backfill_rejects_out_of_range_bare_prices() -> None:
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_market_candlesticks(self, ticker, **params):
             assert ticker == "KXTEST"
             return {
@@ -274,6 +504,7 @@ def test_historical_and_recording_reject_ambiguous_trade_prices(economics):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["historical", "live"])
 @pytest.mark.parametrize("cursors,cap,expected", [
     (["next"], 1, "page_limit"),
     (["same", "same"], 5, "repeated_cursor"),
@@ -282,12 +513,17 @@ def test_historical_and_recording_reject_ambiguous_trade_prices(economics):
     (["a", None], 2, "cursor_exhausted"),
     (["a", "error"], 3, "fetch_error"),
 ])
-async def test_historical_trade_pagination_completeness(cursors, cap, expected, tmp_path):
+async def test_historical_trade_pagination_completeness(cursors, cap, expected, tmp_path, source):
     import json
 
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         def __init__(self):
             self.calls = {}
+
+        async def historical_cutoff(self):
+            if source == "live":
+                return {"trades_created_ts": "1970-01-01T00:00:00Z"}
+            return await super().historical_cutoff()
 
         async def historical_market_candlesticks(self, ticker, **params):
             return {"candlesticks": []}
@@ -302,6 +538,8 @@ async def test_historical_trade_pagination_completeness(cursors, cap, expected, 
             return {"trades": ([{"trade_id": f"{ticker}-{index}", "yes_price": 1,
                                  "count_fp": "1.75", "created_ts": 1}]
                                if index == 0 else []), "cursor": cursor}
+
+        trades = historical_trades
 
     fake = FakeKalshi()
     result = await backfill_venue_history(
@@ -356,7 +594,7 @@ async def test_malformed_trade_page_stays_incomplete_and_retains_prior_rows(
 
     trade = {"trade_id": "kept", "yes_price": 42, "count_fp": "1.75", "created_ts": 1}
 
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_market_candlesticks(self, ticker, **params):
             return {"candlesticks": []}
 
@@ -406,7 +644,7 @@ async def test_historical_trade_page_acceptance_preserves_publishable_prefix(
         return {"trade_id": trade_id, "yes_price": 42, "count": 2,
                 "count_fp": "1.75", "created_ts": 11}
 
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         calls = 0
 
         async def historical_market_candlesticks(self, ticker, **params):
@@ -464,7 +702,7 @@ async def test_historical_trade_page_acceptance_preserves_publishable_prefix(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("duplicate", [False, True])
 async def test_historical_trade_keys_are_unique_across_ticker_partitions(tmp_path, duplicate):
-    class FakeKalshi:
+    class FakeKalshi(_HistoricalKalshi):
         async def historical_market_candlesticks(self, ticker, **params):
             return {"candlesticks": []}
 
@@ -506,3 +744,38 @@ async def test_backfill_rejects_nonpositive_kalshi_period_interval_before_fetch(
         await backfill_venue_history(
             "kalshi", ["KXTEST"], start_ts=0, end_ts=60, period_interval=value,
             kalshi_client=_FailIfCalled())
+
+
+@pytest.mark.asyncio
+async def test_kalshi_trade_cutoff_keeps_sub_microsecond_precision():
+    # 100 s plus 100 ns: float seconds would round the cutoff onto the start
+    # second and skip historical storage for a trade at exactly 100 s.
+    calls = []
+
+    class FakeKalshi:
+        async def historical_cutoff(self):
+            return {"trades_created_ts": "1970-01-01T00:01:40.000000100Z"}
+
+        async def batch_market_candlesticks(self, *args, **kwargs):
+            return {"markets": []}
+
+        def page(self, historical, params):
+            calls.append((historical, params))
+            ts = 100 if historical else 101
+            included = params["min_ts"] <= ts <= params["max_ts"]
+            trades = [{"trade_id": str(ts), "ticker": "A", "yes_price": 42, "count": 1,
+                       "created_time": datetime.fromtimestamp(ts, timezone.utc).isoformat()}]
+            return {"trades": trades if included else [], "cursor": ""}
+
+        async def historical_trades(self, **params):
+            return self.page(True, params)
+
+        async def trades(self, **params):
+            return self.page(False, params)
+
+    result = await backfill_venue_history(
+        "kalshi", ["A"], start_ts=100, end_ts=110, kalshi_client=FakeKalshi(),
+    )
+    assert set(result.trades["venue_trade_id"]) == {"100", "101"}
+    assert [historical for historical, _ in calls] == [True, False]
+    assert result.summary["trade_partitions"][0]["complete"] is True

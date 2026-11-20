@@ -67,19 +67,30 @@ installed version.
   failed segments publish nothing. A resumed segment is not individually
   authoritative even when it exhausts the cursor. Stitching and chain
   verification are part of the catalog-import follow-up.
+- `ingest-kalshi-markets --complete`: follow cursors through empty pages until
+  the cursor is exhausted. Repeated or cyclic cursors fail without publishing;
+  bounded scans with a continuation cursor retain incomplete evidence manifests.
 - `query`: run DuckDB SQL, optionally registering local Parquet datasets as views.
 - `compute-features`: compute book-derived data features.
 - `record-topbooks`: record normalized top-of-book observations.
 - `backfill-venue-history`: fetch public venue history. Kalshi trade backfills
-  require positive `--max-trade-pages` and `--trade-limit`. The persisted summary's
+  read `trades_created_ts` and split the requested interval between
+  `/historical/trades` and `/markets/trades`, overlapping integer bounds around
+  the cutoff to retain fractional timestamps. Both cursors must be exhausted for
+  completion. The cutoff is re-read after each exhausted instrument; an advance
+  leaves it incomplete with a `cutoff_advanced` gap, since trades may have migrated
+  between reads. An unavailable or malformed cutoff emits a fetch-error gap.
+  Positive `--max-trade-pages` and `--trade-limit` bound the total pages per
+  instrument across both endpoints and the rows per page. The persisted summary's
   `trade_partitions` reports completeness, stop reason, pages, rows and continuation
   cursor per instrument. Page caps, repeated/cyclic cursors, and fetch/parse
   failures leave the requested interval incomplete and emit a trade gap with
   details in `raw_json`; returned trade timestamps do not prove interval coverage.
   Malformed entries (including empty objects) and duplicate trade keys reject the
-  whole page while retaining accepted earlier pages. Duplicate keys are checked
-  across all requested tickers; valid empty lists still indicate exhaustion when
-  there is no continuation cursor.
+  whole page while retaining accepted earlier pages. Identical rows seen across
+  the two endpoints are retained once (ignoring receipt time); conflicting rows
+  are rejected. Duplicate keys are checked across all requested tickers; valid
+  empty lists indicate cursor exhaustion when there is no continuation cursor.
 
 ## Capture and reconstruction commands
 

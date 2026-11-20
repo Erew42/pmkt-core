@@ -1068,6 +1068,26 @@ def test_strict_inferred_validation_rejects_extra_columns() -> None:
     assert report.errors == ("extra columns: debug_note",)
 
 
+def test_write_parquet_interruption_preserves_existing_file(tmp_path, monkeypatch) -> None:
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "cache.parquet"
+    before = pd.DataFrame({"value": [1, 2]})
+    write_parquet(before, path)
+    original_bytes = path.read_bytes()
+
+    def interrupt(*args, **kwargs):
+        raise KeyboardInterrupt("interrupted parquet write")
+
+    monkeypatch.setattr(pq.ParquetWriter, "write_table", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        write_parquet(pd.DataFrame({"value": [3]}), path)
+
+    assert path.read_bytes() == original_bytes
+    pd.testing.assert_frame_equal(pd.read_parquet(path), before)
+    assert list(tmp_path.iterdir()) == [path]
+
+
 def test_write_parquet_strict_validation_rejects_extra_columns(tmp_path) -> None:
     row = topbook_row(
         exchange="polymarket",

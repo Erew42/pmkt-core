@@ -25,6 +25,62 @@ from pmkt.data.registry import (
 )
 from pmkt.data.validation import coerce_frame, validate_frame
 
+@pytest.mark.parametrize("ending", ["exhausted", "page_limit", "cycle"])
+def test_kalshi_ingest_follows_empty_cursor_pages(tmp_path, monkeypatch, ending):
+    import asyncio
+    from pmkt.cli import ingest
+    from pmkt.data.contract_evidence_manifest import contract_evidence_bundle_path
+
+    cursors = []
+
+    class FakeKalshi:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_):
+            pass
+
+        async def markets_page(self, *, cursor, **_):
+            cursors.append(cursor)
+            return {
+                None: {"markets": [], "cursor": "next"},
+                "next": {"markets": [_kalshi_raw()], "cursor": "last"},
+                "last": {"markets": [], "cursor": "next" if ending == "cycle" else ""},
+            }[cursor]
+
+    monkeypatch.setattr(ingest, "AsyncKalshiClient", lambda **_: FakeKalshi())
+    out = tmp_path / "markets.parquet"
+    evidence = tmp_path / "evidence.parquet"
+    manifest = tmp_path / "collection.json"
+    run = ingest._ingest_kalshi_markets_async(
+        out, limit=1, max_pages=1, status=None, complete=ending != "page_limit",
+        manifest_out=manifest, contract_evidence_out=evidence,
+    )
+    if ending == "cycle":
+        with pytest.raises(RuntimeError, match="cursor repeated"):
+            asyncio.run(run)
+        assert not out.exists()
+        assert not manifest.exists()
+        assert not contract_evidence_bundle_path(evidence).exists()
+        return
+    asyncio.run(run)
+    collection = json.loads(manifest.read_text(encoding="utf-8"))
+    bundle = contract_evidence_bundle_path(evidence)
+    state = json.loads((bundle / "manifest.json").read_text(encoding="utf-8"))
+    if ending == "page_limit":
+        assert cursors == [None]
+        assert collection["stop_reason"] == "max_pages_reached"
+        assert collection["final_cursor"] == "next"
+        assert state["collection_complete"] is False
+        assert state["authoritative_complete"] is False
+    else:
+        assert cursors == [None, "next", "last"]
+        assert len(pd.read_parquet(out)) == 1
+        assert collection["stop_reason"] == "cursor_exhausted"
+        assert collection["final_cursor"] is None
+        assert state["authoritative_complete"] is True
+
+
 DERIVED = "2026-07-10T18:00:00+00:00"
 OBSERVED = "2026-07-10T17:59:00+00:00"
 
