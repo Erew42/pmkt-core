@@ -27,6 +27,7 @@ from websockets.protocol import State
 from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
+    _wire_frames,
     DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
     DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
     _UNSET_RECONNECTS,
@@ -134,6 +135,8 @@ def market_operation_payload(
 def application_heartbeat_token(raw: Any) -> str | None:
     """Return PING or PONG for an application heartbeat frame, else None."""
     if isinstance(raw, bytes):
+        if raw.startswith((b"{", b"[")):
+            return None
         raw = raw.decode("utf-8", errors="replace")
     if not isinstance(raw, str):
         return None
@@ -784,11 +787,11 @@ class AsyncMarketWebSocketClient:
             else None,
         }
 
-    async def _receive_frames(self, ws: Any) -> None:
+    async def _receive_frames(self, ws: Any, *, raw_bytes: bool = False) -> None:
         # One bounded application buffer, in addition to the transport buffer.
         # Handle heartbeats ahead of the collector while this queue has room.
         # Once full, downstream backpressure also delays later heartbeat frames.
-        async for raw in ws:
+        async for raw in (_wire_frames(ws) if raw_bytes else ws):
             self._last_inbound = self._heartbeat_clock()
             heartbeat = application_heartbeat_token(raw)
             if heartbeat == "PONG":
@@ -834,6 +837,13 @@ class AsyncMarketWebSocketClient:
             finally:
                 ready.cancel()
                 await asyncio.gather(ready, return_exceptions=True)
+
+    async def _iter_raw_frames(self) -> AsyncIterator[bytes]:
+        if self._receive_task is None:
+            self._receive_task = asyncio.create_task(self._receive_frames(self._ws, raw_bytes=True))
+        async for frame in self._incoming_frames():
+            self.last_frame_sequence += 1
+            yield frame
 
     async def iter_messages(
         self,

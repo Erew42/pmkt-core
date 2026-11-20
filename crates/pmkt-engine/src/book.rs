@@ -396,6 +396,7 @@ impl Touched {
 
 /// One subscription's book engine. Identity and terminal resolution survive ladder resets.
 pub struct VenueBooks {
+    recorder_flags: bool,
     mode: BookMode,
     books: BTreeMap<String, Book>,
     market_ids: BTreeMap<String, String>,
@@ -407,6 +408,7 @@ pub struct VenueBooks {
 impl VenueBooks {
     pub fn new(mode: BookMode, instruments: impl IntoIterator<Item = impl Into<String>>) -> Self {
         let mut books = Self {
+            recorder_flags: true,
             mode,
             books: BTreeMap::new(),
             market_ids: BTreeMap::new(),
@@ -418,6 +420,16 @@ impl VenueBooks {
         for id in instruments {
             books.subscribe(id.into());
         }
+        books
+    }
+    // Managed health keeps terminal resolution independently of the latest
+    // observation. A later snapshot replaces that observation's quality flags.
+    pub(crate) fn managed(
+        mode: BookMode,
+        instruments: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let mut books = Self::new(mode, instruments);
+        books.recorder_flags = false;
         books
     }
     pub fn subscribe(&mut self, id: String) {
@@ -592,10 +604,10 @@ impl VenueBooks {
             if u.action.is_snapshot() && book.integrity() == Integrity::Intact {
                 self.conflicts.remove(id);
             }
-            if self.conflicts.contains(id) {
+            if self.recorder_flags && self.conflicts.contains(id) {
                 book.fault(F::MarketIdentityChanged);
             }
-            if self.resolved.contains(id) {
+            if self.recorder_flags && self.resolved.contains(id) {
                 book.flags.insert(F::MarketResolved);
             }
         }

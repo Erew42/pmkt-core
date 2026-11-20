@@ -1,15 +1,151 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
+use crate::merge::{
+    CopyMerge, MergeOptions, MergeStats, MergedMessage, SessionCoverage, SessionOccurrences, Stream,
+};
 use crate::{
     Error, Result, Venue,
     book::{BookMode, VenueBooks},
-    capture::{CaptureItem, list_session_chunks},
+    capture::{CaptureItem, SealedChunk, list_session_chunks},
     health::Integrity,
     merge::received_us,
     wire::{self, Event},
 };
 use chrono::DateTime;
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+
+// A sidecar-verified individual chunk can be replayed even when its predecessor
+// is archived. Session inputs additionally verify inter-chunk links and gaps.
+type CaptureFrames = Box<dyn Iterator<Item = Result<CaptureItem>>>;
+fn input(path: &Path) -> Result<(Option<Venue>, CaptureFrames)> {
+    if path.is_file() {
+        let chunk = SealedChunk::open(path)?;
+        return Ok((
+            Some(chunk.manifest.venue),
+            Box::new(chunk.frames(true)?.map(|f| f.map(CaptureItem::Frame))),
+        ));
+    }
+    let chunks = list_session_chunks(path)?;
+    Ok((
+        chunks.chunks.first().map(|c| c.manifest.venue),
+        Box::new(chunks.read(true)),
+    ))
+}
+
+/// Merge redundant sessions in venue order and keep the winning frame's original
+/// receive coordinates. Each input is one independently captured connection.
+pub fn reconstruct_merged(
+    venue: Venue,
+    mut sessions: Vec<(String, String, PathBuf)>,
+    version: Version,
+    target_rows: usize,
+    mut emit: impl FnMut(QuoteBatches) -> Result<()>,
+    mut on_message: impl FnMut(&MergedMessage) -> Result<()>,
+) -> Result<(MergeStats, Vec<SessionCoverage>)> {
+    if target_rows == 0 {
+        return Err(Error::Invalid("batch row target must be positive".into()));
+    }
+    sessions.sort();
+    let mut streams = BTreeMap::<_, Vec<_>>::new();
+    for (copy, connection, path) in sessions {
+        let (source_venue, frames) = input(&path)?;
+        if source_venue.is_some_and(|v| v != venue) {
+            return Err(Error::Invalid(
+                "cannot merge sessions from different venues".into(),
+            ));
+        }
+        let session = if path.is_file() {
+            path.parent().unwrap_or(&path)
+        } else {
+            &path
+        };
+        let name = session.file_name().and_then(|p| p.to_str()).unwrap_or("");
+        let stream = Stream::new(copy, connection);
+        streams
+            .entry(stream.clone())
+            .or_default()
+            .push(SessionOccurrences::new(stream, name, frames));
+    }
+    let mode = match venue {
+        Venue::Polymarket => BookMode::Polymarket,
+        Venue::Kalshi => BookMode::kalshi(),
+    };
+    let mut books = VenueBooks::new(mode, std::iter::empty::<String>());
+    let mut batch = QuoteBatchBuilder::new(version);
+    let mut count = 0;
+    let mut kalshi_basis = None;
+    let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
+        streams
+            .values_mut()
+            .map(|sessions| sessions.iter_mut().flatten()),
+        |m| {
+            count += 1;
+            on_message(&m)?;
+            if venue == Venue::Kalshi
+                && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
+            {
+                for origin in &m.occurrences {
+                    let basis = origin.use_yes_price;
+                    if *kalshi_basis.get_or_insert(basis) != basis {
+                        return Err(Error::Invalid(
+                            "cannot merge Kalshi books on different price bases".into(),
+                        ));
+                    }
+                }
+                books.set_kalshi_price_mode(m.origin().use_yes_price);
+            }
+            let event = wire::decode(venue, &m.message)?;
+            if let Event::Books(updates) = &event {
+                for update in updates {
+                    books.subscribe(update.instrument.clone());
+                }
+            }
+            let origin = m.origin();
+            let seq = i64::try_from(origin.frame_seq)
+                .map_err(|_| Error::Invalid("frame sequence exceeds int64".into()))?;
+            let mono = i64::try_from(origin.received_monotonic_ns)
+                .map_err(|_| Error::Invalid("receive clock exceeds int64".into()))?;
+            let mut reference = format!("{}:{seq}", origin.recording_id);
+            if let Some(position) = origin.position {
+                reference.push_str(&format!(":{position}"));
+            }
+            let receive = Receive {
+                run_id: Some(&origin.recording_id),
+                source: Some("ws"),
+                utc: &origin.received_utc,
+                monotonic_ns: Some(mono),
+                local_sequence: Some(seq),
+                raw_event_ref: Some(&reference),
+                quote_age_ms: None,
+            };
+            for item in books.apply_event(event, count) {
+                batch.push(
+                    books.get(&item.instrument).expect("subscribed book"),
+                    receive,
+                    true,
+                )?;
+            }
+            if batch.row_count() >= target_rows {
+                emit(std::mem::replace(&mut batch, QuoteBatchBuilder::new(version)).finish()?)?;
+            }
+            Ok(())
+        },
+    )?;
+    if batch.row_count() > 0 {
+        emit(batch.finish()?)?;
+    }
+    Ok((
+        stats,
+        streams
+            .into_values()
+            .flatten()
+            .map(SessionOccurrences::finish)
+            .collect(),
+    ))
+}
 
 /// Reconstruct one verified raw session in file order. The sink receives complete
 /// book observations in bounded batches (a single deep book can exceed target_rows).
@@ -23,11 +159,11 @@ pub fn reconstruct_session(
     if target_rows == 0 {
         return Err(Error::Invalid("batch row target must be positive".into()));
     }
-    let chunks = list_session_chunks(path)?;
-    let Some(first) = chunks.chunks.first() else {
+    let (venue, frames) = input(path.as_ref())?;
+    let Some(venue) = venue else {
         return Ok(());
     };
-    let mode = match first.manifest.venue {
+    let mode = match venue {
         Venue::Polymarket => BookMode::Polymarket,
         Venue::Kalshi => BookMode::kalshi(),
     };
@@ -37,7 +173,7 @@ pub fn reconstruct_session(
     let mut batch = QuoteBatchBuilder::new(version);
     let mut count = 0;
     let mut last_utc: BTreeMap<String, i64> = BTreeMap::new();
-    for item in chunks.read(true) {
+    for item in frames {
         let f = match item? {
             CaptureItem::Gap(_) => {
                 books.reset();
@@ -56,24 +192,11 @@ pub fn reconstruct_session(
             let instruments = match f.venue {
                 Venue::Polymarket => command["assets_ids"].as_array(),
                 Venue::Kalshi => {
-                    let params = &command["params"];
-                    if !params["channels"]
-                        .as_array()
-                        .is_some_and(|cs| cs.iter().any(|c| c == "orderbook_delta"))
-                    {
+                    let Some(mode) = wire::kalshi::subscription_basis(&command)? else {
                         continue;
-                    }
-                    let mode = params
-                        .get("use_yes_price")
-                        .map(|v| {
-                            v.as_bool().ok_or_else(|| {
-                                Error::Invalid("use_yes_price must be boolean".into())
-                            })
-                        })
-                        .transpose()?
-                        .unwrap_or(true);
+                    };
                     books.set_kalshi_price_mode(mode);
-                    params["market_tickers"].as_array()
+                    command["params"]["market_tickers"].as_array()
                 }
             };
             if let Some(ids) = instruments {

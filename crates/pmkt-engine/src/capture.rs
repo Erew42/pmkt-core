@@ -134,7 +134,9 @@ impl SealedChunk {
 pub fn list_session_chunks(root: impl AsRef<Path>) -> Result<SessionChunks> {
     let root = root.as_ref();
     let mut files = BTreeSet::new();
-    for entry in fs::read_dir(root).map_err(|e| failure(root, e))? {
+    for entry in
+        fs::read_dir(root).map_err(|e| failure(root, format!("cannot list session: {e}")))?
+    {
         let entry = entry?;
         if entry.path().is_file() {
             files.insert(entry.file_name().to_string_lossy().into_owned());
@@ -189,7 +191,7 @@ impl ChunkReader {
             {
                 return Err(failure(
                     path,
-                    "frame_count or frame sequence endpoint mismatch",
+                    "frame_count mismatch or frame sequence endpoint mismatch",
                 ));
             }
             return Ok(None);

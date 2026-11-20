@@ -12,6 +12,7 @@ crate-type = ["cdylib"]
 workspace = true
 
 [dependencies]
+serde_json = "1"
 arrow-array = { version = "58", features = ["ffi"] }
 pmkt-engine = { path = "../pmkt-engine" }
 pyo3 = { version = "0.28", features = ["abi3-py310"] }

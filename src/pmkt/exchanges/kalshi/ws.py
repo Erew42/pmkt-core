@@ -27,6 +27,7 @@ from websockets.protocol import State
 from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels, snapshot_ladder
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
+    _wire_frames,
     DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
     DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
     _UNSET_RECONNECTS,
@@ -878,6 +879,9 @@ class AsyncKalshiWebSocketClient:
         except (ConnectionClosed, OSError, RuntimeError, asyncio.TimeoutError):
             return False
         return self.is_connected
+
+    def _iter_raw_frames(self) -> AsyncIterator[bytes]:
+        return _wire_frames(self._ws)
 
     async def iter_messages(
         self,
