@@ -50,7 +50,7 @@ jobs:
           empty = pathlib.Path("empty-capture")
           empty.mkdir()
           stream = _native.reconstruct_raw_capture(empty)["depth"]
-          assert "schema_version" in pa.table(stream).column_names
+          assert "schema_version" in pa.RecordBatchReader.from_stream(stream).schema.names
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-${{ matrix.os }}

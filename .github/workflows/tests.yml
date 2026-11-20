@@ -191,7 +191,7 @@ jobs:
           duckdb==1.5.5 ${{ matrix.stack.pyarrow }} ${{ matrix.stack.numpy }}
       - run: >-
           python -m pytest -q tests/test_catalog.py tests/test_clob_history.py
-          tests/test_kalshi_history.py
+          tests/test_kalshi_history.py tests/test_native_bridge.py
 
   packaging-smoke:
     runs-on: ubuntu-latest

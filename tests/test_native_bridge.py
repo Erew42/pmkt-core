@@ -97,6 +97,6 @@ def test_empty_capture_keeps_schemas(tmp_path: Path) -> None:
 
     result = _native.reconstruct_raw_capture(tmp_path)
     for name in ("topbook", "depth"):
-        table = pa.RecordBatchReader.from_stream(result[name]).read_all()
+        table = pa.table(result[name])
         assert table.num_rows == 0
         assert "schema_version" in table.column_names
