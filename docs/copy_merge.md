@@ -55,6 +55,28 @@ two-sided book can differ from the venue's reported best bid or ask at the
 next frame. With multiple inputs, the native entry point uses the copy merge
 rules below.
 
+### Cached checkpoints in redundant Polymarket recordings
+
+When a reconnect returns a full book, the native raw-session replay can check
+the other recorder's sealed receipt intervals to place the checkpoint.
+
+- Within one market and venue millisecond, the reconnect book can carry the
+  per-asset hash of an earlier `price_change`. If that hash identifies one
+  update and a continuously recording peer saw a later update of the token
+  before the checkpoint arrived, the replay places the checkpoint before the
+  later update. It preserves the order of messages received in the checkpoint's
+  own uninterrupted interval and keeps multi-token changes in their original
+  frames.
+- A reconnect book that arrives after its venue timestamp cleared the merge
+  window can describe an older state than the current intact ladder. When a
+  peer that observed the newer update covered the checkpoint's arrival, replay
+  emits the current ladder at the checkpoint's receipt coordinates. Its exchange
+  time and book hash still identify the state that supplied the ladder. The
+  optional message evidence retains the cached checkpoint exactly as received.
+
+These decisions use the raw-session coverage scan. An arbitrary iterator of
+occurrences has no verified receipt intervals on which to base them.
+
 ## The four rules and how they are implemented
 
 1. **Union by content.** Identity is a 128-bit BLAKE2b digest of the message

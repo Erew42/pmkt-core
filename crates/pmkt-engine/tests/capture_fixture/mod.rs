@@ -54,7 +54,7 @@ pub fn seal(root: &Path, i: u64, frames: &[Value], prev: Option<&str>) -> String
         root,
         i,
         frames[0]["venue"].as_str().unwrap(),
-        "run",
+        frames[0]["recording_id"].as_str().unwrap(),
         frames[0]["local_frame_seq"].as_u64().unwrap()
             ..=frames.last().unwrap()["local_frame_seq"].as_u64().unwrap(),
         prev,

@@ -47,6 +47,20 @@ pub struct Interval {
     pub start_reason: StartReason,
     pub end_reason: EndReason,
 }
+/// Coordinates in the verified, unpooled receipt coverage of one recording.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReceiptPeriod {
+    pub(super) source: usize,
+    pub(super) interval: usize,
+}
+impl ReceiptPeriod {
+    pub(crate) fn bridges(self, sessions: &[SessionCoverage], received: &Origin) -> bool {
+        let source = &sessions[self.source];
+        let span = &source.intervals[self.interval];
+        source.stream != received.stream
+            && (span.start_us..=span.end_us).contains(&received.received_us)
+    }
+}
 #[derive(Debug)]
 enum Window {
     Closed(StartReason),
@@ -225,7 +239,6 @@ pub fn conflated_subscription(raw: &str) -> bool {
 /// Annotates occurrences with receipt coverage. Quote replay can observe this
 /// evidence without using a coverage boundary as a book-state transition.
 pub(crate) struct SessionEvidence {
-    pub(crate) coverage_periods: Vec<usize>,
     pub(crate) coverage_group: usize,
     tracker: CoverageTracker,
     generation: Option<u64>,
@@ -234,7 +247,6 @@ pub(crate) struct SessionEvidence {
 impl SessionEvidence {
     pub(crate) fn new(stream: Stream, session: impl Into<String>) -> Self {
         Self {
-            coverage_periods: vec![],
             coverage_group: 0,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
@@ -281,12 +293,6 @@ impl SessionEvidence {
         subscription: &wire::RecordedSubscription,
         m: wire::WireMessage<'_>,
     ) -> Occurrence {
-        let interval = self.tracker.report.intervals.len();
-        let coverage_period = if self.coverage_periods.is_empty() {
-            interval
-        } else {
-            self.coverage_periods[interval]
-        };
         let v = m.value;
         let asset = match f.venue {
             Venue::Kalshi => (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
@@ -308,7 +314,7 @@ impl SessionEvidence {
                 use_yes_price: subscription.kalshi_basis.unwrap_or(true),
                 subscription: subscription.instruments.clone(),
                 book_command: subscription.book_command,
-                coverage_period,
+                coverage_period: self.tracker.report.intervals.len(),
                 coverage_group: self.coverage_group,
             },
             message: v,
