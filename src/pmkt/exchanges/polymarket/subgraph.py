@@ -118,8 +118,8 @@ class AsyncSubgraphClient:
     ) -> list[dict[str, Any]]:
         """Fetch volume and liquidity metadata for specific condition IDs."""
         query = """
-        query GetMarketsByCondition($conditions: [String!]!) {
-          markets(first: 1000, where: { conditionId_in: $conditions }) {
+        query GetMarketsByCondition($conditions: [String!]!, $first: Int!, $skip: Int!) {
+          markets(first: $first, skip: $skip, orderBy: id, where: { conditionId_in: $conditions }) {
             id
             conditionId
             volume
@@ -129,7 +129,15 @@ class AsyncSubgraphClient:
           }
         }
         """
-        data = await self.query(
-            query, variables={"conditions": condition_ids}, expiry=expiry
-        )
-        return data.get("markets", [])
+        page_size = 1000
+        markets: list[dict[str, Any]] = []
+        while True:
+            data = await self.query(
+                query,
+                variables={"conditions": condition_ids, "first": page_size, "skip": len(markets)},
+                expiry=expiry,
+            )
+            page = data.get("markets", [])
+            markets.extend(page)
+            if len(page) < page_size:
+                return markets
