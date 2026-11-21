@@ -599,3 +599,14 @@ def test_validate_jsonl_distinguishes_empty_from_truncated(tmp_path, content, va
         "output_path": dataset.name, "row_count": 0,
     })
     assert validate_run_manifest(manifest).ok is valid
+
+
+def test_validate_empty_parquet_requires_a_readable_footer(tmp_path):
+    dataset = tmp_path / "output.parquet"
+    pd.DataFrame({"market_id": []}).to_parquet(dataset)
+    manifest = write_manifest(tmp_path / "manifest.json", {
+        "output_path": dataset.name, "row_count": 0,
+    })
+    assert validate_run_manifest(manifest).ok
+    dataset.write_bytes(b"")
+    assert not validate_run_manifest(manifest).ok

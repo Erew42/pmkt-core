@@ -1750,11 +1750,6 @@ def _read_dataset_frame(path: Path) -> pd.DataFrame:
             return pd.DataFrame()
         frames = [pd.read_parquet(part) for part in parts]
         return pd.concat(frames, ignore_index=True)
-    try:
-        if path.stat().st_size == 0:
-            return pd.DataFrame()
-    except OSError:
-        pass
     if suffix == ".parquet":
         return pd.read_parquet(path)
     if suffix == ".csv":
