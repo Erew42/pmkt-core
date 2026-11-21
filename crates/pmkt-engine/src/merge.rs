@@ -2,11 +2,11 @@
 mod coverage;
 mod identity;
 mod order;
-pub(crate) use coverage::received_us;
 pub use coverage::{
     CoverageCounts, CoverageTracker, EndReason, Interval, SessionCoverage, SessionOccurrences,
     StartReason, conflated_subscription, uncovered_intervals,
 };
+pub(crate) use coverage::{SessionEvidence, received_us};
 
 use crate::{Error, Result, Venue};
 use identity::ContentId;
@@ -685,27 +685,37 @@ impl CopyMerge {
                 self.last_clock.insert(e.key.scope.clone(), (c, true));
             }
         }
-        e.origins.sort_by(|(_, a), (_, b)| a.rank().cmp(&b.rank()));
-        let copies = e
-            .origins
-            .iter()
-            .map(|(_, o)| o.stream.copy.clone())
-            .collect();
         self.stats.messages += 1;
         self.stats.repeats_merged += (e.origins.len() - 1) as u64;
-        MergedMessage {
-            checkpoint: checkpoint(self.venue, &e.key.kind),
-            kind: e.key.kind,
-            scope: e.key.scope,
-            venue_ts_ms: e.key.venue_ms,
-            order_ms,
-            late,
-            reconnect_snapshot: e.reconnect,
-            message: e.message,
-            content_digest: e.key.id.iter().map(|b| format!("{b:02x}")).collect(),
-            copies,
-            occurrences: e.origins.into_iter().map(|(_, o)| o).collect(),
-        }
+        e.origins.sort_by(|(_, a), (_, b)| a.rank().cmp(&b.rank()));
+        merged_message(self.venue, e, order_ms, late)
+    }
+}
+
+/// There is no cross-copy order or duplicate to resolve in a single recording.
+pub(crate) fn recorded_message(venue: Venue, o: Occurrence, order_ms: i64) -> MergedMessage {
+    let key = Key::new(venue, &o.message);
+    merged_message(venue, Entry::new(o, key, 0, None), order_ms, false)
+}
+
+fn merged_message(venue: Venue, e: Entry, order_ms: i64, late: bool) -> MergedMessage {
+    let copies = e
+        .origins
+        .iter()
+        .map(|(_, o)| o.stream.copy.clone())
+        .collect();
+    MergedMessage {
+        checkpoint: checkpoint(venue, &e.key.kind),
+        kind: e.key.kind,
+        scope: e.key.scope,
+        venue_ts_ms: e.key.venue_ms,
+        order_ms,
+        late,
+        reconnect_snapshot: e.reconnect,
+        message: e.message,
+        content_digest: e.key.id.iter().map(|b| format!("{b:02x}")).collect(),
+        copies,
+        occurrences: e.origins.into_iter().map(|(_, o)| o).collect(),
     }
 }
 

@@ -502,6 +502,82 @@ proptest! {
     #![proptest_config(config(24))]
 
     #[test]
+    fn self_merge_replays_every_topbook_and_depth_column_in_file_order(
+        operations in prop::collection::vec((0_u8..7, 0_i64..10, -4_i64..5, any::<bool>()), 5..30),
+        batch_size in 1_usize..16,
+        v2 in any::<bool>(),
+    ) {
+        let version = if v2 { Version::V2 } else { Version::V1 };
+        for venue in [Venue::Polymarket, Venue::Kalshi] {
+            let mut previous = match venue {
+                Venue::Polymarket => poly_book("a"),
+                Venue::Kalshi => kalshi_book("a", 1, 1, ".3", ".6"),
+            };
+            let mut frames = vec![raw(1, 1, venue.as_str(), previous.clone())];
+            let mut generation = 1;
+            let mut sequence = 1;
+            for &(action, book_clock, jitter, other) in &operations {
+                let id = if other { "b" } else { "a" };
+                let seq = frames.len() as u64 + 1;
+                let ms = MIDNIGHT_MS + jitter;
+                if action == 0 {
+                    generation += 1;
+                    sequence = 0;
+                }
+                sequence += if action == 1 { 3 } else { 1 };
+                let snapshot = action == 2 || action == 0;
+                let mut msg = match venue {
+                    Venue::Kalshi => {
+                        let mut msg = if snapshot {
+                            kalshi_book(id, 1, sequence, ".3", ".6")
+                        } else {
+                            kalshi_delta(id, 1, sequence)
+                        };
+                        msg["sending_ts_ms"] = json!(ms);
+                        msg["msg"]["clock"] = json!(book_clock);
+                        if !snapshot { msg["msg"]["ts_ms"] = json!(ms); }
+                        msg
+                    }
+                    Venue::Polymarket => {
+                        let mut msg = if snapshot {
+                            poly_book(id)
+                        } else {
+                            changes(&[change(id, "BUY", ".6", if other { "0" } else { "2" })])
+                        };
+                        msg["timestamp"] = json!(ms.to_string());
+                        msg
+                    }
+                };
+                if action == 3 { msg = previous.clone(); }
+                let payload = if action == 4 { json!([previous, msg]) } else { msg.clone() };
+                let mut frame = raw(seq, generation, venue.as_str(), payload);
+                if action == 5 {
+                    frame["frame_type"] = json!("transport_error");
+                    frame["direction"] = json!("local");
+                } else {
+                    previous = msg;
+                }
+                frame["received_utc"] = json!(utc(ms * 1000 + book_clock));
+                frame["received_monotonic_ns"] = json!(book_clock * 100_000_000);
+                frames.push(frame);
+            }
+            let path = root();
+            seal(&path, 1, &frames, None);
+            let mut expected = vec![];
+            reconstruct_session(&path, version, batch_size, |b| {
+                expected.push((b.topbook, b.depth));
+                Ok(())
+            }).unwrap();
+            let mut actual = vec![];
+            reconstruct_merged(venue, vec![("a".into(), "conn".into(), path)], version, batch_size, |b| {
+                actual.push((b.topbook, b.depth));
+                Ok(())
+            }, |_| Ok(())).unwrap();
+            prop_assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn file_order_corrective_limits(
         unrelated in 13_usize..18,
         ns in 249_999_998_u64..250_000_003,

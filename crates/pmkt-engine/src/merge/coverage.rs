@@ -222,65 +222,44 @@ pub fn conflated_subscription(raw: &str) -> bool {
         _ => true,
     }
 }
-pub struct SessionOccurrences<I> {
-    // Empty for independent replay. Otherwise map local intervals to the
-    // continuous periods formed by the union of all redundant sources.
+/// Annotates occurrences with receipt coverage. Quote replay can observe this
+/// evidence without using a coverage boundary as a book-state transition.
+pub(crate) struct SessionEvidence {
     pub(crate) coverage_periods: Vec<usize>,
     pub(crate) coverage_group: usize,
-    source: I,
     tracker: CoverageTracker,
     generation: Option<u64>,
     books: BTreeSet<String>,
-    subscription: wire::RecordedSubscription,
-    pending: std::vec::IntoIter<Occurrence>,
-    done: bool,
 }
-impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
-    pub fn new(stream: Stream, session: impl Into<String>, source: I) -> Self {
+impl SessionEvidence {
+    pub(crate) fn new(stream: Stream, session: impl Into<String>) -> Self {
         Self {
             coverage_periods: vec![],
             coverage_group: 0,
-            source,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
             books: BTreeSet::new(),
-            subscription: wire::RecordedSubscription::default(),
-            pending: vec![].into_iter(),
-            done: false,
         }
     }
-    pub fn finish(self) -> SessionCoverage {
+    pub(crate) fn finish(self) -> SessionCoverage {
         self.tracker.finish()
     }
-    pub(crate) fn subscription(&self) -> Option<std::sync::Arc<BTreeSet<String>>> {
-        self.subscription.instruments.clone()
+    pub(crate) fn chunk_gap(&mut self) {
+        self.tracker.chunk_gap();
     }
-    fn frame(&mut self, f: RawFrame) -> Result<()> {
+    pub(crate) fn frame(
+        &mut self,
+        f: &RawFrame,
+        messages: Option<&[wire::WireMessage<'_>]>,
+    ) -> Result<()> {
         let us = received_us(&f.received_utc)?;
         if self.generation != Some(f.connection_generation) || f.frame_type == "subscription" {
             self.books.clear();
             self.generation = Some(f.connection_generation);
         }
-        if f.frame_type == "subscription"
-            && f.venue == Venue::Kalshi
-            && conflated_subscription(&f.payload_raw)
-        {
-            return Err(Error::Invalid(
-                "conflated Kalshi subscription (update_interval_ms)".into(),
-            ));
-        }
-        if f.frame_type == "subscription"
-            && f.direction == "sent"
-            && let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
-        {
-            self.subscription.record(f.venue, &command)?;
-        }
         self.tracker
             .frame(us, f.connection_generation, &f.frame_type, &f.direction);
-        if f.direction != "received" || f.frame_type != "text" {
-            return Ok(());
-        }
-        let Ok(messages) = wire::messages(f.payload_raw.as_bytes()) else {
+        let Some(messages) = messages else {
             self.tracker.report.counts.unparsed_text_frames += 1;
             return Ok(());
         };
@@ -288,61 +267,117 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
         // this one, even when a later array element exposes it. Assign the
         // same resulting local interval to every occurrence of this frame.
         if f.venue == Venue::Kalshi {
-            for m in &messages {
+            for m in messages {
                 if let Some((sid, seq)) = m.value["sid"].as_i64().zip(m.value["seq"].as_i64()) {
                     self.tracker.sequence(sid, seq);
                 }
             }
         }
+        Ok(())
+    }
+    pub(crate) fn occurrence(
+        &mut self,
+        f: &RawFrame,
+        subscription: &wire::RecordedSubscription,
+        m: wire::WireMessage<'_>,
+    ) -> Occurrence {
         let interval = self.tracker.report.intervals.len();
         let coverage_period = if self.coverage_periods.is_empty() {
             interval
         } else {
             self.coverage_periods[interval]
         };
-        let mut events = Vec::with_capacity(messages.len());
-        for m in messages {
-            let v = m.value;
-            let asset = match f.venue {
-                Venue::Kalshi => (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
-                    .then(|| &v["msg"]["market_ticker"]),
-                Venue::Polymarket => (v["event_type"] == "book").then(|| &v["asset_id"]),
-            };
-            let reconnect_snapshot = asset.is_some_and(|a| self.books.insert(a.to_string()));
-            events.push(Occurrence {
-                origin: Origin {
-                    stream: self.tracker.report.stream.clone(),
-                    session: self.tracker.report.session.clone(),
-                    generation: f.connection_generation,
-                    frame_seq: f.local_frame_seq,
-                    position: m.position,
-                    received_us: us,
-                    received_utc: f.received_utc.clone(),
-                    recording_id: f.recording_id.clone(),
-                    received_monotonic_ns: f.received_monotonic_ns,
-                    use_yes_price: self.subscription.kalshi_basis.unwrap_or(true),
-                    subscription: self.subscription.instruments.clone(),
-                    book_command: self.subscription.book_command,
-                    coverage_period,
-                    coverage_group: self.coverage_group,
-                },
-                message: v,
-                reconnect_snapshot,
-            });
+        let v = m.value;
+        let asset = match f.venue {
+            Venue::Kalshi => (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
+                .then(|| &v["msg"]["market_ticker"]),
+            Venue::Polymarket => (v["event_type"] == "book").then(|| &v["asset_id"]),
+        };
+        let reconnect_snapshot = asset.is_some_and(|a| self.books.insert(a.to_string()));
+        Occurrence {
+            origin: Origin {
+                stream: self.tracker.report.stream.clone(),
+                session: self.tracker.report.session.clone(),
+                generation: f.connection_generation,
+                frame_seq: f.local_frame_seq,
+                position: m.position,
+                received_us: self.tracker.frame_us.expect("received text frame"),
+                received_utc: f.received_utc.clone(),
+                recording_id: f.recording_id.clone(),
+                received_monotonic_ns: f.received_monotonic_ns,
+                use_yes_price: subscription.kalshi_basis.unwrap_or(true),
+                subscription: subscription.instruments.clone(),
+                book_command: subscription.book_command,
+                coverage_period,
+                coverage_group: self.coverage_group,
+            },
+            message: v,
+            reconnect_snapshot,
         }
-        self.pending = events.into_iter();
-        Ok(())
+    }
+}
+
+pub struct SessionOccurrences<I> {
+    pub(crate) evidence: SessionEvidence,
+    source: I,
+    subscription: wire::RecordedSubscription,
+    pending: std::vec::IntoIter<Occurrence>,
+    done: bool,
+}
+impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
+    pub fn new(stream: Stream, session: impl Into<String>, source: I) -> Self {
+        Self {
+            evidence: SessionEvidence::new(stream, session),
+            source,
+            subscription: wire::RecordedSubscription::default(),
+            pending: vec![].into_iter(),
+            done: false,
+        }
+    }
+    pub fn finish(self) -> SessionCoverage {
+        self.evidence.finish()
+    }
+    pub(crate) fn subscription(&self) -> Option<std::sync::Arc<BTreeSet<String>>> {
+        self.subscription.instruments.clone()
     }
     fn step(&mut self) -> Result<Option<Occurrence>> {
         loop {
             if let Some(o) = self.pending.next() {
                 return Ok(Some(o));
             }
-            match self.source.next().transpose()? {
-                None => return Ok(None),
-                Some(CaptureItem::Gap(_)) => self.tracker.chunk_gap(),
-                Some(CaptureItem::Frame(f)) => self.frame(f)?,
+            let Some(item) = self.source.next().transpose()? else {
+                return Ok(None);
+            };
+            let CaptureItem::Frame(f) = item else {
+                self.evidence.chunk_gap();
+                continue;
+            };
+            if f.frame_type == "subscription"
+                && f.venue == Venue::Kalshi
+                && conflated_subscription(&f.payload_raw)
+            {
+                return Err(Error::Invalid(
+                    "conflated Kalshi subscription (update_interval_ms)".into(),
+                ));
             }
+            if f.frame_type == "subscription"
+                && f.direction == "sent"
+                && let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
+            {
+                self.subscription.record(f.venue, &command)?;
+            }
+            let messages = if f.frame_type == "text" && f.direction == "received" {
+                wire::messages(f.payload_raw.as_bytes()).ok()
+            } else {
+                Some(vec![])
+            };
+            self.evidence.frame(&f, messages.as_deref())?;
+            self.pending = messages
+                .into_iter()
+                .flatten()
+                .map(|m| self.evidence.occurrence(&f, &self.subscription, m))
+                .collect::<Vec<_>>()
+                .into_iter();
         }
     }
 }

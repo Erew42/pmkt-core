@@ -2,11 +2,12 @@ use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
 use crate::{
     Error, Result, Venue,
     book::{BookMode, SequenceCheck, VenueBooks},
-    capture::{CaptureItem, SealedChunk, SessionChunks, list_session_chunks},
+    capture::{CaptureItem, RawFrame, SealedChunk, SessionChunks, list_session_chunks},
     health::Integrity,
     merge::{
         CopyMerge, EndReason, MergeOptions, MergeStats, MergedMessage, SessionCoverage,
-        SessionOccurrences, Stream, received_us, uncovered_intervals,
+        SessionEvidence, SessionOccurrences, Stream, received_us, recorded_message,
+        uncovered_intervals,
     },
     wire::{self, Event},
 };
@@ -198,8 +199,8 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
     }
 }
 
-/// Merge redundant sessions in venue order and keep the winning frame's original
-/// causal coordinates. A receive-time hole breaks continuity only if no copy spans it.
+/// Replay one session in file order, or merge redundant sessions in venue order.
+/// Keep the winning frame's original causal coordinates. A receive-time hole breaks continuity only if no copy spans it.
 pub fn reconstruct_merged(
     venue: Venue,
     mut sessions: Vec<(String, String, PathBuf)>,
@@ -212,10 +213,10 @@ pub fn reconstruct_merged(
         return Err(Error::Invalid("batch row target must be positive".into()));
     }
     sessions.sort();
-    let multiple = sessions.len() > 1;
     let mut streams = BTreeMap::<_, Vec<_>>::new();
     let mut coverage = Vec::new();
     let mut subscribed = Vec::new();
+    let singleton = sessions.len() == 1;
     for (copy, connection, path) in sessions {
         let input = Input::open(&path)?;
         if input.venue().is_some_and(|v| v != venue) {
@@ -229,6 +230,16 @@ pub fn reconstruct_merged(
         };
         let name = session.file_name().and_then(|p| p.to_str()).unwrap_or("");
         let stream = Stream::new(copy, connection);
+        if singleton {
+            let mut source = RecordedSource {
+                evidence: SessionEvidence::new(stream, name),
+                stats: MergeStats::default(),
+                latest_us: i64::MIN,
+                on_message: &mut on_message,
+            };
+            replay_file(&input, venue, version, target_rows, emit, Some(&mut source))?;
+            return Ok((source.stats, vec![source.evidence.finish()]));
+        }
         let occurrences = || -> Result<_> {
             Ok(SessionOccurrences::new(
                 stream.clone(),
@@ -238,16 +249,14 @@ pub fn reconstruct_merged(
         };
         // Venue ordering can emit before a different copy has finished proving
         // coverage. Scan the same sealed inputs first, retaining only intervals.
-        if multiple {
-            let mut scan = occurrences()?;
-            scan.try_for_each(|item| item.map(drop))?;
-            subscribed.push(scan.subscription());
-            coverage.push(scan.finish());
-        }
+        let mut scan = occurrences()?;
+        scan.try_for_each(|item| item.map(drop))?;
+        subscribed.push(scan.subscription());
+        coverage.push(scan.finish());
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
-    if multiple {
+    {
         // A copy bridges a hole only for the instruments it subscribed to, so copies
         // of one subscription pool their coverage and other subscriptions do not.
         let mut groups = BTreeMap::<_, Vec<_>>::new();
@@ -281,8 +290,8 @@ pub fn reconstruct_merged(
             }
         }
         for (source, (group, periods)) in streams.values_mut().flatten().zip(periods) {
-            source.coverage_group = group;
-            source.coverage_periods = periods;
+            source.evidence.coverage_group = group;
+            source.evidence.coverage_periods = periods;
         }
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
@@ -385,17 +394,64 @@ pub fn reconstruct_session(
     let Some(venue) = input.venue() else {
         return Ok(());
     };
+    replay_file(&input, venue, version, target_rows, emit, None)
+}
+
+struct RecordedSource<'a> {
+    evidence: SessionEvidence,
+    stats: MergeStats,
+    latest_us: i64,
+    on_message: &'a mut dyn FnMut(&MergedMessage) -> Result<()>,
+}
+
+impl RecordedSource<'_> {
+    fn publish(
+        &mut self,
+        f: &RawFrame,
+        subscription: &wire::RecordedSubscription,
+        m: wire::WireMessage<'_>,
+    ) -> Result<Value> {
+        let o = self.evidence.occurrence(f, subscription, m);
+        self.stats.clock_steps_back += u64::from(o.origin.received_us < self.latest_us);
+        self.latest_us = self.latest_us.max(o.origin.received_us);
+        let message = recorded_message(f.venue, o, self.latest_us.div_euclid(1000));
+        self.stats.occurrences += 1;
+        self.stats.messages += 1;
+        self.stats.untimed_messages += u64::from(message.venue_ts_ms.is_none());
+        (self.on_message)(&message)?;
+        Ok(message.message)
+    }
+}
+
+fn replay_file(
+    input: &Input,
+    venue: Venue,
+    version: Version,
+    target_rows: usize,
+    emit: impl FnMut(QuoteBatches) -> Result<()>,
+    mut source: Option<&mut RecordedSource<'_>>,
+) -> Result<()> {
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut generation = None;
     let mut subscription = wire::RecordedSubscription::default();
     for item in input.frames()? {
-        let f = match item? {
-            CaptureItem::Gap(_) => {
-                driver.books.reset();
-                continue;
+        let item = item?;
+        let CaptureItem::Frame(f) = &item else {
+            driver.books.reset();
+            if let Some(s) = &mut source {
+                s.evidence.chunk_gap();
             }
-            CaptureItem::Frame(f) => f,
+            continue;
         };
+        let received_text = f.direction == "received" && f.frame_type == "text";
+        let messages = if received_text {
+            wire::recorded_messages(f.payload_raw.as_bytes())?
+        } else {
+            Some(vec![])
+        };
+        if let Some(s) = &mut source {
+            s.evidence.frame(f, messages.as_deref())?;
+        }
         if generation
             .replace(f.connection_generation)
             .is_some_and(|g| g != f.connection_generation)
@@ -413,13 +469,9 @@ pub fn reconstruct_session(
                     driver.books.subscribe(id.clone());
                 }
             }
-            continue;
-        }
-        if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
+        } else if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
             driver.books.reset();
-            continue;
-        }
-        if f.direction == "received" && f.frame_type == "text" {
+        } else if received_text {
             let receipt = Receipt {
                 utc: &f.received_utc,
                 us: received_us(&f.received_utc)?,
@@ -428,11 +480,16 @@ pub fn reconstruct_session(
                 sequence: f.local_frame_seq,
                 recording_id: &f.recording_id,
             };
-            for m in wire::live_messages(f.payload_raw.as_bytes())? {
+            for m in messages.into_iter().flatten() {
+                let position = m.position;
+                let value = match &mut source {
+                    Some(s) => s.publish(f, &subscription, m)?,
+                    None => m.value,
+                };
                 driver.message(
-                    &m.value,
+                    &value,
                     &receipt,
-                    m.position,
+                    position,
                     subscription.instruments.as_deref().into_iter(),
                     subscription.book_command,
                     SequenceCheck::Connection,

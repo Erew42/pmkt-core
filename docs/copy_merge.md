@@ -43,6 +43,18 @@ since identity is computed from the decoded value. `CoverageTracker` takes the
 same frame fields call by call. Streams are pulled lazily and interleaved by
 receive time; memory holds the lateness window, not the recording.
 
+The native capture reconstruction entry point, `merge_raw_captures`, replays
+a single input session in file order. Its topbook and depth tables match
+`reconstruct_raw_capture`, including repeated messages, per-connection
+sequence checks and the recorder's monotonic corrective deadline. Optional
+message evidence follows frame and array order. Its `order_ms` is the running
+maximum receipt time in milliseconds, and `venue_ts_ms` retains the venue
+timestamp. Receipt coverage still reports sequence gaps. A delayed full book
+can overwrite a newer price change in file order, so even an initialized,
+two-sided book can differ from the venue's reported best bid or ask at the
+next frame. With multiple inputs, the native entry point uses the copy merge
+rules below.
+
 ## The four rules and how they are implemented
 
 1. **Union by content.** Identity is a 128-bit BLAKE2b digest of the message

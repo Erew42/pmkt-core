@@ -566,7 +566,9 @@ fn alternating_kalshi_copies_keep_healthy_ladders_and_winning_coordinates() {
 #[test]
 fn venue_order_cannot_create_a_gap_in_a_continuous_kalshi_copy() {
     let a = kalshi_sequence_source("a", 7, 100, [0, 11000, 20000], [0, 20, 10]);
-    assert_kalshi_sequence_rows(vec![a], [(7, 101), (7, 103), (7, 102)]);
+    assert_kalshi_sequence_rows(vec![a.clone()], [(7, 101), (7, 102), (7, 103)]);
+    let b = kalshi_sequence_source("b", 81, 0, [1000, 12000, 21000], [0, 20, 10]);
+    assert_kalshi_sequence_rows(vec![a, b], [(7, 101), (7, 103), (7, 102)]);
 }
 
 #[test]
@@ -609,8 +611,171 @@ fn a_gap_inside_one_frame_resets_before_its_first_merged_message() {
             |_| Ok(()),
         )
         .unwrap();
-        assert_eq!(depth, [2, 0, 0]);
+        assert_eq!(depth, if copies == 1 { [2, 2, 2] } else { [2, 0, 0] });
     }
+}
+
+#[test]
+fn a_single_kalshi_source_keeps_depth_and_flags_the_sequence_jump() {
+    let frames: Vec<_> = [1, 2, 4, 5, 6]
+        .into_iter()
+        .enumerate()
+        .map(|(i, seq)| {
+            let msg = if i == 0 {
+                json!({"type":"orderbook_snapshot","sid":1,"seq":seq,"msg":{"market_ticker":"K",
+                "yes_dollars_fp":[[".3","3"],[".2","4"]],"no_dollars_fp":[[".7","5"],[".8","3"]]}})
+            } else {
+                json!({"type":"orderbook_delta","sid":1,"seq":seq,"msg":{"market_ticker":"K",
+                "side":"yes","price_dollars":".3","delta_fp":"1"}})
+            };
+            timed(i as u64 + 1, "kalshi", i as i64, i as u64, msg)
+        })
+        .collect();
+    let mut observations = 0;
+    let (stats, coverage) = reconstruct_merged(
+        Venue::Kalshi,
+        vec![session("a", &frames)],
+        Version::V2,
+        1,
+        |batch| {
+            let valid = observations < 2;
+            for rows in [&batch.topbook, &batch.depth] {
+                assert_book_health(rows, if valid { &[] } else { &["seq_gap"] }, valid, valid);
+            }
+            assert_eq!(batch.depth.num_rows(), 4);
+            observations += 1;
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(observations, 5);
+    assert_eq!(stats.messages, 5);
+    assert_eq!(coverage[0].counts.sequence_gaps, 1);
+}
+
+#[test]
+fn a_cached_reconnect_snapshot_precedes_its_deltas_in_a_single_recording() {
+    let ms = 1_735_689_600_000;
+    let mut other = poly_snapshot(ms + 10);
+    other["asset_id"] = json!("other");
+    let change = json!({"event_type":"price_change","market":"M","timestamp":ms+20,
+        "price_changes":[{"asset_id":"P","side":"SELL","price":"0.9","size":"100"}]});
+    // The new connection supplies a cached book timestamped before traffic
+    // on the old one. Its untouched 0.6 ask must survive the 0.9 update.
+    let frames = [
+        raw(1, 1, "polymarket", other),
+        raw(2, 2, "polymarket", poly_snapshot(ms + 1)),
+        raw(3, 2, "polymarket", change),
+    ];
+    let batches = merged_poly(&frames, &[]);
+    let last = batches.last().unwrap();
+    assert_book_health(&last.topbook, &[], true, true);
+    assert_eq!(
+        column::<Float64Array>(&last.topbook, "best_ask_dollars").value(0),
+        0.6
+    );
+    assert_eq!(last.depth.num_rows(), 3);
+}
+
+#[test]
+fn one_recording_keeps_venue_time_inversions_and_repeats_after_the_watermark() {
+    let ms = 1_735_689_600_000;
+    let first = poly_snapshot(ms);
+    let mut second = poly_snapshot(ms - 50);
+    second["bids"] = json!([["0.5", "1"]]);
+    let mut late_repeat = raw(3, 1, "polymarket", first.clone());
+    late_repeat["received_utc"] = json!("2025-01-01T00:03:00+00:00");
+    let frames = [
+        raw(1, 1, "polymarket", first),
+        raw(2, 1, "polymarket", second),
+        late_repeat,
+    ];
+    let mut refs = vec![];
+    let mut bids = vec![];
+    let (stats, _) = reconstruct_merged(
+        Venue::Polymarket,
+        vec![session("a", &frames)],
+        Version::V2,
+        1,
+        |batch| {
+            bids.push(column::<Float64Array>(&batch.topbook, "best_bid_dollars").value(0));
+            Ok(())
+        },
+        |m| {
+            refs.push(m.origin().frame_seq);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(refs, [1, 2, 3]);
+    assert_eq!(bids, [0.4, 0.5, 0.4]);
+    assert_eq!((stats.messages, stats.repeats_after_emit), (3, 0));
+}
+
+#[test]
+fn file_order_evidence_precedes_each_observation_across_a_receipt_clock_rollback() {
+    let ms = 1_735_689_600_000;
+    let book = poly_snapshot(ms);
+    let frames = [
+        timed(1, "polymarket", 30_000, 1, book.clone()),
+        timed(2, "polymarket", 10_000, 2, json!([book, book])),
+        timed(3, "polymarket", 20_000, 3, book),
+    ];
+    let messages = std::cell::Cell::new(0);
+    let mut batches = 0;
+    let (stats, _) = reconstruct_merged(
+        Venue::Polymarket,
+        vec![session("a", &frames)],
+        Version::V2,
+        1,
+        |_| {
+            batches += 1;
+            assert_eq!(batches, messages.get());
+            Ok(())
+        },
+        |msg| {
+            assert_eq!(msg.order_ms, ms + 30);
+            assert_eq!(msg.venue_ts_ms, Some(ms));
+            messages.set(messages.get() + 1);
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(batches, 4);
+    assert_eq!(stats.clock_steps_back, 3);
+}
+
+#[test]
+fn one_conflated_kalshi_session_can_be_replayed_without_ordering_across_copies() {
+    let sub = json!({"params":{"channels":["orderbook_delta"],"market_tickers":["K"],"update_interval_ms":500}});
+    let book = json!({"type":"orderbook_snapshot","sid":1,"seq":1,"msg":{"market_ticker":"K",
+        "yes_dollars_fp":[[".3","3"]],"no_dollars_fp":[[".7","5"]]}});
+    let frames = [
+        kind(raw(1, 1, "kalshi", sub), "subscription", "sent"),
+        raw(2, 1, "kalshi", book),
+    ];
+    let a = session("a", &frames);
+    let mut single = vec![];
+    reconstruct_session(&a.2, Version::V2, 1, |b| {
+        single.push(b.topbook);
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(merged_topbooks(Venue::Kalshi, vec![a.clone()]), single);
+    assert!(
+        reconstruct_merged(
+            Venue::Kalshi,
+            vec![a, session("b", &frames)],
+            Version::V2,
+            1,
+            |_| Ok(()),
+            |_| Ok(())
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("conflated")
+    );
 }
 
 #[test]
@@ -934,6 +1099,22 @@ fn the_corrective_delta_deadline_ignores_the_other_recorders_monotonic_clock() {
         let rows = merged_topbooks(Venue::Polymarket, sources);
         assert_eq!(last_quote(&rows, "X"), (true, Some(0.5), Some(0.7)));
     }
+}
+
+#[test]
+fn one_recording_uses_its_monotonic_corrective_deadline_across_a_wall_clock_step() {
+    let delta = |side, size| {
+        json!({"event_type":"price_change","market":"M","timestamp":"1700000000001","price_changes":[{
+        "asset_id":"X","side":side,"price":"0.5","size":size,
+        "hash":"h2","best_bid":"0.5","best_ask":"0.7"}]})
+    };
+    let frames = [
+        timed(1, "polymarket", 0, 0, poly_book("X", "M")),
+        timed(2, "polymarket", 1_000, 1_000_000, delta("BUY", "2")),
+        timed(3, "polymarket", 901_000, 2_000_000, delta("SELL", "0")),
+    ];
+    let rows = merged_topbooks(Venue::Polymarket, vec![session("a", &frames)]);
+    assert_eq!(last_quote(&rows, "X"), (true, Some(0.5), Some(0.7)));
 }
 
 fn kalshi_channel_session(error: Option<Value>) -> Vec<Value> {
