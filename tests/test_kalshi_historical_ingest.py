@@ -557,3 +557,24 @@ def test_historical_ingest_cli_strips_comma_ticker_whitespace(
     )
     assert result.exit_code == 0, result.output
     assert fake.filters == [(None, None, "KXONE,KXTWO", None)]
+
+
+def test_collection_manifest_keeps_publisher_paths_across_working_directories(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pmkt.data.manifests import validate_run_manifest
+
+    for publisher in ("A", "B"):
+        directory = tmp_path / publisher
+        directory.mkdir()
+        monkeypatch.chdir(directory)
+        _run(monkeypatch, Path("run"), FakeKalshi({
+            None: {"markets": [_market(f"KX{publisher}")], "cursor": ""}
+        }), complete=True)
+
+    manifest = tmp_path / "A" / "run" / "collection.json"
+    for reader_dir in (tmp_path / "B", tmp_path):
+        monkeypatch.chdir(reader_dir)
+        report = validate_run_manifest(manifest)
+        assert report.ok, report.all_errors
+        assert Path(report.datasets[0].path) == manifest.with_suffix(".parquet")

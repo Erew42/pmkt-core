@@ -593,15 +593,15 @@ async def _ingest_markets_keyset_async(
                     )
                 )
             if manifest_out is not None:
-                dataset_paths = {"output": str(path)}
+                dataset_paths = {"output": str(path.absolute())}
                 schema_versions = {
                     "output": POLYMARKET_MARKET_SNAPSHOT_SCHEMA_VERSION,
                 }
                 row_counts = {"output": writer.row_count}
                 if evidence_path is not None and evidence_manifest_path is not None:
-                    dataset_paths["contract_evidence"] = str(evidence_path)
+                    dataset_paths["contract_evidence"] = str(evidence_path.absolute())
                     dataset_paths["contract_evidence_manifest"] = str(
-                        evidence_manifest_path
+                        evidence_manifest_path.absolute()
                     )
                     schema_versions["contract_evidence"] = (
                         CONTRACT_EVIDENCE_SCHEMA_VERSION
@@ -626,7 +626,7 @@ async def _ingest_markets_keyset_async(
                         "final_cursor": final_cursor,
                         "stop_reason": stop_reason,
                         "errors": errors,
-                        "output_path": str(path),
+                        "output_path": dataset_paths["output"],
                         "dataset_paths": dataset_paths,
                         "schema_versions": schema_versions,
                         "row_counts": row_counts,
@@ -792,12 +792,12 @@ async def _ingest_kalshi_markets_async(
             )
         )
     if manifest_out is not None:
-        dataset_paths = {"output": str(path)}
+        dataset_paths = {"output": str(path.absolute())}
         schema_versions = {"output": KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION}
         row_counts = {"output": writer.row_count}
         if evidence_path is not None and evidence_manifest_path is not None:
-            dataset_paths["contract_evidence"] = str(evidence_path)
-            dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path)
+            dataset_paths["contract_evidence"] = str(evidence_path.absolute())
+            dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path.absolute())
             schema_versions["contract_evidence"] = CONTRACT_EVIDENCE_SCHEMA_VERSION
             schema_versions["contract_evidence_manifest"] = (
                 CONTRACT_EVIDENCE_MANIFEST_VERSION
@@ -821,7 +821,7 @@ async def _ingest_kalshi_markets_async(
                 "final_cursor": final_cursor,
                 "stop_reason": stop_reason,
                 "errors": errors,
-                "output_path": str(path),
+                "output_path": dataset_paths["output"],
                 "dataset_paths": dataset_paths,
                 "schema_versions": schema_versions,
                 "row_counts": row_counts,
@@ -1054,12 +1054,12 @@ async def _ingest_kalshi_historical_markets_async(
                 page_count=page_count,
             )
             evidence_published = True
-        dataset_paths = {"output": str(out)}
+        dataset_paths = {"output": str(out.absolute())}
         schema_versions = {"output": KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION}
         row_counts = {"output": writer.row_count}
         if evidence_path is not None and evidence_manifest_path is not None:
-            dataset_paths["contract_evidence"] = str(evidence_path)
-            dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path)
+            dataset_paths["contract_evidence"] = str(evidence_path.absolute())
+            dataset_paths["contract_evidence_manifest"] = str(evidence_manifest_path.absolute())
             schema_versions["contract_evidence"] = CONTRACT_EVIDENCE_SCHEMA_VERSION
             schema_versions["contract_evidence_manifest"] = (
                 CONTRACT_EVIDENCE_MANIFEST_VERSION
@@ -1090,7 +1090,7 @@ async def _ingest_kalshi_historical_markets_async(
                 "stop_reason": stop_reason,
                 "collection_complete": collection_complete,
                 "errors": [],
-                "output_path": str(out),
+                "output_path": dataset_paths["output"],
                 "output_sha256": file_sha256(out),
                 "dataset_paths": dataset_paths,
                 "schema_versions": schema_versions,
