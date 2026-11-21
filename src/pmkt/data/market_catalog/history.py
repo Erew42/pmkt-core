@@ -537,16 +537,30 @@ async def compact_history(
                     resolved.append(await kalshi_client.historical_market(key))
             frame = kalshi_snapshot_dataframe(resolved)
             connection.register("kx_targeted", frame)
+            kx_targeted_columns = ", ".join(
+                f't."{column}"' for column in KALSHI_MARKET_SNAPSHOT_COLUMNS
+            )
             connection.execute(
                 f"""
                     CREATE TEMP VIEW kx_candidates_resolved AS
+                    WITH existing_family AS (
+                      SELECT market_key, _native_family
+                      FROM kx_candidates
+                      QUALIFY row_number() OVER (
+                        PARTITION BY market_key
+                        ORDER BY try_cast(updated_time AS TIMESTAMPTZ) DESC NULLS LAST,
+                                 _observed_at DESC, raw_json_sha256 DESC
+                      ) = 1
+                    )
                     SELECT * FROM kx_candidates
                     UNION ALL BY NAME
-                    SELECT {kx_columns},
+                    SELECT {kx_targeted_columns},
                            try_cast({_quote_sql(targeted_at)} AS TIMESTAMPTZ) AS _observed_at,
-                           {_kalshi_family_sql("market_key")} AS _native_family,
+                           coalesce(ef._native_family, {_kalshi_family_sql("t.market_key")})
+                             AS _native_family,
                            'targeted_conflict_read' AS _source
-                    FROM kx_targeted
+                    FROM kx_targeted AS t
+                    LEFT JOIN existing_family AS ef ON ef.market_key = t.market_key
                     """
             )
             kx_candidate_view = "kx_candidates_resolved"

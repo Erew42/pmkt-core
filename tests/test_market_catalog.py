@@ -1618,6 +1618,62 @@ async def test_compaction_publishes_targeted_same_time_conflict_reads(
 
 
 @pytest.mark.asyncio
+async def test_compaction_targeted_conflict_read_preserves_explicit_kalshi_family(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(tmp_path)
+    pointer, manifest_path, manifest = _history_pointer_and_manifest(service)
+    kx_path = Path(manifest["artifacts"]["kalshi_all_markets"]["path"])
+    kx_path.unlink()
+    parts = []
+    for bucket, title in enumerate(("Version A", "Version B")):
+        part = (
+            kx_path
+            / "source=compacted_base"
+            / "native_family=kalshi_mve"
+            / f"bucket={bucket}"
+            / "part-000000.parquet"
+        )
+        write_parquet(
+            kalshi_markets_dataframe([_kx("KX-EXPLICIT-MVE", title=title)]),
+            part,
+            schema=KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
+            strict=True,
+        )
+        parts.append(part)
+    descriptor = {
+        "format": "partitioned_parquet",
+        "parquet_file_count": 2,
+        "path": str(kx_path.resolve()),
+        "rows": 2,
+        "sha256": None,
+        "tree_sha256": tree_sha256(kx_path),
+        "size_bytes": sum(path.stat().st_size for path in parts),
+    }
+    manifest["artifacts"]["kalshi_all_markets"] = descriptor
+    manifest["base_row_count"] = 3
+    pointer["kalshi_all_markets"] = dict(descriptor)
+    _write_history_pointer_and_manifest(
+        service,
+        pointer=pointer,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+
+    await service.compact_history(
+        force=True,
+        kalshi_client=FakeKalshi(
+            targets={"KX-EXPLICIT-MVE": _kx("KX-EXPLICIT-MVE", title="Confirmed MVE")}
+        ),
+    )
+    with duckdb.connect(database=":memory:") as connection:
+        register_catalog_views(connection, service.market_root)
+        assert connection.execute(
+            "SELECT market_key, title, native_family FROM market_catalog_kalshi"
+        ).fetchall() == [("KX-EXPLICIT-MVE", "Confirmed MVE", "kalshi_mve")]
+
+
+@pytest.mark.asyncio
 async def test_weekly_promotion_is_unique_and_compaction_selects_latest_upsert(
     tmp_path: Path,
 ) -> None:
