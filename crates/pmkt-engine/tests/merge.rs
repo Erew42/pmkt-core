@@ -96,6 +96,7 @@ fn occurrence(copy: &str, t: i64, m: Value, seq: u64) -> Occurrence {
             use_yes_price: true,
             coverage_period: 0,
             subscription: None,
+            book_command: None,
         },
         message: m,
         reconnect_snapshot: false,

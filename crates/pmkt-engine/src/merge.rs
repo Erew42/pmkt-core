@@ -43,6 +43,8 @@ pub struct Origin {
     pub coverage_period: usize,
     #[serde(skip)]
     pub subscription: Option<std::sync::Arc<BTreeSet<String>>>,
+    #[serde(skip)]
+    pub book_command: Option<i64>,
 }
 impl Origin {
     fn rank(&self) -> (i64, &Stream, &str, u64, Option<usize>) {

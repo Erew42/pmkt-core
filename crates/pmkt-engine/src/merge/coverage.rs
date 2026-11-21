@@ -317,6 +317,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     received_monotonic_ns: f.received_monotonic_ns,
                     use_yes_price: self.subscription.kalshi_basis.unwrap_or(true),
                     subscription: self.subscription.instruments.clone(),
+                    book_command: self.subscription.book_command,
                     coverage_period,
                 },
                 message: v,

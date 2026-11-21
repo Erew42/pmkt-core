@@ -85,6 +85,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         frame: &Receipt<'_>,
         position: Option<usize>,
         subscriptions: impl Iterator<Item = &'a BTreeSet<String>> + Clone,
+        book_command: Option<i64>,
         sequence_check: SequenceCheck,
     ) -> Result<()> {
         self.count += 1;
@@ -98,7 +99,9 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         }
         let event = wire::decode(venue, message)?;
         if matches!(event, Event::SubscriptionError) {
-            self.books.reset();
+            if wire::rejects_books(message, book_command) {
+                self.books.reset();
+            }
             return Ok(());
         }
         let discover = subscriptions.clone().next().is_none();
@@ -315,6 +318,7 @@ pub fn reconstruct_merged(
                 m.occurrences
                     .iter()
                     .filter_map(|o| o.subscription.as_deref()),
+                origin.book_command,
                 SequenceCheck::SourceCoverage,
             )
         },
@@ -394,6 +398,7 @@ pub fn reconstruct_session(
                     &receipt,
                     m.position,
                     subscription.instruments.as_deref().into_iter(),
+                    subscription.book_command,
                     SequenceCheck::Connection,
                 )?;
             }

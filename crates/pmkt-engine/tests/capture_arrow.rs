@@ -810,3 +810,113 @@ fn reconstructs_published_venue_sample_envelopes() {
         }
     }
 }
+
+// A frame of one recorded connection, `micros` after the fixture epoch, stamped
+// by a host whose monotonic clock reads `mono_ns`.
+fn timed(seq: u64, venue: &str, micros: i64, mono_ns: u64, msg: Value) -> Value {
+    let mut f = raw(seq, 1, venue, msg);
+    f["received_utc"] = json!(format!("2025-01-01T00:00:00.{micros:06}+00:00"));
+    f["received_monotonic_ns"] = json!(mono_ns);
+    f
+}
+
+fn kind(mut frame: Value, frame_type: &str, direction: &str) -> Value {
+    frame["frame_type"] = json!(frame_type);
+    frame["direction"] = json!(direction);
+    frame
+}
+
+fn merged_topbooks(venue: Venue, sessions: Vec<(String, String, PathBuf)>) -> Vec<RecordBatch> {
+    let mut rows = vec![];
+    reconstruct_merged(
+        venue,
+        sessions,
+        Version::V2,
+        1,
+        |b| {
+            rows.push(b.topbook);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    rows
+}
+
+fn kalshi_channel_session(error: Option<Value>) -> Vec<Value> {
+    // Recorder commands: 1 book, 2 trade, 3 lifecycle.
+    let command = |id: u64, channel: &str| {
+        let mut params = json!({"channels":[channel],"market_tickers":["K"]});
+        if channel == "orderbook_delta" {
+            params["use_yes_price"] = json!(true);
+        }
+        let msg = json!({"id":id,"cmd":"subscribe","params":params});
+        kind(
+            timed(id, "kalshi", id as i64, id, msg),
+            "subscription",
+            "sent",
+        )
+    };
+    let book = json!({"type":"orderbook_snapshot","sid":7,"seq":1,
+        "msg":{"market_ticker":"K","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}});
+    let delta = json!({"type":"orderbook_delta","sid":7,"seq":2,
+        "msg":{"market_ticker":"K","side":"yes","price_dollars":"0.40","delta_fp":"2"}});
+    let mut frames = vec![
+        command(1, "orderbook_delta"),
+        command(2, "trade"),
+        command(3, "market_lifecycle_v2"),
+        timed(4, "kalshi", 1000, 1000, book),
+    ];
+    frames.extend(error.map(|e| timed(5, "kalshi", 2000, 2000, e)));
+    frames.push(timed(6, "kalshi", 3000, 3000, delta));
+    for (i, f) in frames.iter_mut().enumerate() {
+        f["local_frame_seq"] = json!(i as u64 + 1);
+    }
+    frames
+}
+
+fn kalshi_yes_row(batches: &[RecordBatch]) -> (bool, f64) {
+    let b = batches
+        .iter()
+        .rev()
+        .find(|b| column::<StringArray>(b, "outcome").value(0) == "YES")
+        .unwrap();
+    (
+        column::<BooleanArray>(b, "valid_state").value(0),
+        column::<Float64Array>(b, "bid_size_contracts").value(0),
+    )
+}
+
+#[test]
+fn only_an_error_on_the_book_subscription_resets_kalshi_depth() {
+    let error = |id: Option<u64>| {
+        let mut e = json!({"type":"error","msg":{"code":9,"msg":"Unknown channel"}});
+        if let Some(id) = id {
+            e["id"] = json!(id);
+        }
+        e
+    };
+    // (error, depth survives): the trade and lifecycle commands are 2 and 3.
+    for (error, survives) in [
+        (None, true),
+        (Some(error(Some(3))), true),
+        (Some(error(Some(2))), true),
+        (Some(error(Some(1))), false),
+        (Some(error(None)), false),
+    ] {
+        let label = format!("{error:?}");
+        let frames = kalshi_channel_session(error);
+        let expected = if survives { (true, 12.0) } else { (false, 2.0) };
+        let path = root();
+        seal(&path, 1, &frames, None);
+        let mut single = vec![];
+        reconstruct_session(&path, Version::V2, 1, |b| {
+            single.push(b.topbook);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(kalshi_yes_row(&single), expected, "single, error {label}");
+        let merged = merged_topbooks(Venue::Kalshi, vec![("a".into(), "c".into(), path)]);
+        assert_eq!(kalshi_yes_row(&merged), expected, "merged, error {label}");
+    }
+}

@@ -81,6 +81,7 @@ impl Iterator for Source {
                         use_yes_price: true,
                         coverage_period: 0,
                         subscription: None,
+                        book_command: None,
                     },
                     message: json(&message).map_err(InputError)?,
                     reconnect_snapshot,

@@ -16,6 +16,8 @@ pub type Ladder = BTreeMap<D, D>;
 pub(crate) struct RecordedSubscription {
     pub instruments: Option<Arc<BTreeSet<String>>>,
     pub kalshi_basis: Option<bool>,
+    /// Kalshi command id of the order-book subscription; other channels are separate commands.
+    pub book_command: Option<i64>,
 }
 impl RecordedSubscription {
     pub fn record(&mut self, venue: Venue, command: &Value) -> Result<()> {
@@ -26,6 +28,7 @@ impl RecordedSubscription {
                     return Ok(());
                 };
                 self.kalshi_basis = Some(basis);
+                self.book_command = command["id"].as_i64();
                 command["params"]["market_tickers"].as_array()
             }
         };
@@ -35,6 +38,15 @@ impl RecordedSubscription {
         }
         Ok(())
     }
+}
+
+/// An error names the command it rejects. A rejected side channel (trade, lifecycle)
+/// leaves books intact; any other error means the book subscription is unreliable.
+pub(crate) fn rejects_books(error: &Value, book_command: Option<i64>) -> bool {
+    error["id"]
+        .as_i64()
+        .zip(book_command)
+        .is_none_or(|(rejected, book)| rejected == book)
 }
 
 #[derive(Debug)]
