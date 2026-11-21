@@ -566,3 +566,26 @@ def test_dataset_validate_manifest_cli_reports_ok_and_failures(tmp_path) -> None
     assert "OK manifest: 1 datasets" in valid.output
     assert invalid.exit_code == 1
     assert "dataset does not exist" in invalid.output
+
+
+def test_validate_partitioned_topbooks_reads_every_recorder_partition(tmp_path):
+    from pmkt.data.recorder import write_topbook_segments
+
+    rows = [
+        topbook_row(
+            exchange="polymarket", instrument_id=f"token-{day}",
+            received_at_utc=f"2026-05-{day}T12:00:00Z",
+            best_bid_dollars=0.4, best_ask_dollars=0.6, spread_dollars=0.2,
+            valid_state=True, quality_flags=[],
+        )
+        for day in (26, 27)
+    ]
+    assert write_topbook_segments(rows, tmp_path) == 2
+    manifest_path = write_manifest(tmp_path / "manifest.json", {
+        "dataset_paths": {"topbooks": "topbooks"},
+        "schema_versions": {"topbooks": "topbook.v1"},
+        "row_counts": {"topbooks": 2},
+    })
+    report = validate_run_manifest(manifest_path)
+    assert report.ok, report.all_errors
+    assert report.datasets[0].row_count == 2

@@ -1745,11 +1745,11 @@ def _resolve_dataset_path(
 def _read_dataset_frame(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if path.is_dir():
-        parts = sorted(path.glob("part-*.parquet"))
+        parts = sorted(path.rglob("part-*.parquet"))
         if not parts:
             return pd.DataFrame()
         frames = [pd.read_parquet(part) for part in parts]
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+        return pd.concat(frames, ignore_index=True)
     try:
         if path.stat().st_size == 0:
             return pd.DataFrame()
