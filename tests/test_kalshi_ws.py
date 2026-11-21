@@ -258,6 +258,15 @@ def test_kalshi_snapshot_malformed_timestamp_returns_none() -> None:
     assert snapshot.as_dict()["datetime_utc"] is None
 
 
+def test_kalshi_apply_uses_custom_snapshot_projection() -> None:
+    class CustomBook(KalshiOrderBookState):
+        def snapshot(self, *, event_type=None):
+            return super().snapshot(event_type=f"custom_{event_type}")
+
+    book = CustomBook("instrument")
+    assert book.apply_snapshot({"sid": 1, "seq": 1, "msg": {}}).event_type == "custom_orderbook_snapshot"
+
+
 def test_kalshi_reconnect_clears_stale_book_levels() -> None:
     state = KalshiOrderBookState("KXTEST")
     state.apply_snapshot(

@@ -367,6 +367,15 @@ def test_market_payload_rejects_malformed_polymarket_asset_ids() -> None:
         market_subscription_payload(['["token-yes", "token-no"]'])
 
 
+def test_polymarket_apply_uses_custom_snapshot_projection() -> None:
+    class CustomBook(MarketBookState):
+        def snapshot(self, *, event_type=None):
+            return super().snapshot(event_type=f"custom_{event_type}")
+
+    book = CustomBook("instrument")
+    assert book.apply_book({"bids": [], "asks": []}).event_type == "custom_book"
+
+
 def test_polymarket_reconnect_clears_stale_book_levels() -> None:
     state = MarketBookState("asset-a")
     state.apply_book(

@@ -290,11 +290,6 @@ class MarketBookState:
         return _native.book_integrity(self.initial_snapshot_received, list(self.quality_flags))
 
     def snapshot(self, *, event_type: str | None = None) -> MarketStreamSnapshot:
-        return self._snapshot(event_type, self.book_integrity_valid)
-
-    def _snapshot(
-        self, event_type: str | None, book_integrity_valid: bool,
-    ) -> MarketStreamSnapshot:
         quote_age_ms = None
         if self.last_received_at_monotonic_ns is not None:
             quote_age_ms = (
@@ -312,7 +307,7 @@ class MarketBookState:
             len(self.bids), len(self.asks),
             self.last_trade_price, self.last_trade_size, self.last_trade_side, self.tick_size,
             valid_state=self.valid_state,
-            book_integrity_valid=book_integrity_valid,
+            book_integrity_valid=self.book_integrity_valid,
             quality_flags=tuple(sorted(self.quality_flags)) if self.quality_flags else (),
             initial_snapshot_received=self.initial_snapshot_received,
             last_book_hash=self.last_hash,
@@ -324,14 +319,14 @@ class MarketBookState:
         self, message: dict[str, Any], event_type: str,
         change: dict[str, Any] | None = None,
     ) -> MarketStreamSnapshot:
-        intact = _native.update_market_book(self, event_type, message, change)
+        _native.update_market_book(self, event_type, message, change)
         self.market = str(message.get("market") or self.market or "")
         self.timestamp = message.get("timestamp")
         if self.timestamp is None and change is not None:
             self.timestamp = change.get("timestamp")
         self.last_received_at_monotonic_ns = time.monotonic_ns()
         self.last_event_type = event_type
-        return self._snapshot(event_type, intact)
+        return self.snapshot(event_type=event_type)
 
     def apply_book(self, message: dict[str, Any]) -> MarketStreamSnapshot:
         return self._apply(message, "book")

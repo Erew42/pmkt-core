@@ -4,7 +4,6 @@ use crate::book::{flags, parse_flags};
 use pmkt_engine::{
     Book, BookMode, ScaledDecimal as D, Venue,
     book::{BookState, QuotePolicy},
-    health::Integrity,
     wire::{self, Action, Sequence, Side, kalshi, polymarket},
 };
 use pyo3::{
@@ -286,7 +285,7 @@ pub fn update_market_book(
     event_type: &str,
     message: &Bound<'_, PyDict>,
     change: Option<&Bound<'_, PyDict>>,
-) -> PyResult<bool> {
+) -> PyResult<()> {
     let py = state.py();
     let mut prior = evidence(state)?;
     prior.hash = state.getattr(intern!(py, "last_hash"))?.extract()?;
@@ -389,8 +388,7 @@ pub fn update_market_book(
     state.setattr(intern!(py, "best_bid"), convert(bid)?)?;
     state.setattr(intern!(py, "best_ask"), convert(ask)?)?;
     state.setattr(intern!(py, "last_hash"), book.venue_hash())?;
-    publish(state, &book)?;
-    Ok(book.integrity() == Integrity::Intact)
+    publish(state, &book)
 }
 
 #[pyfunction]

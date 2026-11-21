@@ -504,7 +504,10 @@ class KalshiOrderBookState:
             self.market_id = str(msg["market_id"])
         self.timestamp = msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
         self.last_event_type = event_type
-        return self._snapshot(yes_bid, no_price, event_type)
+        # Subclasses can customize the public snapshot projection.
+        if type(self) is KalshiOrderBookState and "snapshot" not in self.__dict__:
+            return self._snapshot(yes_bid, no_price, event_type)
+        return self.snapshot(event_type=event_type)
 
     def apply_snapshot(self, message: dict[str, Any]) -> KalshiBookSnapshot:
         return self._apply(message, "orderbook_snapshot")
