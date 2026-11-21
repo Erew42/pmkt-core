@@ -1263,6 +1263,47 @@ async def test_standard_current_refresh_retains_original_mve_as_of(
 
 
 @pytest.mark.asyncio
+async def test_mve_lifecycle_resumes_from_start_of_last_full_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _catalog(tmp_path)
+    closed_at = NOW + timedelta(seconds=5)
+    times = iter(NOW + timedelta(seconds=t) for t in (0, 10, 20, 30, 40, 50))
+    monkeypatch.setattr("pmkt.data.market_catalog.service.utc_now", lambda: next(times))
+
+    class Kalshi(FakeKalshi):
+        closed_requests = 0
+
+        async def markets_page(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs.get("status") == "closed":
+                self.closed_requests += 1
+                if (
+                    self.closed_requests == 2
+                    and kwargs["min_close_ts"] <= closed_at.timestamp()
+                ):
+                    row = _kx("KXMVE-CLOSED", updated=closed_at, status="closed")
+                    return {"markets": [row], "cursor": ""}
+            return await super().markets_page(**kwargs)
+
+    kalshi = Kalshi()
+    first = await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    assert first["artifacts"]["kalshi_lifecycle_upserts"]["rows"] == 0
+    assert first["artifacts"]["kalshi_mve_current_markets"]["as_of_utc"] == (
+        NOW + timedelta(seconds=10)
+    ).isoformat()
+    await service.refresh_current(
+        scope="standard", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    second = await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    assert second["artifacts"]["kalshi_lifecycle_upserts"]["rows"] == 1
+    assert kalshi.calls[-1]["min_settled_ts"] == int(NOW.timestamp())
+
+
+@pytest.mark.asyncio
 async def test_full_current_refresh_exhausts_mve_close_and_settlement_windows(
     tmp_path: Path,
 ) -> None:
@@ -1289,6 +1330,19 @@ async def test_full_current_refresh_exhausts_mve_close_and_settlement_windows(
     assert result["artifacts"]["kalshi_mve_current_markets"]["rows"] == 1
     assert any("min_close_ts" in call for call in kalshi.calls)
     assert any("min_settled_ts" in call for call in kalshi.calls)
+
+
+@pytest.mark.asyncio
+async def test_mve_lifecycle_uses_legacy_as_of_without_a_manifest(tmp_path: Path) -> None:
+    service = _catalog(tmp_path)
+    _, as_of = _seed_current(service, pm_rows=[], kx_rows=[])
+    kalshi = FakeKalshi()
+    await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    cutoff = int(datetime.fromisoformat(as_of).timestamp())
+    assert kalshi.calls[-2]["min_close_ts"] == cutoff
+    assert kalshi.calls[-1]["min_settled_ts"] == cutoff
 
 
 @pytest.mark.asyncio
