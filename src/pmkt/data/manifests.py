@@ -1763,12 +1763,7 @@ def _read_dataset_frame(path: Path) -> pd.DataFrame:
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
     if suffix == ".jsonl":
-        try:
-            return pd.read_json(path, lines=True)
-        except ValueError as exc:
-            if "Expected object or value" in str(exc):
-                return pd.DataFrame()
-            raise
+        return pd.read_json(path, lines=True)
     if suffix == ".json":
         frame = pd.read_json(path)
         if isinstance(frame, pd.DataFrame):

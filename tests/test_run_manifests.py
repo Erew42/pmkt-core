@@ -589,3 +589,13 @@ def test_validate_partitioned_topbooks_reads_every_recorder_partition(tmp_path):
     report = validate_run_manifest(manifest_path)
     assert report.ok, report.all_errors
     assert report.datasets[0].row_count == 2
+
+
+@pytest.mark.parametrize("content,valid", [("", True), (" \n", True), ('{"id":\n', False)])
+def test_validate_jsonl_distinguishes_empty_from_truncated(tmp_path, content, valid):
+    dataset = tmp_path / "markets.jsonl"
+    dataset.write_text(content, encoding="utf-8")
+    manifest = write_manifest(tmp_path / "manifest.json", {
+        "output_path": dataset.name, "row_count": 0,
+    })
+    assert validate_run_manifest(manifest).ok is valid
