@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+from importlib.util import find_spec
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -16,6 +17,10 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 import collect_polymarket_wallets_rpc as census  # noqa: E402
+
+requires_wallet_cli = pytest.mark.skipif(
+    find_spec("fcntl") is None, reason="the wallet collector and exporter require POSIX file locks"
+)
 
 ALICE = "0x" + "11" * 20
 BOB = "0x" + "22" * 20
@@ -380,6 +385,7 @@ def test_request_budget_keeps_last_committed_checkpoint(store):
     rpc.client.close()
 
 
+@requires_wallet_cli
 def test_cli_budget_resume_and_offline_export(tmp_path, monkeypatch):
     real_rpc = census.Rpc
     def handler(payload):
@@ -422,6 +428,7 @@ def test_cli_budget_resume_and_offline_export(tmp_path, monkeypatch):
     ([], []),
     (["--export-interval-s", "1200"], [2, 4]),
 ])
+@requires_wallet_cli
 def test_periodic_exports_follow_interval(tmp_path, monkeypatch, options, expected_ranges):
     elapsed = 0
     real_rpc, real_export = census.Rpc, census.export
@@ -680,6 +687,7 @@ def test_export_preserves_exact_csv_bytes_and_avoids_artifact_rereads(store, tmp
         assert hashlib.sha256((tmp_path / name).read_bytes()).hexdigest() == digest
 
 
+@requires_wallet_cli
 def test_resume_does_not_postpone_due_export_for_another_interval(tmp_path, monkeypatch):
     clock, real_rpc = Clock(), census.Rpc
     monkeypatch.setattr(census, "time", clock)
