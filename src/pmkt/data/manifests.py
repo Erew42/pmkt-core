@@ -1121,11 +1121,11 @@ def _manifest_mapping(
 
 def _hash_mapping(payload: Mapping[str, Any], warnings: list[str]) -> dict[str, str]:
     hashes: dict[str, str] = {}
-    for field in ("dataset_hashes", "dataset_sha256", "sha256_hashes", "sha256"):
+    for field in ("dataset_hashes", "dataset_sha256", "sha256_hashes", "sha256", "output_sha256"):
         value = payload.get(field)
         if value is None:
             continue
-        if isinstance(value, str) and field == "sha256":
+        if isinstance(value, str) and field in {"sha256", "output_sha256"}:
             hashes["output"] = value
             continue
         mapping = _manifest_mapping(payload, field, warnings)
