@@ -64,6 +64,30 @@ def test_public_cli_help_is_available() -> None:
         assert command in result.output
 
 
+def test_offset_ingest_uses_page_budget_after_short_response(monkeypatch, tmp_path):
+    import httpx
+    import pandas as pd
+    from pmkt.cli import ingest
+    from pmkt.exchanges.polymarket.gamma import AsyncGammaClient
+
+    def handler(request):
+        offset = int(request.url.params["offset"])
+        return httpx.Response(200, json=[
+            {"id": str(i), "conditionId": f"0x{i:064x}", "question": f"Market {i}?"}
+            for i in range(offset, min(offset + 2, 5))
+        ])
+
+    monkeypatch.setattr(ingest, "AsyncGammaClient", lambda **_: AsyncGammaClient(
+        transport=httpx.MockTransport(handler)))
+    out = tmp_path / "markets.parquet"
+    result = CliRunner().invoke(
+        app, ["ingest-markets", "--out", str(out), "--pages", "2", "--limit", "3"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert pd.read_parquet(out)["market_id"].tolist() == ["0", "1", "2", "3"]
+
+
 @pytest.mark.parametrize("closed,cap,scenario,complete", [
     (None, None, "normal", True),
     ("any", None, "normal", True),

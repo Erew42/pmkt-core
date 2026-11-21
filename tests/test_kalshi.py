@@ -166,6 +166,34 @@ async def test_kalshi_iter_markets_stops_on_terminal_empty_page() -> None:
 
 
 @pytest.mark.asyncio
+async def test_kalshi_iter_events_follows_cursor_after_empty_page() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if not request.url.params.get("cursor"):
+            return httpx.Response(200, json={"events": [], "cursor": "next"})
+        return httpx.Response(200, json={"events": [{"event_ticker": "KXFOUND"}], "cursor": ""})
+
+    async with AsyncKalshiClient(transport=httpx.MockTransport(handler)) as client:
+        events = [event async for event in client.iter_events()]
+    assert events == [{"event_ticker": "KXFOUND"}]
+
+
+@pytest.mark.asyncio
+async def test_kalshi_iter_events_rejects_repeated_cursor() -> None:
+    cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("cursor")
+        assert cursor not in cursors
+        cursors.append(cursor)
+        return httpx.Response(200, json={"events": [], "cursor": "b" if cursor == "a" else "a"})
+
+    async with AsyncKalshiClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="cursor repeated"):
+            _ = [event async for event in client.iter_events(cursor="a")]
+    assert cursors == ["a", "b"]
+
+
+@pytest.mark.asyncio
 async def test_kalshi_iter_markets_reuses_generator_tickers() -> None:
     seen: list[tuple[str | None, str | None]] = []
 

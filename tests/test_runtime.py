@@ -162,6 +162,32 @@ def test_rest_client_timeout_must_be_finite_positive_numeric(
 
 
 @pytest.mark.asyncio
+async def test_subgraph_condition_lookup_returns_all_matching_markets() -> None:
+    rows = [
+        {"id": f"{i:04d}", "conditionId": f"0x{i // 2:064x}"} for i in range(1003)
+    ]
+    conditions = [row["conditionId"] for row in rows] + ["0x" + "f" * 64]
+    offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        variables = payload["variables"]
+        offset = variables["skip"] if "skip: $skip" in payload["query"] else 0
+        assert offset not in offsets
+        offsets.append(offset)
+        selected = set(variables["conditions"])
+        matches = [row for row in rows if row["conditionId"] in selected]
+        size = variables.get("first", 1000)
+        return httpx.Response(200, json={"data": {"markets": matches[offset:offset + size]}})
+
+    async with AsyncSubgraphClient(transport=httpx.MockTransport(handler)) as client:
+        found = await client.markets_by_condition_ids(conditions)
+
+    assert found == rows
+    assert offsets == [0, 1000]
+
+
+@pytest.mark.asyncio
 async def test_clob_retries_only_allowlisted_read_posts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

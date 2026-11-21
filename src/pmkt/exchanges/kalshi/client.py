@@ -1200,6 +1200,7 @@ class AsyncKalshiClient:
         **params: Any,
     ) -> AsyncIterator[dict[str, Any]]:
         cursor = params.pop("cursor", None)
+        seen_cursors = {cursor} if cursor else set()
         pages = 0
         while True:
             if max_pages is not None and pages >= max_pages:
@@ -1209,7 +1210,7 @@ class AsyncKalshiClient:
             )
             pages += 1
             events = page.get("events")
-            if not isinstance(events, list) or not events:
+            if not isinstance(events, list):
                 break
             for event in events:
                 if isinstance(event, dict):
@@ -1217,6 +1218,9 @@ class AsyncKalshiClient:
             cursor = page.get("cursor") or None
             if not cursor:
                 break
+            if cursor in seen_cursors:
+                raise RuntimeError("Kalshi events cursor repeated")
+            seen_cursors.add(cursor)
 
     async def orderbook(
         self,
