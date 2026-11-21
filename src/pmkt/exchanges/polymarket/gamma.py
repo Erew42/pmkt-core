@@ -620,6 +620,7 @@ class AsyncGammaClient:
     ) -> AsyncIterator[Market]:
         """Iterate over /markets/keyset until cursor exhaustion."""
         cursor = after_cursor
+        seen_cursors = {normalize_polymarket_cursor(cursor)} if cursor else set()
         while True:
             page = await self.markets_keyset_page(
                 limit=limit,
@@ -633,14 +634,12 @@ class AsyncGammaClient:
                 ascending=ascending,
                 expiry=expiry,
             )
-            markets = page["markets"]
-            if not markets:
-                break
-            for market in markets:
+            for market in page["markets"]:
                 yield market
             next_cursor = normalize_polymarket_cursor(page.get("next_cursor"))
-            if polymarket_cursor_stop_reason(next_cursor, previous_cursor=cursor):
+            if polymarket_cursor_stop_reason(next_cursor) or next_cursor in seen_cursors:
                 break
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
     async def iter_events(

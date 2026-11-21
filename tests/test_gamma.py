@@ -314,6 +314,27 @@ async def test_iter_markets_keyset_stops_on_cursor_exhaustion() -> None:
     assert seen_cursors == [None, "cursor-1"]
 
 
+@pytest.mark.parametrize("final_cursor", [None, "page-a"])
+async def test_iter_markets_keyset_follows_cursor_across_empty_pages(final_cursor) -> None:
+    cursors = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        cursor = request.url.params.get("after_cursor")
+        assert cursor not in cursors
+        cursors.append(cursor)
+        if cursor is None:
+            return httpx.Response(200, json={"markets": [], "next_cursor": "page-a"})
+        if cursor == "page-a":
+            return httpx.Response(200, json={"markets": [market_row()], "next_cursor": "page-b"})
+        return httpx.Response(200, json={"markets": [], "next_cursor": final_cursor})
+
+    async with AsyncGammaClient(transport=httpx.MockTransport(handler)) as client:
+        ids = [market.id async for market in client.iter_markets_keyset()]
+
+    assert ids == ["1"]
+    assert cursors == [None, "page-a", "page-b"]
+
+
 async def test_iter_markets_keyset_stops_on_terminal_lte_cursor() -> None:
     seen_cursors: list[str | None] = []
 
