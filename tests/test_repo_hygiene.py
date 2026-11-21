@@ -211,3 +211,42 @@ def test_pytest_lane_coverage_reports_unassigned_tests(tmp_path: Path) -> None:
 
     assert missing == ["tests/test_missing.py"]
     assert stale == []
+
+
+def test_conftest_cleans_passing_tmp_path_and_preserves_failed_tmp_path(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    import pytest
+    from tests.conftest import _PHASE_FAILED_KEY, _cleanup_passing_tmp_path
+
+    passing_dir = tmp_path / "passing"
+    passing_dir.mkdir()
+    (passing_dir / "artifact.duckdb").write_bytes(b"payload")
+    passing_item = SimpleNamespace(
+        stash=pytest.Stash(),
+        funcargs={"tmp_path": passing_dir},
+    )
+    passing_item.stash[_PHASE_FAILED_KEY] = {
+        "setup": False,
+        "call": False,
+        "teardown": False,
+    }
+
+    assert _cleanup_passing_tmp_path(passing_item) is True
+    assert not passing_dir.exists()
+
+    failing_dir = tmp_path / "failing"
+    failing_dir.mkdir()
+    (failing_dir / "artifact.duckdb").write_bytes(b"payload")
+    failing_item = SimpleNamespace(
+        stash=pytest.Stash(),
+        funcargs={"tmp_path": failing_dir},
+    )
+    failing_item.stash[_PHASE_FAILED_KEY] = {
+        "setup": False,
+        "call": True,
+        "teardown": False,
+    }
+
+    assert _cleanup_passing_tmp_path(failing_item) is False
+    assert (failing_dir / "artifact.duckdb").exists()
