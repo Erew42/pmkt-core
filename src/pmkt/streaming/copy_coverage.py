@@ -8,10 +8,11 @@ periods that no copy covered. It reports; it never drops or invents messages.
 
 An interval opens at the first received frame (text, pong, control) of a
 connection generation and is extended by every later received frame. It ends at
-the last received frame before one of:
+the last received frame when any of the following occurs:
 
 - ``new_generation``: the recorder reconnected (the next generation re-subscribes);
 - ``transport_error``: the recorder's local marker for a failed connection;
+- ``ws_close``: a WebSocket close frame, included in the interval when received;
 - ``disk_pause_gap``: frames were dropped while the disk was low;
 - ``chunk_gap``: chunks are missing from the session (``raw_reader.ChunkGap``);
 - ``seq_gap``: a Kalshi ``seq`` did not follow its predecessor on the same
@@ -111,7 +112,20 @@ class CoverageTracker:
                 self._next_reason = "new_generation"
             self._generation = generation
             self._seqs.clear()
-        if direction == "local":
+        if direction.startswith("received"):
+            self._frame_us = received_us
+            if self._start is None:
+                self._start, self._last, self._before = received_us, received_us, None
+                self._start_reason = self._next_reason
+            else:
+                assert self._last is not None
+                self._before = self._last
+                self._last = max(self._last, received_us)
+        if frame_type == "ws_close":
+            self._close("ws_close")
+            self._next_reason = "after_gap"
+            self._seqs.clear()
+        elif direction == "local":
             if frame_type == "transport_error":
                 self.transport_errors += 1
                 self._close("transport_error")
@@ -122,17 +136,6 @@ class CoverageTracker:
                 self._seqs.clear()
             elif frame_type == "seq_gap":
                 self.seq_gap_markers += 1
-            return
-        if not direction.startswith("received"):
-            return  # sent subscriptions and heartbeats prove nothing about receipt
-        self._frame_us = received_us
-        if self._start is None:
-            self._start, self._last, self._before = received_us, received_us, None
-            self._start_reason = self._next_reason
-            return
-        assert self._last is not None
-        self._before = self._last
-        self._last = max(self._last, received_us)
 
     def sequence(self, sid: int, seq: int) -> None:
         last = self._seqs.get(sid)

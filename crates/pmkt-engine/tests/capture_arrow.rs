@@ -2,7 +2,8 @@ use arrow_array::{
     Array, BooleanArray, Float64Array, Int64Array, ListArray, RecordBatch, StringArray,
 };
 use arrow_schema::DataType;
-use flate2::{Compression, write::GzEncoder};
+mod capture_fixture;
+use capture_fixture::{column, manifest, name, raw, root, seal, sidecar};
 use pmkt_engine::{
     BookMode, Venue, VenueBooks,
     capture::{CaptureItem, SealedChunk, inspect_session, list_session_chunks, read_session},
@@ -11,66 +12,11 @@ use pmkt_engine::{
     },
 };
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::Write,
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-fn root() -> PathBuf {
-    // Each case owns fresh files under the ignored workspace build tree.
-    let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/capture-fixtures");
-    fs::create_dir_all(&base).unwrap();
-    tempfile::tempdir_in(base).unwrap().keep()
-}
-fn raw(seq: u64, generation: u64, venue: &str, msg: Value) -> Value {
-    json!({"schema":format!("{venue}.public_raw_frame.v1"),"venue":venue,"recording_id":"run","connection_generation":generation,
-        "local_frame_seq":seq,"received_utc":"2025-01-01T00:00:00+00:00","received_monotonic_ns":seq*1_000_000,
-        "frame_type":"text","direction":"received","payload_raw":msg.to_string()})
-}
-fn name(i: u64) -> String {
-    format!("chunk_{i:06}.jsonl.gz")
-}
-fn manifest(root: &Path, i: u64) -> PathBuf {
-    root.join(format!("{}.manifest.json", name(i)))
-}
-fn sidecar(
-    root: &Path,
-    i: u64,
-    venue: &str,
-    run: &str,
-    range: std::ops::RangeInclusive<u64>,
-    prev: Option<&str>,
-) -> String {
-    let bytes = fs::read(root.join(name(i))).unwrap();
-    let sha = format!("{:x}", Sha256::digest(&bytes));
-    let m = json!({"schema":format!("{venue}.public_raw_chunk.v1"),"venue":venue,"recording_id":run,"filename":name(i),"size_bytes":bytes.len(),
-        "sha256":sha,"frame_count":range.end()-range.start()+1,"first_frame_seq":range.start(),"last_frame_seq":range.end(),"previous_chunk_sha256":prev,
-        "future_field":"retained"});
-    fs::write(manifest(root, i), m.to_string()).unwrap();
-    sha
-}
-fn seal(root: &Path, i: u64, frames: &[Value], prev: Option<&str>) -> String {
-    let mut gz = GzEncoder::new(
-        fs::File::create(root.join(name(i))).unwrap(),
-        Compression::fast(),
-    );
-    for f in frames {
-        writeln!(gz, "{f}").unwrap();
-    }
-    gz.finish().unwrap();
-    sidecar(
-        root,
-        i,
-        frames[0]["venue"].as_str().unwrap(),
-        "run",
-        frames[0]["local_frame_seq"].as_u64().unwrap()
-            ..=frames.last().unwrap()["local_frame_seq"].as_u64().unwrap(),
-        prev,
-    )
-}
 fn revise(root: &Path, i: u64, f: impl FnOnce(&mut Value)) {
     let p = manifest(root, i);
     let mut m: Value = serde_json::from_slice(&fs::read(&p).unwrap()).unwrap();
@@ -189,14 +135,6 @@ fn missing_prefix_invalid_predecessor_and_duplicate_seq_are_checked() {
             .to_string()
             .contains("consecutive")
     );
-}
-fn column<'a, T: 'static>(batch: &'a RecordBatch, name: &str) -> &'a T {
-    batch
-        .column_by_name(name)
-        .unwrap()
-        .as_any()
-        .downcast_ref()
-        .unwrap()
 }
 
 #[test]
@@ -476,6 +414,203 @@ fn merged_resolution_before_first_snapshot_is_terminal() {
     assert_eq!(batches.len(), 1);
     assert_book_health(&batches[0].topbook, &["market_resolved"], false, true);
     assert_book_health(&batches[0].depth, &["market_resolved"], false, true);
+}
+
+#[test]
+fn a_clock_rollback_cannot_move_a_post_gap_delta_into_the_old_ladder() {
+    let ms = 1735689600000;
+    let snapshot = raw(1, 1, "polymarket", poly_snapshot(ms));
+    let mut gap = raw(2, 1, "polymarket", json!({}));
+    gap["frame_type"] = json!("transport_error");
+    gap["direction"] = json!("local");
+    let delta = |seq, timestamp| {
+        raw(
+            seq,
+            1,
+            "polymarket",
+            json!({
+                "event_type":"price_change","asset_id":"P","timestamp":timestamp,
+                "price_changes":[{"asset_id":"P","side":"BUY","price":"0.4","size":"5"}]
+            }),
+        )
+    };
+    let mut reopened = delta(3, ms + 2);
+    reopened["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    let rollback = delta(4, ms + 1);
+    let mut pong = snapshot.clone();
+    pong["frame_type"] = json!("ws_pong");
+    pong["direction"] = json!("received_control_base64");
+    let batches = merged_poly(&[snapshot, gap, reopened, rollback], &[pong]);
+    let rows: Vec<_> = batches.iter().map(|b| b.depth.num_rows()).collect();
+    assert_eq!(rows, [2, 0, 0]);
+}
+
+#[test]
+fn subscribed_but_silent_books_record_the_same_gap_in_both_replays() {
+    let path = root();
+    let mut sub = raw(1, 1, "polymarket", json!({"assets_ids":["P","silent"]}));
+    sub["direction"] = json!("sent");
+    sub["frame_type"] = json!("subscription");
+    let ms = 1735689600000_i64;
+    let first = raw(2, 1, "polymarket", poly_snapshot(ms));
+    let mut gap = raw(3, 1, "polymarket", json!({}));
+    gap["direction"] = json!("local");
+    gap["frame_type"] = json!("transport_error");
+    let mut delta = raw(
+        4,
+        1,
+        "polymarket",
+        json!({"event_type":"price_change", "market":"M","timestamp":ms+1,
+        "price_changes":[{"asset_id":"silent","price":".3","size":"2","side":"BUY"}]}),
+    );
+    delta["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    seal(&path, 1, &[sub, first, gap, delta], None);
+    let mut file = vec![];
+    reconstruct_session(&path, Version::V2, 1, |b| {
+        file.push(b.topbook);
+        Ok(())
+    })
+    .unwrap();
+    assert_book_health(
+        &file[1],
+        &[
+            "delta_before_snapshot",
+            "empty_ask",
+            "no_initial_snapshot",
+            "reconnect",
+        ],
+        false,
+        false,
+    );
+    let mut merged = vec![];
+    reconstruct_merged(
+        Venue::Polymarket,
+        vec![("a".into(), "c".into(), path)],
+        Version::V2,
+        1,
+        |b| {
+            merged.push(b.topbook);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(merged, file);
+}
+
+fn kalshi_sequence_source(
+    copy: &str,
+    sid: i64,
+    offset: usize,
+    micros: [i64; 3],
+    venue_ms: [i64; 3],
+) -> (String, String, PathBuf) {
+    let path = root();
+    let mut frames = vec![];
+    for (i, (micros, ms)) in micros.into_iter().zip(venue_ms).enumerate() {
+        let sequence = offset + i + 1;
+        let ms = 1_735_689_600_000 + ms;
+        let msg = if i == 0 {
+            json!({"type":"orderbook_snapshot","sid":sid,"seq":sequence,
+                    "sending_ts_ms":ms,"msg":{"market_ticker":"K","clock":1,"yes":[[".3","1"]],"no":[[".6","1"]]}})
+        } else {
+            json!({"type":"orderbook_delta","sid":sid,"seq":sequence,"sending_ts_ms":ms+1,"msg":{"market_ticker":"K",
+                    "clock":i+1,"ts_ms":ms,"side":"yes","price":".3","delta":"1"}})
+        };
+        let mut f = raw(i as u64 + 1, 1, "kalshi", msg);
+        f["received_utc"] = json!(format!("2025-01-01T00:00:00.{micros:06}+00:00"));
+        frames.push(f);
+    }
+    seal(&path, 1, &frames, None);
+    (copy.into(), "conn".into(), path)
+}
+
+fn assert_kalshi_sequence_rows(sessions: Vec<(String, String, PathBuf)>, coords: [(i64, i64); 3]) {
+    let mut expected = coords.into_iter().enumerate();
+    reconstruct_merged(
+        Venue::Kalshi,
+        sessions,
+        Version::V2,
+        1,
+        |batch| {
+            let (i, (sid, seq)) = expected.next().unwrap();
+            for rows in [&batch.topbook, &batch.depth] {
+                assert_eq!(rows.num_rows(), 2);
+                assert_book_health(rows, &[], true, true);
+                assert_eq!(column::<Int64Array>(rows, "venue_sid").values(), &[sid; 2]);
+                assert_eq!(
+                    column::<Int64Array>(rows, "venue_sequence").values(),
+                    &[seq; 2]
+                );
+            }
+            assert_eq!(
+                column::<Float64Array>(&batch.depth, "size_contracts").value(0),
+                (i + 1) as f64
+            );
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert!(expected.next().is_none());
+}
+
+#[test]
+fn alternating_kalshi_copies_keep_healthy_ladders_and_winning_coordinates() {
+    let times = [0, 10, 20];
+    let a = kalshi_sequence_source("a", 7, 100, [0, 11000, 20000], times);
+    let b = kalshi_sequence_source("b", 81, 0, [1000, 10000, 21000], times);
+    assert_kalshi_sequence_rows(vec![a, b], [(7, 101), (81, 2), (7, 103)]);
+}
+
+#[test]
+fn venue_order_cannot_create_a_gap_in_a_continuous_kalshi_copy() {
+    let a = kalshi_sequence_source("a", 7, 100, [0, 11000, 20000], [0, 20, 10]);
+    assert_kalshi_sequence_rows(vec![a], [(7, 101), (7, 103), (7, 102)]);
+}
+
+#[test]
+fn a_gap_inside_one_frame_resets_before_its_first_merged_message() {
+    let a = root();
+    let start = raw(
+        1,
+        1,
+        "kalshi",
+        json!({"type":"orderbook_snapshot","sid":7,"seq":1,
+        "msg":{"market_ticker":"K","ts_ms":100,"yes":[[".3","1"]],"no":[[".6","1"]]}}),
+    );
+    let delta = |seq| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,
+        "msg":{"market_ticker":"K","ts_ms":100+seq,"side":"yes","price":".3","delta":"1"}})
+    };
+    let mut batched = raw(2, 1, "kalshi", json!([delta(2), delta(4)]));
+    batched["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    seal(&a, 1, &[start.clone(), batched], None);
+    let b = root();
+    let mut pong = start;
+    pong["direction"] = json!("received_control_base64");
+    pong["frame_type"] = json!("ws_pong");
+    seal(&b, 1, &[pong], None);
+    let mut sessions = vec![("a".into(), "c".into(), a)];
+    for copies in 1..=2 {
+        if copies == 2 {
+            sessions.push(("b".into(), "c".into(), b.clone()));
+        }
+        let mut depth = Vec::new();
+        reconstruct_merged(
+            Venue::Kalshi,
+            sessions.clone(),
+            Version::V2,
+            1,
+            |batch| {
+                depth.push(batch.depth.num_rows());
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(depth, [2, 0, 0]);
+    }
 }
 
 #[test]

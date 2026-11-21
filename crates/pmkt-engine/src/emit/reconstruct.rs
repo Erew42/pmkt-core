@@ -1,7 +1,7 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, VenueBooks},
+    book::{BookMode, SequenceCheck, VenueBooks},
     capture::{CaptureItem, SealedChunk, SessionChunks, list_session_chunks},
     health::Integrity,
     merge::{
@@ -15,6 +15,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 // Pin the manifests once. A single chunk may have an archived predecessor.
@@ -84,6 +85,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         frame: &Receipt<'_>,
         position: Option<usize>,
         subscriptions: impl Iterator<Item = &'a BTreeSet<String>> + Clone,
+        sequence_check: SequenceCheck,
     ) -> Result<()> {
         self.count += 1;
         let venue = self.books.mode().venue();
@@ -136,7 +138,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         if let Some(i) = position {
             reference.push_str(&format!(":{i}"));
         }
-        for item in self.books.apply_event(event, self.count) {
+        for item in self.books.apply_event(event, self.count, sequence_check) {
             let book = self.books.get(&item.instrument).expect("touched book");
             // The top and all depth rows of one observation share one adjusted clock.
             let adjusted;
@@ -259,6 +261,7 @@ pub fn reconstruct_merged(
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut period = None;
     let mut kalshi_basis = None;
+    let mut subscriptions = BTreeMap::new();
     let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
         streams
             .values_mut()
@@ -271,6 +274,21 @@ pub fn reconstruct_merged(
                 .is_some_and(|old| old != origin.coverage_period)
             {
                 driver.books.reset();
+            }
+            // Register the whole declared shard, including silent instruments
+            // whose first delta may follow a gap. Origins share the same set
+            // until a new subscription command changes it.
+            for o in &m.occurrences {
+                if let Some(ids) = &o.subscription
+                    && subscriptions
+                        .get(&o.stream)
+                        .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
+                {
+                    for id in ids.iter() {
+                        driver.books.subscribe(id.clone());
+                    }
+                    subscriptions.insert(o.stream.clone(), Arc::clone(ids));
+                }
             }
             if venue == Venue::Kalshi
                 && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
@@ -297,6 +315,7 @@ pub fn reconstruct_merged(
                 m.occurrences
                     .iter()
                     .filter_map(|o| o.subscription.as_deref()),
+                SequenceCheck::SourceCoverage,
             )
         },
     )?;
@@ -375,6 +394,7 @@ pub fn reconstruct_session(
                     &receipt,
                     m.position,
                     subscription.instruments.as_deref().into_iter(),
+                    SequenceCheck::Connection,
                 )?;
             }
         }

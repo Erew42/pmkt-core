@@ -46,6 +46,12 @@ impl BookMode {
         }
     }
 }
+/// A venue-ordered merge has already checked continuity in source receive order.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SequenceCheck {
+    Connection,
+    SourceCoverage,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Quote {
     pub price: D,
@@ -83,6 +89,17 @@ pub struct Book {
     tick: Option<D>,
     minimum: Option<D>,
 }
+/// Mutable legacy WebSocket state supplied by the caller on each application.
+#[derive(Default)]
+pub struct BookState {
+    pub levels: (Ladder, Ladder),
+    pub initialized: bool,
+    pub flags: Flags,
+    pub sequence: Sequence,
+    pub hash: Option<String>,
+    pub tick: Option<D>,
+}
+
 impl Book {
     pub fn new(mode: BookMode, instrument: impl Into<String>) -> Self {
         Self {
@@ -102,6 +119,18 @@ impl Book {
     }
     pub fn mode(&self) -> BookMode {
         self.mode
+    }
+    pub fn restore(&mut self, state: BookState) {
+        (self.first, self.second) = state.levels;
+        self.integrity = Integrity::from_observation(state.initialized, &state.flags);
+        self.flags = state.flags;
+        self.sequence = state.sequence;
+        self.hash = state.hash;
+        self.tick = state.tick;
+    }
+
+    pub fn apply_update(&mut self, update: &Update) {
+        self.apply(update, SequenceCheck::Connection);
     }
     pub fn instrument(&self) -> &str {
         &self.instrument
@@ -139,10 +168,10 @@ impl Book {
     pub fn venue_hash(&self) -> Option<&str> {
         self.hash.as_deref()
     }
-    pub(crate) fn best_native_bid(&self) -> Option<D> {
+    pub fn best_native_bid(&self) -> Option<D> {
         self.first.last_key_value().map(|(p, _)| *p)
     }
-    fn best_right(&self) -> Option<Quote> {
+    pub fn best_right(&self) -> Option<Quote> {
         let level = if matches!(
             self.mode,
             BookMode::Kalshi {
@@ -199,7 +228,6 @@ impl Book {
         }
     }
     fn refresh(&mut self) {
-        self.flags.retain(|f| !f.dynamic());
         let bid = self.best_native_bid();
         let ask = self.best_right().map(|q| {
             if matches!(
@@ -214,6 +242,11 @@ impl Book {
                 q.price
             }
         });
+        self.refresh_quotes(bid, ask);
+    }
+
+    pub fn refresh_quotes(&mut self, bid: Option<D>, ask: Option<D>) {
+        self.flags.retain(|f| !f.dynamic());
         if bid.is_none() {
             self.flags.insert(F::EmptyBid);
         }
@@ -227,18 +260,7 @@ impl Book {
                 self.flags.insert(F::CrossedBook);
             }
         }
-        if self.initialized() {
-            self.integrity = if self.flags.iter().all(|f| {
-                matches!(
-                    f,
-                    F::EmptyBid | F::EmptyAsk | F::NewMarket | F::MarketResolved
-                )
-            }) {
-                Integrity::Intact
-            } else {
-                Integrity::Impaired
-            };
-        }
+        self.integrity = Integrity::from_observation(self.initialized(), &self.flags);
     }
     fn fault(&mut self, flag: F) {
         self.flags.insert(flag);
@@ -246,11 +268,15 @@ impl Book {
             self.integrity = Integrity::Impaired;
         }
     }
-    fn apply_sequence(&mut self, s: Sequence) {
+    fn apply_sequence(&mut self, s: Sequence, check: SequenceCheck) {
         let (Some(sid), Some(seq)) = (s.sid, s.seq) else {
             self.flags.insert(F::MissingSequence);
             return;
         };
+        if check == SequenceCheck::SourceCoverage {
+            self.sequence = s;
+            return;
+        }
         if self.sequence.sid.get_or_insert(sid) != &sid {
             self.flags.insert(F::SidChanged);
         }
@@ -265,7 +291,7 @@ impl Book {
             Side::Second => &mut self.second,
         }
     }
-    fn apply(&mut self, update: &Update) {
+    fn apply(&mut self, update: &Update, check: SequenceCheck) {
         if let Some(m) = &update.market {
             self.market = Some(m.clone());
         }
@@ -280,7 +306,7 @@ impl Book {
             self.flags.insert(F::DeltaBeforeSnapshot);
         }
         if let Some(s) = update.sequence {
-            self.apply_sequence(s);
+            self.apply_sequence(s, check);
         }
         match &update.action {
             Action::Snapshot(s) => {
@@ -517,9 +543,18 @@ impl VenueBooks {
         message: &serde_json::Value,
         count: u64,
     ) -> crate::Result<Vec<Touched>> {
-        Ok(self.apply_event(decode(self.mode.venue(), message)?, count))
+        Ok(self.apply_event(
+            decode(self.mode.venue(), message)?,
+            count,
+            SequenceCheck::Connection,
+        ))
     }
-    pub(crate) fn apply_event(&mut self, event: Event, count: u64) -> Vec<Touched> {
+    pub(crate) fn apply_event(
+        &mut self,
+        event: Event,
+        count: u64,
+        check: SequenceCheck,
+    ) -> Vec<Touched> {
         let updates = match event {
             Event::Books(updates) => updates,
             Event::Lifecycle {
@@ -568,10 +603,9 @@ impl VenueBooks {
             });
             *last = u;
             if let Some(s) = u.sequence
-                && (s
-                    .sid
-                    .zip(s.seq)
-                    .is_none_or(|(sid, seq)| self.sequences.gap(sid, seq)))
+                && (s.sid.zip(s.seq).is_none_or(|(sid, seq)| {
+                    check == SequenceCheck::Connection && self.sequences.gap(sid, seq)
+                }))
             {
                 gap = Some(s.sid);
             }
@@ -603,7 +637,7 @@ impl VenueBooks {
             if matches!(u.action, Action::Lifecycle { resolved: true }) {
                 self.resolved.insert(id.clone());
             }
-            book.apply(u);
+            book.apply(u, check);
             if u.action.is_snapshot() && book.integrity() == Integrity::Intact {
                 self.conflicts.remove(id);
             }

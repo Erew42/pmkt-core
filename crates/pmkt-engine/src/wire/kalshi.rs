@@ -17,12 +17,16 @@ pub(crate) fn subscription_basis(command: &Value) -> Result<Option<bool>> {
     })
 }
 
-pub fn decode(message: &Value) -> Result<Event> {
-    let kind = message["type"].as_str().unwrap_or("");
-    let body = message
+pub(super) fn body(message: &Value) -> &Value {
+    message
         .get("msg")
         .filter(|v| v.is_object())
-        .unwrap_or(message);
+        .unwrap_or(message)
+}
+
+pub fn decode(message: &Value) -> Result<Event> {
+    let kind = message["type"].as_str().unwrap_or("");
+    let body = body(message);
     match kind {
         "subscribed" => {
             return Ok(Event::Subscribed {
@@ -48,9 +52,10 @@ pub fn decode(message: &Value) -> Result<Event> {
         seq: message["seq"].as_i64(),
     });
     let action = if kind == "orderbook_snapshot" {
+        let [yes, no] = snapshot_sides(Venue::Kalshi, body);
         Action::Snapshot(Snapshot {
-            first: levels(first(body, &["yes_dollars_fp", "yes_dollars", "yes"]), true),
-            second: levels(first(body, &["no_dollars_fp", "no_dollars", "no"]), true),
+            first: levels(yes, true),
+            second: levels(no, true),
             hash: None,
             tick: Metadata::Absent,
             minimum: Metadata::Absent,

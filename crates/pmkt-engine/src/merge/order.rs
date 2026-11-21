@@ -120,7 +120,7 @@ pub(super) fn resolve(
                 {
                     if options.strict_order {
                         return Err(Error::Invalid(format!(
-                            "conflicting order for {scope} at {time}, origin {origin:?}"
+                            "streams disagree on order for {scope} at {time}, origin {origin:?}"
                         )));
                     }
                     if books_only {
