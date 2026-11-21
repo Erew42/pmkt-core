@@ -344,6 +344,11 @@ fn send(shard: &mut ShardFeed, event: &Value, ns: u64) {
 
 fn whole_shard(shard: &mut ShardFeed, now: u64, reasons: [Option<&str>; 3]) {
     for (id, reason) in ["a", "b", "c"].into_iter().zip(reasons) {
+        let read = shard
+            .read_book(id, now)
+            .unwrap()
+            .map(|b| (b.bids().collect::<Vec<_>>(), b.asks().collect::<Vec<_>>()));
+        assert_eq!(read.is_some(), reason.is_none(), "{id} at {now}");
         let o = shard.observation(id, now).unwrap();
         assert_eq!(o.health.reason.as_deref(), reason, "{id} at {now}");
         assert_eq!(o.health.usable, reason.is_none());
@@ -355,6 +360,7 @@ fn whole_shard(shard: &mut ShardFeed, now: u64, reasons: [Option<&str>; 3]) {
             assert!(b.bids.iter().chain(&b.asks).all(|(_, q)| *q > D::ZERO));
             assert_eq!(b.generation, o.health.generation);
             assert_eq!(b.metadata_revision, o.health.metadata_revision);
+            assert_eq!(read.unwrap(), (b.bids, b.asks));
         }
     }
 }

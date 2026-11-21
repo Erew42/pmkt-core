@@ -176,9 +176,7 @@ def synthetic_feed(venue, instruments=("a", "b")):
     shard.client = SimpleNamespace(
         is_connected=True,
         _last_inbound=None,
-        heartbeat_diagnostics=lambda: {
-            "heartbeat_error_type": None,
-        },
+        _heartbeat_error=None,
     )
     shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
     shard.native.connected(shard.generation, time.monotonic_ns(), command_id=1)
@@ -199,6 +197,23 @@ def test_raw_ingest_leaves_unrelated_books_uninitialized(venue):
     ingest(f, shard, delta(venue))
     assert f.book("a").bids[0][1] == Decimal("0.30")
     assert f.health("b").reason == "no_initial_snapshot"
+
+
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+def test_reads_stay_detached_across_updates_and_instruments(venue):
+    feed, shard = synthetic_feed(venue)
+    ingest(feed, shard, snapshot(venue, "a", seq=1))
+    ingest(feed, shard, snapshot(venue, "b", seq=2))
+    original = feed.book("a")
+    sibling = feed.book("b")
+    ingest(feed, shard, delta(venue, "a", seq=3))
+    changed = feed.book("a")
+    assert feed.book("a") is changed
+    assert feed.book("b") is sibling
+    price = Decimal("0.1234567890123456789")
+    assert changed.bids == ((price, Decimal("0.30")),)
+    assert original.bids == sibling.bids == ((price, Decimal("0.10")),)
+    assert changed.asks == original.asks == sibling.asks
 
 
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])

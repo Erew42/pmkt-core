@@ -246,8 +246,7 @@ class ManagedBookFeed:
             self._invalidate(shard, reason)
             return
         if self.venue == "polymarket":
-            diagnostics = shard.client.heartbeat_diagnostics()
-            if diagnostics["heartbeat_error_type"]:
+            if shard.client._heartbeat_error is not None:
                 self._invalidate(shard, "heartbeat_failed")
                 return
             # The socket reader timestamps receipt before placing the frame in
@@ -323,7 +322,7 @@ class ManagedBookFeed:
         if cached is not None:
             shard.native.poll_books(time.monotonic_ns())
             return cached
-        observed = shard.native.observation(instrument, time.monotonic_ns())["book"]
+        observed = shard.native.read_book(instrument, time.monotonic_ns())
         if observed is None:
             return None
         source = observed["source_timestamp_json"]
@@ -332,8 +331,7 @@ class ManagedBookFeed:
             (observed["market_id"] or "") if self.venue == "polymarket" else observed["market_id"],
             shard.health.shard_id,
             observed["generation"],
-            tuple((Decimal(p), Decimal(q)) for p, q in observed["bids"]),
-            tuple((Decimal(p), Decimal(q)) for p, q in observed["asks"]),
+            observed["bids"], observed["asks"],
             observed["received_monotonic_ns"] / 1_000_000_000,
             json.loads(source, parse_float=Decimal) if source is not None else None,
             tuple(observed["quality_flags"]), observed["metadata_revision"],
@@ -494,7 +492,7 @@ class ManagedBookFeed:
             raise ConnectionError(reason) from exc
         for instrument in touched:
             shard.cached.pop(instrument, None)
-        if self.venue == "kalshi":
+        if self.venue == "kalshi" and shard.sid is None:
             transport = native.transport()
             assert transport is not None
             _, shard.sid = transport

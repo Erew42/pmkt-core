@@ -1,4 +1,5 @@
 from collections.abc import Iterator, Sequence
+from decimal import Decimal
 from os import PathLike
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, final, overload
@@ -84,6 +85,16 @@ class _Observation(TypedDict):
     book: _Book | None
     health: _Health
 
+class _ManagedBookRead(TypedDict):
+    market_id: str | None
+    generation: int
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    received_monotonic_ns: int
+    source_timestamp_json: str | None
+    quality_flags: list[str]
+    metadata_revision: int
+
 @final
 class ShardFeed:
     def __init__(
@@ -105,6 +116,7 @@ class ShardFeed:
     @overload
     def ingest(self, shard_id: str, generation: int, frame: bytes, now_ns: int, *, detach: Literal[False]) -> list[str]: ...
     def health(self, instrument: str, now_ns: int) -> _Health: ...
+    def read_book(self, instrument: str, now_ns: int) -> _ManagedBookRead | None: ...
     def observation(self, instrument: str, now_ns: int) -> _Observation: ...
     def close(self) -> None: ...
 

@@ -1,7 +1,7 @@
 //! Synchronous shard state for a transport owned by the caller.
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, IdentityEvidence, SequenceCheck, Touched, UpdateKind, VenueBooks},
+    book::{Book, BookMode, IdentityEvidence, SequenceCheck, Touched, UpdateKind, VenueBooks},
     decimal::ScaledDecimal,
     health::{
         CORRECTIVE_DELTA_GRACE_NS, Flags, Integrity, QualityFlag as F, Recovery, RecoveryReason,
@@ -40,6 +40,49 @@ pub struct PublicBook {
     pub tick_size: Option<ScaledDecimal>,
     pub minimum_order_size: Option<ScaledDecimal>,
 }
+/// A usable book borrowed at the instant its connection and recovery deadlines were checked.
+/// Consumers can project depth directly into their own detached representation.
+pub struct BookRead<'a> {
+    pub book: &'a Book,
+    pub generation: u64,
+    pub received_monotonic_ns: u64,
+    pub source_timestamp: &'a SourceTime,
+    pub metadata_revision: u64,
+}
+
+impl BookRead<'_> {
+    pub fn bids(&self) -> impl ExactSizeIterator<Item = (ScaledDecimal, ScaledDecimal)> + '_ {
+        self.book
+            .native_levels()
+            .0
+            .iter()
+            .rev()
+            .map(|(&p, &s)| (p, s))
+    }
+
+    pub fn asks(&self) -> impl ExactSizeIterator<Item = (ScaledDecimal, ScaledDecimal)> + '_ {
+        self.book.native_levels().1.iter().map(|(&p, &s)| (p, s))
+    }
+
+    fn detach(&self, shard_id: &str) -> PublicBook {
+        PublicBook {
+            venue: self.book.mode().venue(),
+            instrument: self.book.instrument().into(),
+            market_id: self.book.market().map(str::to_owned),
+            shard_id: shard_id.into(),
+            generation: self.generation,
+            bids: self.bids().collect(),
+            asks: self.asks().collect(),
+            received_monotonic_ns: self.received_monotonic_ns,
+            source_timestamp: self.source_timestamp.clone(),
+            quality_flags: self.book.flags().clone(),
+            metadata_revision: self.metadata_revision,
+            tick_size: self.book.tick_size(),
+            minimum_order_size: self.book.minimum_size(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PublicBookHealth {
     pub venue: Venue,
@@ -308,7 +351,7 @@ impl ShardFeed {
         now_ns: u64,
     ) -> Result<Vec<Observation>> {
         self.ingest_with(shard_id, generation, bytes, now_ns, |feed, id| {
-            feed.observation(id, now_ns)
+            feed.observation(&id, now_ns)
         })
     }
     /// Apply the frame without detaching ladders. Consumers invalidate cached reads by ID.
@@ -319,9 +362,7 @@ impl ShardFeed {
         bytes: &[u8],
         now_ns: u64,
     ) -> Result<Vec<String>> {
-        self.ingest_with(shard_id, generation, bytes, now_ns, |_, id| {
-            Ok(id.to_owned())
-        })
+        self.ingest_with(shard_id, generation, bytes, now_ns, |_, id| Ok(id))
     }
     pub fn resolved(&self, id: &str) -> bool {
         self.books.resolved(id)
@@ -351,7 +392,7 @@ impl ShardFeed {
         generation: u64,
         bytes: &[u8],
         now_ns: u64,
-        project: impl FnMut(&mut Self, &str) -> Result<T>,
+        project: impl FnMut(&mut Self, String) -> Result<T>,
     ) -> Result<Vec<T>> {
         if shard_id != self.id {
             return Err(Error::Invalid("wrong shard".into()));
@@ -369,7 +410,7 @@ impl ShardFeed {
         &mut self,
         bytes: &[u8],
         now: u64,
-        mut project: impl FnMut(&mut Self, &str) -> Result<T>,
+        mut project: impl FnMut(&mut Self, String) -> Result<T>,
     ) -> Result<Vec<T>> {
         let messages =
             wire::live_messages(bytes).map_err(|_| Error::Invalid("malformed_frame".into()))?;
@@ -431,7 +472,7 @@ impl ShardFeed {
                 .apply_event(event, self.count, SequenceCheck::Connection)
             {
                 self.observe(&item, now);
-                observations.push(project(self, &item.instrument)?);
+                observations.push(project(self, item.instrument)?);
             }
         }
         Ok(observations)
@@ -516,19 +557,25 @@ impl ShardFeed {
             _ => {}
         }
     }
-    pub fn health(&mut self, id: &str, now_ns: u64) -> Result<PublicBookHealth> {
+    fn check_read_deadlines(&mut self, now_ns: u64) {
         self.check_liveness(now_ns);
         self.poll_books(now_ns);
-        let book = self
-            .books
+    }
+
+    fn known_book(&self, id: &str) -> Result<&Book> {
+        self.books
             .get(id)
-            .ok_or_else(|| Error::Invalid(format!("unknown instrument {id}")))?;
-        let (connection_state, reason, age) = match &self.connection {
-            Connection::Initialized => ("initialized", Some("not_started"), None),
-            Connection::Closed => ("closed", Some("closed"), None),
-            Connection::Disconnected(r) => ("disconnected", Some(r.as_str()), None),
-            Connection::Connected { alive, .. } => {
-                let reason = if self.books.resolved(id) {
+            .ok_or_else(|| Error::Invalid(format!("unknown instrument {id}")))
+    }
+
+    fn unavailable_reason(&self, book: &Book) -> Option<&str> {
+        let id = book.instrument();
+        match &self.connection {
+            Connection::Initialized => Some("not_started"),
+            Connection::Closed => Some("closed"),
+            Connection::Disconnected(reason) => Some(reason),
+            Connection::Connected { .. } => {
+                if self.books.resolved(id) {
                     Some(F::MarketResolved.as_str())
                 } else if let Some(phase) = self.recovery.get(id) {
                     Some(phase.reason().as_str())
@@ -538,8 +585,21 @@ impl ShardFeed {
                         Integrity::Impaired => Some(RecoveryReason::Integrity.as_str()),
                         Integrity::AwaitingSnapshot => Some(F::NoInitialSnapshot.as_str()),
                     }
-                };
-                ("connected", reason, Some(now_ns.saturating_sub(*alive)))
+                }
+            }
+        }
+    }
+
+    pub fn health(&mut self, id: &str, now_ns: u64) -> Result<PublicBookHealth> {
+        self.check_read_deadlines(now_ns);
+        let book = self.known_book(id)?;
+        let reason = self.unavailable_reason(book);
+        let (connection_state, age) = match self.connection {
+            Connection::Initialized => ("initialized", None),
+            Connection::Closed => ("closed", None),
+            Connection::Disconnected(_) => ("disconnected", None),
+            Connection::Connected { alive, .. } => {
+                ("connected", Some(now_ns.saturating_sub(alive)))
             }
         };
         Ok(PublicBookHealth {
@@ -559,33 +619,34 @@ impl ShardFeed {
             metadata_revision: self.revisions.get(id).copied().unwrap_or(0),
         })
     }
+
+    fn book_read<'a>(&'a self, book: &'a Book) -> BookRead<'a> {
+        let id = book.instrument();
+        let (received, timestamp) = &self.updates[id];
+        BookRead {
+            book,
+            generation: self.generation.expect("usable book is connected"),
+            received_monotonic_ns: *received,
+            source_timestamp: timestamp,
+            metadata_revision: self.revisions.get(id).copied().unwrap_or(0),
+        }
+    }
+
+    pub fn read_book(&mut self, id: &str, now_ns: u64) -> Result<Option<BookRead<'_>>> {
+        self.check_read_deadlines(now_ns);
+        let book = self.known_book(id)?;
+        Ok(self
+            .unavailable_reason(book)
+            .is_none()
+            .then(|| self.book_read(book)))
+    }
+
     pub fn observation(&mut self, id: &str, now_ns: u64) -> Result<Observation> {
         let health = self.health(id, now_ns)?;
-        let detached = if health.usable {
-            let b = self.books.get(id).expect("known instrument");
-            let (left, right) = b.native_levels();
-            let (received, timestamp) = &self.updates[id];
-            Some(PublicBook {
-                venue: self.venue,
-                instrument: id.into(),
-                market_id: b.market().map(str::to_owned),
-                shard_id: self.id.clone(),
-                generation: health.generation,
-                bids: left.iter().rev().map(|(&p, &s)| (p, s)).collect(),
-                asks: right.iter().map(|(&p, &s)| (p, s)).collect(),
-                received_monotonic_ns: *received,
-                source_timestamp: timestamp.clone(),
-                quality_flags: health.quality_flags.clone(),
-                metadata_revision: health.metadata_revision,
-                tick_size: b.tick_size(),
-                minimum_order_size: b.minimum_size(),
-            })
-        } else {
-            None
-        };
-        Ok(Observation {
-            book: detached,
-            health,
-        })
+        let book = health.usable.then(|| {
+            self.book_read(self.books.get(id).expect("known instrument"))
+                .detach(&self.id)
+        });
+        Ok(Observation { book, health })
     }
 }

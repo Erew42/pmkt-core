@@ -44,9 +44,7 @@ class Replay:
         shard.client = SimpleNamespace(
             is_connected=True,
             _last_inbound=None,
-            heartbeat_diagnostics=lambda: {
-                "heartbeat_error_type": None,
-            },
+            _heartbeat_error=None,
         )
         shard.restart = False
         shard.health.mark_connected(now_monotonic_ns=self.clock.ns)
