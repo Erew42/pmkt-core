@@ -602,9 +602,7 @@ class AsyncGammaClient:
                 break
             for market in page:
                 yield market
-            if len(page) < limit:
-                break
-            current_offset += limit
+            current_offset += len(page)
 
     async def iter_markets_keyset(
         self,
@@ -676,9 +674,7 @@ class AsyncGammaClient:
                 break
             for event in page:
                 yield event
-            if len(page) < limit:
-                break
-            current_offset += limit
+            current_offset += len(page)
 
 
 def _require_nonempty_string(value: object, name: str) -> None:

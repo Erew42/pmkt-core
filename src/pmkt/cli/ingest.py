@@ -396,10 +396,7 @@ async def _ingest_markets_async(
             markets.extend(page)
             if contract_evidence_out is not None:
                 evidence_pages.append((page, page_observed_at))
-            if len(page) < limit:
-                stop_reason = "short_page"
-                break
-            offset += limit
+            offset += len(page)
 
     df = markets_dataframe(markets)
     path = write_parquet(

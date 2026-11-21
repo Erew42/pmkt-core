@@ -199,6 +199,31 @@ async def test_market_with_events_uses_detail_closed_state_and_validates_key() -
     ]
 
 
+@pytest.mark.parametrize("endpoint", ["markets", "events"])
+async def test_offset_iterators_follow_short_pages(endpoint: str) -> None:
+    offsets = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        offset = int(request.url.params["offset"])
+        offsets.append(offset)
+        assert request.url.path == f"/{endpoint}"
+        field = "question" if endpoint == "markets" else "title"
+        rows = [
+            {"id": str(i), field: f"Item {i}"}
+            for i in range(offset, min(offset + 100, 218))
+        ]
+        return httpx.Response(200, json=rows)
+
+    async with AsyncGammaClient(transport=httpx.MockTransport(handler)) as client:
+        if endpoint == "markets":
+            ids = [item.id async for item in client.iter_markets(limit=200, offset=7)]
+        else:
+            ids = [item.id async for item in client.iter_events(limit=200, offset=7)]
+
+    assert ids == [str(i) for i in range(7, 218)]
+    assert offsets == [7, 107, 207, 218]
+
+
 async def test_markets_keyset_page_serializes_cursor_params() -> None:
     seen = {}
 
