@@ -515,8 +515,9 @@ async def compact_history(
                     CREATE TEMP VIEW pm_candidates_resolved AS
                     SELECT * FROM pm_candidates
                     UNION ALL BY NAME
-                    SELECT {pm_columns}, try_cast({_quote_sql(targeted_at)} AS TIMESTAMPTZ),
-                           'polymarket', 'targeted_conflict_read'
+                    SELECT {pm_columns},
+                           try_cast({_quote_sql(targeted_at)} AS TIMESTAMPTZ) AS _observed_at,
+                           'polymarket' AS _native_family, 'targeted_conflict_read' AS _source
                     FROM pm_targeted
                     """
             )
@@ -541,9 +542,10 @@ async def compact_history(
                     CREATE TEMP VIEW kx_candidates_resolved AS
                     SELECT * FROM kx_candidates
                     UNION ALL BY NAME
-                    SELECT {kx_columns}, try_cast({_quote_sql(targeted_at)} AS TIMESTAMPTZ),
-                           {_kalshi_family_sql("market_key")},
-                           'targeted_conflict_read'
+                    SELECT {kx_columns},
+                           try_cast({_quote_sql(targeted_at)} AS TIMESTAMPTZ) AS _observed_at,
+                           {_kalshi_family_sql("market_key")} AS _native_family,
+                           'targeted_conflict_read' AS _source
                     FROM kx_targeted
                     """
             )

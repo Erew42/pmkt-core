@@ -1534,6 +1534,36 @@ async def test_partition_family_overrides_legacy_ticker_through_compaction(
 
 
 @pytest.mark.asyncio
+async def test_compaction_publishes_targeted_same_time_conflict_reads(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm("pm-base")], kx_rows=[_kx("KXBASE")])
+    _seed_current(service, pm_rows=[_pm("pm-base")], kx_rows=[_kx("KXBASE")])
+    await service.refresh_current(
+        scope="standard",
+        polymarket_client=FakeGamma(targets={"pm-base": _pm("pm-base", closed=True)}),
+        kalshi_client=FakeKalshi(targets={"KXBASE": _kx("KXBASE", status="finalized")}),
+    )
+    await service.compact_history(
+        force=True,
+        polymarket_client=FakeGamma(
+            targets={"pm-base": _pm("pm-base", closed=True, question="Confirmed PM")}
+        ),
+        kalshi_client=FakeKalshi(
+            targets={"KXBASE": _kx("KXBASE", status="finalized", title="Confirmed KX")}
+        ),
+    )
+    with duckdb.connect(database=":memory:") as connection:
+        register_catalog_views(connection, service.market_root)
+        assert connection.execute(
+            "SELECT venue, question, native_family FROM market_catalog ORDER BY venue"
+        ).fetchall() == [
+            ("kalshi", "Confirmed KX", "kalshi_conventional"),
+            ("polymarket", "Confirmed PM", "polymarket"),
+        ]
+
+
+@pytest.mark.asyncio
 async def test_weekly_promotion_is_unique_and_compaction_selects_latest_upsert(
     tmp_path: Path,
 ) -> None:
