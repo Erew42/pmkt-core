@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -610,3 +612,26 @@ def test_validate_empty_parquet_requires_a_readable_footer(tmp_path):
     assert validate_run_manifest(manifest).ok
     dataset.write_bytes(b"")
     assert not validate_run_manifest(manifest).ok
+
+
+def test_interrupted_manifest_write_preserves_published_bytes(tmp_path, monkeypatch):
+    path = write_manifest(tmp_path / "manifest.json", {"status": "success"})
+    original = path.read_bytes()
+    real_open = Path.open
+
+    @contextmanager
+    def interrupted_open(self, *args, **kwargs):
+        with real_open(self, *args, **kwargs) as handle:
+            class InterruptedWriter:
+                def write(self, data):
+                    handle.write(data[:5])
+                    raise OSError("disk full")
+
+            yield InterruptedWriter()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", interrupted_open)
+        with pytest.raises(OSError, match="disk full"):
+            write_manifest(path, {"status": "replacement"})
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]

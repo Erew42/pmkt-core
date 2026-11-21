@@ -8,7 +8,9 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from math import isfinite
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from shutil import copymode
 from typing import Any, Callable, Iterable, Literal, Mapping, Sequence
+from uuid import uuid4
 
 import pandas as pd
 
@@ -172,7 +174,18 @@ def build_run_manifest(
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    target = output.resolve()
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    content = json.dumps(manifest, indent=2, sort_keys=True)
+    handle = temporary.open("x", encoding="utf-8")
+    try:
+        with handle as writer:
+            if target.exists():
+                copymode(target, temporary)
+            writer.write(content)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return output
 
 
