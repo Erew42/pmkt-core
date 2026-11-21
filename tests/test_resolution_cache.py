@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pandas as pd
 import pytest
 
@@ -848,6 +850,64 @@ async def test_cache_duplicate_polymarket_snapshots_do_not_use_close_time_as_fre
     assert row["resolution_state"] == STATE_METADATA_ONLY
     assert row["confidence"] == CONFIDENCE_METADATA_ONLY
     assert row["result"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("labels", [["Yes", "No"], ["No", "Yes"]])
+@pytest.mark.parametrize("changed_vector", [False, True])
+@pytest.mark.parametrize("timeout_first", [False, True])
+async def test_cache_refresh_with_missing_gamma_labels(
+    tmp_path: Path, labels: list[str], changed_vector: bool, timeout_first: bool,
+) -> None:
+    class Gamma:
+        timeout = False
+
+        async def market(self, market_id, *, expiry):
+            if self.timeout:
+                raise httpx.ReadTimeout("Gamma timed out")
+            return {"id": market_id, "outcomes": labels}
+
+    class Ctf:
+        vector = [1, 0]
+
+        async def ensure_polygon(self, *, expiry):
+            pass
+
+        async def payout_vector(self, condition_id, outcome_count, *, expiry):
+            return 1, self.vector
+
+    gamma, ctf = Gamma(), Ctf()
+    poly, kalshi = tmp_path / "poly.parquet", tmp_path / "kalshi.parquet"
+    _write_polymarket(poly, [{"market_id": "123", "condition_id": "0xabc"}])
+    _write_kalshi(kalshi, [])
+
+    async def refresh() -> dict[str, Any]:
+        summary = await cache_module.resolve_market_resolution_cache(
+            polymarket_markets_path=poly, kalshi_markets_path=kalshi, output_dir=tmp_path,
+            gamma_client=gamma, clob_client=FakeClob(), ctf_client=ctf, refresh=True,
+            kalshi_client=FakeKalshiClient(),
+        )
+        return pd.read_parquet(summary["output_path"]).to_dict("records")[0]
+
+    gamma.timeout = timeout_first
+    previous = await refresh()
+    assert is_authoritative_final_resolution(previous) is not timeout_first
+    gamma.timeout = not timeout_first
+    if changed_vector:
+        ctf.vector = [0, 1]
+    refreshed = await refresh()
+    if gamma.timeout:
+        assert any(obs.get("error_type") == "ReadTimeout"
+                   for obs in json.loads(refreshed["source_observations_json"]))
+    if changed_vector:
+        assert refreshed["error_type"] == "MarketResolutionCacheConflict"
+        assert not is_authoritative_final_resolution(refreshed)
+    else:
+        assert refreshed["winner"] == labels[0].lower()
+        assert [p["outcome"] for p in json.loads(refreshed["payouts_json"])] == [
+            label.lower() for label in labels
+        ]
+        assert is_authoritative_final_resolution(refreshed)
 
 
 @pytest.mark.asyncio

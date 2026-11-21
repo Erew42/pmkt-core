@@ -956,6 +956,20 @@ async def test_known_rows_without_raw_json_fall_back_to_payload_hash(
     assert result["counts"]["unchanged_or_not_newer"] == 1
 
 
+@pytest.mark.asyncio
+async def test_discovery_classifies_mixed_timestamp_precisions(tmp_path: Path) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm("known")])
+    rows = [
+        _pm("known", updated=NOW.replace(microsecond=1), question="New question"),
+        _pm("new", updated=NOW),
+    ]
+    result = await service.discover(
+        "polymarket",
+        client=FakeGamma({(False, None): {"markets": rows, "next_cursor": ""}}),
+    )
+    assert (result["counts"]["new"], result["counts"]["upsert"]) == (1, 1)
+
+
 def test_known_key_index_fingerprints_polymarket_contracts_only(
     tmp_path: Path,
 ) -> None:
@@ -1249,6 +1263,47 @@ async def test_standard_current_refresh_retains_original_mve_as_of(
 
 
 @pytest.mark.asyncio
+async def test_mve_lifecycle_resumes_from_start_of_last_full_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = _catalog(tmp_path)
+    closed_at = NOW + timedelta(seconds=5)
+    times = iter(NOW + timedelta(seconds=t) for t in (0, 10, 20, 30, 40, 50))
+    monkeypatch.setattr("pmkt.data.market_catalog.service.utc_now", lambda: next(times))
+
+    class Kalshi(FakeKalshi):
+        closed_requests = 0
+
+        async def markets_page(self, **kwargs: Any) -> dict[str, Any]:
+            if kwargs.get("status") == "closed":
+                self.closed_requests += 1
+                if (
+                    self.closed_requests == 2
+                    and kwargs["min_close_ts"] <= closed_at.timestamp()
+                ):
+                    row = _kx("KXMVE-CLOSED", updated=closed_at, status="closed")
+                    return {"markets": [row], "cursor": ""}
+            return await super().markets_page(**kwargs)
+
+    kalshi = Kalshi()
+    first = await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    assert first["artifacts"]["kalshi_lifecycle_upserts"]["rows"] == 0
+    assert first["artifacts"]["kalshi_mve_current_markets"]["as_of_utc"] == (
+        NOW + timedelta(seconds=10)
+    ).isoformat()
+    await service.refresh_current(
+        scope="standard", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    second = await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    assert second["artifacts"]["kalshi_lifecycle_upserts"]["rows"] == 1
+    assert kalshi.calls[-1]["min_settled_ts"] == int(NOW.timestamp())
+
+
+@pytest.mark.asyncio
 async def test_full_current_refresh_exhausts_mve_close_and_settlement_windows(
     tmp_path: Path,
 ) -> None:
@@ -1275,6 +1330,19 @@ async def test_full_current_refresh_exhausts_mve_close_and_settlement_windows(
     assert result["artifacts"]["kalshi_mve_current_markets"]["rows"] == 1
     assert any("min_close_ts" in call for call in kalshi.calls)
     assert any("min_settled_ts" in call for call in kalshi.calls)
+
+
+@pytest.mark.asyncio
+async def test_mve_lifecycle_uses_legacy_as_of_without_a_manifest(tmp_path: Path) -> None:
+    service = _catalog(tmp_path)
+    _, as_of = _seed_current(service, pm_rows=[], kx_rows=[])
+    kalshi = FakeKalshi()
+    await service.refresh_current(
+        scope="all", polymarket_client=FakeGamma(), kalshi_client=kalshi
+    )
+    cutoff = int(datetime.fromisoformat(as_of).timestamp())
+    assert kalshi.calls[-2]["min_close_ts"] == cutoff
+    assert kalshi.calls[-1]["min_settled_ts"] == cutoff
 
 
 @pytest.mark.asyncio
@@ -1517,6 +1585,92 @@ async def test_partition_family_overrides_legacy_ticker_through_compaction(
             "kalshi_mve",
         ),
     }
+
+
+@pytest.mark.asyncio
+async def test_compaction_publishes_targeted_same_time_conflict_reads(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm("pm-base")], kx_rows=[_kx("KXBASE")])
+    _seed_current(service, pm_rows=[_pm("pm-base")], kx_rows=[_kx("KXBASE")])
+    await service.refresh_current(
+        scope="standard",
+        polymarket_client=FakeGamma(targets={"pm-base": _pm("pm-base", closed=True)}),
+        kalshi_client=FakeKalshi(targets={"KXBASE": _kx("KXBASE", status="finalized")}),
+    )
+    await service.compact_history(
+        force=True,
+        polymarket_client=FakeGamma(
+            targets={"pm-base": _pm("pm-base", closed=True, question="Confirmed PM")}
+        ),
+        kalshi_client=FakeKalshi(
+            targets={"KXBASE": _kx("KXBASE", status="finalized", title="Confirmed KX")}
+        ),
+    )
+    with duckdb.connect(database=":memory:") as connection:
+        register_catalog_views(connection, service.market_root)
+        assert connection.execute(
+            "SELECT venue, question, native_family FROM market_catalog ORDER BY venue"
+        ).fetchall() == [
+            ("kalshi", "Confirmed KX", "kalshi_conventional"),
+            ("polymarket", "Confirmed PM", "polymarket"),
+        ]
+
+
+@pytest.mark.asyncio
+async def test_compaction_targeted_conflict_read_preserves_explicit_kalshi_family(
+    tmp_path: Path,
+) -> None:
+    service = _catalog(tmp_path)
+    pointer, manifest_path, manifest = _history_pointer_and_manifest(service)
+    kx_path = Path(manifest["artifacts"]["kalshi_all_markets"]["path"])
+    kx_path.unlink()
+    parts = []
+    for bucket, title in enumerate(("Version A", "Version B")):
+        part = (
+            kx_path
+            / "source=compacted_base"
+            / "native_family=kalshi_mve"
+            / f"bucket={bucket}"
+            / "part-000000.parquet"
+        )
+        write_parquet(
+            kalshi_markets_dataframe([_kx("KX-EXPLICIT-MVE", title=title)]),
+            part,
+            schema=KALSHI_MARKET_SNAPSHOT_SCHEMA_VERSION,
+            strict=True,
+        )
+        parts.append(part)
+    descriptor = {
+        "format": "partitioned_parquet",
+        "parquet_file_count": 2,
+        "path": str(kx_path.resolve()),
+        "rows": 2,
+        "sha256": None,
+        "tree_sha256": tree_sha256(kx_path),
+        "size_bytes": sum(path.stat().st_size for path in parts),
+    }
+    manifest["artifacts"]["kalshi_all_markets"] = descriptor
+    manifest["base_row_count"] = 3
+    pointer["kalshi_all_markets"] = dict(descriptor)
+    _write_history_pointer_and_manifest(
+        service,
+        pointer=pointer,
+        manifest_path=manifest_path,
+        manifest=manifest,
+    )
+
+    await service.compact_history(
+        force=True,
+        kalshi_client=FakeKalshi(
+            targets={"KX-EXPLICIT-MVE": _kx("KX-EXPLICIT-MVE", title="Confirmed MVE")}
+        ),
+    )
+    with duckdb.connect(database=":memory:") as connection:
+        register_catalog_views(connection, service.market_root)
+        assert connection.execute(
+            "SELECT market_key, title, native_family FROM market_catalog_kalshi"
+        ).fetchall() == [("KX-EXPLICIT-MVE", "Confirmed MVE", "kalshi_mve")]
 
 
 @pytest.mark.asyncio

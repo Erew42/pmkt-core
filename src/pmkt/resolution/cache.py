@@ -49,7 +49,12 @@ from pmkt.resolution.models import (
     error_record,
 )
 from pmkt.resolution.polymarket import PolymarketResolutionResolver
-from pmkt.resolution.terminal_labels import POLYMARKET_DEFAULT_LABEL_SOURCE, _ordered_outcomes
+from pmkt.resolution.terminal_labels import (
+    POLYMARKET_DEFAULT_LABEL_SOURCE,
+    _ordered_outcomes,
+    _polymarket_outcome_mapping_assumed,
+    payout_fraction,
+)
 
 POLYMARKET_RESOLUTION_COLUMNS = [
     "market_id",
@@ -444,15 +449,43 @@ def _terminal_key(row: dict[str, Any]) -> tuple[str, Any] | None:
     return None
 
 
-def _canonical_final_conflict(
-    existing_row: dict[str, Any],
-    refreshed_row: dict[str, Any],
-) -> bool:
-    if not (_is_canonical_final(existing_row) and _is_canonical_final(refreshed_row)):
-        return False
+def _ctf_index_key(row: dict[str, Any]) -> tuple[str, Any] | None:
+    condition = _field_text(row, "condition_id")
+    payouts = _decode_observations(row.get("payouts_json"))
+    if not condition or not payouts or row.get("canonical_source") != "polygon_ctf":
+        return None
+    by_index: dict[int, str] = {}
+    for payout in payouts:
+        index = payout.get("outcome_index")
+        value = payout_fraction(payout)
+        if type(index) is not int or value is None:
+            return None
+        by_index[index] = str(value)
+    indices = range(len(payouts))
+    if set(by_index) != set(indices):
+        return None
+    return ("ctf_payouts", (condition.lower(), tuple(by_index[i] for i in indices)))
+
+
+def _merge_canonical_finals(
+    existing_row: dict[str, Any], refreshed_row: dict[str, Any]
+) -> dict[str, Any]:
     existing_key = _terminal_key(existing_row)
     refreshed_key = _terminal_key(refreshed_row)
-    return existing_key is not None and refreshed_key is not None and existing_key != refreshed_key
+    if existing_row.get("resolver_version") in COMPATIBLE_RESOLVER_VERSIONS:
+        refreshed_assumed = _polymarket_outcome_mapping_assumed(refreshed_row)
+        if refreshed_assumed or _polymarket_outcome_mapping_assumed(existing_row):
+            # CTF settles an index. A default outcome name cannot contradict
+            # a verified label, or hide a change to the underlying index payout.
+            old_vector = _ctf_index_key(existing_row)
+            new_vector = _ctf_index_key(refreshed_row)
+            if old_vector is not None and new_vector is not None:
+                existing_key, refreshed_key = old_vector, new_vector
+                if refreshed_assumed and old_vector == new_vector:
+                    return _carry_forward_final(existing_row, refreshed_row)
+    if existing_key is not None and refreshed_key is not None and existing_key != refreshed_key:
+        return _inconsistent_cache_conflict(existing_row, refreshed_row, existing_key, refreshed_key)
+    return refreshed_row
 
 
 def _is_cache_conflict(row: dict[str, Any]) -> bool:
@@ -465,6 +498,8 @@ def _is_cache_conflict(row: dict[str, Any]) -> bool:
 def _inconsistent_cache_conflict(
     existing_row: dict[str, Any],
     refreshed_row: dict[str, Any],
+    existing_key: tuple[str, Any],
+    refreshed_key: tuple[str, Any],
 ) -> dict[str, Any]:
     platform = str(refreshed_row.get("platform") or existing_row.get("platform"))
     market_key = str(refreshed_row.get("market_key") or existing_row.get("market_key"))
@@ -486,8 +521,8 @@ def _inconsistent_cache_conflict(
         resolver_version=RESOLVER_VERSION,
         error_type="MarketResolutionCacheConflict",
         error_message=(
-            f"Existing canonical result {_terminal_key(existing_row)!r} conflicts with "
-            f"refreshed canonical result {_terminal_key(refreshed_row)!r}"
+            f"Existing canonical result {existing_key!r} conflicts with "
+            f"refreshed canonical result {refreshed_key!r}"
         ),
     )
 
@@ -673,16 +708,11 @@ async def resolve_market_resolution_cache(
         pair = _row_pair(row)
         existing_row = existing_merge_rows.get(pair)
         if existing_row is not None:
-            if pair in existing_legacy_rows:
-                if _canonical_final_conflict(existing_row, row):
-                    rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)
-                else:
-                    rows_by_pair[pair] = row
-            elif _is_cache_conflict(existing_row):
+            if _is_cache_conflict(existing_row):
                 rows_by_pair[pair] = _carry_forward_final(existing_row, row)
-            elif _canonical_final_conflict(existing_row, row):
-                rows_by_pair[pair] = _inconsistent_cache_conflict(existing_row, row)
-            elif _is_weaker_than_current_final(row):
+            elif _is_canonical_final(existing_row) and _is_canonical_final(row):
+                rows_by_pair[pair] = _merge_canonical_finals(existing_row, row)
+            elif pair not in existing_legacy_rows and _is_weaker_than_current_final(row):
                 rows_by_pair[pair] = _carry_forward_final(existing_row, row)
             else:
                 rows_by_pair[pair] = row

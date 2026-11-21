@@ -1043,7 +1043,9 @@ class MarketCatalogService:
                 [venue],
             ).df()
         is_new = classified["known_hash"].isna()
-        observed_time = pd.to_datetime(classified["observed_updated_at"], utc=True)
+        observed_time = pd.to_datetime(
+            classified["observed_updated_at"], format="ISO8601", utc=True
+        )
         known_time = pd.to_datetime(classified["known_updated_at"], utc=True)
         payload_changed = classified["observed_hash"].ne(classified["known_hash"])
         # Polymarket compares contract fields where both sides have them.
@@ -1409,6 +1411,27 @@ class MarketCatalogService:
                 reopenings[bucket].append(row)
         return reopenings, upserts, sorted(set(unresolved))
 
+    def _prior_mve_lifecycle_cutoff(self, previous: Mapping[str, Any]) -> datetime | None:
+        prior_mve = previous.get("kalshi_mve_current_markets")
+        if not isinstance(prior_mve, dict):
+            return None
+        as_of = parse_timestamp(prior_mve.get("as_of_utc"))
+        # A close or settlement after its page was read can precede publication.
+        # Standard refreshes carry the last full MVE scan forward.
+        reference = previous.get("manifest")
+        while isinstance(reference, dict):
+            manifest = _read_json(self._resolve_ref(reference))
+            if manifest.get("schema_version") != CURRENT_MANIFEST_SCHEMA:
+                break
+            if manifest.get("scope") == "all":
+                started = parse_timestamp(manifest.get("started_at_utc"))
+                if started is not None:
+                    return min(started, as_of) if as_of is not None else started
+                break
+            reference = manifest.get("predecessor_manifest")
+        # Legacy census pointers only record their as-of time.
+        return as_of
+
     async def refresh_current(
         self,
         *,
@@ -1471,14 +1494,9 @@ class MarketCatalogService:
                     native_family="kalshi_mve",
                     **page_overrides,
                 )
-                prior_mve = previous.get("kalshi_mve_current_markets")
-                prior_as_of = (
-                    parse_timestamp(prior_mve.get("as_of_utc"))
-                    if isinstance(prior_mve, dict)
-                    else None
-                )
-                if prior_as_of is not None:
-                    lifecycle_cutoff = prior_as_of
+                prior_cutoff = self._prior_mve_lifecycle_cutoff(previous)
+                if prior_cutoff is not None:
+                    lifecycle_cutoff = prior_cutoff
                     lifecycle_cutoff_source = "prior_current_mve"
                 elif bootstrap_cutoff is not None:
                     lifecycle_cutoff = bootstrap_cutoff
