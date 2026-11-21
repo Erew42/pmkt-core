@@ -1043,7 +1043,9 @@ class MarketCatalogService:
                 [venue],
             ).df()
         is_new = classified["known_hash"].isna()
-        observed_time = pd.to_datetime(classified["observed_updated_at"], utc=True)
+        observed_time = pd.to_datetime(
+            classified["observed_updated_at"], format="ISO8601", utc=True
+        )
         known_time = pd.to_datetime(classified["known_updated_at"], utc=True)
         payload_changed = classified["observed_hash"].ne(classified["known_hash"])
         # Polymarket compares contract fields where both sides have them.

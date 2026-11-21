@@ -956,6 +956,20 @@ async def test_known_rows_without_raw_json_fall_back_to_payload_hash(
     assert result["counts"]["unchanged_or_not_newer"] == 1
 
 
+@pytest.mark.asyncio
+async def test_discovery_classifies_mixed_timestamp_precisions(tmp_path: Path) -> None:
+    service = _catalog(tmp_path, pm_rows=[_pm("known")])
+    rows = [
+        _pm("known", updated=NOW.replace(microsecond=1), question="New question"),
+        _pm("new", updated=NOW),
+    ]
+    result = await service.discover(
+        "polymarket",
+        client=FakeGamma({(False, None): {"markets": rows, "next_cursor": ""}}),
+    )
+    assert (result["counts"]["new"], result["counts"]["upsert"]) == (1, 1)
+
+
 def test_known_key_index_fingerprints_polymarket_contracts_only(
     tmp_path: Path,
 ) -> None:
