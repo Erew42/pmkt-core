@@ -44,12 +44,12 @@ def _cleanup_passing_tmp_path(item: pytest.Item) -> bool:
     return not tmp_path.exists()
 
 
-@pytest.hookimpl(wrapper=True, tryfirst=True)
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
 def pytest_runtest_makereport(
     item: pytest.Item, call: pytest.CallInfo[object]
-) -> Generator[None, pytest.TestReport, pytest.TestReport]:
-    report = yield
+) -> Generator[None, None, None]:
+    outcome = yield
+    report = outcome.get_result()
     item.stash.setdefault(_PHASE_FAILED_KEY, {})[report.when] = bool(report.failed)
     if report.when == "teardown":
         _cleanup_passing_tmp_path(item)
-    return report
