@@ -4,6 +4,9 @@ from os import PathLike
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, final, overload
 
+from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
+from pmkt.exchanges.polymarket.ws import MarketBookState
+
 @final
 class ArrowStream:
     """A one-shot Arrow C stream, consumable by a PyCapsule-aware reader."""
@@ -121,26 +124,13 @@ class ShardFeed:
     def close(self) -> None: ...
 
 
-class _LocalState(TypedDict):
-    initialized: bool
-    flags: list[str]
-    first: list[tuple[str, str]]
-    second: list[tuple[str, str]]
-    sid: int | None
-    seq: int | None
-    hash: str | None
-    tick: str | None
-
-class _LocalBook(_LocalState):
-    valid: bool
-    bid: str | None
-    ask: str | None
-
 def book_integrity(initialized: bool, quality_flags: Sequence[str]) -> bool: ...
-def update_local_book(
-    venue_name: str, instrument: str, state: _LocalState, message: str, *,
-    use_yes_price: bool = True, quotes: tuple[str | None, str | None] | None = None,
-) -> _LocalBook: ...
+def update_market_book(
+    state: MarketBookState, event_type: str, message: dict[str, object], change: dict[str, object] | None = None,
+) -> bool: ...
+def update_kalshi_book(
+    state: KalshiOrderBookState, event_type: str, body: dict[str, object], sid: int | None, seq: int | None,
+) -> tuple[Decimal | None, Decimal | None]: ...
 
 class _RecordingBook(TypedDict):
     instrument: str

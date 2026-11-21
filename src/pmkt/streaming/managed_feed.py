@@ -6,12 +6,12 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field
 from decimal import Decimal
-import json
 import math
 import time
 from typing import Any, Awaitable, Callable, Literal, Sequence, TypeVar
 
 from pmkt import _native
+from pmkt.exchanges._ws_book import decode_decimal_json
 from pmkt.exchanges.kalshi.ws import (
     AsyncKalshiWebSocketClient,
     normalize_market_tickers,
@@ -333,7 +333,7 @@ class ManagedBookFeed:
             observed["generation"],
             observed["bids"], observed["asks"],
             observed["received_monotonic_ns"] / 1_000_000_000,
-            json.loads(source, parse_float=Decimal) if source is not None else None,
+            decode_decimal_json(source) if source is not None else None,
             tuple(observed["quality_flags"]), observed["metadata_revision"],
         )
         shard.cached[instrument] = result

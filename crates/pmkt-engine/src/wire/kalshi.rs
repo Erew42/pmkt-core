@@ -24,6 +24,21 @@ pub(super) fn body(message: &Value) -> &Value {
         .unwrap_or(message)
 }
 
+pub const DELTA_PRICE_FIELDS: [&str; 2] = ["price_dollars", "price"];
+pub const DELTA_SIZE_FIELDS: [&str; 3] = ["delta_fp", "delta", "size_delta"];
+
+pub fn relative(side: &str, price: Option<D>, delta: Option<D>) -> Action {
+    Action::Relative {
+        side: match side.to_ascii_lowercase().as_str() {
+            "yes" => Some(Side::First),
+            "no" => Some(Side::Second),
+            _ => None,
+        },
+        price: price.filter(|p| p.is_probability()),
+        delta,
+    }
+}
+
 pub fn decode(message: &Value) -> Result<Event> {
     let kind = message["type"].as_str().unwrap_or("");
     let body = body(message);
@@ -52,29 +67,13 @@ pub fn decode(message: &Value) -> Result<Event> {
         seq: message["seq"].as_i64(),
     });
     let action = if kind == "orderbook_snapshot" {
-        let [yes, no] = snapshot_sides(Venue::Kalshi, body);
-        Action::Snapshot(Snapshot {
-            first: levels(yes, true),
-            second: levels(no, true),
-            hash: None,
-            tick: Metadata::Absent,
-            minimum: Metadata::Absent,
-        })
+        Action::Snapshot(snapshot(Venue::Kalshi, body))
     } else {
-        Action::Relative {
-            side: match body["side"]
-                .as_str()
-                .unwrap_or("")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "yes" => Some(Side::First),
-                "no" => Some(Side::Second),
-                _ => None,
-            },
-            price: price(first(body, &["price_dollars", "price"])),
-            delta: decimal(first(body, &["delta_fp", "delta", "size_delta"])),
-        }
+        relative(
+            body["side"].as_str().unwrap_or(""),
+            decimal(first(body, &DELTA_PRICE_FIELDS)),
+            decimal(first(body, &DELTA_SIZE_FIELDS)),
+        )
     };
     Ok(Event::Books(vec![Update {
         instrument,

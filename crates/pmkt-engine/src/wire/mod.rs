@@ -174,14 +174,32 @@ fn snapshot_sides(venue: Venue, body: &Value) -> [Option<&Value>; 2] {
     }
 }
 
+/// Decode the depth-bearing body of a full book on either venue.
+pub fn snapshot(venue: Venue, body: &Value) -> Snapshot {
+    let [first, second] = snapshot_sides(venue, body);
+    let kalshi = venue == Venue::Kalshi;
+    let (hash, tick, minimum) = if kalshi {
+        (None, Metadata::Absent, Metadata::Absent)
+    } else {
+        (
+            text(body.get("hash")),
+            Metadata::read(body.get("tick_size")),
+            Metadata::read(body.get("min_order_size")),
+        )
+    };
+    Snapshot {
+        first: levels(first, kalshi),
+        second: levels(second, kalshi),
+        hash,
+        tick,
+        minimum,
+    }
+}
+
 type SnapshotSpelling<'a> = BTreeMap<D, (&'a Value, &'a Value)>;
 
 /// Keep the legacy Decimal spelling of accepted snapshot levels at the Python boundary.
-pub fn snapshot_spelling(venue: Venue, message: &Value) -> [SnapshotSpelling<'_>; 2] {
-    let body = match venue {
-        Venue::Polymarket => message,
-        Venue::Kalshi => kalshi::body(message),
-    };
+pub fn snapshot_spelling(venue: Venue, body: &Value) -> [SnapshotSpelling<'_>; 2] {
     snapshot_sides(venue, body).map(|side| {
         let mut spelling = SnapshotSpelling::new();
         visit_levels(side, true, |price, _, p, q| {
@@ -266,6 +284,16 @@ pub enum Action {
     },
 }
 impl Action {
+    pub fn relative_level(&self) -> Option<(Side, D)> {
+        match self {
+            Self::Relative {
+                side: Some(side),
+                price: Some(price),
+                delta: Some(_),
+            } => Some((*side, *price)),
+            _ => None,
+        }
+    }
     pub fn is_snapshot(&self) -> bool {
         matches!(self, Self::Snapshot(_))
     }

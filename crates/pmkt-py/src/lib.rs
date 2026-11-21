@@ -2,6 +2,7 @@ mod arrow;
 mod book;
 mod capture;
 mod feed;
+mod local_book;
 mod merge;
 
 use pyo3::{exceptions::PyValueError, prelude::*};
@@ -32,7 +33,8 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<merge::CopyMerge>()?;
     module.add("MergeError", module.py().get_type::<merge::MergeError>())?;
     module.add_function(wrap_pyfunction!(book::book_integrity, module)?)?;
-    module.add_function(wrap_pyfunction!(book::update_local_book, module)?)?;
+    module.add_function(wrap_pyfunction!(local_book::update_market_book, module)?)?;
+    module.add_function(wrap_pyfunction!(local_book::update_kalshi_book, module)?)?;
     module.add_function(wrap_pyfunction!(merge::message_key, module)?)?;
     module.add_function(wrap_pyfunction!(merge::snapshot_class, module)?)?;
     module.add_function(wrap_pyfunction!(merge::conflated_subscription, module)?)?;
