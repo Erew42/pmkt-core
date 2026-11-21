@@ -826,6 +826,12 @@ fn kind(mut frame: Value, frame_type: &str, direction: &str) -> Value {
     frame
 }
 
+fn session(copy: &str, frames: &[Value]) -> (String, String, PathBuf) {
+    let path = root();
+    seal(&path, 1, frames, None);
+    (copy.into(), "conn".into(), path)
+}
+
 fn merged_topbooks(venue: Venue, sessions: Vec<(String, String, PathBuf)>) -> Vec<RecordBatch> {
     let mut rows = vec![];
     reconstruct_merged(
@@ -841,6 +847,57 @@ fn merged_topbooks(venue: Venue, sessions: Vec<(String, String, PathBuf)>) -> Ve
     )
     .unwrap();
     rows
+}
+
+// The last published top-of-book row of one instrument: (valid, best bid, best ask).
+fn last_quote(rows: &[RecordBatch], instrument: &str) -> (bool, Option<f64>, Option<f64>) {
+    let b = rows
+        .iter()
+        .rev()
+        .find(|b| column::<StringArray>(b, "instrument_id").value(0) == instrument)
+        .unwrap();
+    let price = |name: &str| {
+        let c = column::<Float64Array>(b, name);
+        (!c.is_null(0)).then(|| c.value(0))
+    };
+    (
+        column::<BooleanArray>(b, "valid_state").value(0),
+        price("best_bid_dollars"),
+        price("best_ask_dollars"),
+    )
+}
+
+fn poly_book(asset: &str, market: &str) -> Value {
+    json!({"event_type":"book","market":market,"asset_id":asset,"timestamp":"1700000000000","hash":"h1",
+        "bids":[{"price":"0.4","size":"1"}],"asks":[{"price":"0.5","size":"3"},{"price":"0.7","size":"4"}]})
+}
+
+#[test]
+fn the_corrective_delta_deadline_ignores_the_other_recorders_monotonic_clock() {
+    let change = |side, size| {
+        json!({"event_type":"price_change","market":"M","timestamp":"1700000000001",
+            "price_changes":[{"asset_id":"X","side":side,"price":"0.5","size":size,
+                "hash":"h2","best_bid":"0.5","best_ask":"0.7"}]})
+    };
+    let messages = [poly_book("X", "M"), change("BUY", "2"), change("SELL", "0")];
+    // Two hosts: the second one's monotonic clock started two hours earlier.
+    let host = |copy, micros: [i64; 3], offset_ns: u64| {
+        let frames: Vec<_> = (1..)
+            .zip(micros.into_iter().zip(&messages))
+            .map(|(seq, (us, m))| {
+                let mono = 1_000_000_000 + us as u64 * 1000 + offset_ns;
+                timed(seq, "polymarket", us, mono, m.clone())
+            })
+            .collect();
+        session(copy, &frames)
+    };
+    let a = host("a", [100, 1100, 2000], 0);
+    let b = host("b", [200, 1200, 1900], 7_200_000_000_000);
+    // The winning copy changes to b for the corrective delta, 0.8 ms after the crossing.
+    for sources in [vec![a.clone()], vec![b.clone()], vec![a, b]] {
+        let rows = merged_topbooks(Venue::Polymarket, sources);
+        assert_eq!(last_quote(&rows, "X"), (true, Some(0.5), Some(0.7)));
+    }
 }
 
 fn kalshi_channel_session(error: Option<Value>) -> Vec<Value> {

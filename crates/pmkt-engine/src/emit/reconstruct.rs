@@ -52,6 +52,9 @@ struct Receipt<'a> {
     utc: &'a str,
     us: i64,
     monotonic_ns: u64,
+    /// The clock for the corrective-delta deadline. A single session reads its own
+    /// monotonic clock; a merged stream needs one clock shared by its recorders.
+    clock_ns: u64,
     sequence: u64,
     recording_id: &'a str,
 }
@@ -93,7 +96,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         for id in self
             .books
             .complementary
-            .expired_instruments(self.count, frame.monotonic_ns)
+            .expired_instruments(self.count, frame.clock_ns)
         {
             self.books.reset_book(&id);
         }
@@ -176,7 +179,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
                 && !self
                     .books
                     .complementary
-                    .defer(&item.instrument, self.count, frame.monotonic_ns)
+                    .defer(&item.instrument, self.count, frame.clock_ns)
             {
                 self.books.reset_book(&item.instrument);
             }
@@ -272,6 +275,12 @@ pub fn reconstruct_merged(
         |m| {
             on_message(&m)?;
             let origin = m.origin();
+            // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
+            // time already orders the merge, so it also times the corrective-delta deadline.
+            let clock_ns = u64::try_from(origin.received_us)
+                .ok()
+                .and_then(|us| us.checked_mul(1_000))
+                .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
             if period
                 .replace(origin.coverage_period)
                 .is_some_and(|old| old != origin.coverage_period)
@@ -311,6 +320,7 @@ pub fn reconstruct_merged(
                     utc: &origin.received_utc,
                     us: origin.received_us,
                     monotonic_ns: origin.received_monotonic_ns,
+                    clock_ns,
                     sequence: origin.frame_seq,
                     recording_id: &origin.recording_id,
                 },
@@ -389,6 +399,7 @@ pub fn reconstruct_session(
                 utc: &f.received_utc,
                 us: received_us(&f.received_utc)?,
                 monotonic_ns: f.received_monotonic_ns,
+                clock_ns: f.received_monotonic_ns,
                 sequence: f.local_frame_seq,
                 recording_id: &f.recording_id,
             };
