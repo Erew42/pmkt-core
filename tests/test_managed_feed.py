@@ -9,6 +9,7 @@ from websockets.protocol import State
 
 from pmkt.streaming.managed_feed import ManagedBookFeed
 from pmkt.exchanges._ws_book import encode_message
+from pmkt.exchanges.polymarket.ws import AsyncMarketWebSocketClient
 
 
 class Auth:
@@ -174,8 +175,9 @@ def synthetic_feed(venue, instruments=("a", "b")):
     shard.restart = False
     shard.client = SimpleNamespace(
         is_connected=True,
+        _last_inbound=None,
         heartbeat_diagnostics=lambda: {
-            "inbound_age_seconds": 0.0, "heartbeat_error_type": None,
+            "heartbeat_error_type": None,
         },
     )
     shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
@@ -490,6 +492,45 @@ async def test_reader_latches_expired_liveness_before_monitor_wakes(venue, advan
         socket.put(snapshot(venue))
         assert f.book("a") is None
         await until(lambda: socket.closed)
+
+
+@pytest.mark.asyncio
+async def test_queued_polymarket_delta_does_not_extend_socket_liveness(monkeypatch):
+    from pmkt.streaming import managed_feed
+
+    now = 1
+    monkeypatch.setattr(managed_feed, "time", SimpleNamespace(monotonic_ns=lambda: now * 10**9))
+    connections = Connections()
+    f = feed("polymarket", connections, probe_interval=2, liveness_timeout=10)
+    shard = f._shards[0]
+    async with AsyncMarketWebSocketClient(
+        ["a"], connect_factory=connections, heartbeat_clock=lambda: now,
+    ) as client:
+        shard.client = client
+        shard.restart = False
+        shard.health.mark_connected(now_monotonic_ns=now * 10**9)
+        shard.native.connected(shard.generation, now * 10**9)
+        socket = connections.sockets[0]
+        frames = client._iter_raw_frames()
+        try:
+            socket.put(snapshot("polymarket"))
+            f._ingest_raw(shard, await asyncio.wait_for(anext(frames), 3))
+            now = 2
+            socket.put(delta("polymarket"))
+            await until(lambda: client.heartbeat_diagnostics()["receive_queue_frames"] == 1)
+            now = 9
+            assert f.health("a").usable
+            f._ingest_raw(shard, await anext(frames))
+            assert f.book("a").bids[0][1] == Decimal("0.30")
+            assert f.health("a").liveness_age_seconds == 7
+
+            now = 13
+            health = f.health("a")
+            assert health.reason == "liveness_expired"
+            assert not health.usable
+            assert f.book("a") is None
+        finally:
+            await frames.aclose()
 
 
 @pytest.mark.asyncio

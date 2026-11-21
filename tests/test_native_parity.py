@@ -43,8 +43,8 @@ class Replay:
         shard.generation = 1
         shard.client = SimpleNamespace(
             is_connected=True,
+            _last_inbound=None,
             heartbeat_diagnostics=lambda: {
-                "inbound_age_seconds": 0,
                 "heartbeat_error_type": None,
             },
         )

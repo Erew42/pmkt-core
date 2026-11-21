@@ -183,6 +183,7 @@ class ManagedBookFeed:
                 venue, health.shard_id, ids_in_shard,
                 liveness_ns=_timeout_ns(liveness_timeout),
                 snapshot_ns=_timeout_ns(snapshot_timeout),
+                polymarket_socket_liveness=venue == "polymarket",
             )
             self._shards.append(_Shard(health, native))
         self._by_instrument = {
@@ -249,8 +250,10 @@ class ManagedBookFeed:
             if diagnostics["heartbeat_error_type"]:
                 self._invalidate(shard, "heartbeat_failed")
                 return
-            if (age := diagnostics["inbound_age_seconds"]) is not None:
-                evidence = now_ns - round(age * 1_000_000_000)
+            # The socket reader timestamps receipt before placing the frame in
+            # the queue. Use that timestamp directly on every poll.
+            if (received := shard.client._last_inbound) is not None:
+                evidence = round(received * 1_000_000_000)
                 transport = shard.native.transport()
                 if transport is not None and evidence > transport[0]:
                     shard.native.heartbeat(shard.generation, evidence)

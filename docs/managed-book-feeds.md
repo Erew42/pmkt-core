@@ -136,7 +136,7 @@ Fault scope is explicit:
 
 Polymarket locked or crossed depth from a price change is withheld immediately
 with reason `crossed_book`. Only these nonpersistent ladder flags qualify for a
-grace owned by `pmkt.exchanges.polymarket.recovery.CORRECTIVE_DELTA_GRACE_SECONDS`. During the grace, any `price_change` or `book` message that leaves
+grace owned by `CORRECTIVE_DELTA_GRACE_NS` in `crates/pmkt-engine/src/health.rs`. During the grace, any `price_change` or `book` message that leaves
 the retained ladder intact clears the recovery; best-price hints and activity
 events do not change the ladder. Repeated invalid updates
 do not extend the deadline. Reads and ingress latch expiry before a late update

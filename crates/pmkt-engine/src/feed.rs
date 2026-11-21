@@ -86,6 +86,7 @@ pub struct ShardFeed {
     venue: Venue,
     generation: Option<u64>,
     timeouts: FeedTimeouts,
+    polymarket_socket_liveness: bool,
     initial_deadline_checked: bool,
     connection: Connection,
     books: VenueBooks,
@@ -116,6 +117,7 @@ impl ShardFeed {
             venue,
             generation: None,
             timeouts,
+            polymarket_socket_liveness: false,
             initial_deadline_checked: false,
             connection: Connection::Initialized,
             books: VenueBooks::managed(mode, instruments),
@@ -127,6 +129,11 @@ impl ShardFeed {
             error_count: 0,
             last_error: None,
         })
+    }
+    /// For queued Polymarket frames, track socket receipt via `heartbeat`.
+    pub fn with_polymarket_socket_liveness(mut self) -> Self {
+        self.polymarket_socket_liveness = true;
+        self
     }
     pub fn connected(
         &mut self,
@@ -367,6 +374,7 @@ impl ShardFeed {
         let messages =
             wire::live_messages(bytes).map_err(|_| Error::Invalid("malformed_frame".into()))?;
         if self.venue == Venue::Polymarket
+            && !self.polymarket_socket_liveness
             && let Connection::Connected { alive, .. } = &mut self.connection
         {
             *alive = now;

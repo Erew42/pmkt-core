@@ -79,13 +79,14 @@ pub struct ShardFeed(feed::ShardFeed);
 #[pymethods]
 impl ShardFeed {
     #[new]
-    #[pyo3(signature = (venue, shard_id, instruments, *, liveness_ns=None, snapshot_ns=None))]
+    #[pyo3(signature = (venue, shard_id, instruments, *, liveness_ns=None, snapshot_ns=None, polymarket_socket_liveness=false))]
     fn new(
         venue: &str,
         shard_id: String,
         instruments: Vec<String>,
         liveness_ns: Option<u64>,
         snapshot_ns: Option<u64>,
+        polymarket_socket_liveness: bool,
     ) -> PyResult<Self> {
         let venue = match venue {
             "polymarket" => Venue::Polymarket,
@@ -97,9 +98,12 @@ impl ShardFeed {
             liveness_ns: liveness_ns.unwrap_or(defaults.liveness_ns),
             snapshot_ns: snapshot_ns.unwrap_or(defaults.snapshot_ns),
         };
-        feed::ShardFeed::new(venue, shard_id, instruments, timeouts)
-            .map(Self)
-            .map_err(engine_error)
+        let mut shard =
+            feed::ShardFeed::new(venue, shard_id, instruments, timeouts).map_err(engine_error)?;
+        if polymarket_socket_liveness {
+            shard = shard.with_polymarket_socket_liveness();
+        }
+        Ok(Self(shard))
     }
 
     #[pyo3(signature = (generation, now_ns, *, command_id=None))]
