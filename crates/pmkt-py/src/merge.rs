@@ -80,6 +80,7 @@ impl Iterator for Source {
                         received_monotonic_ns: 0,
                         use_yes_price: true,
                         coverage_period: 0,
+                        coverage_group: 0,
                         subscription: None,
                         book_command: None,
                     },

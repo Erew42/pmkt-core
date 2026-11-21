@@ -226,6 +226,7 @@ pub struct SessionOccurrences<I> {
     // Empty for independent replay. Otherwise map local intervals to the
     // continuous periods formed by the union of all redundant sources.
     pub(crate) coverage_periods: Vec<usize>,
+    pub(crate) coverage_group: usize,
     source: I,
     tracker: CoverageTracker,
     generation: Option<u64>,
@@ -238,6 +239,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     pub fn new(stream: Stream, session: impl Into<String>, source: I) -> Self {
         Self {
             coverage_periods: vec![],
+            coverage_group: 0,
             source,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
@@ -249,6 +251,9 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     }
     pub fn finish(self) -> SessionCoverage {
         self.tracker.finish()
+    }
+    pub(crate) fn subscription(&self) -> Option<std::sync::Arc<BTreeSet<String>>> {
+        self.subscription.instruments.clone()
     }
     fn frame(&mut self, f: RawFrame) -> Result<()> {
         let us = received_us(&f.received_utc)?;
@@ -319,6 +324,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     subscription: self.subscription.instruments.clone(),
                     book_command: self.subscription.book_command,
                     coverage_period,
+                    coverage_group: self.coverage_group,
                 },
                 message: v,
                 reconnect_snapshot,

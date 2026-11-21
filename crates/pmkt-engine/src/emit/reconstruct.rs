@@ -215,6 +215,7 @@ pub fn reconstruct_merged(
     let multiple = sessions.len() > 1;
     let mut streams = BTreeMap::<_, Vec<_>>::new();
     let mut coverage = Vec::new();
+    let mut subscribed = Vec::new();
     for (copy, connection, path) in sessions {
         let input = Input::open(&path)?;
         if input.venue().is_some_and(|v| v != venue) {
@@ -240,32 +241,52 @@ pub fn reconstruct_merged(
         if multiple {
             let mut scan = occurrences()?;
             scan.try_for_each(|item| item.map(drop))?;
+            subscribed.push(scan.subscription());
             coverage.push(scan.finish());
         }
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
     if multiple {
-        let spans = coverage
-            .iter()
-            .flat_map(|c| &c.intervals)
-            .map(|i| (i.start_us, i.end_us));
-        if let (Some(start), Some(end)) = (
-            spans.clone().map(|i| i.0).min(),
-            spans.clone().map(|i| i.1).max(),
-        ) {
+        // A copy bridges a hole only for the instruments it subscribed to, so copies
+        // of one subscription pool their coverage and other subscriptions do not.
+        let mut groups = BTreeMap::<_, Vec<_>>::new();
+        for (source, ids) in subscribed.iter().enumerate() {
+            groups.entry(ids).or_default().push(source);
+        }
+        let mut periods = vec![(0, vec![]); coverage.len()];
+        for (group, members) in groups.into_values().enumerate() {
+            let spans: Vec<_> = members
+                .iter()
+                .flat_map(|&s| &coverage[s].intervals)
+                .map(|i| (i.start_us, i.end_us))
+                .collect();
+            let (Some(start), Some(end)) = (
+                spans.iter().map(|s| s.0).min(),
+                spans.iter().map(|s| s.1).max(),
+            ) else {
+                continue;
+            };
             let holes = uncovered_intervals(spans, start, end)?;
-            for (source, report) in streams.values_mut().flatten().zip(&coverage) {
-                source.coverage_periods = report
-                    .intervals
-                    .iter()
-                    .map(|i| holes.partition_point(|&(_, end)| end <= i.start_us))
-                    .collect();
+            for source in members {
+                let hole_count = |start_us| holes.partition_point(|&(_, end)| end <= start_us);
+                periods[source] = (
+                    group,
+                    coverage[source]
+                        .intervals
+                        .iter()
+                        .map(|i| hole_count(i.start_us))
+                        .collect(),
+                );
             }
+        }
+        for (source, (group, periods)) in streams.values_mut().flatten().zip(periods) {
+            source.coverage_group = group;
+            source.coverage_periods = periods;
         }
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
-    let mut period = None;
+    let mut periods = BTreeMap::new();
     let mut kalshi_basis = None;
     let mut subscriptions = BTreeMap::new();
     let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
@@ -275,18 +296,22 @@ pub fn reconstruct_merged(
         |m| {
             on_message(&m)?;
             let origin = m.origin();
+            // A hole in the receipt of one subscription restarts only its instruments.
+            if periods
+                .insert(origin.coverage_group, origin.coverage_period)
+                .is_some_and(|old| old != origin.coverage_period)
+            {
+                match &origin.subscription {
+                    Some(ids) => ids.iter().for_each(|id| driver.books.restart(id)),
+                    None => driver.books.reset(),
+                }
+            }
             // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
             // time already orders the merge, so it also times the corrective-delta deadline.
             let clock_ns = u64::try_from(origin.received_us)
                 .ok()
                 .and_then(|us| us.checked_mul(1_000))
                 .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
-            if period
-                .replace(origin.coverage_period)
-                .is_some_and(|old| old != origin.coverage_period)
-            {
-                driver.books.reset();
-            }
             // Register the whole declared shard, including silent instruments
             // whose first delta may follow a gap. Origins share the same set
             // until a new subscription command changes it.

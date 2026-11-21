@@ -41,6 +41,9 @@ pub struct Origin {
     /// Contiguous coverage period containing this occurrence, used during replay.
     #[serde(skip)]
     pub coverage_period: usize,
+    /// Copies of one subscription share a group and its coverage periods.
+    #[serde(skip)]
+    pub coverage_group: usize,
     #[serde(skip)]
     pub subscription: Option<std::sync::Arc<BTreeSet<String>>>,
     #[serde(skip)]

@@ -873,6 +873,42 @@ fn poly_book(asset: &str, market: &str) -> Value {
 }
 
 #[test]
+fn a_copy_that_never_subscribed_to_an_instrument_cannot_cover_its_gap() {
+    let subscribe = |micros, asset: &str| {
+        let sub = timed(1, "polymarket", micros, 1, json!({"assets_ids":[asset]}));
+        kind(sub, "subscription", "sent")
+    };
+    let change = json!({"event_type":"price_change","market":"M","timestamp":"1700000000001",
+        "price_changes":[{"asset_id":"X","side":"BUY","price":"0.42","size":"2"}]});
+    let x = [
+        subscribe(10, "X"),
+        timed(2, "polymarket", 100, 2, poly_book("X", "M")),
+        kind(
+            timed(3, "polymarket", 1200, 3, json!({})),
+            "disk_pause_gap",
+            "local",
+        ),
+        timed(4, "polymarket", 3000, 4, change),
+    ];
+    // Healthy and continuous, but subscribed to a different instrument.
+    let y = [
+        subscribe(9, "Y"),
+        timed(2, "polymarket", 90, 2, poly_book("Y", "N")),
+        kind(
+            timed(3, "polymarket", 3100, 3, json!({})),
+            "ws_pong",
+            "received_control_base64",
+        ),
+    ];
+    let alone = merged_topbooks(Venue::Polymarket, vec![session("a", &x)]);
+    assert_eq!(last_quote(&alone, "X"), (false, Some(0.42), None));
+    let with_y = merged_topbooks(Venue::Polymarket, vec![session("a", &x), session("b", &y)]);
+    assert_eq!(last_quote(&with_y, "X"), (false, Some(0.42), None));
+    // Y was never interrupted, so the other instrument's gap must not touch it.
+    assert_eq!(last_quote(&with_y, "Y"), (true, Some(0.4), Some(0.5)));
+}
+
+#[test]
 fn the_corrective_delta_deadline_ignores_the_other_recorders_monotonic_clock() {
     let change = |side, size| {
         json!({"event_type":"price_change","market":"M","timestamp":"1700000000001",

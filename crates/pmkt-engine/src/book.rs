@@ -502,6 +502,19 @@ impl VenueBooks {
     pub fn reset(&mut self) {
         self.clear_connection(true);
     }
+    /// Reset one instrument as `reset` does all of them, for a receipt gap that
+    /// concerns only its subscription.
+    pub(crate) fn restart(&mut self, id: &str) {
+        if let Some(book) = self.books.get_mut(id) {
+            *book = reconnected(
+                self.mode,
+                book,
+                self.conflicts.contains(id),
+                self.resolved.contains(id),
+            );
+        }
+        self.complementary.forget(id);
+    }
     /// After publishing the current observation, ask whether the recorder needs
     /// fresh baselines. Check complementary.due before applying later messages.
     pub fn recovery_due(&mut self, count: u64, now_ns: u64) -> bool {
@@ -517,20 +530,16 @@ impl VenueBooks {
     }
     fn clear_connection(&mut self, retain_metadata: bool) {
         for (id, book) in &mut self.books {
-            let mut fresh = Book::new(self.mode, id);
-            if retain_metadata {
-                fresh.market = book.market.take();
-                fresh.tick = book.tick;
-                fresh.minimum = book.minimum;
-                fresh.flags.insert(F::Reconnect);
-                if self.conflicts.contains(id) {
-                    fresh.flags.insert(F::MarketIdentityChanged);
-                }
-                if self.resolved.contains(id) {
-                    fresh.flags.insert(F::MarketResolved);
-                }
-            }
-            *book = fresh;
+            *book = if retain_metadata {
+                reconnected(
+                    self.mode,
+                    book,
+                    self.conflicts.contains(id),
+                    self.resolved.contains(id),
+                )
+            } else {
+                Book::new(self.mode, id)
+            };
         }
         self.sequences.clear();
         self.complementary = ComplementaryRecovery::default();
@@ -692,4 +701,20 @@ impl VenueBooks {
         }
         touched
     }
+}
+
+/// A book after a connection break: empty, but keeping what identifies its market.
+fn reconnected(mode: BookMode, old: &mut Book, conflicted: bool, resolved: bool) -> Book {
+    let mut fresh = Book::new(mode, old.instrument());
+    fresh.market = old.market.take();
+    fresh.tick = old.tick;
+    fresh.minimum = old.minimum;
+    fresh.flags.insert(F::Reconnect);
+    if conflicted {
+        fresh.flags.insert(F::MarketIdentityChanged);
+    }
+    if resolved {
+        fresh.flags.insert(F::MarketResolved);
+    }
+    fresh
 }
