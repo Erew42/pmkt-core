@@ -1462,3 +1462,253 @@ fn rejected_kalshi_book_subscription_does_not_reset_unrelated_market() {
         "rejection of unrelated market Y must not reset healthy market X"
     );
 }
+
+#[test]
+fn delayed_book_rejection_and_future_reconnect_cannot_corrupt_coverage() {
+    let sub_book = |seq: u64, us: i64, generation: u64| {
+        let mut f = kind(
+            timed(
+                seq,
+                "kalshi",
+                us,
+                us as u64,
+                json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["X"],"use_yes_price":true}}),
+            ),
+            "subscription",
+            "sent",
+        );
+        f["connection_generation"] = json!(generation);
+        f
+    };
+    let sub_trade = |seq: u64, us: i64| {
+        kind(
+            timed(
+                seq,
+                "kalshi",
+                us,
+                us as u64,
+                json!({"id":2,"cmd":"subscribe","params":{"channels":["trade"],"market_tickers":["X"]}}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let with_gen = |mut f: Value, generation: u64| {
+        f["connection_generation"] = json!(generation);
+        f
+    };
+    let snap = |ms: i64| {
+        json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"market_ticker":"X","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}})
+    };
+    let delta = |ms: i64, seq: i64| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"ts_ms":1700000000000i64 + ms,"market_ticker":"X","side":"yes","price_dollars":"0.40","delta_fp":"2"}})
+    };
+    let side_ack = json!({"id":2,"type":"subscribed","msg":{"channel":"trade","sid":8}});
+    let book_ack = json!({"id":1,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":7}});
+    let error = json!({"id":1,"type":"error","msg":{"code":9,"msg":"Unknown channel"}});
+    let trade = |ms: i64| {
+        json!({"type":"trade","sid":8,"seq":1,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"market_ticker":"X","ts_ms":1700000000000i64 + ms,"yes_price_dollars":"0.4","count_fp":"1","taker_side":"yes"}})
+    };
+
+    // Case 1: side ack + trade arrive BEFORE the book rejection at 7ms.
+    let dir_gapped = root();
+    let dir_pending = root();
+    seal(
+        &dir_gapped,
+        1,
+        &[
+            sub_book(1, 0, 1),
+            timed(2, "kalshi", 2000, 2000, snap(2)),
+            timed(3, "kalshi", 5000, 5000, delta(5, 3)),
+        ],
+        None,
+    );
+    seal(
+        &dir_pending,
+        1,
+        &[
+            sub_book(1, 0, 1),
+            sub_trade(2, 0),
+            timed(3, "kalshi", 1000, 1000, side_ack),
+            timed(4, "kalshi", 6000, 6000, trade(6)),
+            timed(5, "kalshi", 7000, 7000, error.clone()),
+        ],
+        None,
+    );
+    let merged_pending = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "conn".into(), dir_gapped),
+            ("b".into(), "conn".into(), dir_pending),
+        ],
+    );
+    assert!(
+        !kalshi_yes_row(&merged_pending).0,
+        "side frames before delayed book rejection must not certify peer seq gap"
+    );
+
+    // Case 2: rejected copy emits a post-rejection trade at 3ms, then reconnects at 9-11ms.
+    let dir_good = root();
+    let dir_recovered = root();
+    seal(
+        &dir_good,
+        1,
+        &[
+            sub_book(1, 0, 1),
+            timed(2, "kalshi", 2000, 2000, snap(2)),
+            timed(3, "kalshi", 5000, 5000, delta(5, 2)),
+        ],
+        None,
+    );
+    seal(
+        &dir_recovered,
+        1,
+        &[
+            sub_book(1, 0, 1),
+            sub_trade(2, 0),
+            timed(3, "kalshi", 1000, 1000, error),
+            timed(4, "kalshi", 3000, 3000, trade(3)),
+            sub_book(5, 9000, 2),
+            with_gen(timed(6, "kalshi", 10000, 10000, book_ack), 2),
+            with_gen(timed(7, "kalshi", 11000, 11000, snap(11)), 2),
+        ],
+        None,
+    );
+    let merged_recovered = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("good".into(), "conn".into(), dir_good),
+            ("recovered".into(), "conn".into(), dir_recovered),
+        ],
+    );
+    let good_delta = merged_recovered
+        .iter()
+        .find(|b| {
+            column::<StringArray>(b, "instrument_id").value(0) == "X:YES"
+                && column::<StringArray>(b, "raw_event_ref")
+                    .value(0)
+                    .ends_with(":3")
+        })
+        .expect("healthy delta from good");
+    assert!(column::<BooleanArray>(good_delta, "valid_state").value(0));
+    assert_eq!(
+        column::<Float64Array>(good_delta, "bid_size_contracts").value(0),
+        12.0
+    );
+}
+
+#[test]
+fn gapped_trade_or_overlapping_stream_does_not_reset_continuously_covered_book() {
+    let sub_book = |ticker: &str| {
+        kind(
+            timed(
+                1,
+                "kalshi",
+                0,
+                0,
+                json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":[ticker],"use_yes_price":true}}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let sub_trade = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":2,"cmd":"subscribe","params":{"channels":["trade"],"market_tickers":["Y"]}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let snap = |ticker: &str, ms: i64, seq: i64| {
+        json!({"type":"orderbook_snapshot","sid":7,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"market_ticker":ticker,"yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}})
+    };
+    let delta = |ticker: &str, ms: i64, seq: i64| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"ts_ms":1700000000000i64 + ms,"market_ticker":ticker,"side":"yes","price_dollars":"0.40","delta_fp":"2"}})
+    };
+    let trade = |ms: i64, seq: i64| {
+        json!({"type":"trade","sid":8,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"market_ticker":"Y","ts_ms":1700000000000i64 + ms,"yes_price_dollars":"0.4","count_fp":"1","taker_side":"yes"}})
+    };
+    let gap = |seq: u64, us: i64| {
+        kind(
+            timed(seq, "kalshi", us, us as u64, json!({})),
+            "disk_pause_gap",
+            "local",
+        )
+    };
+
+    // Control: gapped trade-only stream must not reset healthy book stream.
+    let dir_book = root();
+    let dir_trade = root();
+    seal(
+        &dir_book,
+        1,
+        &[
+            sub_book("X"),
+            timed(2, "kalshi", 1000, 1000, snap("X", 1, 1)),
+            timed(3, "kalshi", 8000, 8000, delta("X", 8, 2)),
+        ],
+        None,
+    );
+    seal(
+        &dir_trade,
+        1,
+        &[
+            sub_trade,
+            timed(2, "kalshi", 2000, 2000, trade(2, 1)),
+            gap(3, 3000),
+            timed(4, "kalshi", 5000, 5000, trade(5, 2)),
+        ],
+        None,
+    );
+    let merged_trade = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("book".into(), "book-a".into(), dir_book),
+            ("trades".into(), "trade-b".into(), dir_trade),
+        ],
+    );
+    assert_eq!(kalshi_yes_row(&merged_trade), (true, 12.0));
+
+    // Partial overlap: archived shard {X, Z} gaps, while shard {Y, X} continuously covers X.
+    let dir_good = root();
+    let dir_overlap = root();
+    seal(
+        &dir_good,
+        1,
+        &[
+            timed(1, "kalshi", 1000, 1000, snap("Y", 1, 1)),
+            timed(2, "kalshi", 2000, 2000, snap("X", 2, 2)),
+            timed(3, "kalshi", 8000, 8000, delta("X", 8, 3)),
+        ],
+        None,
+    );
+    seal(
+        &dir_overlap,
+        1,
+        &[
+            timed(1, "kalshi", 1000, 1000, snap("X", 1, 1)),
+            timed(2, "kalshi", 2000, 2000, snap("Z", 2, 2)),
+            gap(3, 3000),
+            timed(4, "kalshi", 5000, 5000, delta("Z", 5, 4)),
+        ],
+        None,
+    );
+    let merged_overlap = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("good".into(), "same".into(), dir_good),
+            ("other".into(), "same".into(), dir_overlap),
+        ],
+    );
+    assert_eq!(kalshi_yes_row(&merged_overlap), (true, 12.0));
+}

@@ -51,14 +51,20 @@ pub struct Interval {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ReceiptPeriod {
     pub(super) source: usize,
-    pub(super) interval: usize,
+    pub(super) interval: Option<usize>,
 }
 impl ReceiptPeriod {
     pub(crate) fn bridges(self, sessions: &[SessionCoverage], received: &Origin) -> bool {
+        let Some(id) = self.interval else {
+            return false;
+        };
         let Some(source) = sessions.get(self.source) else {
             return false;
         };
-        let Some(span) = source.intervals.get(self.interval) else {
+        let Ok(pos) = source.interval_ids.binary_search(&id) else {
+            return false;
+        };
+        let Some(span) = source.intervals.get(pos) else {
             return false;
         };
         source.stream != received.stream
@@ -69,6 +75,7 @@ impl ReceiptPeriod {
 enum Window {
     Closed(StartReason),
     Open {
+        id: usize,
         start: i64,
         last: i64,
         before: Option<i64>,
@@ -89,6 +96,8 @@ pub struct SessionCoverage {
     pub stream: Stream,
     pub session: String,
     pub intervals: Vec<Interval>,
+    #[serde(skip)]
+    pub(crate) interval_ids: Vec<usize>,
     pub counts: CoverageCounts,
 }
 #[derive(Debug)]
@@ -96,6 +105,8 @@ pub struct CoverageTracker {
     window: Window,
     generation: Option<u64>,
     frame_us: Option<i64>,
+    next_interval_id: usize,
+    pending_book_from: Option<usize>,
     seqs: Sequences,
     report: SessionCoverage,
 }
@@ -105,14 +116,44 @@ impl CoverageTracker {
             window: Window::Closed(StartReason::SessionStart),
             generation: None,
             frame_us: None,
+            next_interval_id: 0,
+            pending_book_from: None,
             seqs: Sequences::default(),
             report: SessionCoverage {
                 stream,
                 session: session.into(),
                 intervals: vec![],
+                interval_ids: vec![],
                 counts: CoverageCounts::default(),
             },
         }
+    }
+    fn open(&mut self, us: i64, reason: StartReason) {
+        let id = self.next_interval_id;
+        self.next_interval_id += 1;
+        self.window = Window::Open {
+            id,
+            start: us,
+            last: us,
+            before: None,
+            reason,
+        };
+    }
+    pub(crate) fn current_interval_id(&self) -> Option<usize> {
+        match self.window {
+            Window::Open { id, .. } => Some(id),
+            Window::Closed(_) => None,
+        }
+    }
+    pub(crate) fn begin_generation(&mut self) {
+        self.pending_book_from = None;
+    }
+    pub(crate) fn mark_book_pending(&mut self) {
+        self.pending_book_from
+            .get_or_insert(self.report.intervals.len());
+    }
+    pub(crate) fn confirm_books(&mut self) {
+        self.pending_book_from = None;
     }
     pub fn frame(&mut self, us: i64, generation: u64, kind: &str, direction: &str) {
         if self.generation != Some(generation) {
@@ -127,12 +168,8 @@ impl CoverageTracker {
             self.frame_us = Some(us);
             match &mut self.window {
                 Window::Closed(reason) => {
-                    self.window = Window::Open {
-                        start: us,
-                        last: us,
-                        before: None,
-                        reason: *reason,
-                    }
+                    let reason = *reason;
+                    self.open(us, reason);
                 }
                 Window::Open { last, before, .. } => {
                     *before = Some(*last);
@@ -158,12 +195,7 @@ impl CoverageTracker {
             self.report.counts.sequence_gaps += 1;
             if let (Window::Open { before, start, .. }, Some(us)) = (&self.window, self.frame_us) {
                 self.end(EndReason::SequenceGap, Some(before.unwrap_or(*start)));
-                self.window = Window::Open {
-                    start: us,
-                    last: us,
-                    before: None,
-                    reason: StartReason::AfterGap,
-                };
+                self.open(us, StartReason::AfterGap);
             }
         }
     }
@@ -174,12 +206,18 @@ impl CoverageTracker {
         self.seqs.clear();
     }
     pub(crate) fn reject_books(&mut self) {
-        self.end(EndReason::TransportError, None);
+        if let Some(from) = self.pending_book_from.take() {
+            self.report.intervals.truncate(from);
+            self.report.interval_ids.truncate(from);
+        } else {
+            self.end(EndReason::TransportError, None);
+        }
         self.window = Window::Closed(StartReason::AfterGap);
         self.seqs.clear();
     }
     fn end(&mut self, reason: EndReason, end: Option<i64>) {
         if let Window::Open {
+            id,
             start,
             last,
             reason: start_reason,
@@ -193,6 +231,7 @@ impl CoverageTracker {
                 start_reason,
                 end_reason: reason,
             });
+            self.report.interval_ids.push(id);
             self.window = Window::Closed(StartReason::AfterGap);
         }
     }
@@ -245,6 +284,19 @@ pub fn conflated_subscription(raw: &str) -> bool {
         _ => true,
     }
 }
+pub(crate) fn confirms_books(venue: Venue, value: &Value, book_command: Option<i64>) -> bool {
+    if matches!(wire::decode(venue, value), Ok(wire::Event::Books(_))) {
+        return true;
+    }
+    venue == Venue::Kalshi
+        && value["type"] == "subscribed"
+        && (value["msg"]["channel"] == "orderbook_delta"
+            || value["id"]
+                .as_i64()
+                .zip(book_command)
+                .is_some_and(|(ack, book)| ack == book))
+}
+
 /// Annotates occurrences with receipt coverage. Quote replay can observe this
 /// evidence without using a coverage boundary as a book-state transition.
 pub(crate) struct SessionEvidence {
@@ -269,6 +321,15 @@ impl SessionEvidence {
     }
     pub(crate) fn chunk_gap(&mut self) {
         self.tracker.chunk_gap();
+    }
+    pub(crate) fn begin_generation(&mut self) {
+        self.tracker.begin_generation();
+    }
+    pub(crate) fn mark_book_pending(&mut self) {
+        self.tracker.mark_book_pending();
+    }
+    pub(crate) fn confirm_books(&mut self) {
+        self.tracker.confirm_books();
     }
     pub(crate) fn frame(
         &mut self,
@@ -333,7 +394,7 @@ impl SessionEvidence {
                 use_yes_price: subscription.kalshi_basis.unwrap_or(true),
                 subscription: subscription.instruments.clone(),
                 book_command: subscription.book_command,
-                coverage_period: self.tracker.report.intervals.len(),
+                coverage_period: self.tracker.current_interval_id(),
                 coverage_group: self.coverage_group,
             },
             message: v,
@@ -348,6 +409,8 @@ pub struct SessionOccurrences<I> {
     subscription: wire::RecordedSubscription,
     observed_books: BTreeSet<String>,
     last_generation: Option<u64>,
+    saw_subscription: bool,
+    book_confirmed: bool,
     book_rejected: bool,
     pending: std::vec::IntoIter<Occurrence>,
     done: bool,
@@ -360,6 +423,8 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             subscription: wire::RecordedSubscription::default(),
             observed_books: BTreeSet::new(),
             last_generation: None,
+            saw_subscription: false,
+            book_confirmed: false,
             book_rejected: false,
             pending: vec![].into_iter(),
             done: false,
@@ -373,6 +438,9 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     }
     pub(crate) fn observed_books(&self) -> BTreeSet<String> {
         self.observed_books.clone()
+    }
+    pub(crate) fn side_only_subscription(&self) -> bool {
+        self.saw_subscription && self.subscription.instruments.is_none()
     }
     fn step(&mut self) -> Result<Option<Occurrence>> {
         loop {
@@ -389,6 +457,8 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             if self.last_generation != Some(f.connection_generation) {
                 self.last_generation = Some(f.connection_generation);
                 self.book_rejected = false;
+                self.book_confirmed = false;
+                self.evidence.begin_generation();
             }
             if f.frame_type == "subscription"
                 && f.venue == Venue::Kalshi
@@ -398,12 +468,16 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     "conflated Kalshi subscription (update_interval_ms)".into(),
                 ));
             }
-            if f.frame_type == "subscription"
-                && f.direction == "sent"
-                && let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
-                && self.subscription.record(f.venue, &command)?
-            {
-                self.book_rejected = false;
+            if f.frame_type == "subscription" && f.direction == "sent" {
+                self.saw_subscription = true;
+                if let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
+                    && self.subscription.record(f.venue, &command)?
+                {
+                    self.book_rejected = false;
+                    if !self.book_confirmed {
+                        self.evidence.mark_book_pending();
+                    }
+                }
             }
             let messages = if f.frame_type == "text" && f.direction == "received" {
                 wire::messages(f.payload_raw.as_bytes()).ok()
@@ -412,6 +486,10 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             };
             if let Some(msgs) = messages.as_deref() {
                 for m in msgs {
+                    if confirms_books(f.venue, &m.value, self.subscription.book_command) {
+                        self.book_confirmed = true;
+                        self.evidence.confirm_books();
+                    }
                     match wire::decode(f.venue, &m.value) {
                         Ok(wire::Event::SubscriptionError)
                             if wire::rejects_books(&m.value, self.subscription.book_command) =>

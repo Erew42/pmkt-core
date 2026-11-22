@@ -6,7 +6,7 @@ pub use coverage::{
     CoverageCounts, CoverageTracker, EndReason, Interval, SessionCoverage, SessionOccurrences,
     StartReason, conflated_subscription, uncovered_intervals,
 };
-pub(crate) use coverage::{ReceiptPeriod, SessionEvidence, received_us};
+pub(crate) use coverage::{ReceiptPeriod, SessionEvidence, confirms_books, received_us};
 
 use crate::{Error, Result, Venue};
 use identity::ContentId;
@@ -38,9 +38,9 @@ pub struct Origin {
     pub recording_id: String,
     pub received_monotonic_ns: u64,
     pub use_yes_price: bool,
-    /// Contiguous coverage period containing this occurrence, used during replay.
+    /// Contiguous coverage interval id containing this occurrence, if covered.
     #[serde(skip)]
-    pub coverage_period: usize,
+    pub coverage_period: Option<usize>,
     /// During the raw merge each recording is its own group. Reconstructed
     /// message evidence exposes the pooled group of its redundant subscriptions.
     #[serde(skip)]
