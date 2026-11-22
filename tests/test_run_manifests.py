@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from contextlib import contextmanager
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -588,3 +590,70 @@ def test_dataset_validate_manifest_cli_reports_ok_and_failures(tmp_path) -> None
     assert "OK manifest: 1 datasets" in valid.output
     assert invalid.exit_code == 1
     assert "dataset does not exist" in invalid.output
+
+
+def test_validate_partitioned_topbooks_reads_every_recorder_partition(tmp_path):
+    from pmkt.data.recorder import write_topbook_segments
+
+    rows = [
+        topbook_row(
+            exchange="polymarket", instrument_id=f"token-{day}",
+            received_at_utc=f"2026-05-{day}T12:00:00Z",
+            best_bid_dollars=0.4, best_ask_dollars=0.6, spread_dollars=0.2,
+            valid_state=True, quality_flags=[],
+        )
+        for day in (26, 27)
+    ]
+    assert write_topbook_segments(rows, tmp_path) == 2
+    manifest_path = write_manifest(tmp_path / "manifest.json", {
+        "dataset_paths": {"topbooks": "topbooks"},
+        "schema_versions": {"topbooks": "topbook.v1"},
+        "row_counts": {"topbooks": 2},
+    })
+    report = validate_run_manifest(manifest_path)
+    assert report.ok, report.all_errors
+    assert report.datasets[0].row_count == 2
+
+
+@pytest.mark.parametrize("content,valid", [("", True), (" \n", True), ('{"id":\n', False)])
+def test_validate_jsonl_distinguishes_empty_from_truncated(tmp_path, content, valid):
+    dataset = tmp_path / "markets.jsonl"
+    dataset.write_text(content, encoding="utf-8")
+    manifest = write_manifest(tmp_path / "manifest.json", {
+        "output_path": dataset.name, "row_count": 0,
+    })
+    assert validate_run_manifest(manifest).ok is valid
+
+
+def test_validate_empty_parquet_requires_a_readable_footer(tmp_path):
+    dataset = tmp_path / "output.parquet"
+    pd.DataFrame({"market_id": []}).to_parquet(dataset)
+    manifest = write_manifest(tmp_path / "manifest.json", {
+        "output_path": dataset.name, "row_count": 0,
+    })
+    assert validate_run_manifest(manifest).ok
+    dataset.write_bytes(b"")
+    assert not validate_run_manifest(manifest).ok
+
+
+def test_interrupted_manifest_write_preserves_published_bytes(tmp_path, monkeypatch):
+    path = write_manifest(tmp_path / "manifest.json", {"status": "success"})
+    original = path.read_bytes()
+    real_open = Path.open
+
+    @contextmanager
+    def interrupted_open(self, *args, **kwargs):
+        with real_open(self, *args, **kwargs) as handle:
+            class InterruptedWriter:
+                def write(self, data):
+                    handle.write(data[:5])
+                    raise OSError("disk full")
+
+            yield InterruptedWriter()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(Path, "open", interrupted_open)
+        with pytest.raises(OSError, match="disk full"):
+            write_manifest(path, {"status": "replacement"})
+    assert path.read_bytes() == original
+    assert list(tmp_path.iterdir()) == [path]

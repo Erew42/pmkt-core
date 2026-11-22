@@ -7,7 +7,9 @@ import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import copymode
 from typing import Any, Callable, Iterable, Literal, Mapping
+from uuid import uuid4
 
 import pandas as pd
 
@@ -170,7 +172,18 @@ def build_run_manifest(
 def write_manifest(path: str | Path, manifest: Mapping[str, Any]) -> Path:
     output = Path(path)
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    target = output.resolve()
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    content = json.dumps(manifest, indent=2, sort_keys=True)
+    handle = temporary.open("x", encoding="utf-8")
+    try:
+        with handle as writer:
+            if target.exists():
+                copymode(target, temporary)
+            writer.write(content)
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
     return output
 
 
@@ -422,11 +435,11 @@ def _manifest_mapping(
 
 def _hash_mapping(payload: Mapping[str, Any], warnings: list[str]) -> dict[str, str]:
     hashes: dict[str, str] = {}
-    for field in ("dataset_hashes", "dataset_sha256", "sha256_hashes", "sha256"):
+    for field in ("dataset_hashes", "dataset_sha256", "sha256_hashes", "sha256", "output_sha256"):
         value = payload.get(field)
         if value is None:
             continue
-        if isinstance(value, str) and field == "sha256":
+        if isinstance(value, str) and field in {"sha256", "output_sha256"}:
             hashes["output"] = value
             continue
         mapping = _manifest_mapping(payload, field, warnings)
@@ -545,16 +558,11 @@ def _resolve_dataset_path(
 def _read_dataset_frame(path: Path) -> pd.DataFrame:
     suffix = path.suffix.lower()
     if path.is_dir():
-        parts = sorted(path.glob("part-*.parquet"))
+        parts = sorted(path.rglob("part-*.parquet"))
         if not parts:
             return pd.DataFrame()
         frames = [pd.read_parquet(part) for part in parts]
-        return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    try:
-        if path.stat().st_size == 0:
-            return pd.DataFrame()
-    except OSError:
-        pass
+        return pd.concat(frames, ignore_index=True)
     if suffix == ".parquet":
         return pd.read_parquet(path)
     if suffix == ".csv":
@@ -563,12 +571,7 @@ def _read_dataset_frame(path: Path) -> pd.DataFrame:
         except pd.errors.EmptyDataError:
             return pd.DataFrame()
     if suffix == ".jsonl":
-        try:
-            return pd.read_json(path, lines=True)
-        except ValueError as exc:
-            if "Expected object or value" in str(exc):
-                return pd.DataFrame()
-            raise
+        return pd.read_json(path, lines=True)
     if suffix == ".json":
         frame = pd.read_json(path)
         if isinstance(frame, pd.DataFrame):
