@@ -436,10 +436,12 @@ pub fn reconstruct_merged(
         }
         per_source
     };
-    // Compute rollback-safe cross-stream bridging spans per (source, interval).
-    // If an interval's start rolled back at or before a prior interval's end
-    // on the same source, its receive timestamps cannot bridge cross-stream by
-    // UTC alone; continuity across that break requires a shared witness.
+    // Compute rollback- and sequence-gap-safe cross-stream bridging spans per
+    // (source, interval). An interval whose start rolled back at or before a
+    // prior interval's end on the same source, or that immediately follows a
+    // proven wire sequence gap, cannot bridge cross-stream by UTC alone;
+    // continuity across that break requires a shared witness on the post-gap
+    // message itself.
     let (effective_spans, sorted_spans) = {
         let mut effective = Vec::with_capacity(coverage.len());
         let mut sorted = Vec::with_capacity(coverage.len());
@@ -448,7 +450,9 @@ pub fn reconstruct_merged(
             let mut active = Vec::new();
             let mut prev_max_end = i64::MIN;
             for (idx, span) in session.intervals.iter().enumerate() {
-                let eff = if span.start_us > prev_max_end {
+                let after_seq_gap =
+                    idx > 0 && session.intervals[idx - 1].end_reason == EndReason::SequenceGap;
+                let eff = if span.start_us > prev_max_end && !after_seq_gap {
                     let bounds = (span.start_us, span.end_us);
                     active.push((span.start_us, span.end_us, idx));
                     Some(bounds)
@@ -490,6 +494,7 @@ pub fn reconstruct_merged(
     let intervals_connected = |coverage: &[SessionCoverage],
                                undeclared: &[BTreeSet<String>],
                                inst: &str,
+                               prior_witnesses: &[Witness],
                                u: Witness,
                                v: Witness|
      -> bool {
@@ -512,7 +517,15 @@ pub fn reconstruct_merged(
             }
             (ua, u_hi, v_lo, vb)
         };
-        if coverage[u.0].stream != coverage[v.0].stream && u_a <= v_b && v_a <= u_b {
+        let u_ended_at_prev = !u.3
+            && !v.3
+            && u.2 >= u_hi
+            && coverage[u.0].intervals[u.1].end_reason != EndReason::SessionEnd;
+        if coverage[u.0].stream != coverage[v.0].stream
+            && !u_ended_at_prev
+            && u_a <= v_b
+            && v_a <= u_b
+        {
             return true;
         }
         let need_start_le = u_b.min(v_b);
@@ -524,12 +537,23 @@ pub fn reconstruct_merged(
             }
             let pos = peers.partition_point(|&(_, end_us, _)| end_us < need_end_ge);
             if let Some(&(_, _, idx_w)) = peers.get(pos)
-                && let Some((w_lo, w_hi)) =
+                && let Some((mut w_lo, w_hi)) =
                     inst_bridge_span(coverage, undeclared, src_w, idx_w, inst)
-                && w_lo <= need_start_le
-                && w_hi >= need_end_ge
             {
-                return true;
+                if let Some(w_prev) = prior_witnesses
+                    .iter()
+                    .find(|w| w.0 == src_w && w.1 == idx_w && !w.3)
+                {
+                    if w_prev.2 >= w_hi
+                        && coverage[src_w].intervals[idx_w].end_reason != EndReason::SessionEnd
+                    {
+                        continue;
+                    }
+                    w_lo = w_lo.max(w_prev.2);
+                }
+                if w_lo <= need_start_le && w_hi >= need_end_ge {
+                    return true;
+                }
             }
         }
         false
@@ -642,6 +666,7 @@ pub fn reconstruct_merged(
                                 &cov.coverage,
                                 &cov.undeclared_instruments,
                                 inst,
+                                witnesses,
                                 u,
                                 v,
                             )
@@ -690,6 +715,7 @@ pub fn reconstruct_merged(
                                     &cov.coverage,
                                     &cov.undeclared_instruments,
                                     inst,
+                                    &[u],
                                     u,
                                     v,
                                 )

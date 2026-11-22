@@ -2445,3 +2445,140 @@ fn multihop_ended_peers_and_same_class_polymarket_interleave_are_exact() {
         12.0
     );
 }
+
+#[test]
+fn forward_clock_ended_peers_cannot_certify_kalshi_seq_gap() {
+    let sub_k = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["X"],"use_yes_price":true}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let ksnap = json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1735689600001i64,
+        "msg":{"market_ticker":"X","clock":4100001,"market_id":"m-1","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}});
+    let kdelta = |ms: i64, seq: i64, qty: &str, clock: i64| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1735689600000i64 + ms,
+            "msg":{"ts_ms":1735689600000i64 + ms,"market_ticker":"X","clock":clock,"market_id":"m-1","side":"yes","price_dollars":"0.40","delta_fp":qty}})
+    };
+    let d2 = kdelta(5, 2, "1", 4100002);
+    let d3 = kdelta(6, 3, "5", 4100003);
+    let d4 = kdelta(7, 4, "2", 4100004);
+    let d5 = kdelta(8, 5, "1", 4100005);
+
+    let dir_gap = root();
+    let dir_early = root();
+    let dir_late = root();
+    let dir_c3 = root();
+    let dir_full = root();
+    seal(
+        &dir_gap,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 1000, 1000, ksnap.clone()),
+            timed(3, "kalshi", 5000, 5000, d2.clone()),
+            timed(4, "kalshi", 7000, 7000, d4.clone()),
+            timed(5, "kalshi", 8000, 8000, d5.clone()),
+        ],
+        None,
+    );
+    seal(
+        &dir_early,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 2000, 2000, ksnap.clone()),
+            timed(3, "kalshi", 6000, 6000, d2.clone()),
+            kind(
+                timed(4, "kalshi", 6100, 6100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_late,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 6000, 6000, ksnap.clone()),
+            timed(3, "kalshi", 10000, 10000, d2.clone()),
+            kind(
+                timed(4, "kalshi", 10100, 10100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_c3,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 4000, 4000, ksnap.clone()),
+            timed(3, "kalshi", 8000, 8000, d2.clone()),
+            kind(
+                timed(4, "kalshi", 8100, 8100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_full,
+        1,
+        &[
+            sub_k,
+            timed(2, "kalshi", 1000, 1000, ksnap),
+            timed(3, "kalshi", 5000, 5000, d2),
+            timed(4, "kalshi", 6000, 6000, d3),
+            timed(5, "kalshi", 7000, 7000, d4),
+            timed(6, "kalshi", 8000, 8000, d5),
+        ],
+        None,
+    );
+
+    let with_c3 = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("gap".into(), "c".into(), dir_gap.clone()),
+            ("c3".into(), "c".into(), dir_c3),
+        ],
+    );
+    assert!(!kalshi_yes_row(&with_c3).0);
+
+    for sources in [
+        vec![
+            ("gap".into(), "c".into(), dir_gap.clone()),
+            ("early".into(), "c".into(), dir_early.clone()),
+            ("late".into(), "c".into(), dir_late.clone()),
+        ],
+        vec![
+            ("late".into(), "c".into(), dir_late.clone()),
+            ("early".into(), "c".into(), dir_early.clone()),
+            ("gap".into(), "c".into(), dir_gap.clone()),
+        ],
+    ] {
+        let merged = merged_topbooks(Venue::Kalshi, sources);
+        assert!(!kalshi_yes_row(&merged).0);
+    }
+
+    let with_full = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("gap".into(), "c".into(), dir_gap),
+            ("early".into(), "c".into(), dir_early),
+            ("late".into(), "c".into(), dir_late),
+            ("full".into(), "c".into(), dir_full),
+        ],
+    );
+    assert_eq!(kalshi_yes_row(&with_full), (true, 19.0));
+}
