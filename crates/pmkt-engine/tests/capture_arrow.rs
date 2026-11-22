@@ -1194,3 +1194,271 @@ fn only_an_error_on_the_book_subscription_resets_kalshi_depth() {
         assert_eq!(kalshi_yes_row(&merged), expected, "merged, error {label}");
     }
 }
+
+#[test]
+fn archived_subscriptions_do_not_pool_coverage_across_shards() {
+    let dir_a = root();
+    let dir_b = root();
+    let book_a = json!({"event_type":"book","asset_id":"a","market":"market-a","timestamp":"1700000000001",
+        "bids":[{"price":"0.30","size":"7"},{"price":"0.20","size":"3"}],"asks":[{"price":"0.60","size":"10"}]});
+    let change_a = json!({"event_type":"price_change","market":"market-a","timestamp":"1700000000003",
+        "price_changes":[{"asset_id":"a","side":"SELL","price":"0.60","size":"5"}]});
+    let book_b = json!({"event_type":"book","asset_id":"b","market":"market-b","timestamp":"1700000000000",
+        "bids":[{"price":"0.30","size":"7"}],"asks":[{"price":"0.60","size":"10"}]});
+    let change_b = json!({"event_type":"price_change","market":"market-b","timestamp":"1700000000004",
+        "price_changes":[{"asset_id":"b","side":"BUY","price":"0.20","size":"1"}]});
+
+    // Shard A has an archived subscription (chunk 1 removed) and a missing chunk 3.
+    let sub_a = kind(
+        timed(
+            1,
+            "polymarket",
+            1,
+            1,
+            json!({"type":"market","assets_ids":["a"]}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let sub_b = kind(
+        timed(
+            1,
+            "polymarket",
+            1,
+            1,
+            json!({"type":"market","assets_ids":["b"]}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let full_a = root();
+    let full_b = root();
+    let sha1_a = seal(&full_a, 1, &[sub_a], None);
+    let sha2_a = seal(
+        &full_a,
+        2,
+        &[timed(2, "polymarket", 1000, 1000, book_a)],
+        Some(&sha1_a),
+    );
+    let sha3_a = seal(
+        &full_a,
+        3,
+        &[timed(
+            3,
+            "polymarket",
+            2000,
+            2000,
+            json!({"event_type":"price_change","market":"market-a","timestamp":"1700000000002",
+                "price_changes":[{"asset_id":"a","side":"BUY","price":"0.30","size":"0"}]}),
+        )],
+        Some(&sha2_a),
+    );
+    seal(
+        &full_a,
+        4,
+        &[timed(4, "polymarket", 3000, 3000, change_a)],
+        Some(&sha3_a),
+    );
+    let sha1_b = seal(&full_b, 1, &[sub_b], None);
+    seal(
+        &full_b,
+        2,
+        &[
+            timed(2, "polymarket", 100, 100, book_b),
+            timed(3, "polymarket", 4000, 4000, change_b),
+        ],
+        Some(&sha1_b),
+    );
+    for idx in [2_u32, 4] {
+        for ext in ["jsonl.gz", "jsonl.gz.manifest.json"] {
+            let name = format!("chunk_{idx:06}.{ext}");
+            std::fs::copy(full_a.join(&name), dir_a.join(&name)).unwrap();
+        }
+    }
+    for ext in ["jsonl.gz", "jsonl.gz.manifest.json"] {
+        let name = format!("chunk_000002.{ext}");
+        std::fs::copy(full_b.join(&name), dir_b.join(&name)).unwrap();
+    }
+
+    let merged = merged_topbooks(
+        Venue::Polymarket,
+        vec![
+            ("A".into(), "shard-A".into(), dir_a),
+            ("B".into(), "shard-B".into(), dir_b),
+        ],
+    );
+    let post_gap = merged
+        .iter()
+        .find(|b| {
+            column::<StringArray>(b, "instrument_id").value(0) == "a"
+                && column::<StringArray>(b, "raw_event_ref")
+                    .value(0)
+                    .ends_with(":4")
+        })
+        .expect("post-gap observation for token a");
+    assert!(
+        !column::<BooleanArray>(post_gap, "valid_state").value(0),
+        "unrelated shard with archived subscription must not mask chunk gap"
+    );
+    let healthy_b = merged
+        .iter()
+        .find(|b| {
+            column::<StringArray>(b, "instrument_id").value(0) == "b"
+                && column::<StringArray>(b, "raw_event_ref")
+                    .value(0)
+                    .ends_with(":3")
+        })
+        .expect("healthy shard b update");
+    assert!(
+        column::<BooleanArray>(healthy_b, "valid_state").value(0),
+        "shard a's chunk gap must not reset unrelated healthy shard b"
+    );
+}
+
+#[test]
+fn rejected_kalshi_book_subscription_does_not_mask_peer_seq_gap() {
+    let sub_book = |ticker: &str| {
+        kind(
+            timed(
+                1,
+                "kalshi",
+                0,
+                0,
+                json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":[ticker],"use_yes_price":true}}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let sub_trade = kind(
+        timed(
+            2,
+            "kalshi",
+            10,
+            10,
+            json!({"id":2,"cmd":"subscribe","params":{"channels":["trade"],"market_tickers":["X"]}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let book = json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1700000000002i64,
+        "msg":{"market_ticker":"X","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}});
+    let delta_gap = json!({"type":"orderbook_delta","sid":7,"seq":3,"sending_ts_ms":1700000000005i64,
+        "msg":{"ts_ms":1700000000005i64,"market_ticker":"X","side":"yes","price_dollars":"0.40","delta_fp":"2"}});
+    let error = json!({"id":1,"type":"error","msg":{"code":9,"msg":"Unknown channel"}});
+    let trade = json!({"type":"trade","sid":8,"seq":1,"sending_ts_ms":1700000000007i64,
+        "msg":{"market_ticker":"X","ts_ms":1700000000007i64,"yes_price_dollars":"0.4","count_fp":"1","taker_side":"yes"}});
+
+    let dir_a = root();
+    let dir_b = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_book("X"),
+            timed(2, "kalshi", 2000, 2000, book),
+            timed(3, "kalshi", 5000, 5000, delta_gap),
+        ],
+        None,
+    );
+    seal(
+        &dir_b,
+        1,
+        &[
+            sub_book("X"),
+            sub_trade.clone(),
+            timed(3, "kalshi", 1000, 1000, error.clone()),
+            timed(4, "kalshi", 7000, 7000, trade),
+        ],
+        None,
+    );
+
+    let dir_control = root();
+    seal(
+        &dir_control,
+        1,
+        &[
+            sub_book("X"),
+            sub_trade,
+            timed(3, "kalshi", 1000, 1000, error),
+        ],
+        None,
+    );
+    let control = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "conn".into(), dir_a.clone()),
+            ("short".into(), "conn".into(), dir_control),
+        ],
+    );
+    let merged = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "conn".into(), dir_a),
+            ("b".into(), "conn".into(), dir_b),
+        ],
+    );
+    assert!(!kalshi_yes_row(&control).0);
+    assert_eq!(
+        kalshi_yes_row(&merged),
+        kalshi_yes_row(&control),
+        "rejected book subscription with active trade channel must not mask peer seq gap"
+    );
+}
+
+#[test]
+fn rejected_kalshi_book_subscription_does_not_reset_unrelated_market() {
+    let sub_book = |seq: u64, us: i64, ticker: &str| {
+        kind(
+            timed(
+                seq,
+                "kalshi",
+                us,
+                us as u64,
+                json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":[ticker],"use_yes_price":true}}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let book = json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1700000000001i64,
+        "msg":{"market_ticker":"X","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}});
+    let delta = json!({"type":"orderbook_delta","sid":7,"seq":2,"sending_ts_ms":1700000000005i64,
+        "msg":{"ts_ms":1700000000005i64,"market_ticker":"X","side":"yes","price_dollars":"0.40","delta_fp":"2"}});
+    let error = json!({"id":1,"type":"error","msg":{"code":9,"msg":"Unknown channel"}});
+
+    let dir_a = root();
+    let dir_b = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_book(1, 0, "X"),
+            timed(2, "kalshi", 1000, 1000, book),
+            timed(3, "kalshi", 5000, 5000, delta),
+        ],
+        None,
+    );
+    seal(
+        &dir_b,
+        1,
+        &[
+            sub_book(1, 2000, "Y"),
+            timed(2, "kalshi", 3000, 3000, error),
+        ],
+        None,
+    );
+
+    let merged = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "conn".into(), dir_a),
+            ("b".into(), "conn".into(), dir_b),
+        ],
+    );
+    assert_eq!(
+        kalshi_yes_row(&merged),
+        (true, 12.0),
+        "rejection of unrelated market Y must not reset healthy market X"
+    );
+}

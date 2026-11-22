@@ -112,9 +112,54 @@ impl MergedDepth {
     }
 }
 
+struct MergedCoverage {
+    coverage: Arc<[SessionCoverage]>,
+    subscribed: Vec<Option<Arc<BTreeSet<String>>>>,
+    observed: Vec<BTreeSet<String>>,
+}
+
+impl MergedCoverage {
+    fn covered_by_other(&self, instrument: &str, origin: &Origin) -> bool {
+        self.coverage
+            .iter()
+            .zip(&self.subscribed)
+            .zip(&self.observed)
+            .any(|((session, ids), obs)| {
+                session.stream != origin.stream
+                    && (ids.as_deref().is_some_and(|set| set.contains(instrument))
+                        || obs.contains(instrument))
+                    && session
+                        .intervals
+                        .iter()
+                        .any(|span| (span.start_us..=span.end_us).contains(&origin.received_us))
+            })
+    }
+
+    fn restart_for_stream(
+        &self,
+        origin: &Origin,
+        books: &mut VenueBooks,
+        skip_covered: bool,
+    ) -> bool {
+        let mut touched = false;
+        for (session, obs) in self.coverage.iter().zip(&self.observed) {
+            if session.stream == origin.stream {
+                for id in obs {
+                    touched = true;
+                    if !skip_covered || !self.covered_by_other(id, origin) {
+                        books.restart(id);
+                    }
+                }
+            }
+        }
+        touched
+    }
+}
+
 struct ReconstructDriver<F> {
     books: VenueBooks,
     merged_depth: Option<MergedDepth>,
+    merged_coverage: Option<MergedCoverage>,
     count: u64,
     last_utc: BTreeMap<String, i64>,
     batch: QuoteBatchBuilder,
@@ -130,6 +175,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         Self {
             books: VenueBooks::new(mode, std::iter::empty::<String>()),
             merged_depth: None,
+            merged_coverage: None,
             count: 0,
             last_utc: BTreeMap::new(),
             batch: QuoteBatchBuilder::new(version),
@@ -158,7 +204,26 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         let event = wire::decode(venue, message)?;
         if matches!(event, Event::SubscriptionError) {
             if wire::rejects_books(message, book_command) {
-                self.books.reset();
+                if let Some(m) = merged {
+                    let origin = m.origin();
+                    if let Some(ids) = origin.subscription.as_deref() {
+                        for id in ids {
+                            if self
+                                .merged_coverage
+                                .as_ref()
+                                .is_none_or(|cov| !cov.covered_by_other(id, origin))
+                            {
+                                self.books.restart(id);
+                            }
+                        }
+                    } else if let Some(cov) = &self.merged_coverage {
+                        cov.restart_for_stream(origin, &mut self.books, true);
+                    } else {
+                        self.books.reset();
+                    }
+                } else {
+                    self.books.reset();
+                }
             }
             return Ok(());
         }
@@ -294,6 +359,7 @@ pub fn reconstruct_merged(
     let mut streams = BTreeMap::<_, Vec<_>>::new();
     let mut coverage = Vec::new();
     let mut subscribed = Vec::new();
+    let mut observed = Vec::new();
     let singleton = sessions.len() == 1;
     for (copy, connection, path) in sessions {
         let input = Input::open(&path)?;
@@ -330,19 +396,43 @@ pub fn reconstruct_merged(
         let mut scan = occurrences()?;
         scan.try_for_each(|item| item.map(drop))?;
         subscribed.push(scan.subscription());
+        observed.push(scan.observed_books());
         coverage.push(scan.finish());
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
     let pooled = {
-        // A copy bridges a hole only for the instruments it subscribed to, so copies
-        // of one subscription pool their coverage and other subscriptions do not.
-        let mut groups = BTreeMap::<_, Vec<_>>::new();
+        // A copy bridges a hole only for copies of the same declared subscription,
+        // or undeclared copies of the same connection without disjoint books.
+        let mut declared = BTreeMap::<&BTreeSet<String>, Vec<usize>>::new();
+        let mut undeclared = BTreeMap::<&str, Vec<usize>>::new();
         for (source, ids) in subscribed.iter().enumerate() {
-            groups.entry(ids).or_default().push(source);
+            match ids.as_deref() {
+                Some(set) if !set.is_empty() => declared.entry(set).or_default().push(source),
+                _ => undeclared
+                    .entry(coverage[source].stream.connection.as_str())
+                    .or_default()
+                    .push(source),
+            }
+        }
+        let mut groups: Vec<Vec<usize>> = declared.into_values().collect();
+        for members in undeclared.into_values() {
+            let non_empty: Vec<&BTreeSet<String>> = members
+                .iter()
+                .map(|&s| &observed[s])
+                .filter(|set| !set.is_empty())
+                .collect();
+            let mismatched = non_empty
+                .first()
+                .is_some_and(|first| non_empty[1..].iter().any(|other| other != first));
+            if mismatched {
+                groups.extend(members.into_iter().map(|s| vec![s]));
+            } else {
+                groups.push(members);
+            }
         }
         let mut periods = vec![(0, vec![]); coverage.len()];
-        for (group, members) in groups.into_values().enumerate() {
+        for (group, members) in groups.into_iter().enumerate() {
             let spans: Vec<_> = members
                 .iter()
                 .flat_map(|&s| &coverage[s].intervals)
@@ -381,6 +471,11 @@ pub fn reconstruct_merged(
     let mut subscriptions = BTreeMap::new();
     let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
     merger.verified_sessions = coverage.into();
+    driver.merged_coverage = Some(MergedCoverage {
+        coverage: Arc::clone(&merger.verified_sessions),
+        subscribed,
+        observed,
+    });
     if venue == Venue::Polymarket {
         driver.merged_depth = Some(MergedDepth {
             coverage: Arc::clone(&merger.verified_sessions),
@@ -399,21 +494,35 @@ pub fn reconstruct_merged(
                     .receipts
                     .extend(m.occurrences.iter().map(Origin::receipt_period));
             }
-            for o in &mut m.occurrences {
+            let mut origin_covered = false;
+            for (index, o) in m.occurrences.iter_mut().enumerate() {
                 let (group, periods) = &pooled[o.coverage_group];
-                o.coverage_group = *group;
-                o.coverage_period = periods[o.coverage_period];
+                if let Some(&period) = periods.get(o.coverage_period) {
+                    o.coverage_group = *group;
+                    o.coverage_period = period;
+                    if index == 0 {
+                        origin_covered = true;
+                    }
+                }
             }
             on_message(&m)?;
             let origin = m.origin();
             // A hole in the receipt of one subscription restarts only its instruments.
-            if periods
-                .insert(origin.coverage_group, origin.coverage_period)
-                .is_some_and(|old| old != origin.coverage_period)
+            if origin_covered
+                && periods
+                    .insert(origin.coverage_group, origin.coverage_period)
+                    .is_some_and(|old| old != origin.coverage_period)
             {
                 match &origin.subscription {
                     Some(ids) => ids.iter().for_each(|id| driver.books.restart(id)),
-                    None => driver.books.reset(),
+                    None => {
+                        let scoped = driver.merged_coverage.as_ref().is_some_and(|cov| {
+                            cov.restart_for_stream(origin, &mut driver.books, false)
+                        });
+                        if !scoped {
+                            driver.books.reset();
+                        }
+                    }
                 }
             }
             // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
@@ -535,6 +644,7 @@ fn replay_file(
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut generation = None;
     let mut subscription = wire::RecordedSubscription::default();
+    let mut book_rejected = false;
     for item in input.frames()? {
         let item = item?;
         let CaptureItem::Frame(f) = &item else {
@@ -550,18 +660,18 @@ fn replay_file(
         } else {
             Some(vec![])
         };
-        if let Some(s) = &mut source {
-            s.evidence.frame(f, messages.as_deref())?;
-        }
         if generation
             .replace(f.connection_generation)
             .is_some_and(|g| g != f.connection_generation)
         {
+            book_rejected = false;
             driver.books.reset();
         }
         if f.frame_type == "subscription" && f.direction == "sent" {
             let command: Value = serde_json::from_str(&f.payload_raw)?;
-            subscription.record(venue, &command)?;
+            if subscription.record(venue, &command)? {
+                book_rejected = false;
+            }
             if let Some(basis) = subscription.kalshi_basis {
                 driver.books.set_kalshi_price_mode(basis);
             }
@@ -570,6 +680,22 @@ fn replay_file(
                     driver.books.subscribe(id.clone());
                 }
             }
+        }
+        if received_text
+            && messages.as_deref().is_some_and(|msgs| {
+                msgs.iter().any(|m| {
+                    matches!(wire::decode(venue, &m.value), Ok(Event::SubscriptionError))
+                        && wire::rejects_books(&m.value, subscription.book_command)
+                })
+            })
+        {
+            book_rejected = true;
+        }
+        if let Some(s) = &mut source {
+            s.evidence.frame(f, messages.as_deref(), !book_rejected)?;
+        }
+        if f.frame_type == "subscription" && f.direction == "sent" {
+            continue;
         } else if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
             driver.books.reset();
         } else if received_text {

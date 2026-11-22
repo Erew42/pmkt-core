@@ -20,12 +20,12 @@ pub(crate) struct RecordedSubscription {
     pub book_command: Option<i64>,
 }
 impl RecordedSubscription {
-    pub fn record(&mut self, venue: Venue, command: &Value) -> Result<()> {
+    pub fn record(&mut self, venue: Venue, command: &Value) -> Result<bool> {
         let ids = match venue {
             Venue::Polymarket => command["assets_ids"].as_array(),
             Venue::Kalshi => {
                 let Some(basis) = kalshi::subscription_basis(command)? else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 self.kalshi_basis = Some(basis);
                 self.book_command = command["id"].as_i64();
@@ -35,8 +35,9 @@ impl RecordedSubscription {
         if let Some(ids) = ids {
             let instruments = Arc::make_mut(self.instruments.get_or_insert_with(Arc::default));
             instruments.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+            return Ok(true);
         }
-        Ok(())
+        Ok(venue == Venue::Kalshi)
     }
 }
 

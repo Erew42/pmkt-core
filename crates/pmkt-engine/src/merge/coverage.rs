@@ -55,8 +55,12 @@ pub(crate) struct ReceiptPeriod {
 }
 impl ReceiptPeriod {
     pub(crate) fn bridges(self, sessions: &[SessionCoverage], received: &Origin) -> bool {
-        let source = &sessions[self.source];
-        let span = &source.intervals[self.interval];
+        let Some(source) = sessions.get(self.source) else {
+            return false;
+        };
+        let Some(span) = source.intervals.get(self.interval) else {
+            return false;
+        };
         source.stream != received.stream
             && (span.start_us..=span.end_us).contains(&received.received_us)
     }
@@ -169,6 +173,11 @@ impl CoverageTracker {
         self.window = Window::Closed(StartReason::AfterGap);
         self.seqs.clear();
     }
+    pub(crate) fn reject_books(&mut self) {
+        self.end(EndReason::TransportError, None);
+        self.window = Window::Closed(StartReason::AfterGap);
+        self.seqs.clear();
+    }
     fn end(&mut self, reason: EndReason, end: Option<i64>) {
         if let Window::Open {
             start,
@@ -242,6 +251,7 @@ pub(crate) struct SessionEvidence {
     pub(crate) coverage_group: usize,
     tracker: CoverageTracker,
     generation: Option<u64>,
+    last_received_us: Option<i64>,
     books: BTreeSet<String>,
 }
 impl SessionEvidence {
@@ -250,6 +260,7 @@ impl SessionEvidence {
             coverage_group: 0,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
+            last_received_us: None,
             books: BTreeSet::new(),
         }
     }
@@ -263,11 +274,19 @@ impl SessionEvidence {
         &mut self,
         f: &RawFrame,
         messages: Option<&[wire::WireMessage<'_>]>,
+        record_coverage: bool,
     ) -> Result<()> {
         let us = received_us(&f.received_utc)?;
+        if f.direction.starts_with("received") {
+            self.last_received_us = Some(us);
+        }
         if self.generation != Some(f.connection_generation) || f.frame_type == "subscription" {
             self.books.clear();
             self.generation = Some(f.connection_generation);
+        }
+        if !record_coverage {
+            self.tracker.reject_books();
+            return Ok(());
         }
         self.tracker
             .frame(us, f.connection_generation, &f.frame_type, &f.direction);
@@ -307,7 +326,7 @@ impl SessionEvidence {
                 generation: f.connection_generation,
                 frame_seq: f.local_frame_seq,
                 position: m.position,
-                received_us: self.tracker.frame_us.expect("received text frame"),
+                received_us: self.last_received_us.expect("received text frame"),
                 received_utc: f.received_utc.clone(),
                 recording_id: f.recording_id.clone(),
                 received_monotonic_ns: f.received_monotonic_ns,
@@ -327,6 +346,9 @@ pub struct SessionOccurrences<I> {
     pub(crate) evidence: SessionEvidence,
     source: I,
     subscription: wire::RecordedSubscription,
+    observed_books: BTreeSet<String>,
+    last_generation: Option<u64>,
+    book_rejected: bool,
     pending: std::vec::IntoIter<Occurrence>,
     done: bool,
 }
@@ -336,6 +358,9 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             evidence: SessionEvidence::new(stream, session),
             source,
             subscription: wire::RecordedSubscription::default(),
+            observed_books: BTreeSet::new(),
+            last_generation: None,
+            book_rejected: false,
             pending: vec![].into_iter(),
             done: false,
         }
@@ -345,6 +370,9 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     }
     pub(crate) fn subscription(&self) -> Option<std::sync::Arc<BTreeSet<String>>> {
         self.subscription.instruments.clone()
+    }
+    pub(crate) fn observed_books(&self) -> BTreeSet<String> {
+        self.observed_books.clone()
     }
     fn step(&mut self) -> Result<Option<Occurrence>> {
         loop {
@@ -358,6 +386,10 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                 self.evidence.chunk_gap();
                 continue;
             };
+            if self.last_generation != Some(f.connection_generation) {
+                self.last_generation = Some(f.connection_generation);
+                self.book_rejected = false;
+            }
             if f.frame_type == "subscription"
                 && f.venue == Venue::Kalshi
                 && conflated_subscription(&f.payload_raw)
@@ -369,15 +401,34 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             if f.frame_type == "subscription"
                 && f.direction == "sent"
                 && let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
+                && self.subscription.record(f.venue, &command)?
             {
-                self.subscription.record(f.venue, &command)?;
+                self.book_rejected = false;
             }
             let messages = if f.frame_type == "text" && f.direction == "received" {
                 wire::messages(f.payload_raw.as_bytes()).ok()
             } else {
                 Some(vec![])
             };
-            self.evidence.frame(&f, messages.as_deref())?;
+            if let Some(msgs) = messages.as_deref() {
+                for m in msgs {
+                    match wire::decode(f.venue, &m.value) {
+                        Ok(wire::Event::SubscriptionError)
+                            if wire::rejects_books(&m.value, self.subscription.book_command) =>
+                        {
+                            self.book_rejected = true;
+                        }
+                        Ok(wire::Event::Books(updates)) => {
+                            for u in updates {
+                                self.observed_books.insert(u.instrument);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            self.evidence
+                .frame(&f, messages.as_deref(), !self.book_rejected)?;
             self.pending = messages
                 .into_iter()
                 .flatten()
