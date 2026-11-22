@@ -98,13 +98,6 @@ jobs:
               tests/test_venue_adapter.py
           - name: feeds-streaming
             paths: >-
-              tests/test_capture_storage_backends.py
-              tests/test_cr18_book_reconstruction.py
-              tests/test_cr18_foundations.py
-              tests/test_cr18_instrument_evidence.py
-              tests/test_cr18_observations.py
-              tests/test_cr18_tape_durability.py
-              tests/test_cr18_topbook_emission.py
               tests/test_kalshi_integration.py
               tests/test_kalshi_ws.py
               tests/test_live_feed_supervisor.py

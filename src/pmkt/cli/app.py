@@ -13,8 +13,6 @@ from pmkt.cli.ingest import (
 from pmkt.cli.market_catalog import markets_app
 from pmkt.cli.query import query_cmd
 from pmkt.cli.raw_inspection import inspect_raw_capture
-from pmkt.cli.reconstruction import reconstruct_book_tape_cmd
-from pmkt.cli.recovery import recover_stream_run_cmd
 from pmkt.cli.resolution import resolve_market_resolutions_cmd
 from pmkt.cli.schema import dataset_app, schema_app
 from pmkt.cli.streaming import (
@@ -46,8 +44,6 @@ app.command("compute-features")(compute_features_cmd)
 app.command("backfill-venue-history")(backfill_venue_history_cmd)
 app.command("record-topbooks")(record_topbooks_cmd)
 app.command("resolve-market-resolutions")(resolve_market_resolutions_cmd)
-app.command("recover-stream-run")(recover_stream_run_cmd)
-app.command("reconstruct-book-tape")(reconstruct_book_tape_cmd)
 
 
 def main() -> None:

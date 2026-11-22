@@ -91,13 +91,11 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
 - **Capture.** Recording a live feed, since neither venue documents a historical
   book endpoint (`/book`, `/markets/{ticker}/orderbook` are current only).
   `stream-books` and `stream-kalshi-books` write `recording.v1` (`BookRecorder`,
-  `RecordingOptions.mode` `topbook` or `full`); older profile runs use
-  `collector_run_id` and `run_manifest.v1`. `recover-stream-run` reads both.
-- **Tape and reconstruction.** The tape (`book_tape_event.v1`, `book_tape_level.v1`,
-  `book_tape_control.v1`) is the legacy replayable log; `recording.v1` is not one.
-  `reconstruct-book-tape` replays it into `topbook`/`depth` rows with
-  `source=reconstructed_book_tape`, checking post-book hashes
-  (`BookTapeReconstructionError`).
+  `RecordingOptions.mode` `topbook` or `full`). Older profile runs use
+  `collector_run_id` and `run_manifest.v1`.
+- **Committed tape.** Historical replayable log stored in `book_tape_event.v1`,
+  `book_tape_level.v1`, and `book_tape_control.v1` rows. Replay produced
+  `topbook` and `depth` rows with `source=reconstructed_book_tape`.
 - **Catalog, census, discovery.** `data/markets` (`pmkt markets`). A census is the
   full list of current nonterminal markets per stream (`polymarket`,
   `kalshi-conventional`, `kalshi-mve`); discovery finds markets created since a
