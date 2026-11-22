@@ -14,7 +14,7 @@ use crate::{
 use chrono::DateTime;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -436,116 +436,103 @@ pub fn reconstruct_merged(
         }
         per_source
     };
-    let (class_instruments, instrument_class, interval_classes, class_components) = {
-        fn find(parent: &mut [usize], mut x: usize) -> usize {
-            while parent[x] != x {
-                parent[x] = parent[parent[x]];
-                x = parent[x];
-            }
-            x
-        }
-        // Compute rollback-safe cross-stream union spans per (source, interval).
-        // If an interval's start rolled back at or before a prior interval's end
-        // on the same source, an ended peer cannot bridge that break by UTC alone.
-        let mut effective_spans: Vec<Vec<Option<(i64, i64)>>> = Vec::with_capacity(coverage.len());
+    // Compute rollback-safe cross-stream bridging spans per (source, interval).
+    // If an interval's start rolled back at or before a prior interval's end
+    // on the same source, its receive timestamps cannot bridge cross-stream by
+    // UTC alone; continuity across that break requires a shared witness.
+    let (effective_spans, sorted_spans) = {
+        let mut effective = Vec::with_capacity(coverage.len());
+        let mut sorted = Vec::with_capacity(coverage.len());
         for session in &coverage {
             let mut spans = Vec::with_capacity(session.intervals.len());
+            let mut active = Vec::new();
             let mut prev_max_end = i64::MIN;
-            for span in &session.intervals {
+            for (idx, span) in session.intervals.iter().enumerate() {
                 let eff = if span.start_us > prev_max_end {
-                    Some((span.start_us, span.end_us))
-                } else if span.end_us > prev_max_end {
-                    Some((span.end_us, span.end_us))
+                    let bounds = (span.start_us, span.end_us);
+                    active.push((span.start_us, span.end_us, idx));
+                    Some(bounds)
                 } else {
                     None
                 };
                 prev_max_end = prev_max_end.max(span.end_us);
                 spans.push(eff);
             }
-            effective_spans.push(spans);
+            effective.push(spans);
+            sorted.push(active);
         }
-        type IntervalVertex = (usize, usize, Option<(i64, i64)>);
-        let mut vertices_by_instrument = BTreeMap::<String, Vec<IntervalVertex>>::new();
-        for (source, session) in coverage.iter().enumerate() {
-            for (idx, _) in session.intervals.iter().enumerate() {
-                let declared = session.interval_instruments[idx]
-                    .as_deref()
-                    .filter(|set| !set.is_empty());
-                let ids: &BTreeSet<String> = declared.unwrap_or(&undeclared_instruments[source]);
-                let base_span = effective_spans[source][idx];
-                for id in ids {
-                    let bridge_span = if venue == Venue::Kalshi && declared.is_some() {
-                        session.interval_first_book_us[idx]
-                            .get(id)
-                            .and_then(|&first_us| {
-                                base_span.and_then(|(a, b)| {
-                                    let start = a.max(first_us);
-                                    (start <= b).then_some((start, b))
-                                })
-                            })
-                    } else {
-                        base_span
-                    };
-                    vertices_by_instrument.entry(id.clone()).or_default().push((
-                        source,
-                        idx,
-                        bridge_span,
-                    ));
-                }
+        (effective, sorted)
+    };
+    let inst_bridge_span = |coverage: &[SessionCoverage],
+                            undeclared: &[BTreeSet<String>],
+                            source: usize,
+                            idx: usize,
+                            inst: &str|
+     -> Option<(i64, i64)> {
+        let session = coverage.get(source)?;
+        let declared = session.interval_instruments[idx]
+            .as_deref()
+            .filter(|set| !set.is_empty());
+        let ids: &BTreeSet<String> = declared.unwrap_or(&undeclared[source]);
+        if !ids.contains(inst) {
+            return None;
+        }
+        let base_span = effective_spans[source][idx]?;
+        if venue == Venue::Kalshi && declared.is_some() {
+            let &first_us = session.interval_first_book_us[idx].get(inst)?;
+            let start = base_span.0.max(first_us);
+            (start <= base_span.1).then_some((start, base_span.1))
+        } else {
+            Some(base_span)
+        }
+    };
+    type Witness = (usize, usize, i64, bool);
+    let intervals_connected = |coverage: &[SessionCoverage],
+                               undeclared: &[BTreeSet<String>],
+                               inst: &str,
+                               u: Witness,
+                               v: Witness|
+     -> bool {
+        if u.0 == v.0 && u.1 == v.1 {
+            return true;
+        }
+        let Some((u_lo, u_hi)) = inst_bridge_span(coverage, undeclared, u.0, u.1, inst) else {
+            return false;
+        };
+        let Some((v_lo, v_hi)) = inst_bridge_span(coverage, undeclared, v.0, v.1, inst) else {
+            return false;
+        };
+        let (u_a, u_b, v_a, v_b) = if u.3 || v.3 {
+            (u_lo, u_hi, v_lo, v_hi)
+        } else {
+            let ua = u_lo.max(u.2);
+            let vb = v_hi.min(v.2);
+            if ua > u_hi || v_lo > vb {
+                return false;
+            }
+            (ua, u_hi, v_lo, vb)
+        };
+        if coverage[u.0].stream != coverage[v.0].stream && u_a <= v_b && v_a <= u_b {
+            return true;
+        }
+        let need_start_le = u_b.min(v_b);
+        let need_end_ge = u_a.max(v_a);
+        for (src_w, peers) in sorted_spans.iter().enumerate() {
+            let stream_w = &coverage[src_w].stream;
+            if stream_w == &coverage[u.0].stream || stream_w == &coverage[v.0].stream {
+                continue;
+            }
+            let pos = peers.partition_point(|&(_, end_us, _)| end_us < need_end_ge);
+            if let Some(&(_, _, idx_w)) = peers.get(pos)
+                && let Some((w_lo, w_hi)) =
+                    inst_bridge_span(coverage, undeclared, src_w, idx_w, inst)
+                && w_lo <= need_start_le
+                && w_hi >= need_end_ge
+            {
+                return true;
             }
         }
-        let mut grouped = BTreeMap::<Vec<IntervalVertex>, Vec<String>>::new();
-        for (id, verts) in vertices_by_instrument {
-            grouped.entry(verts).or_default().push(id);
-        }
-        let mut class_instruments = Vec::with_capacity(grouped.len());
-        let mut instrument_class = BTreeMap::<String, usize>::new();
-        let mut interval_classes: Vec<Vec<Vec<usize>>> = coverage
-            .iter()
-            .map(|c| vec![Vec::new(); c.intervals.len()])
-            .collect();
-        let mut class_components = Vec::with_capacity(grouped.len());
-        for (class_id, (verts, instruments)) in grouped.into_iter().enumerate() {
-            for id in &instruments {
-                instrument_class.insert(id.clone(), class_id);
-            }
-            for &(s, idx, _) in &verts {
-                interval_classes[s][idx].push(class_id);
-            }
-            class_instruments.push(instruments);
-            let mut order: Vec<usize> =
-                (0..verts.len()).filter(|&v| verts[v].2.is_some()).collect();
-            order.sort_unstable_by_key(|&v| verts[v].2.expect("bridging span"));
-            let mut parent: Vec<usize> = (0..verts.len()).collect();
-            let mut active: Vec<usize> = Vec::new();
-            for v in order {
-                let (src_v, _, span_v) = verts[v];
-                let (start_v, _) = span_v.expect("bridging span");
-                active.retain(|&u| verts[u].2.expect("bridging span").1 >= start_v);
-                for &u in &active {
-                    let src_u = verts[u].0;
-                    if coverage[src_u].stream != coverage[src_v].stream {
-                        let ru = find(&mut parent, u);
-                        let rv = find(&mut parent, v);
-                        if ru != rv {
-                            parent[rv] = ru;
-                        }
-                    }
-                }
-                active.push(v);
-            }
-            let mut comp_map = BTreeMap::<(usize, usize), usize>::new();
-            for (v, &(s, idx, _)) in verts.iter().enumerate() {
-                comp_map.insert((s, idx), find(&mut parent, v));
-            }
-            class_components.push(comp_map);
-        }
-        (
-            class_instruments,
-            instrument_class,
-            interval_classes,
-            class_components,
-        )
+        false
     };
     // Each source keeps its own index in verified_sessions so per-interval
     // coverage classes and ReceiptPeriod stay aligned across the merge.
@@ -553,8 +540,11 @@ pub fn reconstruct_merged(
         source.evidence.coverage_group = index;
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
-    let mut last_components: Vec<Vec<usize>> = vec![Vec::new(); class_instruments.len()];
-    let mut last_reset_seq: Vec<u64> = vec![0; class_instruments.len()];
+    let mut interval_seen_us: Vec<Vec<Option<i64>>> = coverage
+        .iter()
+        .map(|c| vec![None; c.intervals.len()])
+        .collect();
+    let mut instrument_states: HashMap<String, (Vec<Witness>, u64)> = HashMap::new();
     let mut kalshi_basis = None;
     let mut subscriptions = BTreeMap::new();
     let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
@@ -571,9 +561,8 @@ pub fn reconstruct_merged(
             latest: BTreeMap::new(),
         });
     }
-    let mut covered_occurrences = Vec::new();
-    let mut touched_classes = Vec::new();
-    let mut current_components = Vec::new();
+    let mut covered_occurrences: Vec<Witness> = Vec::new();
+    let mut msg_instruments: Vec<String> = Vec::new();
     let mut msg_seq = 0_u64;
     let mut run = merger.stream(
         streams
@@ -591,15 +580,18 @@ pub fn reconstruct_merged(
                 && let Ok(pos) = session.interval_ids.binary_search(&id)
             {
                 for inst in &instruments {
-                    if let Some(&class_id) = instrument_class.get(inst)
-                        && last_reset_seq[class_id] <= orig_seq
-                        && let Some(&comp) =
-                            class_components[class_id].get(&(rep_origin.coverage_group, pos))
+                    if let Some((witnesses, last_reset_seq)) = instrument_states.get_mut(inst)
+                        && *last_reset_seq <= orig_seq
+                        && !witnesses
+                            .iter()
+                            .any(|w| w.0 == rep_origin.coverage_group && w.1 == pos)
                     {
-                        let prev = &mut last_components[class_id];
-                        if !prev.is_empty() && !prev.contains(&comp) {
-                            prev.push(comp);
-                        }
+                        witnesses.push((
+                            rep_origin.coverage_group,
+                            pos,
+                            rep_origin.received_us,
+                            true,
+                        ));
                     }
                 }
             }
@@ -613,59 +605,113 @@ pub fn reconstruct_merged(
         on_message(&m)?;
         let origin = m.origin();
         covered_occurrences.clear();
-        touched_classes.clear();
         if let Some(cov) = &driver.merged_coverage {
             for o in &m.occurrences {
                 if let Some(id) = o.coverage_period
                     && let Some(session) = cov.coverage.get(o.coverage_group)
                     && let Ok(pos) = session.interval_ids.binary_search(&id)
+                    && !covered_occurrences
+                        .iter()
+                        .any(|c| c.0 == o.coverage_group && c.1 == pos)
                 {
-                    covered_occurrences.push((o.coverage_group, pos));
-                    for &class_id in &interval_classes[o.coverage_group][pos] {
-                        if !touched_classes.contains(&class_id) {
-                            touched_classes.push(class_id);
-                        }
-                    }
+                    covered_occurrences.push((o.coverage_group, pos, o.received_us, m.late));
                 }
             }
         }
-        // A message crosses an uncovered gap for a coverage class only if
-        // none of its covered occurrences shares a component with the last
-        // covered message for that class. Only messages targeting that class
-        // narrow its witnessing components when no gap occurred.
-        for &class_id in &touched_classes {
-            current_components.clear();
-            let comp_map = &class_components[class_id];
-            for &(src, pos) in &covered_occurrences {
-                if let Some(&c) = comp_map.get(&(src, pos))
-                    && !current_components.contains(&c)
-                {
-                    current_components.push(c);
+        // Track continuity strictly per targeted instrument in O(1) for the
+        // common same-interval case, without scanning quiet instruments or
+        // letting unrelated assets narrow another asset's witnesses.
+        if !covered_occurrences.is_empty()
+            && let Some(cov) = &driver.merged_coverage
+        {
+            msg_instruments.clear();
+            wire::visit_message_instruments(venue, &m.message, |inst| {
+                if !msg_instruments.iter().any(|s| s == inst) {
+                    msg_instruments.push(inst.to_owned());
+                }
+            });
+            for inst in &msg_instruments {
+                if let Some((witnesses, last_reset_seq)) = instrument_states.get_mut(inst) {
+                    let connected = witnesses.iter().any(|&u| {
+                        covered_occurrences
+                            .iter()
+                            .any(|&v| u.0 == v.0 && u.1 == v.1)
+                    }) || witnesses.iter().any(|&u| {
+                        covered_occurrences.iter().any(|&v| {
+                            intervals_connected(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                inst,
+                                u,
+                                v,
+                            )
+                        })
+                    });
+                    if !connected {
+                        driver.books.restart(inst);
+                        *last_reset_seq = msg_seq;
+                    }
+                    witnesses.clear();
+                    witnesses.extend_from_slice(&covered_occurrences);
+                } else {
+                    let mut crossed_prior_gap = false;
+                    'prior: for (src, seen) in interval_seen_us.iter().enumerate() {
+                        for (pos, seen_us) in seen.iter().enumerate() {
+                            let Some(t_prev) = *seen_us else {
+                                continue;
+                            };
+                            let same_source_prior =
+                                covered_occurrences.iter().any(|&v| v.0 == src && pos < v.1);
+                            let prior_covers = if same_source_prior {
+                                let session = &cov.coverage[src];
+                                let declared = session.interval_instruments[pos]
+                                    .as_deref()
+                                    .filter(|set| !set.is_empty());
+                                declared
+                                    .unwrap_or(&cov.undeclared_instruments[src])
+                                    .contains(inst)
+                            } else if let Some((s_lo, _)) = inst_bridge_span(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                src,
+                                pos,
+                                inst,
+                            ) {
+                                covered_occurrences.iter().any(|&v| s_lo <= v.2)
+                            } else {
+                                false
+                            };
+                            if !prior_covers {
+                                continue;
+                            }
+                            let u = (src, pos, t_prev, false);
+                            if !covered_occurrences.iter().any(|&v| {
+                                intervals_connected(
+                                    &cov.coverage,
+                                    &cov.undeclared_instruments,
+                                    inst,
+                                    u,
+                                    v,
+                                )
+                            }) {
+                                crossed_prior_gap = true;
+                                break 'prior;
+                            }
+                        }
+                    }
+                    let reset_seq = if crossed_prior_gap {
+                        driver.books.restart(inst);
+                        msg_seq
+                    } else {
+                        0
+                    };
+                    instrument_states
+                        .insert(inst.clone(), (covered_occurrences.clone(), reset_seq));
                 }
             }
-            if !current_components.is_empty() {
-                let prev = &mut last_components[class_id];
-                if prev.is_empty() {
-                    prev.extend_from_slice(&current_components);
-                } else if !prev.iter().any(|c| current_components.contains(c)) {
-                    for id in &class_instruments[class_id] {
-                        driver.books.restart(id);
-                    }
-                    last_reset_seq[class_id] = msg_seq;
-                    prev.clear();
-                    prev.extend_from_slice(&current_components);
-                } else {
-                    let mut targets_class = false;
-                    wire::visit_message_instruments(venue, &m.message, |inst| {
-                        if instrument_class.get(inst) == Some(&class_id) {
-                            targets_class = true;
-                        }
-                    });
-                    if targets_class {
-                        prev.clear();
-                        prev.extend_from_slice(&current_components);
-                    }
-                }
+            for &(src, pos, us, _) in &covered_occurrences {
+                interval_seen_us[src][pos] =
+                    Some(interval_seen_us[src][pos].map_or(us, |prev| prev.max(us)));
             }
         }
         // The recorders' monotonic clocks are unrelated host clocks; the UTC receive

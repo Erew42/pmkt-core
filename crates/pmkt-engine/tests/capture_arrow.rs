@@ -2223,3 +2223,225 @@ fn unrelated_y_interleave_and_late_duplicate_preserve_healthy_polymarket_book() 
         0.6
     );
 }
+
+#[test]
+fn multihop_ended_peers_and_same_class_polymarket_interleave_are_exact() {
+    let sub_k = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["X"],"use_yes_price":true}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let ksnap = |ms: i64, seq: i64, clock: i64| {
+        json!({"type":"orderbook_snapshot","sid":7,"seq":seq,"sending_ts_ms":1735689600000i64 + ms,
+            "msg":{"market_ticker":"X","clock":clock,"market_id":"m-1","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}})
+    };
+    let kdelta = |ms: i64, seq: i64, qty: &str, clock: i64| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1735689600000i64 + ms,
+            "msg":{"ts_ms":1735689600000i64 + ms,"market_ticker":"X","clock":clock,"market_id":"m-1","side":"yes","price_dollars":"0.40","delta_fp":qty}})
+    };
+    let dir_a = root();
+    let dir_c3 = root();
+    let dir_early = root();
+    let dir_late = root();
+    let dir_full = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 1000, 1000, ksnap(1, 1, 4100001)),
+            timed(3, "kalshi", 5000, 5000, kdelta(5, 2, "1", 4100002)),
+            timed(4, "kalshi", 3000, 6000, kdelta(7, 4, "2", 4100004)),
+            timed(5, "kalshi", 8000, 8000, kdelta(8, 5, "1", 4100005)),
+        ],
+        None,
+    );
+    seal(
+        &dir_c3,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 4000, 4000, ksnap(1, 1, 4100001)),
+            timed(3, "kalshi", 8000, 8000, kdelta(5, 2, "1", 4100002)),
+            kind(
+                timed(4, "kalshi", 8100, 8100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_early,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 2000, 2000, ksnap(-2, 1, 4099988)),
+            kind(
+                timed(3, "kalshi", 7000, 7000, json!({})),
+                "ws_pong",
+                "received_control_base64",
+            ),
+            kind(
+                timed(4, "kalshi", 7100, 7100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_late,
+        1,
+        &[
+            sub_k.clone(),
+            timed(2, "kalshi", 6000, 6000, ksnap(-1, 1, 4099989)),
+            kind(
+                timed(3, "kalshi", 9000, 9000, json!({})),
+                "ws_pong",
+                "received_control_base64",
+            ),
+            kind(
+                timed(4, "kalshi", 9100, 9100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_full,
+        1,
+        &[
+            sub_k,
+            timed(2, "kalshi", 1000, 1000, ksnap(1, 1, 4100001)),
+            timed(3, "kalshi", 5000, 5000, kdelta(5, 2, "1", 4100002)),
+            timed(4, "kalshi", 6000, 6000, kdelta(6, 3, "5", 4100003)),
+            timed(5, "kalshi", 7000, 7000, kdelta(7, 4, "2", 4100004)),
+            timed(6, "kalshi", 8000, 8000, kdelta(8, 5, "1", 4100005)),
+        ],
+        None,
+    );
+    let with_c3 = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a.clone()),
+            ("c3".into(), "c".into(), dir_c3),
+        ],
+    );
+    assert!(!kalshi_yes_row(&with_c3).0);
+    let with_multihop = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a.clone()),
+            ("early".into(), "c".into(), dir_early),
+            ("late".into(), "c".into(), dir_late),
+        ],
+    );
+    assert!(!kalshi_yes_row(&with_multihop).0);
+    let with_full = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a),
+            ("full".into(), "c".into(), dir_full),
+        ],
+    );
+    assert_eq!(kalshi_yes_row(&with_full), (true, 19.0));
+
+    // Same-class Polymarket {X, Y, Z} interleave on A must not narrow B's witness for X.
+    let sub_p = kind(
+        timed(
+            1,
+            "polymarket",
+            0,
+            0,
+            json!({"type":"market","assets_ids":["X","Y","Z"]}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let psnap = |asset: &str, ts_ms: i64| {
+        json!({
+            "event_type": "book",
+            "asset_id": asset,
+            "market": "M",
+            "timestamp": ts_ms.to_string(),
+            "hash": format!("h{asset}{ts_ms}"),
+            "bids": [{"price": "0.40", "size": "10"}],
+            "asks": [{"price": "0.60", "size": "20"}],
+        })
+    };
+    let pdelta = |assets: &[(&str, &str)], ms: i64| {
+        let changes: Vec<_> = assets
+            .iter()
+            .map(|(id, size)| json!({"asset_id": id, "price": "0.40", "size": size, "side": "BUY"}))
+            .collect();
+        json!({
+            "event_type": "price_change",
+            "market": "M",
+            "timestamp": (1735689600000i64 + ms).to_string(),
+            "price_changes": changes,
+        })
+    };
+    let dir_pa = root();
+    let dir_pb = root();
+    seal(
+        &dir_pa,
+        1,
+        &[
+            sub_p.clone(),
+            timed(2, "polymarket", 200, 200, psnap("Y", 1735689600000)),
+            timed(3, "polymarket", 400, 400, psnap("Z", 1735689600000)),
+            timed(4, "polymarket", 1000, 1000, psnap("X", 1735689600001)),
+            timed(
+                5,
+                "polymarket",
+                2000,
+                2000,
+                pdelta(&[("Y", "40"), ("Z", "60")], 2),
+            ),
+            kind(
+                timed(6, "polymarket", 2900, 2900, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_pb,
+        1,
+        &[
+            sub_p,
+            timed(2, "polymarket", 3000, 3000, psnap("X", 1735689600001)),
+            timed(3, "polymarket", 6000, 6000, pdelta(&[("X", "12")], 6)),
+        ],
+        None,
+    );
+    let merged_p = merged_topbooks(
+        Venue::Polymarket,
+        vec![
+            ("a".into(), "c".into(), dir_pa),
+            ("b".into(), "c".into(), dir_pb),
+        ],
+    );
+    let last_x = merged_p
+        .iter()
+        .rfind(|b| column::<StringArray>(b, "instrument_id").value(0) == "X")
+        .expect("final X row");
+    assert!(column::<BooleanArray>(last_x, "valid_state").value(0));
+    assert_eq!(
+        column::<Float64Array>(last_x, "best_ask_dollars").value(0),
+        0.6
+    );
+    assert_eq!(
+        column::<Float64Array>(last_x, "bid_size_contracts").value(0),
+        12.0
+    );
+}
