@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import runpy
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import tarfile
 import zipfile
 from email.parser import Parser
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -71,16 +74,11 @@ def test_wheel_retry_excludes_retired_module(tmp_path: Path, monkeypatch) -> Non
     # Fail delivery after maturin built the intermediate wheel containing retired.py.
     blocked_output = tmp_path / "blocked-output"
     blocked_output.touch()
-    failed = subprocess.run(
-        [sys.executable, "-c", "import build_support,sys; build_support.build_wheel(sys.argv[1])",
-         str(blocked_output)],
-        cwd=checkout,
-        capture_output=True,
-        encoding="utf-8",
-        errors="replace",
-    )
-    assert failed.returncode != 0
-    assert blocked_output.name in failed.stderr
+    with monkeypatch.context() as patch:
+        patch.chdir(checkout)
+        backend = runpy.run_path("build_support.py")
+        with pytest.raises((NotADirectoryError, FileNotFoundError)):
+            backend["build_wheel"](str(blocked_output))
     with zipfile.ZipFile(next((target / "wheels").glob("pmkt-*.whl"))) as archive:
         assert "pmkt/retired.py" in archive.namelist()
 

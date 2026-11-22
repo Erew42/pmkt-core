@@ -1,11 +1,11 @@
 use crate::{engine_error, venue};
 use pmkt_engine::{
-    Book, BookMode, ScaledDecimal, Venue, VenueBooks,
-    book::{BookState, QuotePolicy, UpdateKind},
+    Book, BookMode, Venue, VenueBooks,
+    book::UpdateKind,
     health::{Flags, Integrity},
-    wire::{Action, Event, Ladder, Sequence, decode, snapshot_spelling},
+    wire::{Action, Event, Ladder, decode},
 };
-use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
+use pyo3::{prelude::*, types::PyDict};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -13,11 +13,11 @@ pub(crate) fn json(text: &str) -> PyResult<Value> {
     serde_json::from_str(text).map_err(|error| engine_error(error.into()))
 }
 
-fn flags(values: &Flags) -> Vec<&'static str> {
+pub(crate) fn flags(values: &Flags) -> Vec<&'static str> {
     values.iter().map(|flag| flag.as_str()).collect()
 }
 
-fn parse_flags(values: Vec<String>) -> Flags {
+pub(crate) fn parse_flags(values: Vec<String>) -> Flags {
     values
         .into_iter()
         .filter_map(|value| serde_json::from_value(Value::String(value)).ok())
@@ -31,143 +31,11 @@ fn levels(values: &Ladder) -> Vec<(String, String)> {
         .collect()
 }
 
-fn decimal(value: Option<&str>) -> Option<ScaledDecimal> {
-    value.and_then(|s| s.parse().ok())
-}
-
-#[derive(FromPyObject)]
-#[pyo3(from_item_all)]
-pub struct LocalState {
-    initialized: bool,
-    flags: Vec<String>,
-    first: Vec<(String, String)>,
-    second: Vec<(String, String)>,
-    sid: Option<i64>,
-    seq: Option<i64>,
-    hash: Option<String>,
-    tick: Option<String>,
-}
-
-fn ladder(values: Vec<(String, String)>) -> PyResult<Ladder> {
-    values
-        .into_iter()
-        .map(|(p, q)| {
-            let parse = |s: &str| {
-                s.parse().map_err(|e: pmkt_engine::decimal::DecimalError| {
-                    PyValueError::new_err(e.to_string())
-                })
-            };
-            Ok((parse(&p)?, parse(&q)?))
-        })
-        .collect()
-}
-
 #[pyfunction]
 pub fn book_integrity(initialized: bool, quality_flags: Vec<String>) -> bool {
     let count = quality_flags.len();
     let flags = parse_flags(quality_flags);
     flags.len() == count && Integrity::from_observation(initialized, &flags) == Integrity::Intact
-}
-
-/// Adapt the public mutable WS dataclasses without making a second state store.
-#[pyfunction]
-#[pyo3(signature = (venue_name, instrument, state, message, *, use_yes_price=true, quotes=None))]
-pub fn update_local_book<'py>(
-    py: Python<'py>,
-    venue_name: &str,
-    instrument: &str,
-    state: LocalState,
-    message: &str,
-    use_yes_price: bool,
-    quotes: Option<(Option<&str>, Option<&str>)>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let venue = venue(venue_name)?;
-    let mode = match venue {
-        Venue::Polymarket => BookMode::Polymarket,
-        Venue::Kalshi => BookMode::Kalshi {
-            use_yes_price,
-            policy: QuotePolicy::Current,
-        },
-    };
-    let mut book = Book::new(mode, instrument);
-    book.restore(BookState {
-        levels: (ladder(state.first)?, ladder(state.second)?),
-        initialized: state.initialized,
-        flags: parse_flags(state.flags),
-        sequence: Sequence {
-            sid: state.sid,
-            seq: state.seq,
-        },
-        hash: state.hash,
-        tick: decimal(state.tick.as_deref()),
-    });
-    let message = json(message)?;
-    let event = decode(venue, &message).map_err(engine_error)?;
-    let mut snapshot = false;
-    match event {
-        Event::Books(updates) => {
-            for update in updates {
-                snapshot |= update.action.is_snapshot();
-                book.apply_update(&update);
-            }
-        }
-        Event::Lifecycle {
-            market,
-            timestamp,
-            resolved,
-            ..
-        } => {
-            book.apply_update(&pmkt_engine::wire::Update {
-                instrument: instrument.into(),
-                market,
-                timestamp,
-                sequence: None,
-                action: Action::Lifecycle { resolved },
-            });
-        }
-        _ => {}
-    }
-    let (bid, ask) = if let Some((bid, ask)) = quotes {
-        let (mut bid, mut ask) = (decimal(bid), decimal(ask));
-        if message["event_type"] == "best_bid_ask" {
-            bid = ScaledDecimal::from_json(&message["best_bid"]).ok().or(bid);
-            ask = ScaledDecimal::from_json(&message["best_ask"]).ok().or(ask);
-        }
-        if message["event_type"] != "market_resolved" {
-            book.refresh_quotes(bid, ask);
-        }
-        (bid, ask)
-    } else {
-        (book.best_native_bid(), book.best_right().map(|q| q.price))
-    };
-    let (first, second) = book.native_levels();
-    let [first, second] = if snapshot {
-        snapshot_spelling(venue, &message).map(|side| {
-            let spelling = |value: &Value| {
-                value
-                    .as_str()
-                    .map_or_else(|| value.to_string(), str::to_owned)
-            };
-            side.into_values()
-                .map(|(p, q)| (spelling(p), spelling(q)))
-                .collect()
-        })
-    } else {
-        [levels(first), levels(second)]
-    };
-    let result = PyDict::new(py);
-    result.set_item("first", first)?;
-    result.set_item("second", second)?;
-    result.set_item("bid", bid.map(|p| p.to_string()))?;
-    result.set_item("ask", ask.map(|p| p.to_string()))?;
-    result.set_item("initialized", book.initialized())?;
-    result.set_item("valid", book.valid_state())?;
-    result.set_item("flags", flags(book.flags()))?;
-    result.set_item("hash", book.venue_hash())?;
-    result.set_item("tick", book.tick_size().map(|d| d.to_string()))?;
-    result.set_item("sid", book.sequence().sid)?;
-    result.set_item("seq", book.sequence().seq)?;
-    Ok(result)
 }
 
 #[pyclass(module = "pmkt._native")]

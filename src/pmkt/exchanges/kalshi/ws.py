@@ -25,7 +25,7 @@ from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
 from pmkt import _native
-from pmkt.exchanges._ws_book import decimal_levels, encode_message, local_state, sync_ladder
+from pmkt.exchanges._ws_book import decode_decimal_json
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     _wire_frames,
@@ -149,10 +149,10 @@ def decode_kalshi_messages(
         raw = raw.decode("utf-8", errors="replace")
     if isinstance(raw, str):
         frame = raw.strip()
-        if not frame or frame.upper() in {"PING", "PONG"}:
+        if not frame or (len(frame) == 4 and frame.upper() in {"PING", "PONG"}):
             return []
         try:
-            decoded = json.loads(frame, parse_float=Decimal if decimal_numbers else float)
+            decoded = decode_decimal_json(frame) if decimal_numbers else json.loads(frame)
         except json.JSONDecodeError:
             logger.warning("Failed to parse Kalshi websocket message: %s", raw)
             if on_decode_error is not None:
@@ -460,6 +460,11 @@ class KalshiOrderBookState:
             if self.no_bids
             else None
         )
+        return self._snapshot(yes_bid, no_price, event_type)
+
+    def _snapshot(
+        self, yes_bid: Decimal | None, no_price: Decimal | None, event_type: str | None,
+    ) -> KalshiBookSnapshot:
         yes_bid_size = self.yes_bids.get(yes_bid) if yes_bid is not None else None
         no_price_size = self.no_bids.get(no_price) if no_price is not None else None
         quotes = project_kalshi_quotes(
@@ -489,35 +494,19 @@ class KalshiOrderBookState:
     def _apply(self, message: dict[str, Any], event_type: str) -> KalshiBookSnapshot:
         msg = _message_payload(message)
         ticker = str(msg.get("market_ticker") or self.market_ticker)
-        snapshot = event_type == "orderbook_snapshot"
-        state = _native.update_local_book(
-            "kalshi", ticker,
-            local_state(
-                {} if snapshot else self.yes_bids, {} if snapshot else self.no_bids,
-                self.initial_snapshot_received, self.quality_flags,
-                sid=self.sid, seq=self.last_seq,
-            ),
-            encode_message({
-                "type": event_type, "msg": {**msg, "market_ticker": ticker},
-                "sid": _parse_int(message.get("sid")), "seq": _parse_int(message.get("seq")),
-            }),
-            use_yes_price=self.use_yes_price,
+        if not ticker:
+            raise ValueError("invalid_book_identity_or_sequence")
+        yes_bid, no_price = _native.update_kalshi_book(
+            self, event_type, msg, _parse_int(message.get("sid")), _parse_int(message.get("seq")),
         )
-        if snapshot:
-            self.yes_bids = decimal_levels(state["first"])
-            self.no_bids = decimal_levels(state["second"])
-        else:
-            sync_ladder(self.yes_bids, state["first"])
-            sync_ladder(self.no_bids, state["second"])
         self.market_ticker = ticker
         if msg.get("market_id") is not None:
             self.market_id = str(msg["market_id"])
         self.timestamp = msg.get("ts_ms") if msg.get("ts_ms") is not None else msg.get("ts")
-        self.sid, self.last_seq = state["sid"], state["seq"]
-        self.initial_snapshot_received = state["initialized"]
-        self.valid_state = state["valid"]
-        self.quality_flags = set(state["flags"])
         self.last_event_type = event_type
+        # Subclasses can customize the public snapshot projection.
+        if type(self) is KalshiOrderBookState and "snapshot" not in self.__dict__:
+            return self._snapshot(yes_bid, no_price, event_type)
         return self.snapshot(event_type=event_type)
 
     def apply_snapshot(self, message: dict[str, Any]) -> KalshiBookSnapshot:
@@ -542,9 +531,9 @@ def _state_for(
     ticker = str(market_ticker)
     if not ticker:
         return None
-    state = states.setdefault(
-        ticker, KalshiOrderBookState(ticker, use_yes_price=use_yes_price)
-    )
+    state = states.get(ticker)
+    if state is None:
+        state = states[ticker] = KalshiOrderBookState(ticker, use_yes_price=use_yes_price)
     state.use_yes_price = use_yes_price
     return state
 

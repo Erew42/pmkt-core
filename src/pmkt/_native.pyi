@@ -1,7 +1,11 @@
 from collections.abc import Iterator, Sequence
+from decimal import Decimal
 from os import PathLike
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, final, overload
+
+from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
+from pmkt.exchanges.polymarket.ws import MarketBookState
 
 @final
 class ArrowStream:
@@ -84,6 +88,16 @@ class _Observation(TypedDict):
     book: _Book | None
     health: _Health
 
+class _ManagedBookRead(TypedDict):
+    market_id: str | None
+    generation: int
+    bids: tuple[tuple[Decimal, Decimal], ...]
+    asks: tuple[tuple[Decimal, Decimal], ...]
+    received_monotonic_ns: int
+    source_timestamp_json: str | None
+    quality_flags: list[str]
+    metadata_revision: int
+
 @final
 class ShardFeed:
     def __init__(
@@ -105,30 +119,18 @@ class ShardFeed:
     @overload
     def ingest(self, shard_id: str, generation: int, frame: bytes, now_ns: int, *, detach: Literal[False]) -> list[str]: ...
     def health(self, instrument: str, now_ns: int) -> _Health: ...
+    def read_book(self, instrument: str, now_ns: int) -> _ManagedBookRead | None: ...
     def observation(self, instrument: str, now_ns: int) -> _Observation: ...
     def close(self) -> None: ...
 
 
-class _LocalState(TypedDict):
-    initialized: bool
-    flags: list[str]
-    first: list[tuple[str, str]]
-    second: list[tuple[str, str]]
-    sid: int | None
-    seq: int | None
-    hash: str | None
-    tick: str | None
-
-class _LocalBook(_LocalState):
-    valid: bool
-    bid: str | None
-    ask: str | None
-
 def book_integrity(initialized: bool, quality_flags: Sequence[str]) -> bool: ...
-def update_local_book(
-    venue_name: str, instrument: str, state: _LocalState, message: str, *,
-    use_yes_price: bool = True, quotes: tuple[str | None, str | None] | None = None,
-) -> _LocalBook: ...
+def update_market_book(
+    state: MarketBookState, event_type: str, message: dict[str, object], change: dict[str, object] | None = None,
+) -> None: ...
+def update_kalshi_book(
+    state: KalshiOrderBookState, event_type: str, body: dict[str, object], sid: int | None, seq: int | None,
+) -> tuple[Decimal | None, Decimal | None]: ...
 
 class _RecordingBook(TypedDict):
     instrument: str

@@ -1,5 +1,5 @@
 use pmkt_engine::{
-    BookMode, ScaledDecimal as D, ShardFeed, Venue, VenueBooks,
+    Book, BookMode, ScaledDecimal as D, ShardFeed, Venue, VenueBooks,
     book::QuotePolicy,
     feed::FeedTimeouts,
     health::{CORRECTIVE_DELTA_GRACE_NS as GRACE, Integrity, QualityFlag as F},
@@ -361,4 +361,27 @@ fn malformed_first_present_ladder_cannot_fall_back_and_empty_is_intact() {
     apply(&mut b, Venue::Kalshi, m, 2);
     assert_eq!(b.get("X").unwrap().integrity(), Integrity::Intact);
     assert!(!b.get("X").unwrap().valid_state());
+}
+
+#[test]
+fn relative_edit_uses_only_the_quantity_at_the_updated_price() {
+    let price = d(".24");
+    for previous in 0..=5_i128 {
+        for change in -6..=6_i128 {
+            let mut book = Book::new(BookMode::kalshi(), "X");
+            let q = |n| D::new(n, 2).unwrap();
+            let action = wire::kalshi::relative("no", Some(price), Some(q(change)));
+            let remaining = previous + change;
+            let edit = book.observe_local(&action, None, (previous != 0).then(|| q(previous)));
+            assert_eq!(
+                edit,
+                Some((
+                    wire::Side::Second,
+                    price,
+                    (remaining > 0).then(|| q(remaining))
+                ))
+            );
+            assert_eq!(book.flags().contains(&F::MalformedBook), remaining < 0);
+        }
+    }
 }

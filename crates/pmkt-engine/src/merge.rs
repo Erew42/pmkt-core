@@ -6,7 +6,7 @@ pub use coverage::{
     CoverageCounts, CoverageTracker, EndReason, Interval, SessionCoverage, SessionOccurrences,
     StartReason, conflated_subscription, uncovered_intervals,
 };
-pub(crate) use coverage::{ReceiptPeriod, SessionEvidence, received_us};
+pub(crate) use coverage::{ReceiptPeriod, SessionEvidence, confirms_books, received_us};
 
 use crate::{Error, Result, Venue};
 use identity::ContentId;
@@ -38,9 +38,9 @@ pub struct Origin {
     pub recording_id: String,
     pub received_monotonic_ns: u64,
     pub use_yes_price: bool,
-    /// Contiguous coverage period containing this occurrence, used during replay.
+    /// Contiguous coverage interval id containing this occurrence, if covered.
     #[serde(skip)]
-    pub coverage_period: usize,
+    pub coverage_period: Option<usize>,
     /// During the raw merge each recording is its own group. Reconstructed
     /// message evidence exposes the pooled group of its redundant subscriptions.
     #[serde(skip)]
@@ -295,6 +295,7 @@ struct Group {
 type GroupKey = (i64, String);
 struct Remembered {
     at: i64,
+    msg_seq: u64,
     streams: BTreeSet<Stream>,
 }
 
@@ -311,9 +312,13 @@ pub struct CopyMerge {
     market_epochs: HashMap<String, u64>,
     stream_clocks: HashMap<(Stream, String), BookClock>,
     last_clock: HashMap<String, (BookClock, bool)>,
-    emitted_timed: HashMap<ContentId, i64>,
+    emitted_timed: HashMap<ContentId, (i64, u64)>,
     emitted_untimed: HashMap<ContentId, BTreeMap<usize, Remembered>>,
     expiry: BTreeMap<i64, Vec<(ContentId, Option<usize>)>>,
+    // Only a consumer that drains them (reconstruction) collects late-repeat
+    // witnesses; otherwise they would grow with the recording, not the windows.
+    pub(crate) collect_repeat_witnesses: bool,
+    repeat_witnesses: Vec<(Vec<String>, u64, Origin)>,
     pending: usize,
 }
 impl CopyMerge {
@@ -347,6 +352,8 @@ impl CopyMerge {
             emitted_timed: HashMap::new(),
             emitted_untimed: HashMap::new(),
             expiry: BTreeMap::new(),
+            collect_repeat_witnesses: false,
+            repeat_witnesses: Vec::new(),
             pending: 0,
         })
     }
@@ -451,6 +458,16 @@ impl CopyMerge {
         self.pending += 1;
         self.stats.max_pending_occurrences = self.stats.max_pending_occurrences.max(self.pending);
     }
+    fn witness_repeat(&mut self, o: Occurrence, msg_seq: u64) {
+        if !self.collect_repeat_witnesses {
+            return;
+        }
+        let mut instruments = Vec::new();
+        crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
+            instruments.push(inst.to_owned());
+        });
+        self.repeat_witnesses.push((instruments, msg_seq, o.origin));
+    }
     fn add(
         &mut self,
         o: Occurrence,
@@ -491,11 +508,14 @@ impl CopyMerge {
                     !r.streams.contains(&o.origin.stream) && at.abs_diff(r.at) <= tolerance
                 })
             {
-                r.streams.insert(o.origin.stream);
+                r.streams.insert(o.origin.stream.clone());
+                let msg_seq = r.msg_seq;
+                self.witness_repeat(o, msg_seq);
                 self.stats.repeats_after_emit += 1;
                 return None;
             }
-        } else if self.emitted_timed.contains_key(&id) {
+        } else if let Some(&(_, msg_seq)) = self.emitted_timed.get(&id) {
+            self.witness_repeat(o, msg_seq);
             self.stats.repeats_after_emit += 1;
             return None;
         }
@@ -560,18 +580,23 @@ impl CopyMerge {
     }
     fn remember(&mut self, e: &Entry, until: i64) {
         let id = e.key.id;
+        let msg_seq = self.stats.messages + 1;
         let record = if let Some(at) = e.at {
             // Late untimed copies match records in emission order, even when
             // a clock moved a later-received snapshot into an earlier batch.
             let i = self.stats.messages as usize;
             let streams = e.origins.iter().map(|(_, o)| o.stream.clone()).collect();
-            self.emitted_untimed
-                .entry(id)
-                .or_default()
-                .insert(i, Remembered { at, streams });
+            self.emitted_untimed.entry(id).or_default().insert(
+                i,
+                Remembered {
+                    at,
+                    msg_seq,
+                    streams,
+                },
+            );
             Some(i)
         } else {
-            self.emitted_timed.insert(id, until);
+            self.emitted_timed.insert(id, (until, msg_seq));
             None
         };
         self.expiry.entry(until).or_default().push((id, record));
@@ -592,7 +617,7 @@ impl CopyMerge {
                             self.emitted_untimed.remove(&id);
                         }
                     }
-                } else if self.emitted_timed.get(&id) == Some(&t) {
+                } else if self.emitted_timed.get(&id).is_some_and(|&(u, _)| u == t) {
                     self.emitted_timed.remove(&id);
                 }
             }
@@ -757,6 +782,16 @@ where
         &self.engine.stats
     }
 
+    pub(crate) fn into_stats(self) -> MergeStats {
+        self.engine.stats
+    }
+
+    pub(crate) fn drain_repeat_witnesses(
+        &mut self,
+    ) -> std::vec::Drain<'_, (Vec<String>, u64, Origin)> {
+        self.engine.repeat_witnesses.drain(..)
+    }
+
     pub fn next_message(&mut self) -> std::result::Result<Option<MergedMessage>, E> {
         loop {
             if let Some(entry) = self.group.pop_front() {
@@ -802,5 +837,71 @@ where
                 return Ok(emitted);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn occurrence(copy: &str, t: i64, seq: u64) -> Result<Occurrence> {
+        Ok(Occurrence {
+            origin: Origin {
+                stream: Stream::new(copy, "conn"),
+                session: "session".into(),
+                generation: 1,
+                frame_seq: seq,
+                position: None,
+                received_us: t * 1000,
+                received_utc: String::new(),
+                recording_id: "session".into(),
+                received_monotonic_ns: 0,
+                use_yes_price: true,
+                coverage_period: Some(0),
+                coverage_group: 0,
+                subscription: None,
+                book_command: None,
+            },
+            message: json!({"type":"orderbook_delta","sid":1,"seq":seq,"sending_ts_ms":seq * 10 + 1,
+                "msg":{"clock":seq,"market_ticker":"K","ts_ms":seq * 10,"side":"yes",
+                       "price_dollars":"0.4","delta_fp":"1"}}),
+            reconnect_snapshot: false,
+        })
+    }
+
+    fn late_repeats(collect: bool) -> (usize, u64) {
+        let n = 50_u64;
+        // Copy b receives every delta long after the lateness window emitted it.
+        let a: Vec<_> = (1..=n)
+            .map(|s| occurrence("a", s as i64 * 10 + 2, s))
+            .collect();
+        let b: Vec<_> = (1..=n)
+            .map(|s| occurrence("b", s as i64 * 10 + 500, s))
+            .collect();
+        let mut merger = CopyMerge::new(
+            Venue::Kalshi,
+            MergeOptions {
+                lateness_ms: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        merger.collect_repeat_witnesses = collect;
+        let mut run = merger.stream([a, b]).unwrap();
+        while run.next_message().unwrap().is_some() {}
+        (
+            run.engine.repeat_witnesses.len(),
+            run.stats().repeats_after_emit,
+        )
+    }
+
+    #[test]
+    fn late_repeat_witnesses_are_kept_only_for_a_consumer_that_drains_them() {
+        let (kept, repeats) = late_repeats(false);
+        assert!(repeats > 0);
+        assert_eq!(kept, 0);
+        let (kept, repeats_collected) = late_repeats(true);
+        assert_eq!((kept as u64, repeats_collected), (repeats, repeats));
     }
 }

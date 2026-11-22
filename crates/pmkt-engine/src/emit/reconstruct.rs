@@ -6,15 +6,15 @@ use crate::{
     health::Integrity,
     merge::{
         CopyMerge, EndReason, MergeOptions, MergeStats, MergedMessage, Origin, ReceiptPeriod,
-        SessionCoverage, SessionEvidence, SessionOccurrences, Stream, received_us,
-        recorded_message, uncovered_intervals,
+        SessionCoverage, SessionEvidence, SessionOccurrences, Stream, confirms_books, received_us,
+        recorded_message,
     },
     wire::{self, Event},
 };
 use chrono::DateTime;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -112,9 +112,61 @@ impl MergedDepth {
     }
 }
 
+struct MergedCoverage {
+    venue: Venue,
+    coverage: Arc<[SessionCoverage]>,
+    undeclared_instruments: Vec<BTreeSet<String>>,
+}
+
+impl MergedCoverage {
+    fn interval_covers(&self, source: usize, idx: usize, instrument: &str) -> bool {
+        let session = &self.coverage[source];
+        match session.interval_instruments[idx].as_deref() {
+            Some(set) if !set.is_empty() => set.contains(instrument),
+            _ => self.undeclared_instruments[source].contains(instrument),
+        }
+    }
+
+    fn covered_by_other(&self, instrument: &str, origin: &Origin) -> bool {
+        self.coverage.iter().enumerate().any(|(source, session)| {
+            session.stream != origin.stream
+                && session.intervals.iter().enumerate().any(|(idx, span)| {
+                    if !self.interval_covers(source, idx, instrument)
+                        || !(span.start_us..=span.end_us).contains(&origin.received_us)
+                    {
+                        return false;
+                    }
+                    let declared = session.interval_instruments[idx]
+                        .as_deref()
+                        .is_some_and(|set| !set.is_empty());
+                    if self.venue == Venue::Kalshi && declared {
+                        session.interval_first_book_us[idx]
+                            .get(instrument)
+                            .is_some_and(|&first| first <= origin.received_us)
+                    } else {
+                        true
+                    }
+                })
+        })
+    }
+
+    fn source_instruments_for(&self, origin: &Origin) -> BTreeSet<String> {
+        if let Some(ids) = origin.subscription.as_deref()
+            && !ids.is_empty()
+        {
+            return ids.clone();
+        }
+        self.undeclared_instruments
+            .get(origin.coverage_group)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
 struct ReconstructDriver<F> {
     books: VenueBooks,
     merged_depth: Option<MergedDepth>,
+    merged_coverage: Option<MergedCoverage>,
     count: u64,
     last_utc: BTreeMap<String, i64>,
     batch: QuoteBatchBuilder,
@@ -130,6 +182,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         Self {
             books: VenueBooks::new(mode, std::iter::empty::<String>()),
             merged_depth: None,
+            merged_coverage: None,
             count: 0,
             last_utc: BTreeMap::new(),
             batch: QuoteBatchBuilder::new(version),
@@ -158,7 +211,20 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         let event = wire::decode(venue, message)?;
         if matches!(event, Event::SubscriptionError) {
             if wire::rejects_books(message, book_command) {
-                self.books.reset();
+                if let Some(m) = merged {
+                    let origin = m.origin();
+                    if let Some(cov) = &self.merged_coverage {
+                        for id in cov.source_instruments_for(origin) {
+                            if !cov.covered_by_other(&id, origin) {
+                                self.books.restart(&id);
+                            }
+                        }
+                    } else {
+                        self.books.reset();
+                    }
+                } else {
+                    self.books.reset();
+                }
             }
             return Ok(());
         }
@@ -294,6 +360,8 @@ pub fn reconstruct_merged(
     let mut streams = BTreeMap::<_, Vec<_>>::new();
     let mut coverage = Vec::new();
     let mut subscribed = Vec::new();
+    let mut observed = Vec::new();
+    let mut side_only = Vec::new();
     let singleton = sessions.len() == 1;
     for (copy, connection, path) in sessions {
         let input = Input::open(&path)?;
@@ -330,57 +398,182 @@ pub fn reconstruct_merged(
         let mut scan = occurrences()?;
         scan.try_for_each(|item| item.map(drop))?;
         subscribed.push(scan.subscription());
+        observed.push(scan.observed_books());
+        side_only.push(scan.side_only_subscription());
         coverage.push(scan.finish());
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
-    let pooled = {
-        // A copy bridges a hole only for the instruments it subscribed to, so copies
-        // of one subscription pool their coverage and other subscriptions do not.
-        let mut groups = BTreeMap::<_, Vec<_>>::new();
+    let undeclared_instruments = {
+        let mut per_source: Vec<BTreeSet<String>> = observed.clone();
+        // A pure control-only copy with no subscription command can still bridge
+        // an undeclared peer on the same connection when every undeclared peer
+        // on that connection observed the same non-empty instrument set.
+        let mut undeclared_by_conn = BTreeMap::<&str, Vec<usize>>::new();
         for (source, ids) in subscribed.iter().enumerate() {
-            groups.entry(ids).or_default().push(source);
-        }
-        let mut periods = vec![(0, vec![]); coverage.len()];
-        for (group, members) in groups.into_values().enumerate() {
-            let spans: Vec<_> = members
-                .iter()
-                .flat_map(|&s| &coverage[s].intervals)
-                .map(|i| (i.start_us, i.end_us))
-                .collect();
-            let (Some(start), Some(end)) = (
-                spans.iter().map(|s| s.0).min(),
-                spans.iter().map(|s| s.1).max(),
-            ) else {
-                continue;
-            };
-            let holes = uncovered_intervals(spans, start, end)?;
-            for source in members {
-                let hole_count = |start_us| holes.partition_point(|&(_, end)| end <= start_us);
-                periods[source] = (
-                    group,
-                    coverage[source]
-                        .intervals
-                        .iter()
-                        .map(|i| hole_count(i.start_us))
-                        .collect(),
-                );
+            if ids.as_deref().is_none_or(BTreeSet::is_empty) {
+                undeclared_by_conn
+                    .entry(coverage[source].stream.connection.as_str())
+                    .or_default()
+                    .push(source);
             }
         }
-        periods
+        for members in undeclared_by_conn.into_values() {
+            let non_empty: Vec<&BTreeSet<String>> = members
+                .iter()
+                .map(|&s| &observed[s])
+                .filter(|set| !set.is_empty())
+                .collect();
+            if let Some(&first) = non_empty.first()
+                && non_empty[1..].iter().all(|&other| other == first)
+            {
+                for &s in &members {
+                    if observed[s].is_empty() && !side_only[s] {
+                        per_source[s] = first.clone();
+                    }
+                }
+            }
+        }
+        per_source
     };
-    // During ordering each source is its own coverage group. Pool only when
-    // applying the merged stream to the books, retaining the recorder evidence
-    // needed to place a cached checkpoint across another recorder's reconnect.
+    // Compute rollback- and sequence-gap-safe cross-stream bridging spans per
+    // (source, interval). An interval whose start rolled back at or before a
+    // prior interval's end on the same source, or that immediately follows a
+    // proven wire sequence gap, cannot bridge cross-stream by UTC alone;
+    // continuity across that break requires a shared witness on the post-gap
+    // message itself.
+    let (effective_spans, sorted_spans) = {
+        let mut effective = Vec::with_capacity(coverage.len());
+        let mut sorted = Vec::with_capacity(coverage.len());
+        for session in &coverage {
+            let mut spans = Vec::with_capacity(session.intervals.len());
+            let mut active = Vec::new();
+            let mut prev_max_end = i64::MIN;
+            for (idx, span) in session.intervals.iter().enumerate() {
+                let after_seq_gap =
+                    idx > 0 && session.intervals[idx - 1].end_reason == EndReason::SequenceGap;
+                let eff = if span.start_us > prev_max_end && !after_seq_gap {
+                    let bounds = (span.start_us, span.end_us);
+                    active.push((span.start_us, span.end_us, idx));
+                    Some(bounds)
+                } else {
+                    None
+                };
+                prev_max_end = prev_max_end.max(span.end_us);
+                spans.push(eff);
+            }
+            effective.push(spans);
+            sorted.push(active);
+        }
+        (effective, sorted)
+    };
+    let inst_bridge_span = |coverage: &[SessionCoverage],
+                            undeclared: &[BTreeSet<String>],
+                            source: usize,
+                            idx: usize,
+                            inst: &str|
+     -> Option<(i64, i64)> {
+        let session = coverage.get(source)?;
+        let declared = session.interval_instruments[idx]
+            .as_deref()
+            .filter(|set| !set.is_empty());
+        let ids: &BTreeSet<String> = declared.unwrap_or(&undeclared[source]);
+        if !ids.contains(inst) {
+            return None;
+        }
+        let base_span = effective_spans[source][idx]?;
+        if venue == Venue::Kalshi && declared.is_some() {
+            let &first_us = session.interval_first_book_us[idx].get(inst)?;
+            let start = base_span.0.max(first_us);
+            (start <= base_span.1).then_some((start, base_span.1))
+        } else {
+            Some(base_span)
+        }
+    };
+    type Witness = (usize, usize, i64);
+    let intervals_connected = |coverage: &[SessionCoverage],
+                               undeclared: &[BTreeSet<String>],
+                               inst: &str,
+                               prior_witnesses: &[Witness],
+                               u: Witness,
+                               v: Witness|
+     -> bool {
+        if u.0 == v.0 && u.1 == v.1 {
+            return true;
+        }
+        let Some((u_lo, u_hi)) = inst_bridge_span(coverage, undeclared, u.0, u.1, inst) else {
+            return false;
+        };
+        let Some((v_lo, v_hi)) = inst_bridge_span(coverage, undeclared, v.0, v.1, inst) else {
+            return false;
+        };
+        let u_a = u_lo.max(u.2);
+        let u_b = u_hi;
+        let v_a = v_lo;
+        let v_b = v_hi.min(v.2);
+        if u_a > u_b || v_a > v_b {
+            return false;
+        }
+        let u_ended_at_prev =
+            u.2 >= u_hi && coverage[u.0].intervals[u.1].end_reason != EndReason::SessionEnd;
+        if coverage[u.0].stream != coverage[v.0].stream
+            && !u_ended_at_prev
+            && u_a <= v_b
+            && v_a <= u_b
+        {
+            return true;
+        }
+        let need_start_le = u_b.min(v_b);
+        let need_end_ge = u_a.max(v_a);
+        for (src_w, peers) in sorted_spans.iter().enumerate() {
+            let stream_w = &coverage[src_w].stream;
+            if stream_w == &coverage[u.0].stream || stream_w == &coverage[v.0].stream {
+                continue;
+            }
+            let pos = peers.partition_point(|&(_, end_us, _)| end_us < need_end_ge);
+            if let Some(&(_, _, idx_w)) = peers.get(pos)
+                && let Some((mut w_lo, w_hi)) =
+                    inst_bridge_span(coverage, undeclared, src_w, idx_w, inst)
+            {
+                if let Some(w_prev) = prior_witnesses
+                    .iter()
+                    .find(|w| w.0 == src_w && w.1 == idx_w)
+                {
+                    if w_prev.2 >= w_hi
+                        && coverage[src_w].intervals[idx_w].end_reason != EndReason::SessionEnd
+                    {
+                        continue;
+                    }
+                    w_lo = w_lo.max(w_prev.2);
+                }
+                if w_lo <= need_start_le && w_hi >= need_end_ge {
+                    return true;
+                }
+            }
+        }
+        false
+    };
+    // Each source keeps its own index in verified_sessions so per-interval
+    // coverage classes and ReceiptPeriod stay aligned across the merge.
     for (index, source) in streams.values_mut().flatten().enumerate() {
         source.evidence.coverage_group = index;
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
-    let mut periods = BTreeMap::new();
+    let mut interval_seen_us: Vec<Vec<Option<i64>>> = coverage
+        .iter()
+        .map(|c| vec![None; c.intervals.len()])
+        .collect();
+    let mut instrument_states: HashMap<String, (Vec<Witness>, u64)> = HashMap::new();
     let mut kalshi_basis = None;
     let mut subscriptions = BTreeMap::new();
     let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
     merger.verified_sessions = coverage.into();
+    merger.collect_repeat_witnesses = true;
+    driver.merged_coverage = Some(MergedCoverage {
+        venue,
+        coverage: Arc::clone(&merger.verified_sessions),
+        undeclared_instruments,
+    });
     if venue == Venue::Polymarket {
         driver.merged_depth = Some(MergedDepth {
             coverage: Arc::clone(&merger.verified_sessions),
@@ -388,86 +581,231 @@ pub fn reconstruct_merged(
             latest: BTreeMap::new(),
         });
     }
-    let stats = merger.merge(
+    let mut covered_occurrences: Vec<Witness> = Vec::new();
+    let mut msg_instruments: Vec<String> = Vec::new();
+    let mut msg_seq = 0_u64;
+    let mut run = merger.stream(
         streams
             .values_mut()
             .map(|sessions| sessions.iter_mut().flatten()),
-        |mut m| {
-            if let Some(depth) = &mut driver.merged_depth {
-                depth.receipts.clear();
-                depth
-                    .receipts
-                    .extend(m.occurrences.iter().map(Origin::receipt_period));
-            }
-            for o in &mut m.occurrences {
-                let (group, periods) = &pooled[o.coverage_group];
-                o.coverage_group = *group;
-                o.coverage_period = periods[o.coverage_period];
-            }
-            on_message(&m)?;
-            let origin = m.origin();
-            // A hole in the receipt of one subscription restarts only its instruments.
-            if periods
-                .insert(origin.coverage_group, origin.coverage_period)
-                .is_some_and(|old| old != origin.coverage_period)
-            {
-                match &origin.subscription {
-                    Some(ids) => ids.iter().for_each(|id| driver.books.restart(id)),
-                    None => driver.books.reset(),
-                }
-            }
-            // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
-            // time already orders the merge, so it also times the corrective-delta deadline.
-            let clock_ns = u64::try_from(origin.received_us)
-                .ok()
-                .and_then(|us| us.checked_mul(1_000))
-                .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
-            // Register the whole declared shard, including silent instruments
-            // whose first delta may follow a gap. Origins share the same set
-            // until a new subscription command changes it.
-            for o in &m.occurrences {
-                if let Some(ids) = &o.subscription
-                    && subscriptions
-                        .get(&o.stream)
-                        .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
-                {
-                    for id in ids.iter() {
-                        driver.books.subscribe(id.clone());
-                    }
-                    subscriptions.insert(o.stream.clone(), Arc::clone(ids));
-                }
-            }
-            if venue == Venue::Kalshi
-                && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
-            {
-                for o in &m.occurrences {
-                    if *kalshi_basis.get_or_insert(o.use_yes_price) != o.use_yes_price {
-                        return Err(Error::Invalid(
-                            "cannot merge Kalshi books on different price bases".into(),
-                        ));
-                    }
-                }
-                driver.books.set_kalshi_price_mode(origin.use_yes_price);
-            }
-            driver.message(
-                &m.message,
-                &Receipt {
-                    utc: &origin.received_utc,
-                    us: origin.received_us,
-                    monotonic_ns: origin.received_monotonic_ns,
-                    clock_ns,
-                    sequence: origin.frame_seq,
-                    recording_id: &origin.recording_id,
-                },
-                origin.position,
-                m.occurrences
-                    .iter()
-                    .filter_map(|o| o.subscription.as_deref()),
-                origin.book_command,
-                Some(&m),
-            )
-        },
     )?;
+    while let Some(m) = run.next_message()? {
+        msg_seq += 1;
+        // Propagate late deduplicated repeats so a peer whose copy was suppressed
+        // as repeats_after_emit still witnesses the baseline it received.
+        for (instruments, orig_seq, rep_origin) in run.drain_repeat_witnesses() {
+            if let Some(id) = rep_origin.coverage_period
+                && let Some(cov) = &driver.merged_coverage
+                && let Some(session) = cov.coverage.get(rep_origin.coverage_group)
+                && let Ok(pos) = session.interval_ids.binary_search(&id)
+            {
+                for inst in &instruments {
+                    if let Some((witnesses, last_reset_seq)) = instrument_states.get_mut(inst)
+                        && *last_reset_seq <= orig_seq
+                        && !witnesses
+                            .iter()
+                            .any(|w| w.0 == rep_origin.coverage_group && w.1 == pos)
+                    {
+                        witnesses.push((rep_origin.coverage_group, pos, rep_origin.received_us));
+                    }
+                }
+            }
+        }
+        if let Some(depth) = &mut driver.merged_depth {
+            depth.receipts.clear();
+            depth
+                .receipts
+                .extend(m.occurrences.iter().map(Origin::receipt_period));
+        }
+        on_message(&m)?;
+        let origin = m.origin();
+        covered_occurrences.clear();
+        if let Some(cov) = &driver.merged_coverage {
+            for o in &m.occurrences {
+                if let Some(id) = o.coverage_period
+                    && let Some(session) = cov.coverage.get(o.coverage_group)
+                    && let Ok(pos) = session.interval_ids.binary_search(&id)
+                    && !covered_occurrences
+                        .iter()
+                        .any(|c| c.0 == o.coverage_group && c.1 == pos)
+                {
+                    covered_occurrences.push((o.coverage_group, pos, o.received_us));
+                }
+            }
+        }
+        // Track continuity strictly per targeted instrument in O(1) for the
+        // common same-interval case, without scanning quiet instruments or
+        // letting unrelated assets narrow another asset's witnesses.
+        if !covered_occurrences.is_empty()
+            && let Some(cov) = &driver.merged_coverage
+        {
+            msg_instruments.clear();
+            wire::visit_message_instruments(venue, &m.message, |inst| {
+                if !msg_instruments.iter().any(|s| s == inst) {
+                    msg_instruments.push(inst.to_owned());
+                }
+            });
+            for inst in &msg_instruments {
+                if let Some((witnesses, last_reset_seq)) = instrument_states.get_mut(inst) {
+                    let connected = witnesses.iter().any(|&u| {
+                        covered_occurrences
+                            .iter()
+                            .any(|&v| u.0 == v.0 && u.1 == v.1)
+                    }) || witnesses.iter().any(|&u| {
+                        covered_occurrences.iter().any(|&v| {
+                            intervals_connected(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                inst,
+                                witnesses,
+                                u,
+                                v,
+                            )
+                        })
+                    });
+                    if !connected {
+                        driver.books.restart(inst);
+                        *last_reset_seq = msg_seq;
+                        witnesses.clear();
+                        witnesses.extend_from_slice(&covered_occurrences);
+                    } else if m.late && m.reconnect_snapshot {
+                        // A late cached reconnect snapshot anchored before later messages on an
+                        // uninterrupted witness must not evict that witness from `witnesses`.
+                        witnesses.retain(|&u| {
+                            inst_bridge_span(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                u.0,
+                                u.1,
+                                inst,
+                            )
+                            .is_some_and(|(_, u_hi)| {
+                                covered_occurrences.iter().any(|&v| u_hi >= v.2)
+                            })
+                        });
+                        for &v in &covered_occurrences {
+                            if !witnesses.iter().any(|w| w.0 == v.0 && w.1 == v.1) {
+                                witnesses.push(v);
+                            }
+                        }
+                    } else {
+                        witnesses.clear();
+                        witnesses.extend_from_slice(&covered_occurrences);
+                    }
+                } else {
+                    let mut crossed_prior_gap = false;
+                    'prior: for (src, seen) in interval_seen_us.iter().enumerate() {
+                        for (pos, seen_us) in seen.iter().enumerate() {
+                            let Some(t_prev) = *seen_us else {
+                                continue;
+                            };
+                            let same_source_prior =
+                                covered_occurrences.iter().any(|&v| v.0 == src && pos < v.1);
+                            let prior_covers = if same_source_prior {
+                                let session = &cov.coverage[src];
+                                let declared = session.interval_instruments[pos]
+                                    .as_deref()
+                                    .filter(|set| !set.is_empty());
+                                declared
+                                    .unwrap_or(&cov.undeclared_instruments[src])
+                                    .contains(inst)
+                            } else if let Some((s_lo, _)) = inst_bridge_span(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                src,
+                                pos,
+                                inst,
+                            ) {
+                                covered_occurrences.iter().any(|&v| s_lo <= v.2)
+                            } else {
+                                false
+                            };
+                            if !prior_covers {
+                                continue;
+                            }
+                            let u = (src, pos, t_prev);
+                            if !covered_occurrences.iter().any(|&v| {
+                                intervals_connected(
+                                    &cov.coverage,
+                                    &cov.undeclared_instruments,
+                                    inst,
+                                    &[u],
+                                    u,
+                                    v,
+                                )
+                            }) {
+                                crossed_prior_gap = true;
+                                break 'prior;
+                            }
+                        }
+                    }
+                    let reset_seq = if crossed_prior_gap {
+                        driver.books.restart(inst);
+                        msg_seq
+                    } else {
+                        0
+                    };
+                    instrument_states
+                        .insert(inst.clone(), (covered_occurrences.clone(), reset_seq));
+                }
+            }
+            for &(src, pos, us) in &covered_occurrences {
+                interval_seen_us[src][pos] =
+                    Some(interval_seen_us[src][pos].map_or(us, |prev| prev.max(us)));
+            }
+        }
+        // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
+        // time already orders the merge, so it also times the corrective-delta deadline.
+        let clock_ns = u64::try_from(origin.received_us)
+            .ok()
+            .and_then(|us| us.checked_mul(1_000))
+            .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
+        // Register the whole declared shard, including silent instruments
+        // whose first delta may follow a gap. Origins share the same set
+        // until a new subscription command changes it.
+        for o in &m.occurrences {
+            if let Some(ids) = &o.subscription
+                && subscriptions
+                    .get(&o.stream)
+                    .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
+            {
+                for id in ids.iter() {
+                    driver.books.subscribe(id.clone());
+                }
+                subscriptions.insert(o.stream.clone(), Arc::clone(ids));
+            }
+        }
+        if venue == Venue::Kalshi
+            && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
+        {
+            for o in &m.occurrences {
+                if *kalshi_basis.get_or_insert(o.use_yes_price) != o.use_yes_price {
+                    return Err(Error::Invalid(
+                        "cannot merge Kalshi books on different price bases".into(),
+                    ));
+                }
+            }
+            driver.books.set_kalshi_price_mode(origin.use_yes_price);
+        }
+        driver.message(
+            &m.message,
+            &Receipt {
+                utc: &origin.received_utc,
+                us: origin.received_us,
+                monotonic_ns: origin.received_monotonic_ns,
+                clock_ns,
+                sequence: origin.frame_seq,
+                recording_id: &origin.recording_id,
+            },
+            origin.position,
+            m.occurrences
+                .iter()
+                .filter_map(|o| o.subscription.as_deref()),
+            origin.book_command,
+            Some(&m),
+        )?;
+    }
+    let stats = run.into_stats();
     driver.finish()?;
     Ok((
         stats,
@@ -535,6 +873,9 @@ fn replay_file(
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut generation = None;
     let mut subscription = wire::RecordedSubscription::default();
+    let mut book_confirmed = false;
+    let mut awaiting_book_confirm = false;
+    let mut book_rejected = false;
     for item in input.frames()? {
         let item = item?;
         let CaptureItem::Frame(f) = &item else {
@@ -550,18 +891,33 @@ fn replay_file(
         } else {
             Some(vec![])
         };
-        if let Some(s) = &mut source {
-            s.evidence.frame(f, messages.as_deref())?;
-        }
         if generation
             .replace(f.connection_generation)
             .is_some_and(|g| g != f.connection_generation)
         {
+            book_confirmed = false;
+            awaiting_book_confirm = false;
+            book_rejected = false;
+            if let Some(s) = &mut source {
+                s.evidence.begin_generation(f.connection_generation);
+            }
             driver.books.reset();
         }
         if f.frame_type == "subscription" && f.direction == "sent" {
             let command: Value = serde_json::from_str(&f.payload_raw)?;
-            subscription.record(venue, &command)?;
+            if subscription.record(venue, f.connection_generation, &command)? {
+                if let Some(s) = &mut source {
+                    s.evidence.set_instruments(subscription.instruments.clone());
+                }
+                book_rejected = false;
+                if !book_confirmed {
+                    if venue == Venue::Kalshi {
+                        awaiting_book_confirm = true;
+                    } else if let Some(s) = &mut source {
+                        s.evidence.mark_book_pending();
+                    }
+                }
+            }
             if let Some(basis) = subscription.kalshi_basis {
                 driver.books.set_kalshi_price_mode(basis);
             }
@@ -570,6 +926,34 @@ fn replay_file(
                     driver.books.subscribe(id.clone());
                 }
             }
+        }
+        if received_text && let Some(msgs) = messages.as_deref() {
+            for m in msgs {
+                if confirms_books(venue, &m.value, subscription.book_command) {
+                    book_confirmed = true;
+                    awaiting_book_confirm = false;
+                    if let Some(s) = &mut source {
+                        s.evidence.confirm_books();
+                    }
+                }
+                if matches!(wire::decode(venue, &m.value), Ok(Event::SubscriptionError))
+                    && wire::rejects_books(&m.value, subscription.book_command)
+                {
+                    book_rejected = true;
+                    awaiting_book_confirm = false;
+                }
+            }
+        }
+        if let Some(s) = &mut source {
+            s.evidence.frame(
+                f,
+                messages.as_deref(),
+                !book_rejected,
+                awaiting_book_confirm,
+            )?;
+        }
+        if f.frame_type == "subscription" && f.direction == "sent" {
+            continue;
         } else if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
             driver.books.reset();
         } else if received_text {

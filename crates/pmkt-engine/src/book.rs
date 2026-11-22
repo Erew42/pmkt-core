@@ -89,10 +89,10 @@ pub struct Book {
     tick: Option<D>,
     minimum: Option<D>,
 }
-/// Mutable legacy WebSocket state supplied by the caller on each application.
+/// Scalar evidence supplied by the public mutable WebSocket state. Its ladders
+/// remain owned by the caller.
 #[derive(Default)]
 pub struct BookState {
-    pub levels: (Ladder, Ladder),
     pub initialized: bool,
     pub flags: Flags,
     pub sequence: Sequence,
@@ -102,31 +102,35 @@ pub struct BookState {
 
 impl Book {
     pub fn new(mode: BookMode, instrument: impl Into<String>) -> Self {
+        Self::from_state(
+            mode,
+            instrument,
+            BookState {
+                flags: [F::NoInitialSnapshot].into(),
+                ..BookState::default()
+            },
+        )
+    }
+
+    pub fn from_state(mode: BookMode, instrument: impl Into<String>, state: BookState) -> Self {
         Self {
             mode,
             instrument: instrument.into(),
             market: None,
             first: Ladder::new(),
             second: Ladder::new(),
-            integrity: Integrity::AwaitingSnapshot,
-            flags: [F::NoInitialSnapshot].into(),
-            sequence: Sequence::default(),
+            integrity: Integrity::from_observation(state.initialized, &state.flags),
+            flags: state.flags,
+            sequence: state.sequence,
             timestamp: SourceTime::default(),
-            hash: None,
-            tick: None,
+            hash: state.hash,
+            tick: state.tick,
             minimum: None,
         }
     }
+
     pub fn mode(&self) -> BookMode {
         self.mode
-    }
-    pub fn restore(&mut self, state: BookState) {
-        (self.first, self.second) = state.levels;
-        self.integrity = Integrity::from_observation(state.initialized, &state.flags);
-        self.flags = state.flags;
-        self.sequence = state.sequence;
-        self.hash = state.hash;
-        self.tick = state.tick;
     }
 
     pub fn apply_update(&mut self, update: &Update) {
@@ -229,7 +233,11 @@ impl Book {
     }
     fn refresh(&mut self) {
         let bid = self.best_native_bid();
-        let ask = self.best_right().map(|q| {
+        self.refresh_native_quotes(bid, self.best_right().map(|q| q.price));
+    }
+
+    pub fn refresh_native_quotes(&mut self, bid: Option<D>, right: Option<D>) {
+        let ask = right.map(|price| {
             if matches!(
                 self.mode,
                 BookMode::Kalshi {
@@ -237,9 +245,9 @@ impl Book {
                     ..
                 }
             ) {
-                q.complement(true).price
+                price.complement().expect("validated binary price")
             } else {
-                q.price
+                price
             }
         });
         self.refresh_quotes(bid, ask);
@@ -296,22 +304,59 @@ impl Book {
             self.market = Some(m.clone());
         }
         self.timestamp = update.timestamp.clone();
-        if update.action.is_snapshot() {
+        let prior = update
+            .action
+            .relative_level()
+            .and_then(|(side, p)| self.side_mut(side).get(&p).copied());
+        let edit = self.observe(&update.action, update.sequence, check, prior);
+        if let Action::Snapshot(s) = &update.action {
+            self.first.clone_from(&s.first.levels);
+            self.second.clone_from(&s.second.levels);
+        } else if let Some((side, price, size)) = edit {
+            let levels = self.side_mut(side);
+            if let Some(size) = size {
+                levels.insert(price, size);
+            } else {
+                levels.remove(&price);
+            }
+        }
+        if !matches!(&update.action, Action::Lifecycle { resolved: true }) {
+            self.refresh();
+        }
+    }
+
+    /// Evaluate one transition against depth owned by the caller. A relative
+    /// change needs only the previous quantity at its own price.
+    pub fn observe_local(
+        &mut self,
+        action: &Action,
+        sequence: Option<Sequence>,
+        prior: Option<D>,
+    ) -> Option<(Side, D, Option<D>)> {
+        self.observe(action, sequence, SequenceCheck::Connection, prior)
+    }
+
+    fn observe(
+        &mut self,
+        action: &Action,
+        sequence: Option<Sequence>,
+        check: SequenceCheck,
+        prior: Option<D>,
+    ) -> Option<(Side, D, Option<D>)> {
+        if action.is_snapshot() {
             self.flags.clear();
             self.integrity = Integrity::Intact;
             self.sequence = Sequence::default();
-        } else if matches!(update.action, Action::Absolute(_) | Action::Relative { .. })
+        } else if matches!(action, Action::Absolute(_) | Action::Relative { .. })
             && !self.initialized()
         {
             self.flags.insert(F::DeltaBeforeSnapshot);
         }
-        if let Some(s) = update.sequence {
+        if let Some(s) = sequence {
             self.apply_sequence(s, check);
         }
-        match &update.action {
+        match action {
             Action::Snapshot(s) => {
-                self.first.clone_from(&s.first.levels);
-                self.second.clone_from(&s.second.levels);
                 if s.first.malformed || s.second.malformed {
                     self.flags.insert(F::MalformedBook);
                 }
@@ -329,18 +374,6 @@ impl Book {
                 }
             }
             Action::Absolute(c) => {
-                if let (Some(side), Some(p), Some(q)) =
-                    (c.side, c.price, c.size.filter(|q| *q >= D::ZERO))
-                {
-                    let levels = self.side_mut(side);
-                    if q == D::ZERO {
-                        levels.remove(&p);
-                    } else {
-                        levels.insert(p, q);
-                    }
-                } else {
-                    self.flags.insert(F::MalformedBook);
-                }
                 if c.previous_hash
                     .as_ref()
                     .zip(self.hash.as_ref())
@@ -351,32 +384,23 @@ impl Book {
                 if c.hash.is_some() {
                     self.hash.clone_from(&c.hash);
                 }
+                if let (Some(side), Some(p), Some(q)) =
+                    (c.side, c.price, c.size.filter(|q| *q >= D::ZERO))
+                {
+                    return Some((side, p, (q > D::ZERO).then_some(q)));
+                }
+                self.flags.insert(F::MalformedBook);
             }
             Action::Relative { side, price, delta } => {
-                if let (Some(side), Some(p), Some(delta)) = (*side, *price, *delta) {
-                    let levels = self.side_mut(side);
-                    match levels
-                        .get(&p)
-                        .copied()
-                        .unwrap_or(D::ZERO)
-                        .checked_add(delta)
-                    {
-                        Ok(q) if q > D::ZERO => {
-                            levels.insert(p, q);
-                        }
-                        Ok(q) => {
-                            levels.remove(&p);
-                            if q < D::ZERO {
-                                self.flags.insert(F::MalformedBook);
-                            }
-                        }
-                        Err(_) => {
-                            self.flags.insert(F::MalformedBook);
-                        }
+                if let (Some(side), Some(p), Some(delta)) = (*side, *price, *delta)
+                    && let Ok(q) = prior.unwrap_or(D::ZERO).checked_add(delta)
+                {
+                    if q < D::ZERO {
+                        self.flags.insert(F::MalformedBook);
                     }
-                } else {
-                    self.flags.insert(F::MalformedBook);
+                    return Some((side, p, (q > D::ZERO).then_some(q)));
                 }
+                self.flags.insert(F::MalformedBook);
             }
             Action::Tick(tick) => self.tick = *tick,
             Action::Lifecycle { resolved } => {
@@ -385,12 +409,9 @@ impl Book {
                 } else {
                     F::NewMarket
                 });
-                if *resolved {
-                    return;
-                }
             }
         }
-        self.refresh();
+        None
     }
 }
 

@@ -20,9 +20,10 @@ from websockets.asyncio.server import serve
 
 from pmkt.cli.app import app
 from pmkt.streaming import raw_capture as rr
-from raw_capture_helpers import validate_chunk
+from raw_capture_helpers import requires_posix_capture, validate_chunk
 
 
+@requires_posix_capture
 @pytest.mark.parametrize("use_uvloop", [False, True])
 @pytest.mark.parametrize(
     "stop_signal,gzip_level,lag_warn_ms",

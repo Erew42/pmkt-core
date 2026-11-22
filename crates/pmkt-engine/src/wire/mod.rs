@@ -18,14 +18,15 @@ pub(crate) struct RecordedSubscription {
     pub kalshi_basis: Option<bool>,
     /// Kalshi command id of the order-book subscription; other channels are separate commands.
     pub book_command: Option<i64>,
+    book_generation: Option<u64>,
 }
 impl RecordedSubscription {
-    pub fn record(&mut self, venue: Venue, command: &Value) -> Result<()> {
+    pub fn record(&mut self, venue: Venue, generation: u64, command: &Value) -> Result<bool> {
         let ids = match venue {
             Venue::Polymarket => command["assets_ids"].as_array(),
             Venue::Kalshi => {
                 let Some(basis) = kalshi::subscription_basis(command)? else {
-                    return Ok(());
+                    return Ok(false);
                 };
                 self.kalshi_basis = Some(basis);
                 self.book_command = command["id"].as_i64();
@@ -33,10 +34,15 @@ impl RecordedSubscription {
             }
         };
         if let Some(ids) = ids {
+            if self.book_generation != Some(generation) {
+                self.instruments = None;
+                self.book_generation = Some(generation);
+            }
             let instruments = Arc::make_mut(self.instruments.get_or_insert_with(Arc::default));
             instruments.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+            return Ok(true);
         }
-        Ok(())
+        Ok(venue == Venue::Kalshi)
     }
 }
 
@@ -47,6 +53,31 @@ pub(crate) fn rejects_books(error: &Value, book_command: Option<i64>) -> bool {
         .as_i64()
         .zip(book_command)
         .is_none_or(|(rejected, book)| rejected == book)
+}
+
+pub(crate) fn visit_message_instruments(venue: Venue, value: &Value, mut f: impl FnMut(&str)) {
+    match venue {
+        Venue::Polymarket => {
+            if let Some(id) = value["asset_id"].as_str().filter(|s| !s.is_empty()) {
+                f(id);
+            }
+            if let Some(changes) = value["price_changes"].as_array() {
+                for item in changes {
+                    if let Some(id) = item["asset_id"].as_str().filter(|s| !s.is_empty()) {
+                        f(id);
+                    }
+                }
+            }
+        }
+        Venue::Kalshi => {
+            if let Some(id) = value["msg"]["market_ticker"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                f(id);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -174,14 +205,32 @@ fn snapshot_sides(venue: Venue, body: &Value) -> [Option<&Value>; 2] {
     }
 }
 
+/// Decode the depth-bearing body of a full book on either venue.
+pub fn snapshot(venue: Venue, body: &Value) -> Snapshot {
+    let [first, second] = snapshot_sides(venue, body);
+    let kalshi = venue == Venue::Kalshi;
+    let (hash, tick, minimum) = if kalshi {
+        (None, Metadata::Absent, Metadata::Absent)
+    } else {
+        (
+            text(body.get("hash")),
+            Metadata::read(body.get("tick_size")),
+            Metadata::read(body.get("min_order_size")),
+        )
+    };
+    Snapshot {
+        first: levels(first, kalshi),
+        second: levels(second, kalshi),
+        hash,
+        tick,
+        minimum,
+    }
+}
+
 type SnapshotSpelling<'a> = BTreeMap<D, (&'a Value, &'a Value)>;
 
 /// Keep the legacy Decimal spelling of accepted snapshot levels at the Python boundary.
-pub fn snapshot_spelling(venue: Venue, message: &Value) -> [SnapshotSpelling<'_>; 2] {
-    let body = match venue {
-        Venue::Polymarket => message,
-        Venue::Kalshi => kalshi::body(message),
-    };
+pub fn snapshot_spelling(venue: Venue, body: &Value) -> [SnapshotSpelling<'_>; 2] {
     snapshot_sides(venue, body).map(|side| {
         let mut spelling = SnapshotSpelling::new();
         visit_levels(side, true, |price, _, p, q| {
@@ -266,6 +315,16 @@ pub enum Action {
     },
 }
 impl Action {
+    pub fn relative_level(&self) -> Option<(Side, D)> {
+        match self {
+            Self::Relative {
+                side: Some(side),
+                price: Some(price),
+                delta: Some(_),
+            } => Some((*side, *price)),
+            _ => None,
+        }
+    }
     pub fn is_snapshot(&self) -> bool {
         matches!(self, Self::Snapshot(_))
     }

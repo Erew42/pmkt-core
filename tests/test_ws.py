@@ -367,6 +367,15 @@ def test_market_payload_rejects_malformed_polymarket_asset_ids() -> None:
         market_subscription_payload(['["token-yes", "token-no"]'])
 
 
+def test_polymarket_apply_uses_custom_snapshot_projection() -> None:
+    class CustomBook(MarketBookState):
+        def snapshot(self, *, event_type=None):
+            return super().snapshot(event_type=f"custom_{event_type}")
+
+    book = CustomBook("instrument")
+    assert book.apply_book({"bids": [], "asks": []}).event_type == "custom_book"
+
+
 def test_polymarket_reconnect_clears_stale_book_levels() -> None:
     state = MarketBookState("asset-a")
     state.apply_book(
@@ -378,8 +387,10 @@ def test_polymarket_reconnect_clears_stale_book_levels() -> None:
         }
     )
 
+    bids, asks = state.bids, state.asks
     state.mark_reconnect()
 
+    assert state.bids is bids and state.asks is asks
     assert state.bids == {}
     assert state.asks == {}
     assert state.best_bid is None
@@ -390,6 +401,36 @@ def test_polymarket_reconnect_clears_stale_book_levels() -> None:
     assert snapshot.best_bid is None
     assert snapshot.best_ask is None
     assert snapshot.valid_state is False
+
+
+def test_polymarket_delta_uses_exposed_ladders_until_snapshot_replaces_them() -> None:
+    state = MarketBookState("a")
+    message = {"bids": [["0.400", "2.000"]], "asks": [["0.600", "3.00"]]}
+    original = state.apply_book(message)
+    bids = state.bids
+    asks = {Decimal("0.35"): Decimal("5.00")}
+    state.asks = asks
+
+    # An alias can change depth between messages. An equal absolute update
+    # retains the stored key and quantity spelling.
+    bids[Decimal("0.500")] = Decimal("7.000")
+    snapshot = state.apply_price_change({"side": "BUY", "price": "0.4", "size": "2"}, {})
+    assert state.bids is bids and state.asks is asks
+    assert [(str(p), str(q)) for p, q in bids.items()] == [
+        ("0.400", "2.000"), ("0.500", "7.000"),
+    ]
+    assert (snapshot.best_bid, snapshot.best_bid_size) == (0.5, 7.0)
+    assert (snapshot.best_ask, snapshot.best_ask_size) == (0.35, 5.0)
+    assert snapshot.quality_flags == ("crossed_book", "negative_spread")
+    assert not snapshot.book_integrity_valid
+    assert (original.best_bid, original.best_ask, original.valid_state) == (0.4, 0.6, True)
+
+    state.apply_book(message)
+    assert state.bids is not bids and state.asks is not asks
+    bids.clear()
+    asks.clear()
+    current = state.snapshot()
+    assert (current.bid_depth, current.ask_depth) == (1, 1)
 
 
 def test_polymarket_price_change_hash_mismatch_invalid_until_book() -> None:

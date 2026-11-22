@@ -20,6 +20,7 @@ from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
 
 from pmkt.streaming import raw_capture as rr
+from raw_capture_helpers import requires_posix_capture
 
 PM_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 K_URL = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
@@ -423,6 +424,7 @@ def test_writer_pause_drops_then_records_gap(tmp_path):
 # ---------------------------------------------------------------- end-to-end against local servers
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_polymarket_reconnects_with_new_generation_and_records_exact_frames(
     tmp_path,
@@ -493,6 +495,7 @@ async def test_polymarket_reconnects_with_new_generation_and_records_exact_frame
     assert not list(session.glob("*.part")) and not list(session.glob("*.tmp"))
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_control_frame_payloads_are_recorded_exactly(tmp_path, monkeypatch):
     handlers = capture_signals(monkeypatch)
@@ -536,6 +539,7 @@ async def test_control_frame_payloads_are_recorded_exactly(tmp_path, monkeypatch
     ]
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_kalshi_signed_subscriptions_errors_and_gap_reconnect(tmp_path):
     tickers = ["K-A", "K-B"]
@@ -623,6 +627,7 @@ async def test_kalshi_signed_subscriptions_errors_and_gap_reconnect(tmp_path):
     assert "sig-" not in "".join(p.read_text() for p in session.glob("*.json"))
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_kalshi_refuses_redirects_that_would_carry_signed_headers(tmp_path):
     reached = []
@@ -671,6 +676,7 @@ async def test_kalshi_refuses_redirects_that_would_carry_signed_headers(tmp_path
     assert errors and all("302" in error for error in errors)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, caplog):
     def connector(url, **kwargs):
@@ -708,6 +714,7 @@ async def test_kalshi_connection_errors_redact_sent_header_values(tmp_path, capl
     assert "<redacted>" in recorded and "sig-" not in recorded
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_debug_logging_does_not_emit_signed_handshake_headers(tmp_path, caplog):
     caplog.set_level(logging.DEBUG)
@@ -731,6 +738,7 @@ async def test_debug_logging_does_not_emit_signed_handshake_headers(tmp_path, ca
     assert not any("sig-" in r.getMessage() for r in client)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_transport_error_renders_fields_with_plain_basic_config(
     tmp_path, monkeypatch
@@ -767,6 +775,7 @@ async def test_transport_error_renders_fields_with_plain_basic_config(
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_offline_connector_retries_until_deadline(tmp_path, monkeypatch):
     attempts = []
@@ -805,6 +814,7 @@ async def test_offline_connector_retries_until_deadline(tmp_path, monkeypatch):
     assert "synthetic offline" in final["last_error"]
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_disk_critical_pauses_then_resumes_with_fresh_generation(
     tmp_path, monkeypatch, caplog
@@ -867,6 +877,7 @@ async def test_disk_critical_pauses_then_resumes_with_fresh_generation(
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 @pytest.mark.parametrize("free,disk,dropped", [(150, "low", 0), (50, "critical", 2)])
 async def test_custom_disk_thresholds_warn_or_pause_writes(
@@ -896,6 +907,7 @@ async def test_custom_disk_thresholds_warn_or_pause_writes(
     assert len(frames(session)) == 2 - dropped
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_multiple_connections_are_independent(tmp_path):
     """Two Polymarket slices and one Kalshi slice concurrently; a dead endpoint for one slice harms nobody."""
@@ -971,6 +983,7 @@ async def test_multiple_connections_are_independent(tmp_path):
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_end_in_past_exits_cleanly_without_session(tmp_path):
     root = tmp_path / "runs" / "run1" / "polymarket_00"
@@ -987,6 +1000,7 @@ async def test_end_in_past_exits_cleanly_without_session(tmp_path):
 # ---------------------------------------------------------------- in-memory receive path
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_burst_uses_one_receiver_and_preserves_every_frame_in_order(
     tmp_path, monkeypatch
@@ -1037,6 +1051,7 @@ async def test_burst_uses_one_receiver_and_preserves_every_frame_in_order(
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_polymarket_app_ping_fires_after_ten_seconds_during_continuous_frames(
     tmp_path, monkeypatch
@@ -1080,6 +1095,7 @@ async def test_polymarket_app_ping_fires_after_ten_seconds_during_continuous_fra
     assert json.loads((session / "FINAL.json").read_text())["errors"] == 0
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_silent_receive_times_out_and_reconnects(tmp_path, monkeypatch):
     handlers = capture_signals(monkeypatch)
@@ -1118,6 +1134,7 @@ async def test_silent_receive_times_out_and_reconnects(tmp_path, monkeypatch):
     assert sum(f["frame_type"] == "transport_error" for f in frames(session)) == 1
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_control_frames_extend_receive_timeout_without_text_frames(
     tmp_path, monkeypatch
@@ -1155,6 +1172,7 @@ async def test_control_frames_extend_receive_timeout_without_text_frames(
     assert not any(f["frame_type"] == "text" for f in got)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_buffered_kalshi_gap_reconnects_immediately_and_throttles_later_gaps(
     tmp_path, monkeypatch
@@ -1224,6 +1242,7 @@ async def test_buffered_kalshi_gap_reconnects_immediately_and_throttles_later_ga
     ] == [(1, "local"), (2, "local")]
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 @pytest.mark.parametrize("continued_traffic", [False, True])
 async def test_suppressed_kalshi_gap_reconnects_when_cooldown_expires_without_another_gap(
@@ -1285,6 +1304,7 @@ async def test_suppressed_kalshi_gap_reconnects_when_cooldown_expires_without_an
     ] == ["sig-1", "sig-2", "sig-3"]
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_pending_gap_reconnect_is_cleared_by_an_unrelated_reconnect(
     tmp_path, monkeypatch
@@ -1343,6 +1363,7 @@ async def test_pending_gap_reconnect_is_cleared_by_an_unrelated_reconnect(
     assert all(feed.closed for feed in feeds)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_kalshi_gap_reconnect_resumes_after_cooldown_with_fresh_signatures(
     tmp_path, monkeypatch
@@ -1408,6 +1429,7 @@ async def test_kalshi_gap_reconnect_resumes_after_cooldown_with_fresh_signatures
     assert all(feed.closed for feed in feeds)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "interval,advance,reconnects", [(10, 9, 1), (10, 10, 2), (0, 0, 2)]
@@ -1465,6 +1487,7 @@ async def test_gap_reconnect_interval_controls_when_fresh_snapshots_are_requeste
     assert all(feed.closed for feed in connections)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_disk_recovery_cancels_pending_receive_before_reconnecting(
     tmp_path, monkeypatch
@@ -1514,6 +1537,7 @@ async def test_disk_recovery_cancels_pending_receive_before_reconnecting(
 
 @pytest.mark.parametrize("ending", ["signal", "deadline"])
 @pytest.mark.parametrize("streaming", [False, True])
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_signal_and_deadline_finish_promptly_and_seal_pending_or_busy_receive(
     tmp_path, monkeypatch, ending, streaming
@@ -1659,6 +1683,7 @@ def lag_payload(lag_ms):
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_lag_warnings_need_ten_samples_rate_limit_and_recover_once(
     tmp_path, monkeypatch, caplog
@@ -1687,6 +1712,7 @@ async def test_lag_warnings_need_ten_samples_rate_limit_and_recover_once(
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_lag_threshold_is_strict_and_silence_is_not_recovery(
     tmp_path, monkeypatch, caplog
@@ -1704,6 +1730,7 @@ async def test_lag_threshold_is_strict_and_silence_is_not_recovery(
     assert json.loads((session / "PROVENANCE.json").read_text())["lag_warn_ms"] == 100
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_loop_stall_latest_frame_sampling_and_provenance_only_disclaimers(
     tmp_path, monkeypatch, caplog
@@ -1775,6 +1802,7 @@ async def test_loop_stall_latest_frame_sampling_and_provenance_only_disclaimers(
     assert not any(entry["event"] == "lag_warning" for entry in logs)
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_loop_lag_detects_stall_without_any_frames(tmp_path, monkeypatch, caplog):
     session, _ = await scripted_lag_capture(
@@ -1792,6 +1820,7 @@ async def test_loop_lag_detects_stall_without_any_frames(tmp_path, monkeypatch, 
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_read_auth_failures_do_not_persist_provider_exception_text(
     tmp_path, monkeypatch, caplog
@@ -1839,6 +1868,7 @@ async def test_read_auth_failures_do_not_persist_provider_exception_text(
     )
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_fatal_frame_write_retains_partial_chunk_without_manifest(
     tmp_path, monkeypatch
@@ -1873,6 +1903,7 @@ async def test_fatal_frame_write_retains_partial_chunk_without_manifest(
     assert feed.closed and feed.active_recv == 0
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_terminal_seal_failure_reports_partial_and_retains_evidence(
     tmp_path, monkeypatch
@@ -1922,6 +1953,7 @@ async def test_terminal_seal_failure_reports_partial_and_retains_evidence(
     assert feed.closed and feed.active_recv == 0
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_startup_storage_error_removes_signal_handlers(tmp_path, monkeypatch):
     loop = asyncio.get_running_loop()
