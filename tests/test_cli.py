@@ -20,6 +20,7 @@ PUBLIC_COMMANDS = {
     "ingest-kalshi-historical-markets",
     "ingest-markets",
     "ingest-markets-keyset",
+    "inspect-raw-capture",
     "markets",
     "query",
     "reconstruct-book-tape",

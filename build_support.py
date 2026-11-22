@@ -2,12 +2,19 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from setuptools.command.build_py import build_py
 from setuptools.command.sdist import sdist
+
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ImportError:
+    if not TYPE_CHECKING:
+        from wheel.bdist_wheel import bdist_wheel
 
 
 ROOT = Path(__file__).resolve().parent
@@ -50,16 +57,36 @@ def _write_identity(path: Path, identity: dict[str, Any]) -> None:
     path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _clear_staging(staging: Path) -> None:
+    source = (ROOT / "src" / PACKAGE).resolve()
+    target = staging.resolve()
+    if target.is_relative_to(source) or source.is_relative_to(target):
+        raise ValueError("build output must not overlap the source package")
+    if staging.exists():
+        shutil.rmtree(staging)
+
+
 class IdentityBuildPy(build_py):
     def run(self) -> None:
         identity = build_identity(self.distribution.get_name(), self.distribution.get_version())
+        # Setuptools copies over an existing staging tree without removing
+        # modules retired since the previous build. Never ship those leftovers.
+        _clear_staging(Path(self.build_lib) / PACKAGE)
         super().run()
         _write_identity(Path(self.build_lib) / PACKAGE / "_build_info.json", identity)
 
     def get_outputs(self, include_bytecode: int = 1) -> list[str]:
-        outputs = super().get_outputs(include_bytecode)
+        outputs = super().get_outputs(bool(include_bytecode))
         identity_path = str(Path(self.build_lib) / PACKAGE / "_build_info.json")
         return list(dict.fromkeys([*outputs, identity_path]))
+
+
+class CleanBdistWheel(bdist_wheel):
+    def run(self) -> None:
+        assert self.bdist_dir is not None  # Set by finalize_options().
+        # A failed wheel build can leave files in the install staging tree.
+        _clear_staging(Path(self.bdist_dir))
+        super().run()
 
 
 class IdentitySdist(sdist):

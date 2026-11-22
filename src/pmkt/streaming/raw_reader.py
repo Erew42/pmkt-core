@@ -15,6 +15,7 @@ import hashlib
 import json
 import re
 import zlib
+from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -295,11 +296,17 @@ def read_session(
     reported by list_session_chunks. ChunkGap is yielded even with verify=False,
     since it describes the data rather than checking it.
     """
+    yield from _read_session_chunks(list_session_chunks(session).chunks, verify=verify)
+
+
+def _read_session_chunks(
+    chunks: Iterable[SealedChunk], *, verify: bool
+) -> Iterator[RawFrame | ChunkGap]:
     # Chunk numbers start at 1, so starting previous_index at 0 makes a missing
     # chunk_000001 (an archived prefix) count as a gap like any other.
     previous: SealedChunk | None = None
     previous_index = 0
-    for chunk in list_session_chunks(session).chunks:
+    for chunk in chunks:
         index = int(chunk.path.name.split("_")[1].split(".")[0])
         manifest = chunk.manifest
         missing = index != previous_index + 1
@@ -357,6 +364,62 @@ def read_session(
             )
         yield from _read_chunk(chunk, verify=verify)
         previous, previous_index = chunk, index
+
+
+def inspect_session(session: str | Path) -> dict[str, Any]:
+    """Verify and summarize a fixed snapshot of sealed chunks without venue I/O.
+
+    Exhaust every chunk so EOF checks run. Memory grows with chunk metadata and
+    connection generations, not frame count. No venue payloads are decoded.
+    Verification covers only the files present; it cannot establish network
+    losslessness or detect a missing suffix. State files are not commit markers.
+    """
+    discovery = list_session_chunks(session)
+    frame_types: Counter[str] = Counter()
+    directions: Counter[str] = Counter()
+    local_events: Counter[str] = Counter()
+    generations: set[int] = set()
+    gaps: list[dict[str, Any]] = []
+    first: RawFrame | None = None
+    last: RawFrame | None = None
+    count = 0
+    for item in _read_session_chunks(discovery.chunks, verify=True):
+        if isinstance(item, ChunkGap):
+            gaps.append({
+                "first_missing": item.first_missing,
+                "last_missing": item.last_missing,
+                "next_chunk": item.next_chunk.name,
+                "missing_frame_count": item.missing_frame_count,
+            })
+            continue
+        if first is None:
+            first = item
+        last = item
+        count += 1
+        frame_types[item.frame_type] += 1
+        directions[item.direction] += 1
+        generations.add(item.connection_generation)
+        if item.direction == "local":
+            local_events[item.frame_type] += 1
+    return {
+        "session": str(Path(session)),
+        "verified_present_chunks": True,
+        "sealed_chunk_count": len(discovery.chunks),
+        "compressed_bytes": sum(c.manifest["size_bytes"] for c in discovery.chunks),
+        "venue": first.venue if first else None,
+        "recording_id": first.recording_id if first else None,
+        "frame_count": count,
+        "first_received_utc": first.received_utc if first else None,
+        "last_received_utc": last.received_utc if last else None,
+        "connection_generations": sorted(generations),
+        "frame_type_counts": dict(sorted(frame_types.items())),
+        "direction_counts": dict(sorted(directions.items())),
+        "local_event_counts": dict(sorted(local_events.items())),
+        "chunk_gaps": gaps,
+        "missing_chunk_count": sum(g["last_missing"] - g["first_missing"] + 1 for g in gaps),
+        "missing_recorded_frame_count": sum(g["missing_frame_count"] for g in gaps),
+        "incomplete_files": [p.name for p in discovery.incomplete],
+    }
 
 
 def _reject_json_constant(value: str) -> Any:

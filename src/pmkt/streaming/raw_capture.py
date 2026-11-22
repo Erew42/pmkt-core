@@ -571,6 +571,7 @@ async def capture_raw_ws(
     The market-list JSON selects a public endpoint and native instruments. Kalshi
     requires an injected read-auth provider. Timers and connector are injectable
     for offline replay; use one capture per process (it owns signal handlers).
+    POSIX signals and directory fsync are required; native Windows is unsupported.
     """
     if os.name != "posix" or not hasattr(os, "O_DIRECTORY"):
         raise RuntimeError(

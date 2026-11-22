@@ -73,6 +73,10 @@ Generated data and local credentials belong in ignored directories such as
 
 ## Development
 
+The full test suite includes POSIX-only capture and collector integration tests;
+run it on Linux/WSL. Native Windows can run the portable library tests, but cannot
+run the raw WebSocket recorder or the standalone wallet collector/exporter.
+
 Create a repository-local virtual environment without system-site packages and
 use its interpreter for installation and checks (`.venv/Scripts/python.exe` on
 Windows; `.venv/bin/python` on POSIX). Existing global installations need not

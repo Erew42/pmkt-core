@@ -1,5 +1,10 @@
 # Historical Polymarket wallet registry
 
+The standalone collector and exporter require POSIX file locks (`fcntl.flock`).
+Run them on a POSIX host such as Linux/WSL; native Windows is unsupported.
+Python documents this platform boundary in its
+[`fcntl` reference](https://docs.python.org/3.12/library/fcntl.html).
+
 Run from the repository root on Linux, using Python 3.10–3.12 with the core
 dependencies installed:
 
