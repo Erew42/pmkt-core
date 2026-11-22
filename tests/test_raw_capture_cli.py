@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from pmkt.cli.app import app
 from pmkt.streaming import raw_capture as rr
+from raw_capture_helpers import requires_posix_capture
 
 _ANSI_ESCAPE_RE = re.compile(r"\[[0-?]*[ -/]*[@-~]")
 
@@ -94,6 +95,7 @@ def test_cli_passes_only_supplied_tuning_options(tmp_path, monkeypatch, name, va
     assert calls == [dict(runs_root=tmp_path / "runs", **{name: value})]
 
 
+@requires_posix_capture
 def test_cli_emits_info_events_on_stderr_with_standard_logging(tmp_path):
     markets = tmp_path / "markets.json"
     markets.write_text(
@@ -232,6 +234,7 @@ def test_invalid_cli_options_fail_before_capture_creates_output(
     assert not (tmp_path / "runs").exists()
 
 
+@requires_posix_capture
 @pytest.mark.asyncio
 async def test_library_requires_auth_before_session_or_network(tmp_path):
     markets = tmp_path / "markets.json"
@@ -260,7 +263,7 @@ async def test_library_requires_auth_before_session_or_network(tmp_path):
 
 @pytest.mark.asyncio
 async def test_capture_rejects_platform_without_directory_fsync(tmp_path, monkeypatch):
-    monkeypatch.delattr(rr.os, "O_DIRECTORY")
+    monkeypatch.delattr(rr.os, "O_DIRECTORY", raising=False)
     with pytest.raises(RuntimeError, match="requires POSIX"):
         await rr.capture_raw_ws(
             tmp_path / "runs/run1/instance",

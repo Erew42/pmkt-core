@@ -29,54 +29,6 @@
     "strategy_family",
     "theoretical_edge_dollars"
   ],
-  "book_tape_control.v1": [
-    "control_id",
-    "control_type",
-    "epoch_id",
-    "evidence_role",
-    "exchange_at_utc",
-    "venue_book_id"
-  ],
-  "book_tape_control.v2": [
-    "control_id",
-    "control_type",
-    "epoch_id",
-    "evidence_role",
-    "exchange_at_utc",
-    "venue_book_id"
-  ],
-  "book_tape_event.v1": [
-    "checkpoint_reason",
-    "encoding_version",
-    "epoch_id",
-    "event_kind",
-    "event_payload_hash",
-    "exchange_at_utc",
-    "expected_level_row_count",
-    "post_book_hash",
-    "raw_event_hash",
-    "side_counts_json",
-    "venue_book_id"
-  ],
-  "book_tape_event.v2": [
-    "checkpoint_reason",
-    "encoding_version",
-    "epoch_id",
-    "event_kind",
-    "event_payload_hash",
-    "exchange_at_utc",
-    "expected_level_row_count",
-    "post_book_hash",
-    "raw_event_hash",
-    "side_counts_json",
-    "venue_book_id"
-  ],
-  "book_tape_level.v1": [
-    "epoch_id",
-    "level_ordinal",
-    "size_delta_contracts",
-    "venue_book_id"
-  ],
   "capture_instrument_evidence.v1": [
     "eligibility_observed_at_utc",
     "eligibility_source_identity",

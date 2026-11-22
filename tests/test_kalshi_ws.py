@@ -258,6 +258,15 @@ def test_kalshi_snapshot_malformed_timestamp_returns_none() -> None:
     assert snapshot.as_dict()["datetime_utc"] is None
 
 
+def test_kalshi_apply_uses_custom_snapshot_projection() -> None:
+    class CustomBook(KalshiOrderBookState):
+        def snapshot(self, *, event_type=None):
+            return super().snapshot(event_type=f"custom_{event_type}")
+
+    book = CustomBook("instrument")
+    assert book.apply_snapshot({"sid": 1, "seq": 1, "msg": {}}).event_type == "custom_orderbook_snapshot"
+
+
 def test_kalshi_reconnect_clears_stale_book_levels() -> None:
     state = KalshiOrderBookState("KXTEST")
     state.apply_snapshot(
@@ -270,11 +279,40 @@ def test_kalshi_reconnect_clears_stale_book_levels() -> None:
         }
     )
 
+    yes_bids, no_bids = state.yes_bids, state.no_bids
     state.mark_reconnect()
 
+    assert state.yes_bids is yes_bids and state.no_bids is no_bids
     assert state.yes_bids == {}
     assert state.no_bids == {}
     assert state.valid_state is False
+
+
+def test_kalshi_relative_delta_uses_caller_edited_ladders_and_preserves_key_scale() -> None:
+    state = KalshiOrderBookState("KXTEST")
+    levels = {"yes_dollars_fp": [["0.400", "2.00"]], "no_dollars_fp": [["0.650", "3.00"]]}
+    original = state.apply_snapshot({"sid": 7, "seq": 1, "msg": levels})
+    yes_bids = state.yes_bids
+    no_bids = {Decimal("0.550"): Decimal("4.000")}
+    state.no_bids = no_bids
+    yes_bids[Decimal("0.4")] = Decimal("7.000")
+    assert state.snapshot().yes_ask == 0.55
+
+    changed = state.apply_delta({
+        "sid": 7, "seq": 2, "msg": {"side": "yes", "price_dollars": "0.40", "delta_fp": "-1.50"},
+    })
+    assert state.yes_bids is yes_bids and state.no_bids is no_bids
+    assert [(str(p), str(q)) for p, q in yes_bids.items()] == [("0.400", "5.5")]
+    assert [(str(p), str(q)) for p, q in no_bids.items()] == [("0.550", "4.000")]
+    assert (changed.yes_bid_size, changed.yes_ask_size, changed.valid_state) == (5.5, 4.0, True)
+    assert (original.yes_bid_size, original.yes_ask, original.seq) == (2.0, 0.65, 1)
+
+    state.apply_snapshot({"sid": 7, "seq": 3, "msg": levels})
+    assert state.yes_bids is not yes_bids and state.no_bids is not no_bids
+    yes_bids.clear()
+    no_bids.clear()
+    current = state.snapshot()
+    assert (current.yes_bid_depth, current.no_bid_depth) == (1, 1)
 
 
 def test_kalshi_orderbook_delta_removes_depleted_level() -> None:

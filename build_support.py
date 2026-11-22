@@ -1,13 +1,29 @@
-"""Setuptools hooks: identity belongs to build output, never the source tree."""
+"""PEP 517 backend. Stamp observed source identity into maturin's archives."""
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
+import io
 import json
 import subprocess
+import sys
+import tarfile
+import zipfile
+from email.parser import BytesParser
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
-from setuptools.command.build_py import build_py
-from setuptools.command.sdist import sdist
+import maturin
+from maturin import (
+    build_editable as build_editable,
+    get_requires_for_build_editable as get_requires_for_build_editable,
+    get_requires_for_build_sdist as get_requires_for_build_sdist,
+    get_requires_for_build_wheel as get_requires_for_build_wheel,
+    prepare_metadata_for_build_editable as prepare_metadata_for_build_editable,
+    prepare_metadata_for_build_wheel as prepare_metadata_for_build_wheel,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -45,25 +61,66 @@ def build_identity(name: str, version: str) -> dict[str, Any]:
     return {"format": 1, "distribution": name, "version": version, "commit": None, "dirty": None}
 
 
-def _write_identity(path: Path, identity: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+def _identity_bytes(metadata: bytes) -> bytes:
+    fields = BytesParser().parsebytes(metadata, headersonly=True)
+    identity = build_identity(fields["Name"], fields["Version"])
+    return (json.dumps(identity, indent=2, sort_keys=True) + "\n").encode()
 
 
-class IdentityBuildPy(build_py):
-    def run(self) -> None:
-        identity = build_identity(self.distribution.get_name(), self.distribution.get_version())
-        super().run()
-        _write_identity(Path(self.build_lib) / PACKAGE / "_build_info.json", identity)
+def stamp_wheel(path: Path) -> None:
+    identity_path = f"{PACKAGE}/_build_info.json"
+    with NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        staged = Path(temp.name)
+    try:
+        with zipfile.ZipFile(path) as src, zipfile.ZipFile(staged, "w") as dst:
+            record = next(p for p in src.namelist() if p.endswith(".dist-info/RECORD"))
+            data = _identity_bytes(src.read(record.removesuffix("RECORD") + "METADATA"))
+            for info in src.infolist():
+                if info.filename not in {identity_path, record}:
+                    dst.writestr(info, src.read(info))
+            dst.writestr(identity_path, data, compress_type=zipfile.ZIP_DEFLATED)
+            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+            rows = csv.reader(io.StringIO(src.read(record).decode()))
+            updated = io.StringIO(newline="")
+            writer = csv.writer(updated, lineterminator="\n")
+            writer.writerows(row for row in rows if row[0] not in {identity_path, record})
+            writer.writerows([(identity_path, f"sha256={digest}", len(data)), (record, "", "")])
+            dst.writestr(record, updated.getvalue(), compress_type=zipfile.ZIP_DEFLATED)
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
 
-    def get_outputs(self, include_bytecode: int = 1) -> list[str]:
-        outputs = super().get_outputs(include_bytecode)
-        identity_path = str(Path(self.build_lib) / PACKAGE / "_build_info.json")
-        return list(dict.fromkeys([*outputs, identity_path]))
+
+def build_wheel(wheel_directory, config_settings=None, metadata_directory=None):
+    filename = maturin.build_wheel(wheel_directory, config_settings, metadata_directory)
+    stamp_wheel(Path(wheel_directory) / filename)
+    return filename
 
 
-class IdentitySdist(sdist):
-    def make_release_tree(self, base_dir: str, files: list[str]) -> None:
-        identity = build_identity(self.distribution.get_name(), self.distribution.get_version())
-        super().make_release_tree(base_dir, files)
-        _write_identity(Path(base_dir) / "src" / PACKAGE / "_build_info.json", identity)
+def build_sdist(sdist_directory, config_settings=None):
+    filename = maturin.build_sdist(sdist_directory, config_settings)
+    path = Path(sdist_directory) / filename
+    with NamedTemporaryFile(dir=path.parent, delete=False) as temp:
+        staged = Path(temp.name)
+    try:
+        with tarfile.open(path, "r:gz") as src, tarfile.open(staged, "w:gz") as dst:
+            root = filename.removesuffix(".tar.gz")
+            metadata = src.extractfile(f"{root}/PKG-INFO")
+            if metadata is None:
+                raise ValueError("missing sdist metadata")
+            data = _identity_bytes(metadata.read())
+            identity = tarfile.TarInfo(f"{root}/src/{PACKAGE}/_build_info.json")
+            identity.size = len(data)
+            for member in src:
+                if member.name != identity.name:
+                    dst.addfile(member, src.extractfile(member) if member.isfile() else None)
+            dst.addfile(identity, io.BytesIO(data))
+        staged.replace(path)
+    finally:
+        staged.unlink(missing_ok=True)
+    return filename
+
+
+if __name__ == "__main__":
+    # maturin-action builds platform wheels directly, outside PEP 517.
+    stamp_wheel(Path(sys.argv[1]))

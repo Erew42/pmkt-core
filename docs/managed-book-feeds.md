@@ -136,7 +136,7 @@ Fault scope is explicit:
 
 Polymarket locked or crossed depth from a price change is withheld immediately
 with reason `crossed_book`. Only these nonpersistent ladder flags qualify for a
-grace owned by `pmkt.exchanges.polymarket.recovery.CORRECTIVE_DELTA_GRACE_SECONDS`. During the grace, any `price_change` or `book` message that leaves
+grace owned by `CORRECTIVE_DELTA_GRACE_NS` in `crates/pmkt-engine/src/health.rs`. During the grace, any `price_change` or `book` message that leaves
 the retained ladder intact clears the recovery; best-price hints and activity
 events do not change the ladder. Repeated invalid updates
 do not extend the deadline. Reads and ingress latch expiry before a late update
@@ -162,6 +162,21 @@ late snapshot can restore the instrument during cooldown. A venue that never
 sends a valid snapshot remains explicitly unavailable; recovery cannot invent
 depth. Local recovery does not change the connection generation or the shard's
 reconnect/error counters.
+
+Known limitation (not handled): Polymarket sends no acknowledgement for
+unsubscribe/subscribe, and answers a subscribe for an already-subscribed token
+with the text `NO NEW ASSETS` and no snapshot. So a `book` that the old
+subscription sent before the venue applied the unsubscribe can satisfy the
+recovery barrier. The instrument then holds that book without further deltas
+until the replacement snapshot arrives, normally about one round trip later, or
+indefinitely if the venue never sends one. In a 2026-11-21 replay of the eight
+2026-11-02 midterm Polymarket recordings (680 shard-hours, 240 tokens each,
+181.5M messages), integrity and identity recoveries never occurred. Snapshot
+timeouts occurred 39 times, and none of those tokens received a later book on the
+same connection, so the race never had an opportunity. Operator procedure: for
+runs where a frozen book matters, use REST books (MT-P `--public-books rest`) or
+treat a growing `book_update_age_seconds` on an otherwise active market as
+stale.
 
 Shard faults invalidate all depth before awaited cleanup or backoff. A new valid
 snapshot on a replacement connection is required for reuse.

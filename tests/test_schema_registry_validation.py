@@ -24,6 +24,7 @@ from pmkt.data.canonical import (
     signal_row,
 )
 from pmkt.data.schemas import topbook_row
+from pmkt.data.storage.duckdb import query_parquet
 from pmkt.data.storage.parquet import write_parquet
 from pmkt.data.types import parse_int
 from pmkt.data.validation import (
@@ -515,71 +516,6 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "subsequence": 0,
             }
         )
-    if spec.version in {"book_tape_event.v1", "book_tape_event.v2"}:
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "event_id": "1" * 64,
-                "venue": "polymarket",
-                "venue_market_id": "market-1",
-                "venue_book_id": "token-1",
-                "event_kind": "checkpoint",
-                "epoch_id": "2" * 64,
-                "checkpoint_reason": "startup",
-                "received_at_utc": "2026-07-19T10:00:00Z",
-                "received_at_monotonic_ns": 1,
-                "exchange_at_utc": "2026-07-19T10:00:00Z",
-                "local_sequence": 1,
-                "subsequence": 0,
-                "expected_level_row_count": 0,
-                "side_counts_json": '{"ask":0,"bid":0}',
-                "post_book_hash": "3" * 64,
-                "valid_state": True,
-                "reconstructible": True,
-                "quality_flags_json": "[]",
-                "raw_event_hash": "4" * 64,
-                "event_payload_hash": "5" * 64,
-                "encoding_version": "book-tape.v1",
-            }
-        )
-    if spec.version == "book_tape_level.v1":
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "event_id": "1" * 64,
-                "venue": "polymarket",
-                "venue_book_id": "token-1",
-                "epoch_id": "2" * 64,
-                "source_side": "bid",
-                "price_key": "0.4",
-                "price_dollars": 0.4,
-                "size_after_contracts": 1.0,
-                "size_delta_contracts": 1.0,
-                "level_ordinal": 0,
-            }
-        )
-    if spec.version in {"book_tape_control.v1", "book_tape_control.v2"}:
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "control_id": "6" * 64,
-                "venue": "polymarket",
-                "venue_market_id": "market-1",
-                "venue_book_id": "token-1",
-                "control_type": "book_recovered",
-                "reason": "startup_snapshot",
-                "valid_after": True,
-                "received_at_utc": "2026-07-19T10:00:00Z",
-                "received_at_monotonic_ns": 1,
-                "exchange_at_utc": "2026-07-19T10:00:00Z",
-                "local_sequence": 1,
-                "subsequence": 0,
-                "epoch_id": "2" * 64,
-                "evidence_role": "tape_event",
-                "evidence_id": "1" * 64,
-                "quality_flags_json": "[]",
-            }
-        )
     if spec.version == "stream_lifecycle.v1":
         row.update(
             {
@@ -822,10 +758,6 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "allowed_consumers_json": ["research_report", "manual_review"],
             }
         )
-    if spec.version == "book_tape_event.v2":
-        row["book_integrity_valid"] = row["reconstructible"]
-    if spec.version == "book_tape_control.v2":
-        row["book_integrity_after"] = row["valid_after"]
     return row
 
 
@@ -1952,15 +1884,82 @@ def test_validate_match_relation_accepts_settlement_scope_tracking_label() -> No
 
 
 
+@pytest.mark.parametrize("event_type", ["activated", "metadata_updated"])
+def test_stream_lifecycle_enforces_venue_event_mapping(event_type: str) -> None:
+    spec = get_table_spec("stream_lifecycle.v1")
+    assert spec.primary_key == ("collector_run_id", "lifecycle_event_id")
+    row = _valid_schema_row(spec)
+    row.update(venue="kalshi", event_type=event_type)
+    assert validate_frame(pd.DataFrame([row]), spec, strict=True).ok
+
+    row["event_type"] = "new_market"
+    report = validate_frame(pd.DataFrame([row]), spec, strict=True)
+
+    assert not report.ok
+    assert any("kalshi does not allow" in error for error in report.errors)
+
+
+def test_stream_lifecycle_statuses_round_trip_through_parquet_and_duckdb(tmp_path) -> None:
+    spec = get_table_spec("stream_lifecycle.v1")
+    row = _valid_schema_row(spec)
+    row.update(
+        venue="kalshi",
+        event_type="settled",
+        previous_status="determined",
+        new_status="finalized",
+    )
+    path = tmp_path / "stream_lifecycle.parquet"
+    write_parquet(pd.DataFrame([row]), path, schema=spec.version, coerce=True, strict=True)
+
+    persisted = query_parquet(
+        "SELECT previous_status, new_status FROM lifecycle", {"lifecycle": path}
+    )
+
+    assert persisted.to_dict("records") == [
+        {"previous_status": "determined", "new_status": "finalized"}
+    ]
+
+
+def test_partial_trade_capture_coordinate_fails_strict_validation() -> None:
+    spec = get_table_spec("trade.v1")
+    row = _valid_schema_row(spec)
+    row["local_sequence"] = None
+
+    report = validate_frame(pd.DataFrame([row]), spec, strict=True)
+
+    assert not report.ok
+    assert any("capture coordinate" in error for error in report.errors)
+
+
+@pytest.mark.parametrize(
+    ("schema_version", "column"),
+    [
+        ("stream_lifecycle.v1", "venue"),
+        ("stream_lifecycle.v1", "event_type"),
+        ("trade.v1", "collector_run_id"),
+        ("trade.v1", "received_at_monotonic_ns"),
+        ("trade.v1", "local_sequence"),
+        ("trade.v1", "subsequence"),
+    ],
+)
+def test_vectorized_invariant_hooks_report_missing_columns_without_key_error(
+    schema_version: str, column: str
+) -> None:
+    spec = get_table_spec(schema_version)
+    frame = pd.DataFrame([_valid_schema_row(spec)]).drop(columns=[column])
+
+    report = validate_frame(frame, spec, strict=True)
+
+    assert column in report.missing_columns
+    assert not report.ok
+
+
 @pytest.mark.parametrize(
     "schema",
     [
         "topbook.v1",
         "depth.v1",
         "trade.v1",
-        "book_tape_event.v1",
-        "book_tape_level.v1",
-        "book_tape_control.v1",
         "stream_lifecycle.v1",
     ],
 )

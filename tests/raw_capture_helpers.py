@@ -3,7 +3,16 @@
 import gzip
 import hashlib
 import json
+import os
 from pathlib import Path
+
+import pytest
+
+
+requires_posix_capture = pytest.mark.skipif(
+    os.name != "posix" or not hasattr(os, "O_DIRECTORY"),
+    reason="raw WebSocket capture requires POSIX signals and directory fsync",
+)
 
 
 def validate_chunk(chunk, manifest_path):

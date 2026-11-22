@@ -73,6 +73,10 @@ Generated data and local credentials belong in ignored directories such as
 
 ## Development
 
+The full test suite includes POSIX-only capture and collector integration tests;
+run it on Linux/WSL. Native Windows can run the portable library tests, but cannot
+run the raw WebSocket recorder or the standalone wallet collector/exporter.
+
 Create a repository-local virtual environment without system-site packages and
 use its interpreter for installation and checks (`.venv/Scripts/python.exe` on
 Windows; `.venv/bin/python` on POSIX). Existing global installations need not
@@ -104,12 +108,12 @@ Run manifests preserve their existing identity fields and add `pmkt_core_dirty`
 and `pmkt_core_provenance_source`. Caller metadata cannot override observed core
 identity. Dataset schema versions are unchanged.
 
-`validate_run_manifest(path, *, path_resolver=None)` optionally accepts a
-`Callable[[Path], Path]` for legacy dataset references and declared run directories.
-The caller owns any relocation policy. Exact artifact paths must still be
-canonical and contained within the authoritative manifest directory; hashes,
-schemas, counts, and journal bindings are always validated after resolution.
-With no callback, existing path behavior is unchanged.
+`validate_run_manifest` accepts an optional `path_resolver` callback of type
+`Callable[[Path], Path]` for dataset references and declared run directories.
+The caller owns the relocation policy. Declared hashes, schemas, and row counts
+are checked after resolution. Both `exact_artifact_validation` values (`"full"`
+and `"structure"`) perform the same checks. Manifests declaring `storage_profile`
+or `dataset_artifacts` return a validation error.
 
 ## Python API 0.2
 

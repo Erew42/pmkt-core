@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+/src/pmkt/_native*.so
+/src/pmkt/_native*.pyd
+/src/pmkt/_native*.dylib
 .venv/
 *.egg-info/
 dist/
@@ -72,3 +75,4 @@ node_modules/
 /test_http.py
 /test_io.py
 /visualize_spreads.py
+/target/

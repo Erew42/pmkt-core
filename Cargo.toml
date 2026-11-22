@@ -1,0 +1,7 @@
+[workspace]
+members = ["crates/pmkt-engine", "crates/pmkt-py"]
+resolver = "2"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"

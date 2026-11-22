@@ -1,0 +1,81 @@
+name: wheels
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+      - uses: PyO3/maturin-action@v1
+        with:
+          command: build
+          args: --release --locked --out dist
+          manylinux: "2_28"
+      - name: Stamp and install the platform wheel
+        shell: bash
+        run: |
+          python -m pip install "maturin>=1.7,<2" "pyarrow>=15"
+          wheel=(dist/*-cp310-abi3-*.whl)
+          test "${#wheel[@]}" -eq 1
+          python build_support.py "${wheel[0]}"
+          python -m pip install --no-deps "${wheel[0]}"
+      - name: Verify the installed artifact away from the source
+        working-directory: ${{ runner.temp }}
+        shell: python
+        run: |
+          import json, os, pathlib, sys
+          from pmkt import _native
+          package = pathlib.Path(_native.__file__).resolve().parent
+          assert not package.is_relative_to(pathlib.Path(os.environ["GITHUB_WORKSPACE"]).resolve())
+          assert {"pandas", "pyarrow", "duckdb"}.isdisjoint(sys.modules)
+          info = json.loads((package / "_build_info.json").read_bytes())
+          assert info["commit"] == os.environ["GITHUB_SHA"] and info["dirty"] is False, info
+          shard = _native.ShardFeed("polymarket", "s", ["x"])
+          assert shard.health("x", 0)["connection_state"] == "initialized"
+          import pyarrow as pa
+          empty = pathlib.Path("empty-capture")
+          empty.mkdir()
+          stream = _native.reconstruct_raw_capture(empty)["depth"]
+          assert "schema_version" in pa.RecordBatchReader.from_stream(stream).schema.names
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*-cp310-abi3-*.whl
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
+      - name: Attach verified wheels to the tagged release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.whl
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes dist/*.whl
+          fi

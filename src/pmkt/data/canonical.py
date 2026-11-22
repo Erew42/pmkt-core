@@ -18,9 +18,6 @@ from pmkt.data.registry import (
     MARKET_RESOLUTION_SCHEMA_VERSION,
     INSTRUMENT_SCHEMA_VERSION,
     TRADE_SCHEMA_VERSION,
-    BOOK_TAPE_EVENT_SCHEMA_VERSION,
-    BOOK_TAPE_LEVEL_SCHEMA_VERSION,
-    BOOK_TAPE_CONTROL_SCHEMA_VERSION,
     STREAM_LIFECYCLE_SCHEMA_VERSION,
     MATCH_SCHEMA_VERSION_V1,
     MATCH_SCHEMA_VERSION,
@@ -207,18 +204,6 @@ def instrument_row(**values: Any) -> dict[str, Any]:
 
 def trade_row(**values: Any) -> dict[str, Any]:
     return canonical_row(TRADE_SCHEMA_VERSION, **values)
-
-
-def book_tape_event_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(values.pop("schema_version", BOOK_TAPE_EVENT_SCHEMA_VERSION), **values)
-
-
-def book_tape_level_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(BOOK_TAPE_LEVEL_SCHEMA_VERSION, **values)
-
-
-def book_tape_control_row(**values: Any) -> dict[str, Any]:
-    return canonical_row(values.pop("schema_version", BOOK_TAPE_CONTROL_SCHEMA_VERSION), **values)
 
 
 def stream_lifecycle_row(**values: Any) -> dict[str, Any]:
@@ -431,9 +416,6 @@ __all__ = [
     "TOPBOOK_CAPTURE_GAP_SCHEMA_VERSION",
     "TRADE_COLUMNS",
     "TRADE_SCHEMA_VERSION",
-    "BOOK_TAPE_EVENT_SCHEMA_VERSION",
-    "BOOK_TAPE_LEVEL_SCHEMA_VERSION",
-    "BOOK_TAPE_CONTROL_SCHEMA_VERSION",
     "STREAM_LIFECYCLE_SCHEMA_VERSION",
     "VENUE_HISTORY_CAPABILITY_COLUMNS",
     "VENUE_HISTORY_CAPABILITY_SCHEMA_VERSION",
@@ -441,9 +423,6 @@ __all__ = [
     "SchemaSpec",
     "arbitrage_candidate_row",
     "backtest_report_row",
-    "book_tape_control_row",
-    "book_tape_event_row",
-    "book_tape_level_row",
     "canonical_fixed_decimal",
     "canonical_row",
     "co_resolution_observation_row",

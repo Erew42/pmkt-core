@@ -738,13 +738,6 @@
       ]
     },
     {
-      "path": "pmkt.data.book_reconstruction_streaming.ParityOptions",
-      "tier": "advanced",
-      "methods": [
-        "from_env"
-      ]
-    },
-    {
       "path": "pmkt.streaming.raw_reader.RawCaptureError",
       "tier": "advanced"
     },
@@ -778,6 +771,14 @@
     },
     {
       "path": "pmkt.streaming.raw_reader.read_chunk",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.inspect_raw_capture",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.reconstruct_raw_capture",
       "tier": "advanced"
     },
     {

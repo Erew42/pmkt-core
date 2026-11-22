@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
+from pmkt import _native
 from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
     MarketBookState,
@@ -27,107 +27,62 @@ from pmkt.exchanges.polymarket.ws import (
     "failure", ["time", "traffic", "hash", "cross", "uninitialized"]
 )
 def test_complementary_recovery_has_strict_bounds(failure):
-    state = MarketBookState(asset_id="A", market="m")
-    state.apply_book(
-        {
-            "bids": [{"price": "0.17", "size": "10"}],
-            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
-        }
-    )
+    books = _native.RecordingBooks("polymarket", ["A", "untouched"])
+    if failure != "uninitialized":
+        books.apply(json.dumps({
+            "event_type": "book", "asset_id": "A", "market": "m",
+            "bids": [["0.17", "10"]], "asks": [["0.18", "10"], ["0.19", "10"]],
+        }), 1)
     change = {
-        "asset_id": "A",
-        "side": "BUY",
-        "price": "0.18",
-        "size": "20",
-        "best_bid": "0.18",
-        "best_ask": "0.19",
-        "hash": "paired",
+        "asset_id": "A", "side": "BUY",
+        "price": "0.20" if failure == "cross" else "0.18",
+        "size": "20", "best_bid": "0.18", "best_ask": "0.19", "hash": "paired",
     }
     message = {
         "event_type": "price_change",
         "timestamp": "1789240000000",
         "price_changes": [change],
     }
-    if failure == "cross":
-        change["price"] = "0.20"
-    state.apply_price_change(change, message)
-    if failure == "uninitialized":
-        state.initial_snapshot_received = False
-    recovery = ComplementaryDeltaRecovery()
-    recovery.observe(message, {"A": state}, {"A"}, message_count=1)
+    assert [view["instrument"] for view in books.apply(json.dumps(message), 2)] == ["A"]
     if failure in {"cross", "uninitialized"}:
-        assert not recovery.defer("A", message_count=1, now_ns=0)
+        assert books.next_deadline_ns() is None
+        assert books.recovery_due(2, 0) == (failure == "cross")
         return
     # A slow synchronous commit before the first decision consumes no grace.
-    assert recovery.defer("A", message_count=1, now_ns=12_000_000_000)
+    now = 12_000_000_000
+    assert not books.recovery_due(2, now)
+    assert books.next_deadline_ns() == now + 250_000_000
     if failure == "hash":
         change["hash"] = "different"
-        recovery.observe(message, {"A": state}, set(), message_count=2)
-        assert not recovery.defer("A", message_count=2, now_ns=12_000_000_001)
+        books.apply(json.dumps(message), 3)
+        assert books.recovery_due(3, now + 1)
     elif failure == "time":
-        assert not recovery.defer("A", message_count=2, now_ns=12_250_000_000)
+        assert books.complementary_due(3, now + 250_000_000)
     else:
-        for sequence in range(2, 17):
-            recovery.observe(
-                {"event_type": "trade"}, {"A": state}, set(), message_count=sequence
-            )
-            assert recovery.defer("A", message_count=sequence, now_ns=12_000_000_001)
-        assert not recovery.defer("A", message_count=17, now_ns=12_000_000_001)
+        for sequence in range(3, 18):
+            assert books.apply('{"event_type":"trade"}', sequence) == []
+            assert not books.recovery_due(sequence, now + 1)
+        assert books.complementary_due(18, now + 1)
 
 
 @pytest.mark.parametrize("event_key", ["event_type", "type"])
-def test_complementary_recovery_checks_only_touched_books(event_key):
-    touched = MarketBookState(asset_id="A", market="m")
-    touched.apply_book(
-        {
-            "bids": [{"price": "0.17", "size": "10"}],
-            "asks": [{"price": "0.18", "size": "10"}, {"price": "0.19", "size": "10"}],
-        }
-    )
-    lookups = []
-
-    class LookupOnlyStates(dict):
-        def items(self):
-            raise AssertionError("recovery must not scan unrelated instruments")
-
-        def __iter__(self):
-            raise AssertionError("recovery must not scan unrelated instruments")
-
-        def get(self, key, default=None):
-            lookups.append(key)
-            return super().get(key, default)
-
-    states = LookupOnlyStates(
-        A=touched, untouched=MarketBookState(asset_id="untouched")
-    )
-    recovery = ComplementaryDeltaRecovery()
-    message = {
-        event_key: "price_change",
-        "timestamp": "1789240000000",
-        "price_changes": [
-            {
-                "asset_id": "A",
-                "side": "BUY",
-                "price": "0.18",
-                "size": "20",
-                "best_bid": "0.18",
-                "best_ask": "0.19",
-                "hash": "paired",
-            }
-        ],
-    }
-    before = recovery.intact_changed_assets(message, states)
-    assert before == {"A"}
-    assert lookups == ["A"]
-    apply_market_message(states, message)
-    recovery.observe(message, states, before, message_count=1)
-    assert recovery.defer("A", message_count=1, now_ns=0)
-    lookups.clear()
-    assert (
-        recovery.intact_changed_assets({"event_type": "last_trade_price"}, states)
-        == set()
-    )
-    assert lookups == []
+def test_complementary_recovery_tracks_touched_books(event_key):
+    books = _native.RecordingBooks("polymarket", ["A", "untouched"])
+    books.apply(json.dumps({
+        "event_type": "book", "asset_id": "A",
+        "bids": [["0.17", "10"]], "asks": [["0.18", "10"], ["0.19", "10"]],
+    }), 1)
+    updates = books.apply(json.dumps({
+        event_key: "price_change", "timestamp": "1789240000000",
+        "price_changes": [{
+            "asset_id": "A", "side": "BUY", "price": "0.18", "size": "20",
+            "best_bid": "0.18", "best_ask": "0.19", "hash": "paired",
+        }],
+    }), 2)
+    assert [update["instrument"] for update in updates] == ["A"]
+    assert not books.recovery_due(2, 0)
+    assert books.next_deadline_ns() == 250_000_000
+    assert books.apply('{"event_type":"last_trade_price"}', 3) == []
 
 
 class FakeWebSocket:
@@ -412,6 +367,15 @@ def test_market_payload_rejects_malformed_polymarket_asset_ids() -> None:
         market_subscription_payload(['["token-yes", "token-no"]'])
 
 
+def test_polymarket_apply_uses_custom_snapshot_projection() -> None:
+    class CustomBook(MarketBookState):
+        def snapshot(self, *, event_type=None):
+            return super().snapshot(event_type=f"custom_{event_type}")
+
+    book = CustomBook("instrument")
+    assert book.apply_book({"bids": [], "asks": []}).event_type == "custom_book"
+
+
 def test_polymarket_reconnect_clears_stale_book_levels() -> None:
     state = MarketBookState("asset-a")
     state.apply_book(
@@ -423,8 +387,10 @@ def test_polymarket_reconnect_clears_stale_book_levels() -> None:
         }
     )
 
+    bids, asks = state.bids, state.asks
     state.mark_reconnect()
 
+    assert state.bids is bids and state.asks is asks
     assert state.bids == {}
     assert state.asks == {}
     assert state.best_bid is None
@@ -435,6 +401,36 @@ def test_polymarket_reconnect_clears_stale_book_levels() -> None:
     assert snapshot.best_bid is None
     assert snapshot.best_ask is None
     assert snapshot.valid_state is False
+
+
+def test_polymarket_delta_uses_exposed_ladders_until_snapshot_replaces_them() -> None:
+    state = MarketBookState("a")
+    message = {"bids": [["0.400", "2.000"]], "asks": [["0.600", "3.00"]]}
+    original = state.apply_book(message)
+    bids = state.bids
+    asks = {Decimal("0.35"): Decimal("5.00")}
+    state.asks = asks
+
+    # An alias can change depth between messages. An equal absolute update
+    # retains the stored key and quantity spelling.
+    bids[Decimal("0.500")] = Decimal("7.000")
+    snapshot = state.apply_price_change({"side": "BUY", "price": "0.4", "size": "2"}, {})
+    assert state.bids is bids and state.asks is asks
+    assert [(str(p), str(q)) for p, q in bids.items()] == [
+        ("0.400", "2.000"), ("0.500", "7.000"),
+    ]
+    assert (snapshot.best_bid, snapshot.best_bid_size) == (0.5, 7.0)
+    assert (snapshot.best_ask, snapshot.best_ask_size) == (0.35, 5.0)
+    assert snapshot.quality_flags == ("crossed_book", "negative_spread")
+    assert not snapshot.book_integrity_valid
+    assert (original.best_bid, original.best_ask, original.valid_state) == (0.4, 0.6, True)
+
+    state.apply_book(message)
+    assert state.bids is not bids and state.asks is not asks
+    bids.clear()
+    asks.clear()
+    current = state.snapshot()
+    assert (current.bid_depth, current.ask_depth) == (1, 1)
 
 
 def test_polymarket_price_change_hash_mismatch_invalid_until_book() -> None:

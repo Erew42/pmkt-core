@@ -263,6 +263,7 @@ def test_adaptive_mode_waits_for_long_transient_retry_after_with_heartbeat(store
         rpc.client.close()
 
 
+@fixtures.requires_wallet_cli
 def test_adaptive_cli_pacing_is_recorded_without_changing_pinned_config(tmp_path, clock, monkeypatch):
     original_rpc = census.Rpc
 
@@ -727,6 +728,7 @@ def test_startup_transient_failures_retry_without_range_adaptation(store, clock,
 @pytest.mark.parametrize("existing", [
     "missing", "directory", "uninitialized_database", "empty_registry_schema",
 ])
+@fixtures.requires_wallet_cli
 def test_invalid_offline_export_does_not_create_or_modify_dataset(
     tmp_path, monkeypatch, existing,
 ):
@@ -779,6 +781,7 @@ def test_single_block_tail_capacity_failure_does_not_repeat_a_nominally_wide_win
         rpc.client.close()
 
 
+@fixtures.requires_wallet_cli
 def test_offline_export_preflight_reads_configuration_from_pending_wal(tmp_path, monkeypatch):
     output = tmp_path / "registry"
     output.mkdir()

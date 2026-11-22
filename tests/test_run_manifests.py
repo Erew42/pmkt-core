@@ -96,7 +96,10 @@ def _sha256(path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def test_validate_run_manifest_accepts_canonical_dataset_manifest(tmp_path) -> None:
+@pytest.mark.parametrize("exact_artifact_validation", ["full", "structure"])
+def test_validate_run_manifest_accepts_canonical_dataset_manifest(
+    tmp_path, exact_artifact_validation
+) -> None:
     run_dir = tmp_path / "run"
     dataset_path = run_dir / "topbook_v1.parquet"
     _write_topbook(dataset_path)
@@ -116,12 +119,31 @@ def test_validate_run_manifest_accepts_canonical_dataset_manifest(tmp_path) -> N
         ),
     )
 
-    report = validate_run_manifest(manifest_path)
+    report = validate_run_manifest(
+        manifest_path, exact_artifact_validation=exact_artifact_validation
+    )
 
     assert report.ok, report.all_errors
     assert report.datasets[0].dataset_key == "topbook_v1_parquet"
     assert report.datasets[0].row_count == 1
     assert report.datasets[0].actual_sha256 == _sha256(dataset_path)
+
+
+def test_validate_run_manifest_rejects_invalid_exact_artifact_validation(tmp_path) -> None:
+    with pytest.raises(ValueError, match="exact_artifact_validation"):
+        validate_run_manifest(
+            tmp_path / "manifest.json", exact_artifact_validation="invalid"
+        )
+
+
+@pytest.mark.parametrize("field", ["storage_profile", "dataset_artifacts"])
+def test_validate_run_manifest_rejects_retired_profile_manifest(tmp_path, field) -> None:
+    path = write_manifest(tmp_path / "manifest.json", {field: {}})
+
+    report = validate_run_manifest(path)
+
+    assert not report.ok
+    assert any("retired" in error and field in error for error in report.all_errors)
 
 
 def test_validate_run_manifest_accepts_parquet_directory_dataset(tmp_path) -> None:

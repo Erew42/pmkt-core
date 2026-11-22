@@ -1,14 +1,21 @@
 from __future__ import annotations
 
-import subprocess
-import sys
+import base64
+import csv
+import hashlib
+import io
 import json
 import os
+import runpy
+import shutil
+import subprocess
+import sys
 import tarfile
 import zipfile
 from email.parser import Parser
 from pathlib import Path
 
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -32,7 +39,7 @@ FORBIDDEN_WHEEL_FILES = {
 }
 
 
-def _build_wheel(output_dir: Path) -> Path:
+def _build_wheel(output_dir: Path, *, root: Path = ROOT) -> Path:
     subprocess.run(
         [
             sys.executable,
@@ -43,17 +50,51 @@ def _build_wheel(output_dir: Path) -> Path:
             "--outdir",
             str(output_dir),
         ],
-        cwd=ROOT,
+        cwd=root,
         check=True,
-        capture_output=True,
-        text=True,
     )
     wheels = list(output_dir.glob("*.whl"))
     assert len(wheels) == 1
     return wheels[0]
 
 
+def test_wheel_retry_excludes_retired_module(tmp_path: Path, monkeypatch) -> None:
+    checkout = tmp_path / "checkout"
+    target = checkout / "target"
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(target))
+    package = checkout / "src" / "pmkt"
+    package.mkdir(parents=True)
+    for name in ("build_support.py", "pyproject.toml", "Cargo.toml", "Cargo.lock", "README.md"):
+        shutil.copyfile(ROOT / name, checkout / name)
+    shutil.copytree(ROOT / "crates", checkout / "crates")
+    (package / "__init__.py").touch()
+    retired = package / "retired.py"
+    retired.write_text("RETIRED = True\n", encoding="utf-8")
+
+    # Fail delivery after maturin built the intermediate wheel containing retired.py.
+    blocked_output = tmp_path / "blocked-output"
+    blocked_output.touch()
+    with monkeypatch.context() as patch:
+        patch.chdir(checkout)
+        backend = runpy.run_path("build_support.py")
+        with pytest.raises((NotADirectoryError, FileNotFoundError)):
+            backend["build_wheel"](str(blocked_output))
+    with zipfile.ZipFile(next((target / "wheels").glob("pmkt-*.whl"))) as archive:
+        assert "pmkt/retired.py" in archive.namelist()
+
+    retired.unlink()
+    wheel = _build_wheel(tmp_path / "wheel", root=checkout)
+    with zipfile.ZipFile(wheel) as archive:
+        names = archive.namelist()
+        assert "pmkt/__init__.py" in names
+        assert "pmkt/retired.py" not in names
+
+
 def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
+    # Rebuilding in the same checkout must not resurrect retired private code.
+    stale = ROOT / "build/lib/pmkt/market_structure/retired.py"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("RETIRED = True\n", encoding="utf-8")
     wheel = _build_wheel(tmp_path)
 
     with zipfile.ZipFile(wheel) as archive:
@@ -69,7 +110,11 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
     requirements = "\n".join(metadata.get_all("Requires-Dist", []))
 
     assert forbidden == []
+    assert "-cp310-abi3-" in wheel.name
+    assert "pmkt/_native.pyi" in names
+    assert len([n for n in names if n.startswith("pmkt/_native.") and n.endswith((".pyd", ".so"))]) == 1
     assert "pmkt/py.typed" in names
+    assert "pmkt/cli/raw_inspection.py" in names
     assert "pmkt/text/taxonomy_data/token_aliases.json" in names
     assert metadata["Name"] == "pmkt"
     assert metadata["Version"] == "0.2.0"
@@ -83,24 +128,33 @@ def test_sdist_rebuild_preserves_observed_identity_outside_git(tmp_path: Path) -
     direct = _build_wheel(tmp_path / "direct")
     subprocess.run(
         [sys.executable, "-m", "build", "--sdist", "--no-isolation", "--outdir", str(tmp_path / "sdist")],
-        cwd=ROOT, check=True, capture_output=True, text=True,
+        cwd=ROOT, check=True,
     )
     unpacked = tmp_path / "unpacked"
     with tarfile.open(next((tmp_path / "sdist").glob("*.tar.gz"))) as archive:
+        assert not any(n.endswith((".pyd", ".so", ".pyc")) for n in archive.getnames())
         archive.extractall(unpacked)
     source = next(unpacked.iterdir())
     # An unrelated enclosing repository must never supply the build commit.
     subprocess.run(["git", "init", str(unpacked)], check=True, capture_output=True)
-    subprocess.run(
-        [sys.executable, "-m", "build", "--wheel", "--no-isolation", "--outdir", str(tmp_path / "rebuilt")],
-        cwd=source, check=True, capture_output=True, text=True,
-    )
-    rebuilt = next((tmp_path / "rebuilt").glob("*.whl"))
+    rebuilt = _build_wheel(tmp_path / "rebuilt", root=source)
     with zipfile.ZipFile(direct) as archive:
-        expected = json.loads(archive.read("pmkt/_build_info.json"))
+        data = archive.read("pmkt/_build_info.json")
+        expected = json.loads(data)
+        record = next(n for n in archive.namelist() if n.endswith(".dist-info/RECORD"))
+        rows = list(csv.reader(io.StringIO(archive.read(record).decode())))
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+        assert [r for r in rows if r[0] == "pmkt/_build_info.json"] == [
+            ["pmkt/_build_info.json", f"sha256={digest}", str(len(data))]
+        ]
     with zipfile.ZipFile(rebuilt) as archive:
-        assert json.loads(archive.read("pmkt/_build_info.json")) == expected
-    assert expected["commit"] and isinstance(expected["dirty"], bool)
+        assert archive.read("pmkt/_build_info.json") == data
+    assert (source / "src/pmkt/_build_info.json").read_bytes() == data
+    assert expected == {
+        "format": 1, "distribution": "pmkt", "version": "0.2.0",
+        "commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip(),
+        "dirty": bool(subprocess.check_output(["git", "status", "--porcelain"], cwd=ROOT)),
+    }
     assert not (ROOT / "src/pmkt/_build_info.json").exists()
     installed = tmp_path / "installed"
     subprocess.run(
@@ -111,6 +165,19 @@ def test_sdist_rebuild_preserves_observed_identity_outside_git(tmp_path: Path) -
 import json, pathlib, sys
 sys.path.insert(0, sys.argv[1])
 import pmkt
+assert {"pandas", "pyarrow", "duckdb"}.isdisjoint(sys.modules)
+from pmkt import _native
+assert {"pandas", "pyarrow", "duckdb"}.isdisjoint(sys.modules)
+assert pathlib.Path(_native.__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+import pyarrow as pa
+stream = _native.reconstruct_raw_capture(".")["topbook"]
+assert pa.table(stream).num_rows == 0
+try:
+    pa.table(stream)
+except ValueError as error:
+    assert "consumed" in str(error)
+else:
+    raise AssertionError("reused a consumed stream")
 from pmkt.data.manifests import build_run_manifest, write_manifest, validate_run_manifest
 from pmkt.provenance import implementation_identity
 identity = implementation_identity(pmkt.__file__, "pmkt").require_consistent()
@@ -447,6 +514,7 @@ assert pathlib.Path(sys.modules["pmkt"].__file__).is_relative_to(pathlib.Path(sy
         """\
 from datetime import datetime, timezone
 from pathlib import Path
+from pmkt import _native
 from pmkt.catalog import CatalogQueryResult, CatalogSnapshot
 from pmkt.runtime import RequestPolicy
 from pmkt.config import PmktConfig
@@ -454,6 +522,10 @@ from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiFilter, KalshiInstrum
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketFilter, PolymarketInstrumentRef, PolymarketMarket, PolymarketMarketRef
 from pmkt.records import BookSnapshot, CandleHistoryResult, DiscoveryResult, InstrumentRef, MarketRef, PriceHistoryResult
 from pmkt.resolution import KalshiResolutionResolver, PolygonCtfClient, PolymarketResolutionResolver, ResolutionRecord
+
+native_shard = _native.ShardFeed("polymarket", "s", ["id"])
+revision: int = native_shard.health("id", 0)["metadata_revision"]
+capture: _native.ArrowStream = _native.reconstruct_raw_capture(Path("."))["depth"]
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 result: CatalogQueryResult = snapshot.query(
@@ -549,11 +621,15 @@ async def kalshi_workflow() -> None:
         """\
 from datetime import datetime, timezone
 from pathlib import Path
+from pmkt import _native
 from pmkt.catalog import CatalogSnapshot
 from pmkt.config import PmktConfig
 from pmkt.exchanges.kalshi import AsyncKalshiClient, KalshiInstrumentRef, KalshiMarketRef
 from pmkt.exchanges.polymarket import AsyncClobClient, AsyncGammaClient, PolymarketInstrumentRef, PolymarketMarketRef
 from pmkt.resolution import KalshiResolutionResolver, PolymarketResolutionResolver
+
+native_shard = _native.ShardFeed("polymarket", "s", ["id"])
+native_shard.ingest("s", 1, "text frame", 0)
 
 snapshot = CatalogSnapshot.open_latest_history(Path("data/markets"), path_base=Path("."))
 snapshot.query("SELECT 1", params=())
@@ -668,6 +744,10 @@ async def invalid_resolution_calls() -> None:
     assert rejected.returncode != 0
     assert "[call-arg]" in rejected.stdout
     assert "[arg-type]" in rejected.stdout
+    assert (
+        'No overload variant of "ingest" of "ShardFeed" matches argument types '
+        '"str", "int", "str", "int"'
+    ) in rejected.stdout
     assert 'Unexpected keyword argument "ticker" for "PolymarketMarketRef"' in rejected.stdout
     assert 'Argument 2 to "KalshiInstrumentRef" has incompatible type' in rejected.stdout
     assert 'Unexpected keyword argument "unsupported" for "AsyncGammaClient"' in rejected.stdout
