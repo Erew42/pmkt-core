@@ -516,71 +516,6 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "subsequence": 0,
             }
         )
-    if spec.version in {"book_tape_event.v1", "book_tape_event.v2"}:
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "event_id": "1" * 64,
-                "venue": "polymarket",
-                "venue_market_id": "market-1",
-                "venue_book_id": "token-1",
-                "event_kind": "checkpoint",
-                "epoch_id": "2" * 64,
-                "checkpoint_reason": "startup",
-                "received_at_utc": "2026-07-19T10:00:00Z",
-                "received_at_monotonic_ns": 1,
-                "exchange_at_utc": "2026-07-19T10:00:00Z",
-                "local_sequence": 1,
-                "subsequence": 0,
-                "expected_level_row_count": 0,
-                "side_counts_json": '{"ask":0,"bid":0}',
-                "post_book_hash": "3" * 64,
-                "valid_state": True,
-                "reconstructible": True,
-                "quality_flags_json": "[]",
-                "raw_event_hash": "4" * 64,
-                "event_payload_hash": "5" * 64,
-                "encoding_version": "book-tape.v1",
-            }
-        )
-    if spec.version == "book_tape_level.v1":
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "event_id": "1" * 64,
-                "venue": "polymarket",
-                "venue_book_id": "token-1",
-                "epoch_id": "2" * 64,
-                "source_side": "bid",
-                "price_key": "0.4",
-                "price_dollars": 0.4,
-                "size_after_contracts": 1.0,
-                "size_delta_contracts": 1.0,
-                "level_ordinal": 0,
-            }
-        )
-    if spec.version in {"book_tape_control.v1", "book_tape_control.v2"}:
-        row.update(
-            {
-                "collector_run_id": "run-1",
-                "control_id": "6" * 64,
-                "venue": "polymarket",
-                "venue_market_id": "market-1",
-                "venue_book_id": "token-1",
-                "control_type": "book_recovered",
-                "reason": "startup_snapshot",
-                "valid_after": True,
-                "received_at_utc": "2026-07-19T10:00:00Z",
-                "received_at_monotonic_ns": 1,
-                "exchange_at_utc": "2026-07-19T10:00:00Z",
-                "local_sequence": 1,
-                "subsequence": 0,
-                "epoch_id": "2" * 64,
-                "evidence_role": "tape_event",
-                "evidence_id": "1" * 64,
-                "quality_flags_json": "[]",
-            }
-        )
     if spec.version == "stream_lifecycle.v1":
         row.update(
             {
@@ -823,10 +758,6 @@ def _valid_schema_row(spec: TableSpec) -> dict[str, object]:
                 "allowed_consumers_json": ["research_report", "manual_review"],
             }
         )
-    if spec.version == "book_tape_event.v2":
-        row["book_integrity_valid"] = row["reconstructible"]
-    if spec.version == "book_tape_control.v2":
-        row["book_integrity_after"] = row["valid_after"]
     return row
 
 
@@ -2029,9 +1960,6 @@ def test_vectorized_invariant_hooks_report_missing_columns_without_key_error(
         "topbook.v1",
         "depth.v1",
         "trade.v1",
-        "book_tape_event.v1",
-        "book_tape_level.v1",
-        "book_tape_control.v1",
         "stream_lifecycle.v1",
     ],
 )

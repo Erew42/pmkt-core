@@ -84,6 +84,9 @@ weekly immutable-history promotion, and periodic latest-row compaction are
 implemented in `pmkt.data.market_catalog` and operated manually through
 `pmkt markets ...`.
 
+Both Polymarket snapshot versions carry `event_id`, the parent Gamma event ID
+when available.
+
 `pmkt.market_discovery_manifest.v1` and
 `pmkt.market_discovery_pointer.v1` are JSON-only internal lineage contracts;
 they are not table schemas and do not belong in the schema registry. Discovery
@@ -181,11 +184,6 @@ sections below or in the registry descriptions.
 | `feed_health.v2` | `feed_health` | `feed_health.v1` plus book-integrity evidence for profile-v3 captures. |
 | `capture_instrument_evidence.v1` | `capture_instrument_evidence` | Per-instrument, per-subscription-attempt eligibility and initial valid-book evidence for profile-v2 captures. |
 | `capture_instrument_evidence.v2` | `capture_instrument_evidence` | `capture_instrument_evidence.v1` plus book-integrity evidence for profile-v3 captures. |
-| `book_tape_event.v1` | `book_tape_event` | Logical commit header for one venue-native book checkpoint or delta. |
-| `book_tape_event.v2` | `book_tape_event` | `book_tape_event.v1` plus book-integrity evidence for profile-v3 captures. |
-| `book_tape_level.v1` | `book_tape_level` | Absolute post-event venue-native price-level mutation. |
-| `book_tape_control.v1` | `book_tape_control` | Book validity, epoch, and stream-terminal transition. |
-| `book_tape_control.v2` | `book_tape_control` | `book_tape_control.v1` plus book-integrity evidence for profile-v3 captures. |
 | `stream_lifecycle.v1` | `stream_lifecycle` | Source market-lifecycle observation from a stream run. |
 | `historical_backfill_gap.v1` | `historical_backfill_gap` | Historical backfill unsupported capability, fetch error, or data-quality gap. |
 | `historical_price.v1` | `historical_price` | Historical price/candle context, not executable topbook/depth evidence. |
@@ -606,12 +604,10 @@ NO ladder. Under `kalshi_quote_normalization.v2`, a YES-price-mode NO level is a
 direct YES ask and a complement-derived NO bid. In NO-price mode it is a direct
 NO bid and a complement-derived YES ask. The NO ask is always derived from the
 YES bid. Each ask size follows the ladder that produced that ask; explicit ask
-sizes are preferred by the canonical normalizer. New capture run state persists
-both `use_yes_price` and `quote_normalization_policy`, and tape post-book hashes
-bind to that exact adapter-settings mapping. A missing policy identifies a
-pre-v2 capture and intentionally selects legacy source and opposite-bid-size
-behavior during replay; an empty or unknown policy is invalid evidence rather
-than another legacy spelling.
+sizes are preferred by the canonical normalizer. Profile captures persisted
+both `use_yes_price` and `quote_normalization_policy` in run state. A missing
+policy identifies a pre-v2 capture with legacy source and opposite-bid-size
+semantics. An empty or unknown policy is invalid evidence.
 
 The provenance path is intentionally explicit at each boundary:
 
@@ -621,7 +617,6 @@ The provenance path is intentionally explicit at each boundary:
 | `KalshiOrderBookState` | Native YES/NO bid ladders remain separate; `use_yes_price` determines whether the NO ladder is expressed on the YES or NO scale. |
 | Serialized snapshot | All four projected prices and sizes carry explicit `direct`, `complement_derived`, or `missing` source labels plus the policy version. |
 | Canonical `topbook.v1` | One YES row and one NO row retain executable price, originating size, and bid/ask source. Source changes participate in evidence IDs and on-change fingerprints. |
-| Tape reconstruction | Native ladders are replayed first, then projected using the adapter settings pinned by run state. Missing policy replays legacy semantics; v2 replays corrected semantics. |
 
 `depth.v1` columns:
 
@@ -660,6 +655,10 @@ Historical normalization retains the native trade payload in `raw_json`.
 | `aggressor_side` | Buy/sell or taker side if inferable. |
 | `raw_json` | Optional raw payload JSON. |
 | `raw_json_sha256` | SHA-256 of raw payload when raw JSON is stored elsewhere. |
+
+In historical profile captures, the manifest and journal bind streaming trades
+to their source run and shard. Local sequence and subsequence determine causal
+order within a shard. Each shard has its own sequence clock.
 
 ## Market match schema: `market_match.v2`
 
@@ -959,11 +958,10 @@ market paths, tracking relation count, and relation counts. Current `pmkt`
 recordings do not write it. When present, it lets `tracking_health.v1` reports
 be traced back to the exact match set used to open the websockets.
 
-## Integrity evidence contracts: profile version 3
+## Integrity evidence contracts
 
-`full@3` and `book-tape@3` explicitly select the following schemas. Version 1
-and 2 profiles, and `mm-compact@2`, retain their original contracts. Profile
-selection remains explicit; historical captures are never rewritten.
+Historical profile version 3 introduced the following schemas. Older captures
+retain their original schema versions.
 
 | Schema | Added evidence and meaning |
 |---|---|
@@ -971,8 +969,6 @@ selection remains explicit; historical captures are never rewritten.
 | `depth.v2` | The same integrity field on available native depth levels. An empty side produces no invented level. |
 | `feed_health.v2` | `book_integrity_valid` is true only when every subscribed instrument has current initialized, intact evidence. Detailed instrument state carries initialization, integrity, quote validity, age and side-quality flags separately. |
 | `capture_instrument_evidence.v2` | Adds current `book_integrity_valid`, `first_snapshot_received_at_utc`, `first_integrity_valid_book_at_utc`, and `first_integrity_valid_book_latency_ms`. Existing first-valid-snapshot time and latency still refer to conservative quote validity. |
-| `book_tape_event.v2` | Adds `book_integrity_valid`; `reconstructible` represents intact evidence, including one-sided and empty initialized books. `valid_state` retains conservative quote semantics. Encoding is `book-tape.v2`. |
-| `book_tape_control.v2` | Adds `book_integrity_after`. A recovery can open an intact epoch with `valid_after=false` when quotes are one-sided. Evidence references and hashes remain mandatory. |
 
 New fields are required in the new physical schemas. Their absence in an old
 capture means unavailable evidence: old invalid rows must not be inferred intact.
@@ -986,12 +982,6 @@ capture does not calibrate or approve thesis data. Current integrity failure is
 reported as `integrity_failed`; successful intact initialization is
 `observed_intact`, independently of first-valid-quote evidence. Terminal
 completeness is not a claim of continuous coverage.
-
-Reconstruction orders each collector-run/shard stream by local sequence and
-subsequence, with invalidation, event and recovery precedence at identical
-coordinates. UTC is observation time, not an override of causal sequence. Both
-readers preserve hash/journal checks, epoch ownership and conflicting-coordinate
-rejection. Independent streams do not share a local-sequence clock.
 
 Ordinary age and empty sides remain observable but do not trigger socket
 recovery. Initialization has a 30-second SLA. Kalshi refreshes have one pending
@@ -1025,6 +1015,10 @@ whether each websocket shard is connected, stale, recovering, or blocked by bad
 book state. It is separate from topbook/depth price data and is consumed by
 `tracking_health.v1` so a relation can remain blocked even when an old quote row
 exists.
+
+For historical slim rows, choose the latest causal aggregate row and the most
+recent non-empty instrument detail at or before it. A future heartbeat cannot
+prove past liveness. Malformed or unavailable required detail fails closed.
 
 | Column | Meaning |
 | --- | --- |
@@ -1079,11 +1073,10 @@ periodic observations are compact aggregates. Manifests record rows and bytes
 by reason, including detail rows and bytes. Consumers combine the latest
 aggregate with the latest causally prior valid detail and fail closed if detail
 is absent, incomplete, or malformed.
+
 ## Storage profiles and committed capture authority
 
-Historical: `recording.v1` replaced the storage-profile writer, and no current
-command writes profile captures. Legacy readers, `recover-stream-run`, and
-`reconstruct-book-tape` still read them.
+The historical storage-profile format preceded `recording.v1`.
 
 Profile stream runs use `extra.dataset_artifacts` as the physical source of
 truth. Each role entry names its exact relative path, dataset identity, schema
@@ -1092,16 +1085,6 @@ The manifest's `storage_profile.enabled_roles` must equal the artifact keys and
 `successfully_committed_roles` must equal the closed roles. `dataset_paths`,
 `schema_versions`, and `row_counts` remain readable compatibility projections;
 they do not override an exact role entry.
-
-| Profile | Status when retired | Mandatory evidence |
-| --- | --- | --- |
-| `full` | former default | Legacy parsed/snapshot/level roles, dense topbook/depth, committed book tape, trade, lifecycle, and health. |
-| `book-tape` | experimental; never passed CR-18.9 acceptance | Committed tape/control, changed topbook plus checkpoints, trade, lifecycle, and health. |
-| `mm-compact` | experimental; never passed CR-18.9 acceptance | Changed topbook plus checkpoints, topbook-backed validity controls, trade, lifecycle, and health. No depth-reconstruction promise. |
-
-Overrides are additive only. Raw JSONL, dense topbooks, full depth, and legacy
-book artifacts may be added; a caller cannot subtract a mandatory role.
-Only roles actually opened appear in stream output discovery.
 
 The capture commit journal is the crash boundary.
 `capture_commit_journal.v2.jsonl` is the write format. Every record contains a
@@ -1127,11 +1110,12 @@ A crash-recovered manifest can prove published groups and journal-derived cause
 counts, but represents the process-local accepted/discarded, queue,
 acceptance-to-journal latency, and maximum-uncommitted-age metrics as unknown
 rather than zero.
-A tape event header is only a logical candidate until its event/level counts,
-foreign keys, side counts, payload and post-book hashes, epoch, segment hashes,
-and journal group all validate. Clean shutdown closes and journals every
-enabled role, atomically writes the final manifest, and only then marks
-`run_state.v1` finalized. Crash recovery promotes journaled groups only.
+Clean shutdown closed and journaled every enabled role, atomically wrote the
+final manifest, and then marked `run_state.v1` finalized. Crash recovery
+promoted journaled groups only.
+
+`stream_lifecycle.v1` records market-lifecycle evidence independently of book
+validity.
 
 Two crash guarantees are distinguished, with separate evidence.
 
@@ -1154,52 +1138,6 @@ host-crash guarantee requires a named, tested combination of operating system,
 filesystem and mount settings, persistence implementation and journal version,
 and a fault method demonstrating post-restart recovery. Until such evidence
 exists, describe the implemented guarantee as child-process crash consistent.
-
-## Book tape schemas
-
-`book_tape_event.v1` is one immutable checkpoint or delta header at the grain
-`(collector_run_id, event_id)`. It carries the causal coordinate, epoch,
-expected level count, checkpoint side counts, logical payload hash, post-book
-hash, validity, and reconstructibility. A checkpoint opens an epoch. A
-reconstructible delta must name that open epoch.
-
-`book_tape_level.v1` is an absolute post-event mutation at
-`(collector_run_id, event_id, source_side, price_key)`. `price_key` is canonical
-fixed-decimal identity; `size_after_contracts=0` removes the price. Polymarket
-persists native `bid`/`ask`; Kalshi persists native `yes`/`no`. These native
-sides are normalized only after offline reconstruction.
-
-`book_tape_control.v1` records `book_recovered`, `book_invalidated`, and
-`stream_ended` boundaries. Invalidations close an epoch immediately. Recovery
-controls point to the checkpoint or topbook evidence that reopened valid state.
-`stream_lifecycle.v1` is separate market-lifecycle evidence and never changes
-book validity.
-
-Offline reconstruction validates the manifest and journal before applying
-absolute deltas. Its `topbook.v1`, `depth.v1`, and versioned JSON report are
-research/audit artifacts, never live-book or execution authority.
-
-## Sparse replay evidence
-
-`sparse-v2` loads main topbooks, checkpoint topbooks, trades, tape controls,
-slim health, exact manifests, and shard subscription mappings as one typed
-bundle. State is selected causally at or before the requested time and is never
-forward-filled over invalidation, terminal, liveness, or coverage boundaries.
-Only later main-topbook changes and deduplicated public trades are fill
-triggers. Checkpoints establish coverage but are not market activity. Existing
-file-based replay remains explicitly `dense-v1`.
-
-Each streaming trade is bound to its persisted collector run, capture-local
-monotonic time, local sequence, and subsequence, plus the exact source run and
-shard supplied by manifest/journal artifact ownership. `sparse-v2` uses those
-coordinates directly and never infers a trade sequence from a health timestamp.
-The loader snapshots manifest, run-state, and journal authority and verifies
-artifact hashes before and after materialization and again before returning, so
-concurrent evidence mutation fails closed.
-
-Slim `feed_health.v1` consumers use the latest causal aggregate row plus the
-most recent non-empty detail blob at or before it. A future heartbeat cannot
-prove past liveness; malformed or unavailable required detail fails closed.
 
 ## Tracking health schema: `tracking_health.v1`
 
@@ -1666,8 +1604,8 @@ outputs should gradually add stable ids that link back to `market.v1`,
 
 ## Stream recording format
 
-`recording.v1` replaces the live storage-profile writer. These tables are new
-schemas; historical tape and topbook/depth versions retain their meanings.
+`recording.v1` replaces the live storage-profile writer. Historical topbook and
+depth versions retain their meanings.
 Prices are dollars per contract (0 through 1); quantities are contracts. All
 UTC times use ISO-8601 with a timezone. `observed_at_utc` is emission/sample time,
 `received_at_utc` is recorder receipt time and `venue_time_utc` is nullable source

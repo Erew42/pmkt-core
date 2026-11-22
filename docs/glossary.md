@@ -41,8 +41,8 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
   (`resolve_kalshi_use_yes_price`). `recording.v1` and the managed feed hard-code
   true (`VenueBooks`), so their asks are the NO ladder as received. **Trap:**
   `depth.v1` `outcome=NO` rows copy the native NO ladder uncomplemented, so
-  `price_dollars` is YES-scale for tape reconstruction with the flag true
-  (`_kalshi_depth`) and NO-scale for REST polls (`source=rest_poll`,
+  `price_dollars` is YES-scale in historical reconstructed captures with the
+  flag true and NO-scale for REST polls (`source=rest_poll`,
   `_kalshi_depth_rows`). The row does not record which.
 - **Trap: Kalshi `taker_side`.** It names the outcome the taker is positioned for,
   not the book side consumed: `yes` means a YES ask was lifted (taker bought YES
@@ -86,16 +86,13 @@ columns and dtypes run `pmkt schema show <version>`; this page is a map, not a s
   no REST. It returns detached `PublicBook` and `PublicBookHealth`; re-read both
   for every decision. Kalshi needs an injected `ReadAuthHeaderProvider`.
 
-## Capture, reconstruction and catalog
+## Capture and catalog
 
 - **Capture.** Recording a live feed, since neither venue documents a historical
   book endpoint (`/book`, `/markets/{ticker}/orderbook` are current only).
   `stream-books` and `stream-kalshi-books` write `recording.v1` (`BookRecorder`,
   `RecordingOptions.mode` `topbook` or `full`). Older profile runs use
   `collector_run_id` and `run_manifest.v1`.
-- **Committed tape.** Historical replayable log stored in `book_tape_event.v1`,
-  `book_tape_level.v1`, and `book_tape_control.v1` rows. Replay produced
-  `topbook` and `depth` rows with `source=reconstructed_book_tape`.
 - **Catalog, census, discovery.** `data/markets` (`pmkt markets`). A census is the
   full list of current nonterminal markets per stream (`polymarket`,
   `kalshi-conventional`, `kalshi-mve`); discovery finds markets created since a
