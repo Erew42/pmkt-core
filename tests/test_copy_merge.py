@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from pmkt import _native
 from pmkt.exchanges.kalshi.ws import KalshiOrderBookState
 from pmkt.streaming import raw_capture
 from pmkt.streaming.copy_coverage import (
@@ -509,6 +510,32 @@ def test_empty_list_frame_still_extends_coverage(tmp_path, monkeypatch):
     occurrences = list(connection_occurrences("pc", "polymarket_00", [session], coverage=coverage))
     assert len(occurrences) == 1
     assert [(i.start_us, i.end_us) for i in coverage[0].intervals] == [(T0 * 1_000, (T0 + 1_000) * 1_000)]
+
+
+@pytest.mark.parametrize("direction", ["received_control_base64", "sent"])
+def test_ws_close_splits_coverage_in_both_merge_paths(tmp_path, monkeypatch, direction):
+    session = tmp_path / "pc" / "polymarket_00" / "20261103T000000Z_dddd0001"
+    # The close and subsequent delta are recorded in the same generation.
+    record(session, monkeypatch, "polymarket", [
+        text(T0 + 100, book(T0, [("0.40", "2")])),
+        (T0 + 200, "ws_close", "A+g=", 1, direction),
+        text(T0 + 300, change(T0 + 1, "0.40", "3")),
+    ])
+    coverage = []
+    list(connection_occurrences("pc", "polymarket_00", [session], coverage=coverage))
+    merged = _native.merge_raw_captures("polymarket", [("pc", "polymarket_00", session)])
+    native = json.loads(merged["summary"])["coverage"][0]["intervals"]
+
+    begin, close, resume = ((T0 + ms) * 1_000 for ms in (100, 200, 300))
+    end = close if direction.startswith("received") else begin
+    expected = [
+        (1, begin, end, "session_start", "ws_close"),
+        (1, resume, resume, "after_gap", "session_end"),
+    ]
+    keys = ("generation", "start_us", "end_us", "start_reason", "end_reason")
+    assert [tuple(row[key] for key in keys) for row in native] == expected
+    assert [tuple(getattr(row, key) for key in keys) for row in coverage[0].intervals] == expected
+    assert uncovered_intervals(coverage[0].intervals, begin, resume) == [(end, resume)]
 
 
 def test_kalshi_sequence_gap_splits_coverage():

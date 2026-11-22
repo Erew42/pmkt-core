@@ -1,7 +1,9 @@
 # Stream recording contract
 
 Contract for the simplified recorder. The two venue recording entrypoints use
-this format; historical profile captures are handled separately by legacy readers.
+this format. Historical profile captures and committed book tapes were closed
+out and are no longer readable by this package
+(see `docs/schema_retirements/book_tape_family.md`).
 The new format is a deliberate migration, not a reinterpretation of historical
 profile or schema versions. The current REST, catalog and resolution APIs are
 outside this change.
@@ -270,16 +272,14 @@ acceptance policy or `acceptance_eligible` flag in this recorder.
 
 The new writer omits legacy parsed events, summary/level copies and tape
 production. There are no writer profiles or acceptance/eligibility policies.
-`TapeBatchIntent` lives with historical tape types in `streaming/legacy/tape.py`;
-the unused router, profile runtime, capture session, feed-control scheduler,
-health-emission wrapper and connection-group orchestration have been removed.
-Historical readers/recovery/conversion code lives in `streaming/legacy` and is
-not imported by the new live recording path. Shared book/transport validation
-and independently used supervisor utilities remain.
+The historical tape types, router, profile runtime, capture session,
+feed-control scheduler, health-emission wrapper, connection-group orchestration
+and the `streaming/legacy` readers/recovery/conversion code have been removed.
+Book application and transport validation run in the Rust engine
+(`pmkt._native`); independently used supervisor utilities remain.
 
-Current recording does not produce the `book-tape` and `mm-compact` tape
-profiles; they remain defined only for legacy readers because they never passed
-CR-18.9 acceptance. In the 2026-07-24 one-hour measurement the reduced
+The `book-tape` and `mm-compact` tape profiles were retired because they never
+passed CR-18.9 acceptance. In the 2026-07-24 one-hour measurement the reduced
 Polymarket profiles exceeded their storage budgets (85 and 25 MiB/hour against
 50 and 15), every Polymarket profile missed the 99% dense-health reduction gate,
 and the mandatory one-hour reconstruction ran out of memory. A later
@@ -298,11 +298,12 @@ discarded accepted groups, and was rejected.
   inspection and manifest validation. The database is retained after export.
 - `data/recording_schema.py`: physical field types and keys registered by the
   canonical registry. The data dictionary lists every column.
-- `streaming/legacy/`: only needed to read/recover/convert historical captures.
+- `crates/pmkt-engine`: book state, sequence/gap handling, raw-capture merge,
+  capture verification and topbook/depth emission, exposed as `pmkt._native`.
 
 The venue `order_book_stream.py` modules are small public entrypoints. The
-underlying `ws.py` modules still own venue book semantics and WebSocket transport.
-Live recording does not import the historical profile, tape or durability stack.
+underlying `ws.py` modules own WebSocket transport and call `pmkt._native` for
+venue book semantics.
 
 Malformed WebSocket frames and Polymarket book messages with missing identity or
 malformed price-change envelopes stop recording through the feed-error path.

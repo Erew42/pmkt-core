@@ -5,29 +5,26 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from dataclasses import asdict
+import json
 import math
 from pathlib import Path
 import time
 from typing import Any, Callable, Sequence, cast
 
 import pmkt
+from pmkt import _native
 from pmkt.provenance import implementation_identity
 from pmkt.data.time import isoformat_source_timestamp
-from pmkt.exchanges.book_integrity import finite_number
+from pmkt.exchanges._ws_book import encode_message
 from pmkt.exchanges.kalshi.ws import (
     AsyncKalshiWebSocketClient,
-    KalshiOrderBookState,
     normalize_market_tickers,
-    apply_kalshi_orderbook_message,
 )
 from pmkt.exchanges.polymarket.ws import (
     AsyncMarketWebSocketClient,
     _UNSET_HEARTBEAT_INTERVAL,
-    MarketBookState,
     _normalize_asset_ids,
-    apply_market_message,
 )
-from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
 from pmkt.exchanges.ws_transport import (
     WebSocketDeadlineExceeded,
     WebSocketMessagePump,
@@ -52,233 +49,41 @@ class RecordingError(RuntimeError):
 
 
 class VenueBooks:
-    def __init__(
-        self, venue: str, instruments: list[str], *, enforce_market_identity: bool = False
-    ) -> None:
+    def __init__(self, venue: str, instruments: list[str]) -> None:
         self.venue = venue
-        # ManagedBookFeed owns its identity/recovery policy; recording opts in.
-        self.enforce_market_identity = enforce_market_identity
-        self.polymarket = (
-            {i: MarketBookState(i) for i in instruments}
-            if venue == "polymarket"
-            else {}
-        )
-        self.kalshi = (
-            {i: KalshiOrderBookState(i, use_yes_price=True) for i in instruments}
-            if venue == "kalshi"
-            else {}
-        )
-        self.sequences: dict[int, int] = {}
-        self.venue_times: dict[str, str | None] = {}
-        self.minimum_sizes: dict[str, float | None] = {}
-        self.market_ids: dict[str, str] = {}
-        self.identity_conflicts: set[str] = set()
-        self.resolved: set[str] = set()
-        self.complementary = ComplementaryDeltaRecovery()
+        self.native = _native.RecordingBooks(venue, instruments)
 
     def reset(self) -> None:
-        for poly in self.polymarket.values():
-            poly.mark_reconnect()
-            if poly.asset_id in self.identity_conflicts:
-                poly.quality_flags.add("market_identity_changed")
-            if poly.asset_id in self.resolved:
-                poly.quality_flags.add("market_resolved")
-        for kalshi in self.kalshi.values():
-            kalshi.mark_reconnect()
-        self.sequences.clear()
-        self.venue_times.clear()
-        self.complementary.clear()
+        self.native.reset()
 
     def apply(self, message: dict[str, Any], count: int) -> list[BookView]:
-        if self.venue == "polymarket":
-            kind = message.get("event_type") or message.get("type")
-            if kind == "book" and not message.get("asset_id"):
-                raise RuntimeError("missing_book_identity")
-            if kind == "price_change":
-                changes = message.get("price_changes")
-                if not isinstance(changes, list) or any(
-                    not isinstance(change, dict) or not change.get("asset_id")
-                    for change in changes
-                ):
-                    raise RuntimeError("malformed_price_changes")
-            # Identity and resolution outlive replaceable ladder state. Validate
-            # before mutation so a conflicting delta cannot merge two markets.
-            affected = []
-            if kind == "price_change":
-                affected = [str(change["asset_id"]) for change in message["price_changes"]]
-            elif kind in {"book", "tick_size_change"}:
-                affected = [str(message.get("asset_id") or "")]
-            rejected = set()
-            market = str(message.get("market") or "")
-            for asset in sorted(set(affected)):
-                if asset not in self.polymarket:
-                    continue
-                known = self.market_ids.get(asset)
-                if self.enforce_market_identity and known and (
-                    (market and known != market)
-                    or (kind == "book" and asset in self.identity_conflicts and market != known)
-                ):
-                    self.identity_conflicts.add(asset)
-                    state = self.polymarket[asset]
-                    state.mark_reconnect()
-                    state.market = known
-                    state.quality_flags.add("market_identity_changed")
-                    rejected.add(asset)
-                elif market:
-                    self.market_ids[asset] = market
-            if rejected and kind == "price_change":
-                message = {**message, "price_changes": [
-                    change for change in message["price_changes"]
-                    if str(change["asset_id"]) not in rejected
-                ]}
-            previous = self.complementary.intact_changed_assets(
-                message, self.polymarket
-            )
-            snapshots = [] if kind == "book" and rejected else apply_market_message(
-                self.polymarket, message, allowed_asset_ids=self.polymarket
-            )
-            if (
-                kind == "tick_size_change"
-                and str(message.get("asset_id")) in self.polymarket
-                and not rejected
-            ):
-                snapshots = [
-                    self.polymarket[str(message["asset_id"])].apply_tick_size_change(
-                        message
-                    )
-                ]
-            elif kind in {"new_market", "market_resolved"}:
-                assets = message.get("assets_ids") or message.get("asset_ids") or ()
-                targets = [
-                    state
-                    for key, state in self.polymarket.items()
-                    if key == str(message.get("asset_id"))
-                    or (isinstance(assets, list) and key in assets)
-                    or (
-                        market and self.market_ids.get(key) == market
-                    )
-                ]
-                if market:
-                    for state in targets:
-                        self.market_ids.setdefault(state.asset_id, market)
-                # Only the recorder persists resolution; ManagedBookFeed keeps
-                # its own terminal state keyed by its first-established market.
-                if kind == "market_resolved" and self.enforce_market_identity:
-                    self.resolved.update(state.asset_id for state in targets)
-                snapshots = [
-                    state.apply_lifecycle(
-                        {**message, "market": self.market_ids.get(state.asset_id)}
-                        if self.enforce_market_identity else message,
-                        str(kind),
-                    ) for state in targets
-                ]
-            snapshots.extend(self.polymarket[asset].snapshot() for asset in sorted(rejected))
-            self.complementary.observe(
-                message, self.polymarket, previous, message_count=count
-            )
-            views = []
-            for snapshot in snapshots:
-                state = self.polymarket[snapshot.asset_id]
-                if state.asset_id in self.resolved:
-                    state.valid_state = False
-                    state.quality_flags.add("market_resolved")
-                if kind == "book" and state.asset_id not in rejected:
-                    for field in ("tick_size", "min_order_size"):
-                        if message.get(field) is not None:
-                            value = finite_number(message[field])
-                            if value is None or value <= 0:
-                                state.quality_flags.add("malformed_book")
-                                state.valid_state = False
-                            elif field == "tick_size":
-                                state.tick_size = value
-                            else:
-                                self.minimum_sizes[state.asset_id] = value
-                if state.asset_id in self.identity_conflicts:
-                    if (
-                        kind == "book" and state.asset_id not in rejected
-                        and market == self.market_ids[state.asset_id]
-                        and state.book_integrity_valid
-                    ):
-                        self.identity_conflicts.discard(state.asset_id)
-                    else:
-                        state.valid_state = False
-                        state.quality_flags.add("market_identity_changed")
-                views.append(
-                    BookView(
-                        state.asset_id,
-                        {float(p): float(q) for p, q in state.bids.items()},
-                        {float(p): float(q) for p, q in state.asks.items()},
-                        state.initial_snapshot_received,
-                        state.book_integrity_valid,
-                        state.valid_state,
-                        tuple(sorted(state.quality_flags)),
-                        tick_size=state.tick_size,
-                        minimum_order_size=self.minimum_sizes.get(state.asset_id),
-                        venue_time_utc=isoformat_source_timestamp(
-                            state.timestamp, epoch_unit="milliseconds"
-                        ),
-                        venue_market_id=state.market,
-                    )
-                )
-            return views
-        payload = message.get("msg", message)
-        ticker = str(payload.get("market_ticker") or "")
-        if (
-            message.get("type") not in {"orderbook_snapshot", "orderbook_delta"}
-            or ticker not in self.kalshi
-        ):
-            return []
-        sid, seq = message.get("sid"), message.get("seq")
-        gap = not isinstance(sid, int) or not isinstance(seq, int)
-        if isinstance(sid, int) and isinstance(seq, int):
-            gap = sid in self.sequences and seq != self.sequences[sid] + 1
-            self.sequences[sid] = seq
-        apply_kalshi_orderbook_message(self.kalshi, message, use_yes_price=True)
-        self.venue_times[ticker] = isoformat_source_timestamp(
-            self.kalshi[ticker].timestamp,
-            epoch_unit="milliseconds" if "ts_ms" in payload else "seconds",
-        )
-        touched = {ticker}
-        if gap:
-            for other, sibling in self.kalshi.items():
-                if sid is None or sibling.sid == sid:
-                    sibling.mark_sequence_gap()
-                    touched.add(other)
+        try:
+            updates = self.native.apply(encode_message(message), count)
+        except ValueError as exc:
+            raise RuntimeError(str(exc)) from exc
         views = []
-        for key in sorted(touched):
-            state_k = self.kalshi[key]
-            views.append(
-                BookView(
-                    key + ":YES",
-                    {float(p): float(q) for p, q in state_k.yes_bids.items()},
-                    {float(p): float(q) for p, q in state_k.no_bids.items()},
-                    state_k.initial_snapshot_received,
-                    state_k.book_integrity_valid,
-                    state_k.valid_state,
-                    tuple(sorted(state_k.quality_flags)),
-                    venue_time_utc=self.venue_times.get(key),
-                    venue_market_id=key,
-                    source_book_update=key == ticker,
-                )
-            )
+        for book in updates:
+            ticker = book["instrument"]
+            kalshi = self.venue == "kalshi"
+            ts = book["timestamp_json"]
+            views.append(BookView(
+                ticker + ":YES" if kalshi else ticker,
+                {float(p): float(q) for p, q in book["first"]},
+                {float(p): float(q) for p, q in book["second"]},
+                book["initialized"], book["intact"], book["valid"], tuple(book["flags"]),
+                tick_size=float(book["tick"]) if book["tick"] is not None else None,
+                minimum_order_size=float(book["minimum"]) if book["minimum"] is not None else None,
+                venue_time_utc=isoformat_source_timestamp(
+                    json.loads(ts) if ts is not None else None,
+                    epoch_unit="milliseconds" if book["milliseconds"] else "seconds",
+                ),
+                venue_market_id=ticker if kalshi else book["market"],
+                source_book_update=book["source_update"],
+            ))
         return views
 
     def recovery_due(self, count: int) -> bool:
-        now = time.monotonic_ns()
-        if self.venue == "polymarket":
-            return any(
-                "market_identity_changed" in state.quality_flags
-                or (
-                    state.initial_snapshot_received
-                    and not state.book_integrity_valid
-                    and not self.complementary.defer(asset, message_count=count, now_ns=now)
-                )
-                for asset, state in self.polymarket.items()
-            ) or self.complementary.recovery_due(message_count=count, now_ns=now)
-        return any(
-            state.initial_snapshot_received and not state.book_integrity_valid
-            for state in self.kalshi.values()
-        )
+        return self.native.recovery_due(count, time.monotonic_ns())
 
 
 async def record_feed(
@@ -294,7 +99,7 @@ async def record_feed(
     ws_url: str | None = None,
     connect_factory: Callable[..., Any] | None = None,
     auth: Any = None,
-    heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
+    heartbeat_interval: float | None = cast('float | None', _UNSET_HEARTBEAT_INTERVAL),
     custom_feature_enabled: bool = True,
     websocket_max_size_bytes: int | None = None,
     websocket_max_queue_frames: int | None = None,
@@ -336,7 +141,7 @@ async def record_feed(
         if websocket_max_queue_frames is not None
         else WebSocketTransportSettings().max_queue_frames,
     )
-    books = VenueBooks(venue, ids, enforce_market_identity=True)
+    books = VenueBooks(venue, ids)
     recorder = BookRecorder(
         venue=venue,
         instruments=ids if venue == "polymarket" else [i + ":YES" for i in ids],
@@ -363,7 +168,7 @@ async def record_feed(
     def invalidate(reason: str) -> None:
         # Connection-level invalidation must retain terminal resolution evidence.
         for instrument, book in list(recorder.books.items()):
-            flags = (reason, "market_resolved") if instrument in books.resolved else (reason,)
+            flags = (reason, "market_resolved") if books.native.resolved(instrument) else (reason,)
             recorder.observe_books([BookView(
                 instrument, {}, {}, False, False, False, flags,
                 venue_market_id=book.venue_market_id,
@@ -439,14 +244,14 @@ async def record_feed(
                 time.monotonic() + 1.0,
                 deadline or math.inf,
             )
-            complement = books.complementary.next_deadline_ns
+            complement = books.native.next_deadline_ns()
             if complement is not None:
                 wake = min(wake, complement / 1_000_000_000)
             received = await pump.wait(wake - time.monotonic())
             # Enforce the grace bound before a late corrective message can
             # erase the evidence that this connection needs a fresh snapshot.
-            if books.complementary.recovery_due(
-                message_count=recorder.source_sequence + int(received),
+            if books.native.complementary_due(
+                count=recorder.source_sequence + int(received),
                 now_ns=time.monotonic_ns(),
             ):
                 await pump.close()

@@ -210,7 +210,7 @@ pub(crate) fn received_us(s: &str) -> Result<i64> {
         .map(|v| v.timestamp_micros())
         .map_err(|e| Error::Invalid(format!("invalid receive timestamp {s}: {e}")))
 }
-fn conflated(raw: &str) -> bool {
+pub fn conflated_subscription(raw: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(raw) else {
         return raw.contains("update_interval_ms");
     };
@@ -226,6 +226,7 @@ pub struct SessionOccurrences<I> {
     // Empty for independent replay. Otherwise map local intervals to the
     // continuous periods formed by the union of all redundant sources.
     pub(crate) coverage_periods: Vec<usize>,
+    pub(crate) coverage_group: usize,
     source: I,
     tracker: CoverageTracker,
     generation: Option<u64>,
@@ -238,6 +239,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     pub fn new(stream: Stream, session: impl Into<String>, source: I) -> Self {
         Self {
             coverage_periods: vec![],
+            coverage_group: 0,
             source,
             tracker: CoverageTracker::new(stream, session),
             generation: None,
@@ -250,13 +252,19 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
     pub fn finish(self) -> SessionCoverage {
         self.tracker.finish()
     }
+    pub(crate) fn subscription(&self) -> Option<std::sync::Arc<BTreeSet<String>>> {
+        self.subscription.instruments.clone()
+    }
     fn frame(&mut self, f: RawFrame) -> Result<()> {
         let us = received_us(&f.received_utc)?;
         if self.generation != Some(f.connection_generation) || f.frame_type == "subscription" {
             self.books.clear();
             self.generation = Some(f.connection_generation);
         }
-        if f.frame_type == "subscription" && f.venue == Venue::Kalshi && conflated(&f.payload_raw) {
+        if f.frame_type == "subscription"
+            && f.venue == Venue::Kalshi
+            && conflated_subscription(&f.payload_raw)
+        {
             return Err(Error::Invalid(
                 "conflated Kalshi subscription (update_interval_ms)".into(),
             ));
@@ -276,17 +284,28 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             self.tracker.report.counts.unparsed_text_frames += 1;
             return Ok(());
         };
+        // CoverageTracker puts a sequence loss between the previous frame and
+        // this one, even when a later array element exposes it. Assign the
+        // same resulting local interval to every occurrence of this frame.
+        if f.venue == Venue::Kalshi {
+            for m in &messages {
+                if let Some((sid, seq)) = m.value["sid"].as_i64().zip(m.value["seq"].as_i64()) {
+                    self.tracker.sequence(sid, seq);
+                }
+            }
+        }
+        let interval = self.tracker.report.intervals.len();
+        let coverage_period = if self.coverage_periods.is_empty() {
+            interval
+        } else {
+            self.coverage_periods[interval]
+        };
         let mut events = Vec::with_capacity(messages.len());
         for m in messages {
             let v = m.value;
             let asset = match f.venue {
-                Venue::Kalshi => {
-                    if let Some((sid, seq)) = v["sid"].as_i64().zip(v["seq"].as_i64()) {
-                        self.tracker.sequence(sid, seq);
-                    }
-                    (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
-                        .then(|| &v["msg"]["market_ticker"])
-                }
+                Venue::Kalshi => (v["type"] == "orderbook_snapshot" && v["msg"].is_object())
+                    .then(|| &v["msg"]["market_ticker"]),
                 Venue::Polymarket => (v["event_type"] == "book").then(|| &v["asset_id"]),
             };
             let reconnect_snapshot = asset.is_some_and(|a| self.books.insert(a.to_string()));
@@ -303,11 +322,9 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     received_monotonic_ns: f.received_monotonic_ns,
                     use_yes_price: self.subscription.kalshi_basis.unwrap_or(true),
                     subscription: self.subscription.instruments.clone(),
-                    coverage_period: if self.coverage_periods.is_empty() {
-                        self.tracker.report.intervals.len()
-                    } else {
-                        self.coverage_periods[self.tracker.report.intervals.len()]
-                    },
+                    book_command: self.subscription.book_command,
+                    coverage_period,
+                    coverage_group: self.coverage_group,
                 },
                 message: v,
                 reconnect_snapshot,

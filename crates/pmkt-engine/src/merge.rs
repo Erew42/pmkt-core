@@ -5,13 +5,13 @@ mod order;
 pub(crate) use coverage::received_us;
 pub use coverage::{
     CoverageCounts, CoverageTracker, EndReason, Interval, SessionCoverage, SessionOccurrences,
-    StartReason, uncovered_intervals,
+    StartReason, conflated_subscription, uncovered_intervals,
 };
 
 use crate::{Error, Result, Venue};
 use identity::ContentId;
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 #[derive(serde::Serialize, Clone, Debug, Eq, Hash, Ord, PartialOrd, PartialEq)]
 pub struct Stream {
@@ -41,8 +41,13 @@ pub struct Origin {
     /// Contiguous coverage period containing this occurrence, used during replay.
     #[serde(skip)]
     pub coverage_period: usize,
+    /// Copies of one subscription share a group and its coverage periods.
+    #[serde(skip)]
+    pub coverage_group: usize,
     #[serde(skip)]
     pub subscription: Option<std::sync::Arc<BTreeSet<String>>>,
+    #[serde(skip)]
+    pub book_command: Option<i64>,
 }
 impl Origin {
     fn rank(&self) -> (i64, &Stream, &str, u64, Option<usize>) {
@@ -80,38 +85,46 @@ impl MergedMessage {
         &self.occurrences[0]
     }
     pub fn snapshot_class(&self) -> Option<&'static str> {
-        if !self.checkpoint {
-            return None;
-        }
-        if self.reconnect_snapshot {
-            return Some("reconnect");
-        }
-        let (body, fields): (&Value, &[&str]) = if self.kind == "book" {
-            (&self.message, &["bids", "asks"])
-        } else {
-            (
-                &self.message["msg"],
-                &[
-                    "yes_dollars_fp",
-                    "yes_dollars",
-                    "yes",
-                    "no_dollars_fp",
-                    "no_dollars",
-                    "no",
-                ],
-            )
-        };
-        if body.is_object()
-            && !fields
-                .iter()
-                .any(|s| body[*s].as_array().is_some_and(|v| !v.is_empty()))
-        {
-            Some("empty")
-        } else {
-            Some("later")
-        }
+        self.checkpoint
+            .then(|| snapshot_class(&self.kind, self.reconnect_snapshot, &self.message))
     }
 }
+
+pub fn snapshot_class(kind: &str, reconnect: bool, message: &Value) -> &'static str {
+    if reconnect {
+        return "reconnect";
+    }
+    let (body, fields): (&Value, &[&str]) = match kind {
+        "book" => (message, &["bids", "asks"]),
+        "orderbook_snapshot" => (
+            &message["msg"],
+            &[
+                "yes_dollars_fp",
+                "yes_dollars",
+                "yes",
+                "no_dollars_fp",
+                "no_dollars",
+                "no",
+            ],
+        ),
+        _ => (message, &[]),
+    };
+    if body.is_object()
+        && !fields.iter().any(|s| match &body[*s] {
+            Value::Array(v) => !v.is_empty(),
+            Value::Object(v) => !v.is_empty(),
+            Value::String(v) => !v.is_empty(),
+            Value::Bool(v) => *v,
+            Value::Number(v) => v.as_f64() != Some(0.0),
+            Value::Null => false,
+        })
+    {
+        "empty"
+    } else {
+        "later"
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MergeOptions {
     pub lateness_ms: i64,
@@ -166,15 +179,15 @@ fn ms(value: &Value) -> Option<i64> {
             .and_then(|s| s.parse().ok())
     })
 }
-struct Key {
-    kind: String,
-    scope: String,
-    venue_ms: Option<i64>,
-    sent: Option<i64>,
-    id: ContentId,
+pub struct Key {
+    pub kind: String,
+    pub scope: String,
+    pub venue_ms: Option<i64>,
+    pub sent: Option<i64>,
+    pub id: ContentId,
 }
 impl Key {
-    fn new(venue: Venue, v: &Value) -> Self {
+    pub fn new(venue: Venue, v: &Value) -> Self {
         let (kind, scope, venue_ms, sent) = match venue {
             Venue::Polymarket => (
                 &v["event_type"],
@@ -330,46 +343,48 @@ impl CopyMerge {
     /// Interleave one lookahead per input. The sink runs as each timestamp clears
     /// the watermark; neither the inputs nor the merged output need fit in RAM.
     pub fn merge<I: IntoIterator<Item = Result<Occurrence>>>(
-        mut self,
+        self,
         streams: impl IntoIterator<Item = I>,
         mut emit: impl FnMut(MergedMessage) -> Result<()>,
     ) -> Result<MergeStats> {
-        let mut next = BTreeMap::new();
+        let mut run = self.stream(streams)?;
+        while let Some(message) = run.next_message()? {
+            emit(message)?;
+        }
+        Ok(run.engine.stats)
+    }
+
+    pub fn stream<I, E>(
+        self,
+        streams: impl IntoIterator<Item = I>,
+    ) -> std::result::Result<MergeRun<I::IntoIter>, E>
+    where
+        I: IntoIterator<Item = std::result::Result<Occurrence, E>>,
+        E: From<Error>,
+    {
+        let mut inputs = BTreeMap::new();
         let mut unique = BTreeSet::new();
         for source in streams {
             let mut iter = source.into_iter();
             if let Some(o) = iter.next().transpose()? {
                 if !unique.insert(o.origin.stream.clone()) {
-                    return Err(Error::Invalid("duplicate copy/connection stream".into()));
+                    return Err(
+                        Error::Invalid("two input streams for one copy/connection".into()).into(),
+                    );
                 }
-                next.insert((o.origin.received_us, o.origin.stream.clone()), (o, iter));
+                inputs.insert((o.origin.received_us, o.origin.stream.clone()), (o, iter));
             }
         }
-        let mut index = 0;
-        while let Some(((received, stream), (o, mut rest))) = next.pop_first() {
-            if let Some(f) = rest.next().transpose()? {
-                if f.origin.stream != stream {
-                    return Err(Error::Invalid(
-                        "copy/connection changed inside input stream".into(),
-                    ));
-                }
-                if f.origin.received_us < received {
-                    self.stats.clock_steps_back += 1;
-                }
-                next.insert((received.max(f.origin.received_us), stream), (f, rest));
-            }
-            let received = received.div_euclid(1000);
-            let watermark = received.saturating_sub(self.options.lateness_ms);
-            self.flush(Some(watermark), &mut emit)?;
-            self.expire(watermark);
-            if let Some(row) = self.add(o, index, received, watermark) {
-                emit(row)?;
-            }
-            index += 1;
-        }
-        self.flush(None, &mut emit)?;
-        Ok(self.stats)
+        Ok(MergeRun {
+            engine: self,
+            inputs,
+            pending: None,
+            group: VecDeque::new(),
+            group_time: 0,
+            index: 0,
+        })
     }
+
     fn clock(&mut self, key: &Key, o: &Occurrence) -> (Option<BookClock>, bool) {
         if self.venue != Venue::Kalshi || !book_change(self.venue, &key.kind) {
             return (None, false);
@@ -573,80 +588,84 @@ impl CopyMerge {
             }
         }
     }
-    fn flush(
-        &mut self,
-        limit: Option<i64>,
-        emit: &mut impl FnMut(MergedMessage) -> Result<()>,
-    ) -> Result<()> {
-        while self
+    fn next_group(&mut self, limit: Option<i64>) -> Result<Option<(i64, VecDeque<Entry>)>> {
+        if self
             .groups
             .first_key_value()
-            .is_some_and(|((time, _), _)| limit.is_none_or(|l| *time < l))
+            .is_none_or(|((time, _), _)| limit.is_some_and(|l| *time >= l))
         {
-            let ((time, scope), g) = self.groups.pop_first().unwrap();
-            let mut entries: Vec<_> = g.timed.into_values().collect();
-            let mut batch = g.untimed;
-            if let Some(held) = self.clocked.get(&scope) {
-                let mut newest = BTreeMap::new();
-                for c in entries
-                    .iter()
-                    .filter(|e| e.key.kind == "orderbook_delta")
-                    .chain(
-                        batch
-                            .iter()
-                            .map(|i| &self.untimed[i])
-                            .filter(|e| e.key.kind == "orderbook_snapshot"),
-                    )
-                    .filter_map(|e| e.clock)
-                {
-                    let max = newest.entry(c.epoch).or_insert(c.value);
-                    *max = (*max).max(c.value);
-                }
-                batch.extend(held.iter().copied().filter(|i| {
-                    let c = self.untimed[i].clock.unwrap();
-                    newest.get(&c.epoch).is_some_and(|value| *value > c.value)
-                }));
-            }
-            for i in batch {
-                let e = self.untimed.remove(&i).unwrap();
-                let id = e.key.id;
-                let at = e.at.unwrap();
-                if at != time {
-                    self.unschedule(&(at, scope.clone()), i);
-                }
-                if let Some(matches) = self.by_digest.get_mut(&id) {
-                    matches.remove(&i);
-                    if matches.is_empty() {
-                        self.by_digest.remove(&id);
-                    }
-                }
-                if let Some(held) = self.clocked.get_mut(&scope) {
-                    held.remove(&i);
-                    if held.is_empty() {
-                        self.clocked.remove(&scope);
-                    }
-                }
-                entries.push(e);
-            }
-            let order = order::resolve(
-                self.venue,
-                &self.options,
-                &mut self.stats,
-                &entries,
-                time,
-                &scope,
-            )?;
-            let mut slots = entries.into_iter().map(Some).collect::<Vec<_>>();
-            for node in order {
-                let e = slots[node].take().unwrap();
-                self.pending -= e.origins.len();
-                self.stats.untimed_messages += u64::from(e.at.is_some());
-                self.remember(&e, e.at.unwrap_or(time).max(time));
-                emit(self.message(e, time, false))?;
-            }
+            return Ok(None);
         }
-        Ok(())
+        let ((time, scope), g) = self.groups.pop_first().unwrap();
+        let mut entries: Vec<_> = g.timed.into_values().collect();
+        let mut batch = g.untimed;
+        if let Some(held) = self.clocked.get(&scope) {
+            let mut newest = BTreeMap::new();
+            for c in entries
+                .iter()
+                .filter(|e| e.key.kind == "orderbook_delta")
+                .chain(
+                    batch
+                        .iter()
+                        .map(|i| &self.untimed[i])
+                        .filter(|e| e.key.kind == "orderbook_snapshot"),
+                )
+                .filter_map(|e| e.clock)
+            {
+                let max = newest.entry(c.epoch).or_insert(c.value);
+                *max = (*max).max(c.value);
+            }
+            batch.extend(held.iter().copied().filter(|i| {
+                let c = self.untimed[i].clock.unwrap();
+                newest.get(&c.epoch).is_some_and(|value| *value > c.value)
+            }));
+        }
+        for i in batch {
+            let e = self.untimed.remove(&i).unwrap();
+            let id = e.key.id;
+            let at = e.at.unwrap();
+            if at != time {
+                self.unschedule(&(at, scope.clone()), i);
+            }
+            if let Some(matches) = self.by_digest.get_mut(&id) {
+                matches.remove(&i);
+                if matches.is_empty() {
+                    self.by_digest.remove(&id);
+                }
+            }
+            if let Some(held) = self.clocked.get_mut(&scope) {
+                held.remove(&i);
+                if held.is_empty() {
+                    self.clocked.remove(&scope);
+                }
+            }
+            entries.push(e);
+        }
+        let order = order::resolve(
+            self.venue,
+            &self.options,
+            &mut self.stats,
+            &entries,
+            time,
+            &scope,
+        )?;
+        let mut slots = entries.into_iter().map(Some).collect::<Vec<_>>();
+        Ok(Some((
+            time,
+            order
+                .into_iter()
+                .map(|node| slots[node].take().unwrap())
+                .collect(),
+        )))
     }
+
+    fn emit_entry(&mut self, entry: Entry, time: i64) -> MergedMessage {
+        self.pending -= entry.origins.len();
+        self.stats.untimed_messages += u64::from(entry.at.is_some());
+        self.remember(&entry, entry.at.unwrap_or(time).max(time));
+        self.message(entry, time, false)
+    }
+
     fn message(&mut self, mut e: Entry, order_ms: i64, late: bool) -> MergedMessage {
         if self.venue == Venue::Kalshi
             && let Some(c) = e.clock
@@ -686,6 +705,76 @@ impl CopyMerge {
             content_digest: e.key.id.iter().map(|b| format!("{b:02x}")).collect(),
             copies,
             occurrences: e.origins.into_iter().map(|(_, o)| o).collect(),
+        }
+    }
+}
+
+type Inputs<I> = BTreeMap<(i64, Stream), (Occurrence, I)>;
+
+/// Pull one merged message at a time, with one lookahead per source and
+/// one resolved timestamp group ready for emission.
+pub struct MergeRun<I> {
+    engine: CopyMerge,
+    inputs: Inputs<I>,
+    pending: Option<(Occurrence, i64)>,
+    group: VecDeque<Entry>,
+    group_time: i64,
+    index: usize,
+}
+
+impl<I, E> MergeRun<I>
+where
+    I: Iterator<Item = std::result::Result<Occurrence, E>>,
+    E: From<Error>,
+{
+    pub fn stats(&self) -> &MergeStats {
+        &self.engine.stats
+    }
+
+    pub fn next_message(&mut self) -> std::result::Result<Option<MergedMessage>, E> {
+        loop {
+            if let Some(entry) = self.group.pop_front() {
+                return Ok(Some(self.engine.emit_entry(entry, self.group_time)));
+            }
+            if self.pending.is_none()
+                && let Some(((received, stream), (occurrence, mut rest))) = self.inputs.pop_first()
+            {
+                if let Some(following) = rest.next().transpose()? {
+                    if following.origin.stream != stream {
+                        return Err(Error::Invalid(
+                            "stream yielded an occurrence from another copy/connection".into(),
+                        )
+                        .into());
+                    }
+                    if following.origin.received_us < received {
+                        self.engine.stats.clock_steps_back += 1;
+                    }
+                    self.inputs.insert(
+                        (received.max(following.origin.received_us), stream),
+                        (following, rest),
+                    );
+                }
+                self.pending = Some((occurrence, received.div_euclid(1000)));
+            }
+            let watermark = self
+                .pending
+                .as_ref()
+                .map(|(_, received)| received.saturating_sub(self.engine.options.lateness_ms));
+            if let Some((time, group)) = self.engine.next_group(watermark)? {
+                self.group_time = time;
+                self.group = group;
+                continue;
+            }
+            let Some((occurrence, received)) = self.pending.take() else {
+                return Ok(None);
+            };
+            let watermark = watermark.expect("pending occurrence");
+            self.engine.expire(watermark);
+            let emitted = self.engine.add(occurrence, self.index, received, watermark);
+            self.index += 1;
+            if emitted.is_some() {
+                return Ok(emitted);
+            }
         }
     }
 }

@@ -8,6 +8,8 @@ import pytest
 from websockets.protocol import State
 
 from pmkt.streaming.managed_feed import ManagedBookFeed
+from pmkt.exchanges._ws_book import encode_message
+from pmkt.exchanges.polymarket.ws import AsyncMarketWebSocketClient
 
 
 class Auth:
@@ -171,46 +173,30 @@ def synthetic_feed(venue, instruments=("a", "b")):
     f = ManagedBookFeed(instruments, venue=venue, auth=Auth())
     shard = f._shards[0]
     shard.restart = False
-    shard.sid = 7
-    shard.connected = shard.alive = time.monotonic()
     shard.client = SimpleNamespace(
         is_connected=True,
+        _last_inbound=None,
         heartbeat_diagnostics=lambda: {
-            "inbound_age_seconds": 0.0, "heartbeat_error_type": None,
+            "heartbeat_error_type": None,
         },
     )
     shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
-    if shard.native is not None:
-        shard.command_id = 1
-        shard.native.connected(shard.generation, time.monotonic_ns(), command_id=1)
-        if venue == "kalshi":
-            f._ingest(shard, {"type": "subscribed", "id": 1,
-                              "msg": {"channel": "orderbook_delta", "sid": 7}}, 0)
+    shard.native.connected(shard.generation, time.monotonic_ns(), command_id=1)
+    if venue == "kalshi":
+        ingest(f, shard, {"type": "subscribed", "id": 1,
+                          "msg": {"channel": "orderbook_delta", "sid": 7}})
     return f, shard
 
 
+def ingest(feed, shard, message):
+    feed._ingest_raw(shard, encode_message(message).encode())
+
+
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-def test_oracle_ingest_does_not_scan_unrelated_books(venue, monkeypatch):
-    monkeypatch.setenv("PMKT_ORACLE_ENGINE", "python")
+def test_raw_ingest_leaves_unrelated_books_uninitialized(venue):
     f, shard = synthetic_feed(venue)
-    scans = []
-
-    class ObservedBooks(dict):
-        def __iter__(self):
-            scans.append("iter")
-            return super().__iter__()
-
-        def items(self):
-            scans.append("items")
-            return super().items()
-
-    if venue == "polymarket":
-        shard.books.polymarket = ObservedBooks(shard.books.polymarket)
-    else:
-        shard.books.kalshi = ObservedBooks(shard.books.kalshi)
-    f._ingest(shard, snapshot(venue), 1)
-    f._ingest(shard, delta(venue), 2)
-    assert scans == []
+    ingest(f, shard, snapshot(venue))
+    ingest(f, shard, delta(venue))
     assert f.book("a").bids[0][1] == Decimal("0.30")
     assert f.health("b").reason == "no_initial_snapshot"
 
@@ -221,8 +207,8 @@ def test_ingest_does_not_schedule_unused_supervisor_health(venue, monkeypatch):
     calls = []
     monkeypatch.setattr(shard.health, "record_message", lambda **kwargs: calls.append("message"))
     monkeypatch.setattr(shard.health, "record_book", lambda **kwargs: calls.append("book"))
-    f._ingest(shard, snapshot(venue), 1)
-    f._ingest(shard, delta(venue), 2)
+    ingest(f, shard, snapshot(venue))
+    ingest(f, shard, delta(venue))
     assert calls == []
     health = f.health("a")
     assert health.usable and health.reason is None
@@ -495,25 +481,56 @@ async def test_close_at_setup_completion_preserves_cancellation(venue, stage):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
-async def test_reader_latches_expired_liveness_before_monitor_wakes(venue):
+async def test_reader_latches_expired_liveness_before_monitor_wakes(venue, advance_clock):
     connections = Connections()
     async with feed(venue, connections) as f:
         socket = await ready(f, connections, venue)
-        shard = f._shards[0]
-        if venue == "polymarket":
-            shard.client._last_inbound -= 1
-        else:
-            shard.alive -= 1
+        advance_clock(1)
         assert f.book("a") is None
         assert f.health("a").reason == "liveness_expired"
         # Late liveness evidence from this connection cannot restore cleared depth.
-        if venue == "polymarket":
-            shard.client._last_inbound += 1
-        else:
-            shard.alive = asyncio.get_running_loop().time()
         socket.put(snapshot(venue))
         assert f.book("a") is None
         await until(lambda: socket.closed)
+
+
+@pytest.mark.asyncio
+async def test_queued_polymarket_delta_does_not_extend_socket_liveness(monkeypatch):
+    from pmkt.streaming import managed_feed
+
+    now = 1
+    monkeypatch.setattr(managed_feed, "time", SimpleNamespace(monotonic_ns=lambda: now * 10**9))
+    connections = Connections()
+    f = feed("polymarket", connections, probe_interval=2, liveness_timeout=10)
+    shard = f._shards[0]
+    async with AsyncMarketWebSocketClient(
+        ["a"], connect_factory=connections, heartbeat_clock=lambda: now,
+    ) as client:
+        shard.client = client
+        shard.restart = False
+        shard.health.mark_connected(now_monotonic_ns=now * 10**9)
+        shard.native.connected(shard.generation, now * 10**9)
+        socket = connections.sockets[0]
+        frames = client._iter_raw_frames()
+        try:
+            socket.put(snapshot("polymarket"))
+            f._ingest_raw(shard, await asyncio.wait_for(anext(frames), 3))
+            now = 2
+            socket.put(delta("polymarket"))
+            await until(lambda: client.heartbeat_diagnostics()["receive_queue_frames"] == 1)
+            now = 9
+            assert f.health("a").usable
+            f._ingest_raw(shard, await anext(frames))
+            assert f.book("a").bids[0][1] == Decimal("0.30")
+            assert f.health("a").liveness_age_seconds == 7
+
+            now = 13
+            health = f.health("a")
+            assert health.reason == "liveness_expired"
+            assert not health.usable
+            assert f.book("a") is None
+        finally:
+            await frames.aclose()
 
 
 @pytest.mark.asyncio
@@ -665,12 +682,12 @@ async def test_cross_grace_deadline_is_not_renewed_and_late_correction_needs_sna
     async with feed("polymarket", connections, liveness_timeout=5) as f:
         await ready(f, connections, "polymarket")
         shard = f._shards[0]
-        f._ingest(shard, poly_change("0.8", "1"), 2)
+        ingest(f, shard, poly_change("0.8", "1"))
         assert f.health("a").reason == "crossed_book"
         advance_clock(0.15)
-        f._ingest(shard, poly_change("0.8", "2"), 3)
+        ingest(f, shard, poly_change("0.8", "2"))
         advance_clock(0.11)
-        f._ingest(shard, poly_change("0.8", "0", "SELL"), 4)
+        ingest(f, shard, poly_change("0.8", "0", "SELL"))
         assert f.book("a") is None
         assert f.health("a").reason == "book_integrity_failed"
 
@@ -865,7 +882,7 @@ async def test_kalshi_pending_probe_does_not_block_deltas():
 
 
 @pytest.mark.asyncio
-async def test_kalshi_late_probe_cannot_refresh_expired_liveness():
+async def test_kalshi_late_probe_cannot_refresh_expired_liveness(advance_clock):
     connections = Connections()
     async with feed("kalshi", connections) as f:
         await ready(f, connections, "kalshi")
@@ -874,7 +891,7 @@ async def test_kalshi_late_probe_cannot_refresh_expired_liveness():
 
         async def late_probe(**kwargs):
             # Model a clock advance while awaiting the probe, without a reader.
-            shard.alive -= f.liveness_timeout + 1
+            advance_clock(f.liveness_timeout + 1)
             probed.set()
             return True
 
@@ -962,15 +979,15 @@ async def test_metadata_revision_survives_unavailable_local_recovery_until_new_g
         socket = await ready(f, connections, "polymarket")
         shard = f._shards[0]
         generation = f.health("a").generation
-        f._ingest(shard, poly_change("0.3", "malformed"), 2)
+        ingest(f, shard, poly_change("0.3", "malformed"))
         assert f.book("a") is None
-        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
-                          "new_tick_size": "0.1"}, 2)
+        ingest(f, shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "new_tick_size": "0.1"})
         assert f.book("a") is None
         assert f.health("a").metadata_revision == 1
-        f._ingest(shard, poly_change("0.3", "malformed"), 2)
+        ingest(f, shard, poly_change("0.3", "malformed"))
         assert f.health("a").metadata_revision == 1
-        f._ingest(shard, snapshot("polymarket"), 3)
+        ingest(f, shard, snapshot("polymarket"))
         assert f.book("a").metadata_revision == 1
         f._invalidate(shard, "synthetic_disconnect")
         assert f.health("a").generation == generation
@@ -991,21 +1008,21 @@ async def test_metadata_revision_is_visible_before_snapshot_and_cannot_clear_ide
     async with feed("polymarket", connections, ("a", "b")) as f:
         await ready(f, connections, "polymarket")
         shard = f._shards[0]
-        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "b",
-                          "new_tick_size": "0.1"}, 2)
+        ingest(f, shard, {"event_type": "tick_size_change", "asset_id": "b",
+                          "new_tick_size": "0.1"})
         assert f.book("b") is None
         assert f.health("b").metadata_revision == 1
-        f._ingest(shard, snapshot("polymarket", "b"), 3)
+        ingest(f, shard, snapshot("polymarket", "b"))
         assert f.book("b").metadata_revision == 1
-        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
-                          "market": "foreign", "new_tick_size": "0.1"}, 4)
+        ingest(f, shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "market": "foreign", "new_tick_size": "0.1"})
         assert f.book("a") is None
         assert f.health("a").metadata_revision == 1
-        f._ingest(shard, {"event_type": "tick_size_change", "asset_id": "a",
-                          "market": "condition", "new_tick_size": "0.1"}, 5)
+        ingest(f, shard, {"event_type": "tick_size_change", "asset_id": "a",
+                          "market": "condition", "new_tick_size": "0.1"})
         assert f.book("a") is None
         assert f.health("a").metadata_revision == 2
-        f._ingest(shard, snapshot("polymarket"), 6)
+        ingest(f, shard, snapshot("polymarket"))
         assert f.book("a").metadata_revision == 2
 
 
@@ -1153,9 +1170,9 @@ async def test_identity_conflict_requires_established_market_snapshot(
         payload = foreign if venue == "polymarket" else foreign["msg"]
         key = "market" if venue == "polymarket" else "market_id"
         payload[key] = "foreign"
-        f._ingest(shard, foreign, 2)
+        ingest(f, shard, foreign)
         foreign["seq"] = 3
-        f._ingest(shard, foreign, 3)
+        ingest(f, shard, foreign)
         assert f.book("a") is None
         if transition == "timeout":
             await until(lambda: f.health("a").reason == "recovery_timeout")
@@ -1173,14 +1190,14 @@ async def test_identity_conflict_requires_established_market_snapshot(
                 malformed["bids"][0]["price"] = "bad"
             else:
                 malformed["msg"]["yes_dollars_fp"][0][0] = "bad"
-            f._ingest(shard, malformed, seq)
+            ingest(f, shard, malformed)
             assert f.book("a") is None
             seq += 1
         anonymous = snapshot(venue, seq=seq)
         del (anonymous if venue == "polymarket" else anonymous["msg"])[key]
-        f._ingest(shard, anonymous, seq)
+        ingest(f, shard, anonymous)
         assert f.book("a") is None
-        f._ingest(shard, snapshot(venue, seq=seq + 1), seq + 1)
+        ingest(f, shard, snapshot(venue, seq=seq + 1))
         assert f.book("a").market_id == known
 
 
@@ -1194,7 +1211,7 @@ async def test_anonymous_snapshot_without_identity_conflict_remains_supported(ve
         anonymous = snapshot(venue, seq=2)
         payload = anonymous if venue == "polymarket" else anonymous["msg"]
         del payload["market" if venue == "polymarket" else "market_id"]
-        f._ingest(f._shards[0], anonymous, 2)
+        ingest(f, f._shards[0], anonymous)
         assert f.book("a").market_id == original.market_id
         assert f.book("a").bids == original.bids
 
@@ -1222,15 +1239,15 @@ async def test_identity_repair_cannot_bypass_outstanding_recovery_send(venue, se
             bad["price_changes"][0]["size"] = "NaN"
         else:
             bad["msg"]["delta_fp"] = "NaN"
-        f._ingest(shard, bad, 2)
+        ingest(f, shard, bad)
         await asyncio.wait_for(entered.wait(), 1)
-        f._ingest(shard, snapshot(venue, seq=3), 3)
+        ingest(f, shard, snapshot(venue, seq=3))
         assert f.book("a") is None
         foreign = snapshot(venue, seq=4)
         payload = foreign if venue == "polymarket" else foreign["msg"]
         payload["market" if venue == "polymarket" else "market_id"] = "foreign"
-        f._ingest(shard, foreign, 4)
-        f._ingest(shard, snapshot(venue, seq=5), 5)
+        ingest(f, shard, foreign)
+        ingest(f, shard, snapshot(venue, seq=5))
         assert not release.is_set()
         assert f.book("a") is None
         release.set()
@@ -1252,13 +1269,13 @@ async def test_original_market_resolution_after_identity_conflict_is_terminal():
         shard = f._shards[0]
         foreign = delta("polymarket")
         foreign["market"] = "foreign"
-        f._ingest(shard, foreign, 2)
-        f._ingest(shard, {"event_type": "market_resolved", "market": "condition"}, 3)
+        ingest(f, shard, foreign)
+        ingest(f, shard, {"event_type": "market_resolved", "market": "condition"})
         assert f.health("a").reason == "market_resolved"
         for market in ("foreign", "condition"):
             later = snapshot("polymarket")
             later["market"] = market
-            f._ingest(shard, later, 4)
+            ingest(f, shard, later)
             assert f.book("a") is None
             assert f.health("a").reason == "market_resolved"
         f._invalidate(shard, "disconnected")
@@ -1318,15 +1335,15 @@ async def test_recovery_answer_tracks_latest_integrity_during_send(venue, replac
             bad["price_changes"][0]["size"] = "NaN"
         else:
             bad["msg"]["delta_fp"] = "NaN"
-        f._ingest(shard, bad, 2)
+        ingest(f, shard, bad)
         await asyncio.wait_for(entered.wait(), 3)
-        f._ingest(shard, snapshot(venue, seq=3), 3)
+        ingest(f, shard, snapshot(venue, seq=3))
         assert f.book("a") is None
         bad["seq"] = 4
-        f._ingest(shard, bad, 4)
+        ingest(f, shard, bad)
         assert f.book("a") is None
         if replace_snapshot:
-            f._ingest(shard, snapshot(venue, seq=5), 5)
+            ingest(f, shard, snapshot(venue, seq=5))
             assert f.book("a") is None
         release.set()
         if replace_snapshot:
@@ -1339,7 +1356,7 @@ async def test_recovery_answer_tracks_latest_integrity_during_send(venue, replac
             assert f.health("a").reason == "recovery_timeout"
             advance_clock(31)
             await until(lambda: len(requests) == 2)
-            f._ingest(shard, snapshot(venue, seq=5), 5)
+            ingest(f, shard, snapshot(venue, seq=5))
             await until(lambda: f.book("a") is not None)
         assert f.health("a").reconnect_count == 0
 

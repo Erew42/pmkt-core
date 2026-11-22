@@ -1,7 +1,7 @@
 //! Synchronous shard state for a transport owned by the caller.
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, IdentityEvidence, Touched, UpdateKind, VenueBooks},
+    book::{BookMode, IdentityEvidence, SequenceCheck, Touched, UpdateKind, VenueBooks},
     decimal::ScaledDecimal,
     health::{
         CORRECTIVE_DELTA_GRACE_NS, Flags, Integrity, QualityFlag as F, Recovery, RecoveryReason,
@@ -86,6 +86,7 @@ pub struct ShardFeed {
     venue: Venue,
     generation: Option<u64>,
     timeouts: FeedTimeouts,
+    polymarket_socket_liveness: bool,
     initial_deadline_checked: bool,
     connection: Connection,
     books: VenueBooks,
@@ -116,6 +117,7 @@ impl ShardFeed {
             venue,
             generation: None,
             timeouts,
+            polymarket_socket_liveness: false,
             initial_deadline_checked: false,
             connection: Connection::Initialized,
             books: VenueBooks::managed(mode, instruments),
@@ -127,6 +129,11 @@ impl ShardFeed {
             error_count: 0,
             last_error: None,
         })
+    }
+    /// For queued Polymarket frames, track socket receipt via `heartbeat`.
+    pub fn with_polymarket_socket_liveness(mut self) -> Self {
+        self.polymarket_socket_liveness = true;
+        self
     }
     pub fn connected(
         &mut self,
@@ -331,6 +338,13 @@ impl ShardFeed {
             _ => None,
         }
     }
+    pub fn poll_transport(&mut self, now_ns: u64) -> Option<&str> {
+        self.check_liveness(now_ns);
+        match &self.connection {
+            Connection::Disconnected(reason) => Some(reason),
+            _ => None,
+        }
+    }
     fn ingest_with<T>(
         &mut self,
         shard_id: &str,
@@ -360,6 +374,7 @@ impl ShardFeed {
         let messages =
             wire::live_messages(bytes).map_err(|_| Error::Invalid("malformed_frame".into()))?;
         if self.venue == Venue::Polymarket
+            && !self.polymarket_socket_liveness
             && let Connection::Connected { alive, .. } = &mut self.connection
         {
             *alive = now;
@@ -411,7 +426,10 @@ impl ShardFeed {
                     _ => continue,
                 }
             }
-            for item in self.books.apply_event(event, self.count) {
+            for item in self
+                .books
+                .apply_event(event, self.count, SequenceCheck::Connection)
+            {
                 self.observe(&item, now);
                 observations.push(project(self, &item.instrument)?);
             }

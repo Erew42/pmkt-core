@@ -16,6 +16,8 @@ pub type Ladder = BTreeMap<D, D>;
 pub(crate) struct RecordedSubscription {
     pub instruments: Option<Arc<BTreeSet<String>>>,
     pub kalshi_basis: Option<bool>,
+    /// Kalshi command id of the order-book subscription; other channels are separate commands.
+    pub book_command: Option<i64>,
 }
 impl RecordedSubscription {
     pub fn record(&mut self, venue: Venue, command: &Value) -> Result<()> {
@@ -26,6 +28,7 @@ impl RecordedSubscription {
                     return Ok(());
                 };
                 self.kalshi_basis = Some(basis);
+                self.book_command = command["id"].as_i64();
                 command["params"]["market_tickers"].as_array()
             }
         };
@@ -35,6 +38,15 @@ impl RecordedSubscription {
         }
         Ok(())
     }
+}
+
+/// An error names the command it rejects. A rejected side channel (trade, lifecycle)
+/// leaves books intact; any other error means the book subscription is unreliable.
+pub(crate) fn rejects_books(error: &Value, book_command: Option<i64>) -> bool {
+    error["id"]
+        .as_i64()
+        .zip(book_command)
+        .is_none_or(|(rejected, book)| rejected == book)
 }
 
 #[derive(Debug)]
@@ -107,35 +119,74 @@ pub struct SnapshotSide {
     pub malformed: bool,
 }
 fn levels(value: Option<&Value>, allow_missing: bool) -> SnapshotSide {
-    let mut parsed = Ladder::new();
+    let mut levels = Ladder::new();
+    let malformed = visit_levels(value, allow_missing, |price, size, _, _| {
+        levels.insert(price, size);
+    });
+    SnapshotSide { levels, malformed }
+}
+fn visit_levels<'a>(
+    value: Option<&'a Value>,
+    allow_missing: bool,
+    mut on_level: impl FnMut(D, D, &'a Value, &'a Value),
+) -> bool {
     let Some(items) = value.and_then(Value::as_array) else {
-        return SnapshotSide {
-            levels: parsed,
-            malformed: !(allow_missing && value.is_none_or(Value::is_null)),
-        };
+        return !(allow_missing && value.is_none_or(Value::is_null));
     };
     let mut malformed = false;
     for level in items {
         let (p, q) = if let Some(pair) = level.as_array().filter(|a| a.len() == 2) {
-            (price(pair.first()), decimal(pair.get(1)))
+            (pair.first(), pair.get(1))
         } else {
             (
-                price(first(level, &["price", "price_dollars"])),
-                decimal(first(level, &["size", "count", "count_fp"])),
+                first(level, &["price", "price_dollars"]),
+                first(level, &["size", "count", "count_fp"]),
             )
         };
-        match (p, q) {
-            (Some(p), Some(q)) if q > D::ZERO => {
-                parsed.insert(p, q);
+        match (price(p), decimal(q)) {
+            (Some(price), Some(size)) if size > D::ZERO => {
+                on_level(
+                    price,
+                    size,
+                    p.expect("parsed price"),
+                    q.expect("parsed size"),
+                );
             }
-            (_, Some(q)) if p.is_some() && q == D::ZERO => {}
+            (Some(_), Some(size)) if size == D::ZERO => {}
             _ => malformed = true,
         }
     }
-    SnapshotSide {
-        levels: parsed,
-        malformed,
+    malformed
+}
+
+fn snapshot_sides(venue: Venue, body: &Value) -> [Option<&Value>; 2] {
+    match venue {
+        Venue::Polymarket => [body.get("bids"), body.get("asks")],
+        Venue::Kalshi => [
+            first(body, &["yes_dollars_fp", "yes_dollars", "yes"]),
+            first(body, &["no_dollars_fp", "no_dollars", "no"]),
+        ],
     }
+}
+
+type SnapshotSpelling<'a> = BTreeMap<D, (&'a Value, &'a Value)>;
+
+/// Keep the legacy Decimal spelling of accepted snapshot levels at the Python boundary.
+pub fn snapshot_spelling(venue: Venue, message: &Value) -> [SnapshotSpelling<'_>; 2] {
+    let body = match venue {
+        Venue::Polymarket => message,
+        Venue::Kalshi => kalshi::body(message),
+    };
+    snapshot_sides(venue, body).map(|side| {
+        let mut spelling = SnapshotSpelling::new();
+        visit_levels(side, true, |price, _, p, q| {
+            spelling
+                .entry(price)
+                .and_modify(|pair| pair.1 = q)
+                .or_insert((p, q));
+        });
+        spelling
+    })
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

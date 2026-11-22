@@ -24,14 +24,15 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 from websockets.protocol import State
 
-from pmkt.exchanges.book_integrity import finite_decimal, decimal_levels, well_formed_levels
+from pmkt import _native
+from pmkt.exchanges._ws_book import decimal_levels, decimal_text, encode_message, local_state, sync_ladder
 from pmkt.config import PmktConfig
 from pmkt.exchanges.ws_transport import (
     _wire_frames,
-    DEFAULT_RECONNECT_ATTEMPTS,  # noqa: F401 - legacy module re-export
-    DEFAULT_RECONNECT_BACKOFF_SECONDS,  # noqa: F401 - legacy module re-export
+    DEFAULT_RECONNECT_ATTEMPTS as DEFAULT_RECONNECT_ATTEMPTS,
+    DEFAULT_RECONNECT_BACKOFF_SECONDS as DEFAULT_RECONNECT_BACKOFF_SECONDS,
     _UNSET_RECONNECTS,
-    WS_TRANSPORT_LIMITS,  # noqa: F401 - legacy module re-export
+    WS_TRANSPORT_LIMITS as WS_TRANSPORT_LIMITS,
     WebSocketTransportSettings,
     WebSocketRetryBudget,
     is_transport_teardown_race,
@@ -183,15 +184,6 @@ def decode_market_messages(
 
 
 
-def _previous_hash(change: dict[str, Any], parent: dict[str, Any]) -> str | None:
-    for payload in (change, parent):
-        for key in ("previous_hash", "prev_hash", "old_hash", "previous_book_hash"):
-            value = payload.get(key)
-            if value is not None:
-                return str(value)
-    return None
-
-
 @dataclass
 class MarketStreamSnapshot:
     asset_id: str
@@ -293,9 +285,7 @@ class MarketBookState:
 
     @property
     def book_integrity_valid(self) -> bool:
-        return self.initial_snapshot_received and not (
-            self.quality_flags - {"empty_bid", "empty_ask", "new_market", "market_resolved"}
-        )
+        return _native.book_integrity(self.initial_snapshot_received, list(self.quality_flags))
 
     def snapshot(self, *, event_type: str | None = None) -> MarketStreamSnapshot:
         quote_age_ms = None
@@ -331,105 +321,68 @@ class MarketBookState:
             reconnect_count=self.reconnect_count,
         )
 
-    def apply_book(self, message: dict[str, Any]) -> MarketStreamSnapshot:
-        self.market = str(message.get("market") or self.market or "")
-        self.bids = decimal_levels(message.get("bids"))
-        self.asks = decimal_levels(message.get("asks"))
-        self.timestamp = message.get("timestamp")
-        self.last_hash = (
-            str(message["hash"]) if message.get("hash") is not None else self.last_hash
+    def _apply(self, message: dict[str, Any], event_type: str) -> MarketStreamSnapshot:
+        depth = event_type in POLYMARKET_BOOK_EVENT_TYPES
+        delta = event_type == "price_change"
+        state = _native.update_local_book(
+            "polymarket", self.asset_id,
+            local_state(
+                self.bids if delta else {}, self.asks if delta else {},
+                self.initial_snapshot_received, self.quality_flags,
+                last_hash=self.last_hash, tick=self.tick_size,
+            ),
+            encode_message({**message, "event_type": event_type, "asset_id": self.asset_id}),
+            quotes=None if depth else (decimal_text(self.best_bid), decimal_text(self.best_ask)),
         )
-        self.last_received_at_monotonic_ns = time.monotonic_ns()
-        self.initial_snapshot_received = True
-        self.last_event_type = "book"
-        self._recompute_best_prices()
-        malformed = not all(well_formed_levels(message.get(side)) for side in ("bids", "asks"))
-        self._refresh_validity(preserve={"malformed_book"} if malformed else set())
-        return self.snapshot(event_type="book")
-
-    def apply_price_change(
-        self,
-        change: dict[str, Any],
-        parent: dict[str, Any],
-    ) -> MarketStreamSnapshot:
-        self.market = str(parent.get("market") or self.market or "")
-        self.timestamp = (
-            parent.get("timestamp")
-            if parent.get("timestamp") is not None
-            else change.get("timestamp")
-        )
-        self.last_received_at_monotonic_ns = time.monotonic_ns()
-        self.last_event_type = "price_change"
-        if not self.initial_snapshot_received:
-            self.valid_state = False
-            self.quality_flags.update({"delta_before_snapshot", "no_initial_snapshot"})
-        side = str(change.get("side") or "").upper()
-        price = finite_decimal(change.get("price"))
-        size = finite_decimal(change.get("size"))
-        if (side not in {"BUY", "BID", "BIDS", "SELL", "ASK", "ASKS"}
-                or price is None or size is None
-                or finite_decimal(price) is None or finite_decimal(size) is None
-                or not 0 <= price <= 1 or size < 0):
-            self.quality_flags.add("malformed_book")
-        else:
-            self._set_level(side, price, size)
-        previous_hash = _previous_hash(change, parent)
-        if (
-            previous_hash is not None
-            and self.last_hash is not None
-            and previous_hash != self.last_hash
-        ):
-            self.valid_state = False
-            self.quality_flags.add("hash_mismatch")
-        if change.get("hash") is not None:
-            self.last_hash = str(change["hash"])
-        self._refresh_validity(preserve=self._persistent_flags())
-        return self.snapshot(event_type="price_change")
-
-    def apply_best_bid_ask(self, message: dict[str, Any]) -> MarketStreamSnapshot:
-        self.market = str(message.get("market") or self.market or "")
-        self.timestamp = message.get("timestamp")
-        self.last_received_at_monotonic_ns = time.monotonic_ns()
-        self.last_event_type = "best_bid_ask"
-        self._apply_best_fields(message)
-        self._refresh_validity(preserve=self._persistent_flags())
-        return self.snapshot(event_type="best_bid_ask")
-
-    def apply_last_trade(self, message: dict[str, Any]) -> MarketStreamSnapshot:
-        self.market = str(message.get("market") or self.market or "")
-        self.timestamp = message.get("timestamp")
-        self.last_received_at_monotonic_ns = time.monotonic_ns()
-        self.last_event_type = "last_trade_price"
-        self.last_trade_price = _parse_float(message.get("price"))
-        self.last_trade_size = _parse_float(message.get("size"))
-        side = message.get("side")
-        self.last_trade_side = str(side) if side is not None else None
-        self._refresh_validity(preserve=self._persistent_flags())
-        return self.snapshot(event_type="last_trade_price")
-
-    def apply_tick_size_change(self, message: dict[str, Any]) -> MarketStreamSnapshot:
-        self.market = str(message.get("market") or self.market or "")
-        self.timestamp = message.get("timestamp")
-        self.last_received_at_monotonic_ns = time.monotonic_ns()
-        self.last_event_type = "tick_size_change"
-        self.tick_size = _parse_float(message.get("new_tick_size"))
-        self._refresh_validity(preserve=self._persistent_flags())
-        return self.snapshot(event_type="tick_size_change")
-
-    def apply_lifecycle(
-        self, message: dict[str, Any], event_type: str
-    ) -> MarketStreamSnapshot:
+        if event_type == "book":
+            self.bids, self.asks = decimal_levels(state["first"]), decimal_levels(state["second"])
+        elif delta:
+            sync_ladder(self.bids, state["first"])
+            sync_ladder(self.asks, state["second"])
+        self.best_bid = Decimal(state["bid"]) if state["bid"] is not None else None
+        self.best_ask = Decimal(state["ask"]) if state["ask"] is not None else None
+        self.initial_snapshot_received = state["initialized"]
+        self.valid_state = state["valid"]
+        self.quality_flags = set(state["flags"])
+        self.last_hash = state["hash"]
+        if event_type == "tick_size_change":
+            self.tick_size = float(state["tick"]) if state["tick"] is not None else None
         self.market = str(message.get("market") or self.market or "")
         self.timestamp = message.get("timestamp")
         self.last_received_at_monotonic_ns = time.monotonic_ns()
         self.last_event_type = event_type
-        if event_type == "market_resolved":
-            self.valid_state = False
-            self.quality_flags.add("market_resolved")
-        elif event_type == "new_market":
-            self.quality_flags.add("new_market")
-            self._refresh_validity(preserve=self._persistent_flags() | {"new_market"})
         return self.snapshot(event_type=event_type)
+
+    def apply_book(self, message: dict[str, Any]) -> MarketStreamSnapshot:
+        return self._apply(message, "book")
+
+    def apply_price_change(
+        self, change: dict[str, Any], parent: dict[str, Any],
+    ) -> MarketStreamSnapshot:
+        timestamp = parent.get("timestamp")
+        return self._apply({
+            **parent,
+            "timestamp": timestamp if timestamp is not None else change.get("timestamp"),
+            "price_changes": [{**change, "asset_id": self.asset_id}],
+        }, "price_change")
+
+    def apply_best_bid_ask(self, message: dict[str, Any]) -> MarketStreamSnapshot:
+        return self._apply(message, "best_bid_ask")
+
+    def apply_last_trade(self, message: dict[str, Any]) -> MarketStreamSnapshot:
+        self.last_trade_price = _parse_float(message.get("price"))
+        self.last_trade_size = _parse_float(message.get("size"))
+        side = message.get("side")
+        self.last_trade_side = str(side) if side is not None else None
+        return self._apply(message, "last_trade_price")
+
+    def apply_tick_size_change(self, message: dict[str, Any]) -> MarketStreamSnapshot:
+        return self._apply(message, "tick_size_change")
+
+    def apply_lifecycle(
+        self, message: dict[str, Any], event_type: str,
+    ) -> MarketStreamSnapshot:
+        return self._apply(message, event_type)
 
     def mark_reconnect(self) -> None:
         self.reconnect_count += 1
@@ -444,59 +397,6 @@ class MarketBookState:
         self.last_hash = None
         self.last_book_hash = None
 
-    def _set_level(self, side: str, price: Decimal, size: Decimal) -> None:
-        if side in {"BUY", "BID", "BIDS"}:
-            book_side = self.bids
-        elif side in {"SELL", "ASK", "ASKS"}:
-            book_side = self.asks
-        else:
-            return
-        if size <= 0:
-            book_side.pop(price, None)
-        else:
-            book_side[price] = size
-        self._recompute_best_prices()
-
-    def _apply_best_fields(self, payload: dict[str, Any]) -> None:
-        best_bid = finite_decimal(payload.get("best_bid"))
-        best_ask = finite_decimal(payload.get("best_ask"))
-        if best_bid is not None:
-            self.best_bid = best_bid
-        if best_ask is not None:
-            self.best_ask = best_ask
-
-    def _recompute_best_prices(self) -> None:
-        self.best_bid = max(self.bids) if self.bids else None
-        self.best_ask = min(self.asks) if self.asks else None
-
-    def _persistent_flags(self) -> set[str]:
-        persistent = {
-            "malformed_book",
-            "delta_before_snapshot",
-            "hash_mismatch",
-            "market_resolved",
-            "no_initial_snapshot",
-            "new_market",
-            "reconnect",
-        }
-        return self.quality_flags.intersection(persistent)
-
-    def _refresh_validity(self, *, preserve: set[str] | None = None) -> None:
-        flags = set(preserve or set())
-        if not self.initial_snapshot_received:
-            flags.add("no_initial_snapshot")
-        if self.best_bid is None:
-            flags.add("empty_bid")
-        if self.best_ask is None:
-            flags.add("empty_ask")
-        if self.best_bid is not None and self.best_ask is not None:
-            if self.best_ask < self.best_bid:
-                flags.update({"crossed_book", "negative_spread"})
-            elif self.best_ask == self.best_bid:
-                flags.add("crossed_book")
-        self.quality_flags = flags
-        self.valid_state = self.initial_snapshot_received and not flags
-
 
 def _state_for(
     states: dict[str, MarketBookState],
@@ -507,22 +407,9 @@ def _state_for(
     token = str(asset_id)
     if not token:
         return None
-    return states.setdefault(token, MarketBookState(asset_id=token))
-
-
-def _states_for_lifecycle(
-    states: dict[str, MarketBookState],
-    message: dict[str, Any],
-) -> list[MarketBookState]:
-    asset_id = message.get("asset_id")
-    state = _state_for(states, asset_id)
-    if state is not None:
-        return [state]
-    market = message.get("market")
-    if market is None:
-        return []
-    market_text = str(market)
-    return [state for state in states.values() if state.market == market_text]
+    if token not in states:
+        states[token] = MarketBookState(asset_id=token)
+    return states[token]
 
 
 def apply_market_message(
@@ -849,7 +736,7 @@ class AsyncMarketWebSocketClient:
         self,
         *,
         reconnect: bool = True,
-        max_reconnects: int | None = cast(Any, _UNSET_RECONNECTS),
+        max_reconnects: int | None = cast("int | None", _UNSET_RECONNECTS),
         reconnect_backoff: float | None = None,
         on_reconnect: Callable[[], None] | None = None,
         fail_on_clean_close_exhausted: bool = False,
@@ -1021,8 +908,8 @@ async def collect_market_snapshots(
     timeout_seconds: float = 30.0,
     ws_url: str | None = None,
     custom_feature_enabled: bool = True,
-    heartbeat_interval: float | None = cast(Any, _UNSET_HEARTBEAT_INTERVAL),
-    reconnect_attempts: int | None = cast(Any, _UNSET_RECONNECTS),
+    heartbeat_interval: float | None = cast("float | None", _UNSET_HEARTBEAT_INTERVAL),
+    reconnect_attempts: int | None = cast("int | None", _UNSET_RECONNECTS),
     connect_factory: ConnectFactory | None = None,
 ) -> list[dict[str, Any]]:
     """Collect a bounded set of market websocket snapshots."""

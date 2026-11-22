@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Literal, NoReturn, TypedDict, final, overload
@@ -89,7 +89,7 @@ class ShardFeed:
     def __init__(
         self, venue: Literal["polymarket", "kalshi"], shard_id: str,
         instruments: Sequence[str], *, liveness_ns: int | None = None,
-        snapshot_ns: int | None = None,
+        snapshot_ns: int | None = None, polymarket_socket_liveness: bool = False,
     ) -> None: ...
     def connected(self, generation: int, now_ns: int, *, command_id: int | None = None) -> None: ...
     def disconnected(self, generation: int, reason: str) -> None: ...
@@ -99,6 +99,7 @@ class ShardFeed:
     def poll_books(self, now_ns: int) -> None: ...
     def resolved(self, id: str) -> bool: ...
     def transport(self) -> tuple[int, int | None] | None: ...
+    def poll_transport(self, now_ns: int) -> str | None: ...
     @overload
     def ingest(self, shard_id: str, generation: int, frame: bytes, now_ns: int, *, detach: Literal[True] = True) -> list[_Observation]: ...
     @overload
@@ -106,3 +107,76 @@ class ShardFeed:
     def health(self, instrument: str, now_ns: int) -> _Health: ...
     def observation(self, instrument: str, now_ns: int) -> _Observation: ...
     def close(self) -> None: ...
+
+
+class _LocalState(TypedDict):
+    initialized: bool
+    flags: list[str]
+    first: list[tuple[str, str]]
+    second: list[tuple[str, str]]
+    sid: int | None
+    seq: int | None
+    hash: str | None
+    tick: str | None
+
+class _LocalBook(_LocalState):
+    valid: bool
+    bid: str | None
+    ask: str | None
+
+def book_integrity(initialized: bool, quality_flags: Sequence[str]) -> bool: ...
+def update_local_book(
+    venue_name: str, instrument: str, state: _LocalState, message: str, *,
+    use_yes_price: bool = True, quotes: tuple[str | None, str | None] | None = None,
+) -> _LocalBook: ...
+
+class _RecordingBook(TypedDict):
+    instrument: str
+    market: str | None
+    first: list[tuple[str, str]]
+    second: list[tuple[str, str]]
+    initialized: bool
+    intact: bool
+    valid: bool
+    flags: list[str]
+    timestamp_json: str | None
+    milliseconds: bool
+    tick: str | None
+    minimum: str | None
+    source_update: bool
+
+@final
+class RecordingBooks:
+    def __init__(self, venue_name: str, instruments: Sequence[str]) -> None: ...
+    def reset(self) -> None: ...
+    def resolved(self, instrument: str) -> bool: ...
+    def apply(self, message: str, count: int) -> list[_RecordingBook]: ...
+    def recovery_due(self, count: int, now_ns: int) -> bool: ...
+    def complementary_due(self, count: int, now_ns: int) -> bool: ...
+    def next_deadline_ns(self) -> int | None: ...
+
+@final
+class BookCheck:
+    def __init__(self, venue_name: str) -> None: ...
+    def apply(self, message: str) -> list[tuple[str, int | None]]: ...
+
+
+_MergeInput = tuple[tuple[str, str], str, int, int, int | None, int, str, bool]
+
+class MergeError(ValueError): ...
+
+def snapshot_class(kind: str, reconnect: bool, message: str) -> str: ...
+def conflated_subscription(raw: str) -> bool: ...
+
+def message_key(venue_name: str, message: str) -> tuple[str, str, int | None, int | None, bytes]: ...
+
+@final
+class CopyMerge:
+    def __init__(
+        self, venue_name: str, sources: Sequence[Iterator[_MergeInput]],
+        lateness_ms: int, untimed_match_ms: int, retention_ms: int,
+        strict_order: bool, preferred_copies: Sequence[str],
+    ) -> None: ...
+    def __iter__(self) -> Iterator[str]: ...
+    def __next__(self) -> str: ...
+    def stats(self) -> str: ...

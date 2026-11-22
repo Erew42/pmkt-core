@@ -283,7 +283,7 @@ async def test_recording_keeps_heartbeat_and_unknown_message_handling(tmp_path):
 @pytest.mark.parametrize("reset", [False, True])
 @pytest.mark.parametrize("kind", ["book", "price_change", "tick_size_change"])
 def test_recorder_identity_conflict_requires_established_market_snapshot(reset, kind):
-    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books = VenueBooks("polymarket", ["a"])
     books.apply(poly_book(), 1)
     if reset:
         books.reset()
@@ -305,7 +305,7 @@ def test_recorder_identity_conflict_requires_established_market_snapshot(reset, 
 
 @pytest.mark.parametrize("routing", ["market", "asset_id", "assets_ids", "asset_ids"])
 def test_recorder_resolution_survives_snapshots_and_reset(routing):
-    books = VenueBooks("polymarket", ["a", "b"], enforce_market_identity=True)
+    books = VenueBooks("polymarket", ["a", "b"])
     books.apply(poly_book(), 1)
     books.apply({**poly_book("b"), "market": "other"}, 2)
     books.reset()
@@ -320,24 +320,21 @@ def test_recorder_resolution_survives_snapshots_and_reset(routing):
     assert books.apply({**poly_book("b"), "market": "other"}, 6)[0].quote_valid
 
 
-@pytest.mark.parametrize("routing", ["market", "asset_id"])
-def test_unenforced_books_leave_terminal_resolution_to_their_owner(routing):
-    # ManagedBookFeed keeps its own identity and resolution state; an inner
-    # foreign-market resolution must not outlive a later original snapshot.
+@pytest.mark.parametrize("routing", ["asset_id", "assets_ids"])
+def test_recorder_resolution_before_a_book_remains_terminal(routing):
     books = VenueBooks("polymarket", ["a"])
-    books.apply(poly_book(), 1)
-    books.apply({**poly_book(), "market": "foreign"}, 2)
-    value = "foreign" if routing == "market" else "a"
-    books.apply({"event_type": "market_resolved", routing: value, "market": "foreign"}, 3)
+    value = "a" if routing == "asset_id" else ["a"]
+    resolved = books.apply({"event_type": "market_resolved", routing: value}, 1)
+    assert [v.instrument_id for v in resolved] == ["a"]
     books.reset()
-    repaired = books.apply(poly_book(), 4)[0]
-    assert repaired.integrity_valid and repaired.quote_valid
-    assert "market_resolved" not in repaired.quality_flags
+    view = books.apply(poly_book(), 2)[0]
+    assert view.integrity_valid and not view.quote_valid
+    assert "market_resolved" in view.quality_flags
 
 
 @pytest.mark.parametrize("reset", [False, True])
 def test_recorder_conflict_rejects_anonymous_and_malformed_recovery(reset):
-    books = VenueBooks("polymarket", ["a"], enforce_market_identity=True)
+    books = VenueBooks("polymarket", ["a"])
     books.apply(poly_book(), 1)
     books.apply({**poly_book(), "market": "other"}, 2)
     if reset:
@@ -790,12 +787,7 @@ async def test_periodic_check_runs_during_quiet_feed_without_duplicate_books(tmp
 
 
 @pytest.mark.asyncio
-async def test_late_complementary_correction_cannot_erase_recovery_bound(
-    tmp_path, monkeypatch
-):
-    from pmkt.exchanges.polymarket.recovery import ComplementaryDeltaRecovery
-
-    monkeypatch.setattr(ComplementaryDeltaRecovery, "max_followup_messages", 1)
+async def test_late_complementary_correction_cannot_erase_recovery_bound(tmp_path):
     locked = {
         "event_type": "price_change",
         "timestamp": "1000",
@@ -826,13 +818,14 @@ async def test_late_complementary_correction_cannot_erase_recovery_bound(
             }
         ],
     }
-    sockets = iter([Socket([poly_book(), locked, correction]), Socket([poly_book()])])
+    traffic = [{"event_type": "quote"}] * 15
+    sockets = iter([Socket([poly_book(), locked, *traffic, correction]), Socket([poly_book()])])
     report = await record_feed(
         ["a"],
         venue="polymarket",
         output_root=tmp_path,
         options=RecordingOptions(),
-        max_messages=3,
+        max_messages=18,
         heartbeat_interval=None,
         connect_factory=lambda _: next(sockets),
     )
