@@ -8,7 +8,8 @@ use crate::{
 };
 use chrono::DateTime;
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 #[derive(serde::Serialize, Clone, Copy, Debug, Eq, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -98,6 +99,10 @@ pub struct SessionCoverage {
     pub intervals: Vec<Interval>,
     #[serde(skip)]
     pub(crate) interval_ids: Vec<usize>,
+    #[serde(skip)]
+    pub(crate) interval_instruments: Vec<Option<Arc<BTreeSet<String>>>>,
+    #[serde(skip)]
+    pub(crate) interval_first_book_us: Vec<BTreeMap<String, i64>>,
     pub counts: CoverageCounts,
 }
 #[derive(Debug)]
@@ -107,6 +112,8 @@ pub struct CoverageTracker {
     frame_us: Option<i64>,
     next_interval_id: usize,
     pending_book_from: Option<usize>,
+    current_instruments: Option<Arc<BTreeSet<String>>>,
+    current_first_book_us: BTreeMap<String, i64>,
     seqs: Sequences,
     report: SessionCoverage,
 }
@@ -118,12 +125,16 @@ impl CoverageTracker {
             frame_us: None,
             next_interval_id: 0,
             pending_book_from: None,
+            current_instruments: None,
+            current_first_book_us: BTreeMap::new(),
             seqs: Sequences::default(),
             report: SessionCoverage {
                 stream,
                 session: session.into(),
                 intervals: vec![],
                 interval_ids: vec![],
+                interval_instruments: vec![],
+                interval_first_book_us: vec![],
                 counts: CoverageCounts::default(),
             },
         }
@@ -131,6 +142,7 @@ impl CoverageTracker {
     fn open(&mut self, us: i64, reason: StartReason) {
         let id = self.next_interval_id;
         self.next_interval_id += 1;
+        self.current_first_book_us.clear();
         self.window = Window::Open {
             id,
             start: us,
@@ -143,6 +155,24 @@ impl CoverageTracker {
         match self.window {
             Window::Open { id, .. } => Some(id),
             Window::Closed(_) => None,
+        }
+    }
+    pub(crate) fn set_instruments(&mut self, instruments: Option<Arc<BTreeSet<String>>>) {
+        self.current_instruments = instruments;
+    }
+    pub(crate) fn note_book_observation(&mut self, instrument: &str, us: i64) {
+        if matches!(self.window, Window::Open { .. })
+            && !self.current_first_book_us.contains_key(instrument)
+        {
+            self.current_first_book_us.insert(instrument.to_owned(), us);
+        }
+    }
+    pub(crate) fn record_boundary_counts(&mut self, kind: &str, direction: &str) {
+        if let Some(reason) = EndReason::transport_boundary(kind, direction) {
+            self.report.counts.transport_errors += u64::from(reason == EndReason::TransportError);
+            self.report.counts.disk_pause_markers += u64::from(reason == EndReason::DiskPauseGap);
+        } else if direction == "local" && kind == "seq_gap" {
+            self.report.counts.seq_gap_markers += 1;
         }
     }
     pub(crate) fn begin_generation(&mut self, generation: u64) {
@@ -217,9 +247,12 @@ impl CoverageTracker {
         if let Some(from) = self.pending_book_from.take() {
             self.report.intervals.truncate(from);
             self.report.interval_ids.truncate(from);
+            self.report.interval_instruments.truncate(from);
+            self.report.interval_first_book_us.truncate(from);
         } else {
             self.end(EndReason::TransportError, None);
         }
+        self.current_first_book_us.clear();
         self.window = Window::Closed(StartReason::AfterGap);
         self.seqs.clear();
     }
@@ -240,6 +273,12 @@ impl CoverageTracker {
                 end_reason: reason,
             });
             self.report.interval_ids.push(id);
+            self.report
+                .interval_instruments
+                .push(self.current_instruments.clone());
+            self.report
+                .interval_first_book_us
+                .push(std::mem::take(&mut self.current_first_book_us));
             self.window = Window::Closed(StartReason::AfterGap);
         }
     }
@@ -333,6 +372,9 @@ impl SessionEvidence {
     pub(crate) fn begin_generation(&mut self, generation: u64) {
         self.tracker.begin_generation(generation);
     }
+    pub(crate) fn set_instruments(&mut self, instruments: Option<Arc<BTreeSet<String>>>) {
+        self.tracker.set_instruments(instruments);
+    }
     pub(crate) fn mark_book_pending(&mut self) {
         self.tracker.mark_book_pending();
     }
@@ -359,6 +401,8 @@ impl SessionEvidence {
             return Ok(());
         }
         if awaiting_book_confirm {
+            self.tracker
+                .record_boundary_counts(&f.frame_type, &f.direction);
             return Ok(());
         }
         self.tracker
@@ -374,6 +418,13 @@ impl SessionEvidence {
             for m in messages {
                 if let Some((sid, seq)) = m.value["sid"].as_i64().zip(m.value["seq"].as_i64()) {
                     self.tracker.sequence(sid, seq);
+                }
+            }
+        }
+        for m in messages {
+            if let Ok(wire::Event::Books(updates)) = wire::decode(f.venue, &m.value) {
+                for u in updates {
+                    self.tracker.note_book_observation(&u.instrument, us);
                 }
             }
         }
@@ -486,8 +537,12 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             if f.frame_type == "subscription" && f.direction == "sent" {
                 self.saw_subscription = true;
                 if let Ok(command) = serde_json::from_str::<Value>(&f.payload_raw)
-                    && self.subscription.record(f.venue, &command)?
+                    && self
+                        .subscription
+                        .record(f.venue, f.connection_generation, &command)?
                 {
+                    self.evidence
+                        .set_instruments(self.subscription.instruments.clone());
                     self.book_rejected = false;
                     if !self.book_confirmed {
                         if f.venue == Venue::Kalshi {

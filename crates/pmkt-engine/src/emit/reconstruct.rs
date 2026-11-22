@@ -113,23 +113,53 @@ impl MergedDepth {
 }
 
 struct MergedCoverage {
+    venue: Venue,
     coverage: Arc<[SessionCoverage]>,
-    source_instruments: Vec<BTreeSet<String>>,
+    undeclared_instruments: Vec<BTreeSet<String>>,
 }
 
 impl MergedCoverage {
+    fn interval_covers(&self, source: usize, idx: usize, instrument: &str) -> bool {
+        let session = &self.coverage[source];
+        match session.interval_instruments[idx].as_deref() {
+            Some(set) if !set.is_empty() => set.contains(instrument),
+            _ => self.undeclared_instruments[source].contains(instrument),
+        }
+    }
+
     fn covered_by_other(&self, instrument: &str, origin: &Origin) -> bool {
-        self.coverage
-            .iter()
-            .zip(&self.source_instruments)
-            .any(|(session, ids)| {
-                session.stream != origin.stream
-                    && ids.contains(instrument)
-                    && session
-                        .intervals
-                        .iter()
-                        .any(|span| (span.start_us..=span.end_us).contains(&origin.received_us))
-            })
+        self.coverage.iter().enumerate().any(|(source, session)| {
+            session.stream != origin.stream
+                && session.intervals.iter().enumerate().any(|(idx, span)| {
+                    if !self.interval_covers(source, idx, instrument)
+                        || !(span.start_us..=span.end_us).contains(&origin.received_us)
+                    {
+                        return false;
+                    }
+                    let declared = session.interval_instruments[idx]
+                        .as_deref()
+                        .is_some_and(|set| !set.is_empty());
+                    if self.venue == Venue::Kalshi && declared {
+                        session.interval_first_book_us[idx]
+                            .get(instrument)
+                            .is_some_and(|&first| first <= origin.received_us)
+                    } else {
+                        true
+                    }
+                })
+        })
+    }
+
+    fn source_instruments_for(&self, origin: &Origin) -> BTreeSet<String> {
+        if let Some(ids) = origin.subscription.as_deref()
+            && !ids.is_empty()
+        {
+            return ids.clone();
+        }
+        self.undeclared_instruments
+            .get(origin.coverage_group)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -184,11 +214,9 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
                 if let Some(m) = merged {
                     let origin = m.origin();
                     if let Some(cov) = &self.merged_coverage {
-                        if let Some(ids) = cov.source_instruments.get(origin.coverage_group) {
-                            for id in ids {
-                                if !cov.covered_by_other(id, origin) {
-                                    self.books.restart(id);
-                                }
+                        for id in cov.source_instruments_for(origin) {
+                            if !cov.covered_by_other(&id, origin) {
+                                self.books.restart(&id);
                             }
                         }
                     } else {
@@ -376,15 +404,8 @@ pub fn reconstruct_merged(
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
-    let source_instruments = {
-        let mut per_source: Vec<BTreeSet<String>> = subscribed
-            .iter()
-            .zip(&observed)
-            .map(|(ids, obs)| match ids.as_deref() {
-                Some(set) if !set.is_empty() => set.clone(),
-                _ => obs.clone(),
-            })
-            .collect();
+    let undeclared_instruments = {
+        let mut per_source: Vec<BTreeSet<String>> = observed.clone();
         // A pure control-only copy with no subscription command can still bridge
         // an undeclared peer on the same connection when every undeclared peer
         // on that connection observed the same non-empty instrument set.
@@ -415,7 +436,7 @@ pub fn reconstruct_merged(
         }
         per_source
     };
-    let (class_instruments, source_classes, class_components) = {
+    let (class_instruments, instrument_class, interval_classes, class_components) = {
         fn find(parent: &mut [usize], mut x: usize) -> usize {
             while parent[x] != x {
                 parent[x] = parent[parent[x]];
@@ -423,45 +444,86 @@ pub fn reconstruct_merged(
             }
             x
         }
-        let mut covering_by_instrument = BTreeMap::<String, Vec<usize>>::new();
-        for (source, ids) in source_instruments.iter().enumerate() {
-            for id in ids {
-                covering_by_instrument
-                    .entry(id.clone())
-                    .or_default()
-                    .push(source);
+        // Compute rollback-safe cross-stream union spans per (source, interval).
+        // If an interval's start rolled back at or before a prior interval's end
+        // on the same source, an ended peer cannot bridge that break by UTC alone.
+        let mut effective_spans: Vec<Vec<Option<(i64, i64)>>> = Vec::with_capacity(coverage.len());
+        for session in &coverage {
+            let mut spans = Vec::with_capacity(session.intervals.len());
+            let mut prev_max_end = i64::MIN;
+            for span in &session.intervals {
+                let eff = if span.start_us > prev_max_end {
+                    Some((span.start_us, span.end_us))
+                } else if span.end_us > prev_max_end {
+                    Some((span.end_us, span.end_us))
+                } else {
+                    None
+                };
+                prev_max_end = prev_max_end.max(span.end_us);
+                spans.push(eff);
             }
+            effective_spans.push(spans);
         }
-        let mut grouped = BTreeMap::<Vec<usize>, Vec<String>>::new();
-        for (id, covering) in covering_by_instrument {
-            grouped.entry(covering).or_default().push(id);
-        }
-        let mut class_instruments = Vec::with_capacity(grouped.len());
-        let mut source_classes = vec![Vec::<usize>::new(); coverage.len()];
-        let mut class_components = Vec::with_capacity(grouped.len());
-        for (class_id, (covering, instruments)) in grouped.into_iter().enumerate() {
-            for &s in &covering {
-                source_classes[s].push(class_id);
-            }
-            class_instruments.push(instruments);
-            // Intervals from different streams whose UTC spans overlap belong
-            // to one continuous coverage component; two intervals from the same
-            // stream never bridge their own physical break even across rollback.
-            let mut vertices: Vec<(usize, usize, i64, i64)> = Vec::new();
-            for &s in &covering {
-                for (interval_idx, span) in coverage[s].intervals.iter().enumerate() {
-                    vertices.push((s, interval_idx, span.start_us, span.end_us));
+        type IntervalVertex = (usize, usize, Option<(i64, i64)>);
+        let mut vertices_by_instrument = BTreeMap::<String, Vec<IntervalVertex>>::new();
+        for (source, session) in coverage.iter().enumerate() {
+            for (idx, _) in session.intervals.iter().enumerate() {
+                let declared = session.interval_instruments[idx]
+                    .as_deref()
+                    .filter(|set| !set.is_empty());
+                let ids: &BTreeSet<String> = declared.unwrap_or(&undeclared_instruments[source]);
+                let base_span = effective_spans[source][idx];
+                for id in ids {
+                    let bridge_span = if venue == Venue::Kalshi && declared.is_some() {
+                        session.interval_first_book_us[idx]
+                            .get(id)
+                            .and_then(|&first_us| {
+                                base_span.and_then(|(a, b)| {
+                                    let start = a.max(first_us);
+                                    (start <= b).then_some((start, b))
+                                })
+                            })
+                    } else {
+                        base_span
+                    };
+                    vertices_by_instrument.entry(id.clone()).or_default().push((
+                        source,
+                        idx,
+                        bridge_span,
+                    ));
                 }
             }
-            let mut order: Vec<usize> = (0..vertices.len()).collect();
-            order.sort_unstable_by_key(|&v| (vertices[v].2, vertices[v].3));
-            let mut parent: Vec<usize> = (0..vertices.len()).collect();
+        }
+        let mut grouped = BTreeMap::<Vec<IntervalVertex>, Vec<String>>::new();
+        for (id, verts) in vertices_by_instrument {
+            grouped.entry(verts).or_default().push(id);
+        }
+        let mut class_instruments = Vec::with_capacity(grouped.len());
+        let mut instrument_class = BTreeMap::<String, usize>::new();
+        let mut interval_classes: Vec<Vec<Vec<usize>>> = coverage
+            .iter()
+            .map(|c| vec![Vec::new(); c.intervals.len()])
+            .collect();
+        let mut class_components = Vec::with_capacity(grouped.len());
+        for (class_id, (verts, instruments)) in grouped.into_iter().enumerate() {
+            for id in &instruments {
+                instrument_class.insert(id.clone(), class_id);
+            }
+            for &(s, idx, _) in &verts {
+                interval_classes[s][idx].push(class_id);
+            }
+            class_instruments.push(instruments);
+            let mut order: Vec<usize> =
+                (0..verts.len()).filter(|&v| verts[v].2.is_some()).collect();
+            order.sort_unstable_by_key(|&v| verts[v].2.expect("bridging span"));
+            let mut parent: Vec<usize> = (0..verts.len()).collect();
             let mut active: Vec<usize> = Vec::new();
             for v in order {
-                let (src_v, _, start_v, _) = vertices[v];
-                active.retain(|&u| vertices[u].3 >= start_v);
+                let (src_v, _, span_v) = verts[v];
+                let (start_v, _) = span_v.expect("bridging span");
+                active.retain(|&u| verts[u].2.expect("bridging span").1 >= start_v);
                 for &u in &active {
-                    let src_u = vertices[u].0;
+                    let src_u = verts[u].0;
                     if coverage[src_u].stream != coverage[src_v].stream {
                         let ru = find(&mut parent, u);
                         let rv = find(&mut parent, v);
@@ -472,32 +534,35 @@ pub fn reconstruct_merged(
                 }
                 active.push(v);
             }
-            let mut comp_by_source = BTreeMap::<usize, Vec<usize>>::new();
-            for &s in &covering {
-                comp_by_source.insert(s, vec![0; coverage[s].intervals.len()]);
+            let mut comp_map = BTreeMap::<(usize, usize), usize>::new();
+            for (v, &(s, idx, _)) in verts.iter().enumerate() {
+                comp_map.insert((s, idx), find(&mut parent, v));
             }
-            for (v, &(s, interval_idx, _, _)) in vertices.iter().enumerate() {
-                let root = find(&mut parent, v);
-                comp_by_source.get_mut(&s).expect("covering source")[interval_idx] = root;
-            }
-            class_components.push(comp_by_source);
+            class_components.push(comp_map);
         }
-        (class_instruments, source_classes, class_components)
+        (
+            class_instruments,
+            instrument_class,
+            interval_classes,
+            class_components,
+        )
     };
-    // Each source keeps its own index in verified_sessions and source_instruments
-    // so per-instrument coverage and ReceiptPeriod stay aligned across the merge.
+    // Each source keeps its own index in verified_sessions so per-interval
+    // coverage classes and ReceiptPeriod stay aligned across the merge.
     for (index, source) in streams.values_mut().flatten().enumerate() {
         source.evidence.coverage_group = index;
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut last_components: Vec<Vec<usize>> = vec![Vec::new(); class_instruments.len()];
+    let mut last_reset_seq: Vec<u64> = vec![0; class_instruments.len()];
     let mut kalshi_basis = None;
     let mut subscriptions = BTreeMap::new();
     let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
     merger.verified_sessions = coverage.into();
     driver.merged_coverage = Some(MergedCoverage {
+        venue,
         coverage: Arc::clone(&merger.verified_sessions),
-        source_instruments,
+        undeclared_instruments,
     });
     if venue == Venue::Polymarket {
         driver.merged_depth = Some(MergedDepth {
@@ -509,113 +574,152 @@ pub fn reconstruct_merged(
     let mut covered_occurrences = Vec::new();
     let mut touched_classes = Vec::new();
     let mut current_components = Vec::new();
-    let stats = merger.merge(
+    let mut msg_seq = 0_u64;
+    let mut run = merger.stream(
         streams
             .values_mut()
             .map(|sessions| sessions.iter_mut().flatten()),
-        |m| {
-            if let Some(depth) = &mut driver.merged_depth {
-                depth.receipts.clear();
-                depth
-                    .receipts
-                    .extend(m.occurrences.iter().map(Origin::receipt_period));
-            }
-            on_message(&m)?;
-            let origin = m.origin();
-            covered_occurrences.clear();
-            touched_classes.clear();
-            if let Some(cov) = &driver.merged_coverage {
-                for o in &m.occurrences {
-                    if let Some(id) = o.coverage_period
-                        && let Some(session) = cov.coverage.get(o.coverage_group)
-                        && let Ok(pos) = session.interval_ids.binary_search(&id)
+    )?;
+    while let Some(m) = run.next_message()? {
+        msg_seq += 1;
+        // Propagate late deduplicated repeats so a peer whose copy was suppressed
+        // as repeats_after_emit still witnesses the baseline it received.
+        for (instruments, orig_seq, rep_origin) in run.drain_repeat_witnesses() {
+            if let Some(id) = rep_origin.coverage_period
+                && let Some(cov) = &driver.merged_coverage
+                && let Some(session) = cov.coverage.get(rep_origin.coverage_group)
+                && let Ok(pos) = session.interval_ids.binary_search(&id)
+            {
+                for inst in &instruments {
+                    if let Some(&class_id) = instrument_class.get(inst)
+                        && last_reset_seq[class_id] <= orig_seq
+                        && let Some(&comp) =
+                            class_components[class_id].get(&(rep_origin.coverage_group, pos))
                     {
-                        covered_occurrences.push((o.coverage_group, pos));
-                        for &class_id in &source_classes[o.coverage_group] {
-                            if !touched_classes.contains(&class_id) {
-                                touched_classes.push(class_id);
-                            }
+                        let prev = &mut last_components[class_id];
+                        if !prev.is_empty() && !prev.contains(&comp) {
+                            prev.push(comp);
                         }
                     }
                 }
             }
-            // A message crosses an uncovered gap for a coverage class only if
-            // none of its covered occurrences shares a component with the last
-            // covered message for that class.
-            for &class_id in &touched_classes {
-                current_components.clear();
-                let comp_map = &class_components[class_id];
-                for &(src, pos) in &covered_occurrences {
-                    if let Some(comps) = comp_map.get(&src) {
-                        let c = comps[pos];
-                        if !current_components.contains(&c) {
-                            current_components.push(c);
+        }
+        if let Some(depth) = &mut driver.merged_depth {
+            depth.receipts.clear();
+            depth
+                .receipts
+                .extend(m.occurrences.iter().map(Origin::receipt_period));
+        }
+        on_message(&m)?;
+        let origin = m.origin();
+        covered_occurrences.clear();
+        touched_classes.clear();
+        if let Some(cov) = &driver.merged_coverage {
+            for o in &m.occurrences {
+                if let Some(id) = o.coverage_period
+                    && let Some(session) = cov.coverage.get(o.coverage_group)
+                    && let Ok(pos) = session.interval_ids.binary_search(&id)
+                {
+                    covered_occurrences.push((o.coverage_group, pos));
+                    for &class_id in &interval_classes[o.coverage_group][pos] {
+                        if !touched_classes.contains(&class_id) {
+                            touched_classes.push(class_id);
                         }
                     }
                 }
-                if !current_components.is_empty() {
-                    let prev = &mut last_components[class_id];
-                    if !prev.is_empty() && !prev.iter().any(|c| current_components.contains(c)) {
-                        for id in &class_instruments[class_id] {
-                            driver.books.restart(id);
-                        }
+            }
+        }
+        // A message crosses an uncovered gap for a coverage class only if
+        // none of its covered occurrences shares a component with the last
+        // covered message for that class. Only messages targeting that class
+        // narrow its witnessing components when no gap occurred.
+        for &class_id in &touched_classes {
+            current_components.clear();
+            let comp_map = &class_components[class_id];
+            for &(src, pos) in &covered_occurrences {
+                if let Some(&c) = comp_map.get(&(src, pos))
+                    && !current_components.contains(&c)
+                {
+                    current_components.push(c);
+                }
+            }
+            if !current_components.is_empty() {
+                let prev = &mut last_components[class_id];
+                if prev.is_empty() {
+                    prev.extend_from_slice(&current_components);
+                } else if !prev.iter().any(|c| current_components.contains(c)) {
+                    for id in &class_instruments[class_id] {
+                        driver.books.restart(id);
                     }
+                    last_reset_seq[class_id] = msg_seq;
                     prev.clear();
                     prev.extend_from_slice(&current_components);
-                }
-            }
-            // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
-            // time already orders the merge, so it also times the corrective-delta deadline.
-            let clock_ns = u64::try_from(origin.received_us)
-                .ok()
-                .and_then(|us| us.checked_mul(1_000))
-                .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
-            // Register the whole declared shard, including silent instruments
-            // whose first delta may follow a gap. Origins share the same set
-            // until a new subscription command changes it.
-            for o in &m.occurrences {
-                if let Some(ids) = &o.subscription
-                    && subscriptions
-                        .get(&o.stream)
-                        .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
-                {
-                    for id in ids.iter() {
-                        driver.books.subscribe(id.clone());
+                } else {
+                    let mut targets_class = false;
+                    wire::visit_message_instruments(venue, &m.message, |inst| {
+                        if instrument_class.get(inst) == Some(&class_id) {
+                            targets_class = true;
+                        }
+                    });
+                    if targets_class {
+                        prev.clear();
+                        prev.extend_from_slice(&current_components);
                     }
-                    subscriptions.insert(o.stream.clone(), Arc::clone(ids));
                 }
             }
-            if venue == Venue::Kalshi
-                && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
+        }
+        // The recorders' monotonic clocks are unrelated host clocks; the UTC receive
+        // time already orders the merge, so it also times the corrective-delta deadline.
+        let clock_ns = u64::try_from(origin.received_us)
+            .ok()
+            .and_then(|us| us.checked_mul(1_000))
+            .ok_or_else(|| Error::Invalid("receive timestamp out of range".into()))?;
+        // Register the whole declared shard, including silent instruments
+        // whose first delta may follow a gap. Origins share the same set
+        // until a new subscription command changes it.
+        for o in &m.occurrences {
+            if let Some(ids) = &o.subscription
+                && subscriptions
+                    .get(&o.stream)
+                    .is_none_or(|prev| !Arc::ptr_eq(prev, ids))
             {
-                for o in &m.occurrences {
-                    if *kalshi_basis.get_or_insert(o.use_yes_price) != o.use_yes_price {
-                        return Err(Error::Invalid(
-                            "cannot merge Kalshi books on different price bases".into(),
-                        ));
-                    }
+                for id in ids.iter() {
+                    driver.books.subscribe(id.clone());
                 }
-                driver.books.set_kalshi_price_mode(origin.use_yes_price);
+                subscriptions.insert(o.stream.clone(), Arc::clone(ids));
             }
-            driver.message(
-                &m.message,
-                &Receipt {
-                    utc: &origin.received_utc,
-                    us: origin.received_us,
-                    monotonic_ns: origin.received_monotonic_ns,
-                    clock_ns,
-                    sequence: origin.frame_seq,
-                    recording_id: &origin.recording_id,
-                },
-                origin.position,
-                m.occurrences
-                    .iter()
-                    .filter_map(|o| o.subscription.as_deref()),
-                origin.book_command,
-                Some(&m),
-            )
-        },
-    )?;
+        }
+        if venue == Venue::Kalshi
+            && matches!(m.kind.as_str(), "orderbook_snapshot" | "orderbook_delta")
+        {
+            for o in &m.occurrences {
+                if *kalshi_basis.get_or_insert(o.use_yes_price) != o.use_yes_price {
+                    return Err(Error::Invalid(
+                        "cannot merge Kalshi books on different price bases".into(),
+                    ));
+                }
+            }
+            driver.books.set_kalshi_price_mode(origin.use_yes_price);
+        }
+        driver.message(
+            &m.message,
+            &Receipt {
+                utc: &origin.received_utc,
+                us: origin.received_us,
+                monotonic_ns: origin.received_monotonic_ns,
+                clock_ns,
+                sequence: origin.frame_seq,
+                recording_id: &origin.recording_id,
+            },
+            origin.position,
+            m.occurrences
+                .iter()
+                .filter_map(|o| o.subscription.as_deref()),
+            origin.book_command,
+            Some(&m),
+        )?;
+    }
+    let stats = run.into_stats();
     driver.finish()?;
     Ok((
         stats,
@@ -715,7 +819,10 @@ fn replay_file(
         }
         if f.frame_type == "subscription" && f.direction == "sent" {
             let command: Value = serde_json::from_str(&f.payload_raw)?;
-            if subscription.record(venue, &command)? {
+            if subscription.record(venue, f.connection_generation, &command)? {
+                if let Some(s) = &mut source {
+                    s.evidence.set_instruments(subscription.instruments.clone());
+                }
                 book_rejected = false;
                 if !book_confirmed {
                     if venue == Venue::Kalshi {

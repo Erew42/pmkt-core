@@ -1976,3 +1976,250 @@ fn receipt_clock_rollback_cannot_bridge_own_gap_in_merged_replay() {
         "rollback overlap on one stream must not hide its own seq gap"
     );
 }
+
+#[test]
+fn ended_peer_on_rollback_and_kalshi_ack_before_snapshot_cannot_certify_gap() {
+    let sub_book = |tickers: &[&str]| {
+        kind(
+            timed(
+                1,
+                "kalshi",
+                0,
+                0,
+                json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":tickers,"use_yes_price":true}}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let snap = |ticker: &str, ms: i64, seq: i64, size: &str| {
+        json!({"type":"orderbook_snapshot","sid":7,"seq":seq,"sending_ts_ms":1735689600000i64 + ms,
+            "msg":{"market_ticker":ticker,"yes_dollars_fp":[["0.40",size]],"no_dollars_fp":[["0.60","20"]]}})
+    };
+    let delta = |ticker: &str, ms: i64, seq: i64, qty: &str| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1735689600000i64 + ms,
+            "msg":{"ts_ms":1735689600000i64 + ms,"market_ticker":ticker,"side":"yes","price_dollars":"0.40","delta_fp":qty}})
+    };
+    let book_ack = json!({"id":1,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":7}});
+
+    // Case 1: peer ended at seq=2 (5ms); A skips seq=3 with 2ms rollback on seq=4.
+    let dir_a = root();
+    let dir_ended = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_book(&["X"]),
+            timed(2, "kalshi", 1000, 1000, snap("X", 1, 1, "10")),
+            timed(3, "kalshi", 5000, 5000, delta("X", 5, 2, "1")),
+            timed(4, "kalshi", 3000, 6000, delta("X", 7, 4, "2")),
+            timed(5, "kalshi", 8000, 8000, delta("X", 8, 5, "1")),
+        ],
+        None,
+    );
+    seal(
+        &dir_ended,
+        1,
+        &[
+            sub_book(&["X"]),
+            timed(2, "kalshi", 1000, 1000, snap("X", 1, 1, "10")),
+            timed(3, "kalshi", 5000, 5000, delta("X", 5, 2, "1")),
+            kind(
+                timed(4, "kalshi", 5100, 5100, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    let merged_ended = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a),
+            ("b".into(), "c".into(), dir_ended),
+        ],
+    );
+    assert!(
+        !kalshi_yes_row(&merged_ended).0,
+        "peer that ended at seq 2 must not bridge rollback gap"
+    );
+
+    // Case 2: peer acked {X, Y} at 1ms and received Y at 6ms, but X snapshot only at 9ms.
+    let dir_gap = root();
+    let dir_early = root();
+    seal(
+        &dir_gap,
+        1,
+        &[
+            sub_book(&["X"]),
+            timed(2, "kalshi", 2000, 2000, snap("X", 2, 1, "10")),
+            timed(3, "kalshi", 5000, 5000, delta("X", 5, 3, "2")),
+        ],
+        None,
+    );
+    seal(
+        &dir_early,
+        1,
+        &[
+            sub_book(&["X", "Y"]),
+            timed(2, "kalshi", 1000, 1000, book_ack),
+            timed(3, "kalshi", 6000, 6000, snap("Y", 6, 1, "10")),
+            timed(4, "kalshi", 9000, 9000, snap("X", 9, 2, "17")),
+        ],
+        None,
+    );
+    let merged_early = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("gapped".into(), "c".into(), dir_gap),
+            ("peer".into(), "c".into(), dir_early),
+        ],
+    );
+    let gapped_row = merged_early
+        .iter()
+        .find(|b| {
+            column::<StringArray>(b, "instrument_id").value(0) == "X:YES"
+                && column::<StringArray>(b, "raw_event_ref")
+                    .value(0)
+                    .ends_with(":3")
+        })
+        .expect("gapped X delta");
+    assert!(
+        !column::<BooleanArray>(gapped_row, "valid_state").value(0),
+        "Kalshi channel ack must not certify X before peer's first X snapshot"
+    );
+}
+
+#[test]
+fn unrelated_y_interleave_and_late_duplicate_preserve_healthy_polymarket_book() {
+    let sub = |ids: &[&str]| {
+        kind(
+            timed(
+                1,
+                "polymarket",
+                0,
+                0,
+                json!({"type":"market","assets_ids":ids}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let snap = |asset: &str, ts_ms: i64| {
+        json!({
+            "event_type": "book",
+            "asset_id": asset,
+            "market": "M",
+            "timestamp": ts_ms.to_string(),
+            "hash": format!("h{asset}{ts_ms}"),
+            "bids": [{"price": "0.40", "size": "10"}],
+            "asks": [{"price": "0.60", "size": "20"}],
+        })
+    };
+    let delta = |ms: i64, size: &str| {
+        json!({
+            "event_type": "price_change",
+            "market": "M",
+            "timestamp": (1735689600000i64 + ms).to_string(),
+            "price_changes": [{"asset_id": "X", "price": "0.40", "size": size, "side": "BUY"}],
+        })
+    };
+
+    // Case 1: unrelated Y snapshot on retiring {X, Y} shard must not erase healthy {X, Z} witness.
+    let dir_a = root();
+    let dir_b = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub(&["X", "Y"]),
+            timed(2, "polymarket", 1000, 1000, snap("X", 1735689600001)),
+            timed(3, "polymarket", 2000, 2000, snap("Y", 1735689600002)),
+            kind(
+                timed(4, "polymarket", 2500, 2500, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_b,
+        1,
+        &[
+            sub(&["X", "Z"]),
+            timed(2, "polymarket", 3000, 3000, snap("X", 1735689600001)),
+            timed(3, "polymarket", 6000, 6000, delta(6, "12")),
+        ],
+        None,
+    );
+    let merged_interleave = merged_topbooks(
+        Venue::Polymarket,
+        vec![
+            ("a".into(), "c".into(), dir_a),
+            ("b".into(), "c".into(), dir_b),
+        ],
+    );
+    let last_x = merged_interleave
+        .iter()
+        .rfind(|b| column::<StringArray>(b, "instrument_id").value(0) == "X")
+        .expect("final X row");
+    assert!(column::<BooleanArray>(last_x, "valid_state").value(0));
+    assert_eq!(
+        column::<Float64Array>(last_x, "best_ask_dollars").value(0),
+        0.6
+    );
+
+    // Case 2: 130s-old cached snapshot received 2ms apart (repeats_after_emit) preserves healthy B.
+    let dir_la = root();
+    let dir_lb = root();
+    seal(
+        &dir_la,
+        1,
+        &[
+            sub(&["X", "Y"]),
+            timed(
+                2,
+                "polymarket",
+                1000,
+                1000,
+                snap("X", 1735689600000 - 130000),
+            ),
+            kind(
+                timed(3, "polymarket", 2000, 2000, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    seal(
+        &dir_lb,
+        1,
+        &[
+            sub(&["X", "Z"]),
+            timed(
+                2,
+                "polymarket",
+                3000,
+                3000,
+                snap("X", 1735689600000 - 130000),
+            ),
+            timed(3, "polymarket", 6000, 6000, delta(6, "12")),
+        ],
+        None,
+    );
+    let merged_late = merged_topbooks(
+        Venue::Polymarket,
+        vec![
+            ("a".into(), "c".into(), dir_la),
+            ("b".into(), "c".into(), dir_lb),
+        ],
+    );
+    let last_late = merged_late.last().expect("final late X row");
+    assert!(column::<BooleanArray>(last_late, "valid_state").value(0));
+    assert_eq!(
+        column::<Float64Array>(last_late, "best_ask_dollars").value(0),
+        0.6
+    );
+}

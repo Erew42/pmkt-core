@@ -295,6 +295,7 @@ struct Group {
 type GroupKey = (i64, String);
 struct Remembered {
     at: i64,
+    msg_seq: u64,
     streams: BTreeSet<Stream>,
 }
 
@@ -311,9 +312,10 @@ pub struct CopyMerge {
     market_epochs: HashMap<String, u64>,
     stream_clocks: HashMap<(Stream, String), BookClock>,
     last_clock: HashMap<String, (BookClock, bool)>,
-    emitted_timed: HashMap<ContentId, i64>,
+    emitted_timed: HashMap<ContentId, (i64, u64)>,
     emitted_untimed: HashMap<ContentId, BTreeMap<usize, Remembered>>,
     expiry: BTreeMap<i64, Vec<(ContentId, Option<usize>)>>,
+    repeat_witnesses: Vec<(Vec<String>, u64, Origin)>,
     pending: usize,
 }
 impl CopyMerge {
@@ -347,6 +349,7 @@ impl CopyMerge {
             emitted_timed: HashMap::new(),
             emitted_untimed: HashMap::new(),
             expiry: BTreeMap::new(),
+            repeat_witnesses: Vec::new(),
             pending: 0,
         })
     }
@@ -491,11 +494,22 @@ impl CopyMerge {
                     !r.streams.contains(&o.origin.stream) && at.abs_diff(r.at) <= tolerance
                 })
             {
-                r.streams.insert(o.origin.stream);
+                r.streams.insert(o.origin.stream.clone());
+                let mut instruments = Vec::new();
+                crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
+                    instruments.push(inst.to_owned());
+                });
+                self.repeat_witnesses
+                    .push((instruments, r.msg_seq, o.origin));
                 self.stats.repeats_after_emit += 1;
                 return None;
             }
-        } else if self.emitted_timed.contains_key(&id) {
+        } else if let Some(&(_, msg_seq)) = self.emitted_timed.get(&id) {
+            let mut instruments = Vec::new();
+            crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
+                instruments.push(inst.to_owned());
+            });
+            self.repeat_witnesses.push((instruments, msg_seq, o.origin));
             self.stats.repeats_after_emit += 1;
             return None;
         }
@@ -560,18 +574,23 @@ impl CopyMerge {
     }
     fn remember(&mut self, e: &Entry, until: i64) {
         let id = e.key.id;
+        let msg_seq = self.stats.messages + 1;
         let record = if let Some(at) = e.at {
             // Late untimed copies match records in emission order, even when
             // a clock moved a later-received snapshot into an earlier batch.
             let i = self.stats.messages as usize;
             let streams = e.origins.iter().map(|(_, o)| o.stream.clone()).collect();
-            self.emitted_untimed
-                .entry(id)
-                .or_default()
-                .insert(i, Remembered { at, streams });
+            self.emitted_untimed.entry(id).or_default().insert(
+                i,
+                Remembered {
+                    at,
+                    msg_seq,
+                    streams,
+                },
+            );
             Some(i)
         } else {
-            self.emitted_timed.insert(id, until);
+            self.emitted_timed.insert(id, (until, msg_seq));
             None
         };
         self.expiry.entry(until).or_default().push((id, record));
@@ -592,7 +611,7 @@ impl CopyMerge {
                             self.emitted_untimed.remove(&id);
                         }
                     }
-                } else if self.emitted_timed.get(&id) == Some(&t) {
+                } else if self.emitted_timed.get(&id).is_some_and(|&(u, _)| u == t) {
                     self.emitted_timed.remove(&id);
                 }
             }
@@ -755,6 +774,16 @@ where
 {
     pub fn stats(&self) -> &MergeStats {
         &self.engine.stats
+    }
+
+    pub(crate) fn into_stats(self) -> MergeStats {
+        self.engine.stats
+    }
+
+    pub(crate) fn drain_repeat_witnesses(
+        &mut self,
+    ) -> std::vec::Drain<'_, (Vec<String>, u64, Origin)> {
+        self.engine.repeat_witnesses.drain(..)
     }
 
     pub fn next_message(&mut self) -> std::result::Result<Option<MergedMessage>, E> {

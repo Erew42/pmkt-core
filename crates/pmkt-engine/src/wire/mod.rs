@@ -18,9 +18,10 @@ pub(crate) struct RecordedSubscription {
     pub kalshi_basis: Option<bool>,
     /// Kalshi command id of the order-book subscription; other channels are separate commands.
     pub book_command: Option<i64>,
+    book_generation: Option<u64>,
 }
 impl RecordedSubscription {
-    pub fn record(&mut self, venue: Venue, command: &Value) -> Result<bool> {
+    pub fn record(&mut self, venue: Venue, generation: u64, command: &Value) -> Result<bool> {
         let ids = match venue {
             Venue::Polymarket => command["assets_ids"].as_array(),
             Venue::Kalshi => {
@@ -33,6 +34,10 @@ impl RecordedSubscription {
             }
         };
         if let Some(ids) = ids {
+            if self.book_generation != Some(generation) {
+                self.instruments = None;
+                self.book_generation = Some(generation);
+            }
             let instruments = Arc::make_mut(self.instruments.get_or_insert_with(Arc::default));
             instruments.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
             return Ok(true);
@@ -48,6 +53,31 @@ pub(crate) fn rejects_books(error: &Value, book_command: Option<i64>) -> bool {
         .as_i64()
         .zip(book_command)
         .is_none_or(|(rejected, book)| rejected == book)
+}
+
+pub(crate) fn visit_message_instruments(venue: Venue, value: &Value, mut f: impl FnMut(&str)) {
+    match venue {
+        Venue::Polymarket => {
+            if let Some(id) = value["asset_id"].as_str().filter(|s| !s.is_empty()) {
+                f(id);
+            }
+            if let Some(changes) = value["price_changes"].as_array() {
+                for item in changes {
+                    if let Some(id) = item["asset_id"].as_str().filter(|s| !s.is_empty()) {
+                        f(id);
+                    }
+                }
+            }
+        }
+        Venue::Kalshi => {
+            if let Some(id) = value["msg"]["market_ticker"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+            {
+                f(id);
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
