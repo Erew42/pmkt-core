@@ -1,6 +1,7 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "build_support"
+backend-path = ["."]
 
 [project]
 name = "pmkt"
@@ -62,8 +63,7 @@ test = [
   "duckdb>=1.5.5,<2",
   "websockets>=15.0",
   "build>=1.2",
-  "setuptools>=68",
-  "wheel",
+  "maturin>=1.7,<2",
   "pytest>=7.4",
   "pytest-asyncio>=0.23",
   # Pinned below 0.16: that release enables rules (FURB157, UP045, E712, I001,
@@ -72,7 +72,6 @@ test = [
   # meantime.
   "ruff>=0.15,<0.16",
   "mypy>=1.8",
-  "types-setuptools",
 ]
 
 [tool.ruff]
@@ -88,15 +87,24 @@ mypy_path = "src"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 
-[tool.setuptools]
-package-dir = {"" = "src"}
-
-[tool.setuptools.packages.find]
-where = ["src"]
-
-[tool.setuptools.package-data]
-pmkt = [
-  "_build_info.json",
-  "py.typed",
-  "text/taxonomy_data/*.json",
+[tool.maturin]
+python-source = "src"
+module-name = "pmkt._native"
+manifest-path = "crates/pmkt-py/Cargo.toml"
+features = ["pyo3/extension-module"]
+locked = true
+include = [
+  { path = "build_support.py", format = "sdist" },
+  { path = "Cargo.toml", format = "sdist" },
+  { path = "Cargo.lock", format = "sdist" },
+  { path = "crates/**/*", format = "sdist" },
+  { path = "tests/fixtures/kalshi_orderbook_*.json", format = "sdist" },
+  { path = "tests/fixtures/raw_capture/*.jsonl.gz", format = "sdist" },
+  { path = "docs/data_dictionary.md", format = "sdist" },
+]
+# Maturin includes the Python package (including py.typed and taxonomy JSON).
+exclude = [
+  "**/__pycache__/**", "**/*.pyc", "src/pmkt/_build_info.json",
+  { path = "src/pmkt/_native*.so", format = "sdist" },
+  { path = "src/pmkt/_native*.pyd", format = "sdist" },
 ]
