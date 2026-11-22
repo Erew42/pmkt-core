@@ -19,7 +19,13 @@ from collections import Counter
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal
+
+from pmkt import _native
+from pmkt.streaming import _python_oracle
+
+if TYPE_CHECKING:
+    import pyarrow as pa
 
 
 class RawCaptureError(ValueError):
@@ -366,7 +372,46 @@ def _read_session_chunks(
         previous, previous_index = chunk, index
 
 
+def reconstruct_raw_capture(
+    session: str | Path, *, version: Literal[1, 2] = 2, target_rows: int = 8192,
+) -> tuple[pa.Table, pa.Table]:
+    """Return verified topbook and depth tables in raw session order.
+
+    The raw envelope records receipt but cannot establish live quote age.
+    Both tables retain their registered schema even for an empty session.
+    """
+    import pyarrow as pa
+
+    result = _native.reconstruct_raw_capture(session, version=version, target_rows=target_rows)
+    return pa.table(result["topbook"]), pa.table(result["depth"])
+
+
 def inspect_session(session: str | Path) -> dict[str, Any]:
+    """Verify sealed chunks, preserving the public CLI report and error type."""
+    if _python_oracle():
+        return _inspect_session_python(session)
+    try:
+        report = _native.inspect_raw_capture(session)
+    except (ValueError, OSError) as exc:
+        raise RawCaptureError(str(exc)) from exc
+    gaps = [{
+        "first_missing": g["first_missing"], "last_missing": g["last_missing"],
+        "next_chunk": g["next_chunk"].name, "missing_frame_count": g["missing_frame_count"],
+    } for g in report["chunk_gaps"]]
+    return {
+        **report, "session": str(Path(session)), "verified_present_chunks": True,
+        "connection_generations": sorted(report["connection_generations"]),
+        "incomplete_files": [p.name for p in report["incomplete_files"]],
+        "chunk_gaps": gaps,
+        "missing_chunk_count": sum(g["last_missing"] - g["first_missing"] + 1 for g in report["chunk_gaps"]),
+        "missing_recorded_frame_count": sum(g["missing_frame_count"] for g in report["chunk_gaps"]),
+    }
+
+
+inspect_raw_capture = inspect_session
+
+
+def _inspect_session_python(session: str | Path) -> dict[str, Any]:
     """Verify and summarize a fixed snapshot of sealed chunks without venue I/O.
 
     Exhaust every chunk so EOF checks run. Memory grows with chunk metadata and

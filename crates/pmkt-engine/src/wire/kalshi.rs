@@ -1,5 +1,22 @@
 use super::*;
 
+/// Price basis applies only to order-book subscriptions; another channel's
+/// command must not change how later depth is interpreted.
+pub(crate) fn subscription_basis(command: &Value) -> Result<Option<bool>> {
+    let params = &command["params"];
+    if !params["channels"]
+        .as_array()
+        .is_some_and(|cs| cs.iter().any(|c| c == "orderbook_delta"))
+    {
+        return Ok(None);
+    }
+    params.get("use_yes_price").map_or(Ok(Some(true)), |v| {
+        v.as_bool()
+            .map(Some)
+            .ok_or_else(|| Error::Invalid("use_yes_price must be boolean".into()))
+    })
+}
+
 pub fn decode(message: &Value) -> Result<Event> {
     let kind = message["type"].as_str().unwrap_or("");
     let body = message

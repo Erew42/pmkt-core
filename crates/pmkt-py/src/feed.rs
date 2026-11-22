@@ -131,6 +131,19 @@ impl ShardFeed {
             .map_err(engine_error)
     }
 
+    fn poll_books(&mut self, now_ns: u64) {
+        self.0.poll_books(now_ns);
+    }
+
+    fn resolved(&self, id: &str) -> bool {
+        self.0.resolved(id)
+    }
+
+    fn transport(&self) -> Option<(u64, Option<i64>)> {
+        self.0.transport()
+    }
+
+    #[pyo3(signature = (shard_id, generation, frame, now_ns, *, detach=true))]
     fn ingest<'py>(
         &mut self,
         py: Python<'py>,
@@ -138,13 +151,24 @@ impl ShardFeed {
         generation: u64,
         frame: &[u8],
         now_ns: u64,
-    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
-        self.0
+        detach: bool,
+    ) -> PyResult<Bound<'py, pyo3::types::PyList>> {
+        if !detach {
+            return pyo3::types::PyList::new(
+                py,
+                self.0
+                    .ingest_updates(shard_id, generation, frame, now_ns)
+                    .map_err(engine_error)?,
+            );
+        }
+        let observations = self
+            .0
             .ingest(shard_id, generation, frame, now_ns)
             .map_err(engine_error)?
             .into_iter()
             .map(|item| observation(py, item))
-            .collect()
+            .collect::<PyResult<Vec<_>>>()?;
+        pyo3::types::PyList::new(py, observations)
     }
 
     fn health<'py>(

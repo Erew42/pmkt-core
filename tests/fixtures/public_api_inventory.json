@@ -774,6 +774,14 @@
       "tier": "advanced"
     },
     {
+      "path": "pmkt.streaming.raw_reader.inspect_raw_capture",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.streaming.raw_reader.reconstruct_raw_capture",
+      "tier": "advanced"
+    },
+    {
       "path": "pmkt.streaming.raw_reader.read_session",
       "tier": "advanced"
     },

@@ -6,10 +6,13 @@ import asyncio
 import contextlib
 from dataclasses import dataclass, field
 from decimal import Decimal
+import json
 import math
 import time
 from typing import Any, Awaitable, Callable, Literal, Sequence, TypeVar
 
+from pmkt import _native
+from pmkt.streaming import _python_oracle
 from pmkt.exchanges.kalshi.ws import (
     AsyncKalshiWebSocketClient,
     KalshiOrderBookState,
@@ -33,6 +36,22 @@ from pmkt.streaming.supervisor import FeedShardHealth, LiveFeedSupervisor
 MANAGED_FEED_MAX_RECONNECT_BACKOFF_SECONDS = 30.0
 
 _T = TypeVar("_T")
+
+
+def _timeout_ns(seconds: float) -> int:
+    return min(2**64 - 1, max(1, round(min(seconds, 2**64) * 1_000_000_000)))
+
+
+def _encode_message(value: Any) -> str:
+    # Only used by callers supplying a decoded message. Preserve Decimal tokens
+    # (including numeric source timestamps) without converting through float.
+    if isinstance(value, dict):
+        return "{" + ",".join(json.dumps(k) + ":" + _encode_message(v) for k, v in value.items()) + "}"
+    if isinstance(value, (list, tuple)):
+        return "[" + ",".join(_encode_message(item) for item in value) + "]"
+    if isinstance(value, Decimal):
+        return str(value) if value.is_finite() else json.dumps(str(value))
+    return json.dumps(value)
 
 
 async def _bounded(operation: Awaitable[_T], timeout: float) -> _T:
@@ -96,7 +115,10 @@ class _Recovery:
 @dataclass
 class _Shard:
     health: FeedShardHealth
-    books: VenueBooks
+    oracle_books: VenueBooks | None
+    native: _native.ShardFeed | None
+    cached: dict[str, PublicBook] = field(default_factory=dict)
+
     client: Any = None
     task: asyncio.Task[None] | None = None
     generation: int = 0
@@ -120,6 +142,11 @@ class _Shard:
     # Only an established-market snapshot can clear an identity conflict, even
     # after recovery timeouts or connection replacement.
     identity_conflicts: set[str] = field(default_factory=set)
+
+    @property
+    def books(self) -> VenueBooks:
+        assert self.oracle_books is not None
+        return self.oracle_books
 
 
 class ManagedBookFeed:
@@ -196,10 +223,17 @@ class ManagedBookFeed:
             }
         )
         self._supervisor.require_preflight_ok()
-        self._shards = [
-            _Shard(health, VenueBooks(venue, list(health.subscribed_instruments)))
-            for health in self._supervisor.venue_shards(venue)
-        ]
+        self._shards = []
+        oracle = _python_oracle()
+        for health in self._supervisor.venue_shards(venue):
+            ids_in_shard = list(health.subscribed_instruments)
+            native = None if oracle else _native.ShardFeed(
+                venue, health.shard_id, ids_in_shard,
+                liveness_ns=_timeout_ns(liveness_timeout),
+                snapshot_ns=_timeout_ns(snapshot_timeout),
+            )
+            books = VenueBooks(venue, ids_in_shard) if oracle else None
+            self._shards.append(_Shard(health, books, native))
         self._by_instrument = {
             i: s for s in self._shards for i in s.health.subscribed_instruments
         }
@@ -240,7 +274,13 @@ class ManagedBookFeed:
 
     def _invalidate(self, shard: _Shard, reason: str) -> None:
         # Reset metadata as well as ladders: no evidence crosses generations.
-        shard.books = VenueBooks(self.venue, list(shard.health.subscribed_instruments))
+        if shard.native is None:
+            shard.oracle_books = VenueBooks(self.venue, list(shard.health.subscribed_instruments))
+        elif self._closed:
+            shard.native.close()
+        elif shard.native.transport() is not None:
+            shard.native.disconnected(shard.generation, reason)
+        shard.cached.clear()
         shard.updates.clear()
         shard.source_timestamps.clear()
         shard.recovery.clear()
@@ -287,6 +327,11 @@ class ManagedBookFeed:
                 shard.alive = now - age
         if shard.alive is None or now - shard.alive > self.liveness_timeout:
             self._invalidate(shard, "liveness_expired")
+        elif shard.native is not None and self.venue == "polymarket":
+            transport = shard.native.transport()
+            evidence = round(shard.alive * 1_000_000_000)
+            if transport is not None and evidence > transport[0]:
+                shard.native.heartbeat(shard.generation, evidence)
 
     def _reset_book(self, shard: _Shard, instrument: str) -> None:
         # Subscription sequence continuity belongs to the shard, not this book.
@@ -345,6 +390,21 @@ class ManagedBookFeed:
         # task batches only the affected instruments and is cancelled on teardown.
         try:
             while not shard.restart:
+                if shard.native is not None:
+                    self._check_liveness(shard)
+                    if shard.restart:
+                        return
+                    ids = shard.native.begin_requests(shard.generation, time.monotonic_ns())
+                    if ids:
+                        await _bounded(self._request_snapshots(shard, ids), self.connect_timeout)
+                        if shard.restart:
+                            return
+                        self._check_liveness(shard)
+                        if shard.restart:
+                            return
+                        shard.native.finish_requests(shard.generation, ids, time.monotonic_ns())
+                    await asyncio.sleep(0.05)
+                    continue
                 self._check_books(shard)
                 pending = {
                     i: r for i, r in shard.recovery.items() if r.phase == "pending"
@@ -389,6 +449,25 @@ class ManagedBookFeed:
         """Unknown instruments raise KeyError; liveness expiry latches invalidation."""
         shard = self._by_instrument[instrument]
         self._check_liveness(shard)
+        if shard.native is not None:
+            now = time.monotonic()
+            h = shard.native.health(instrument, round(now * 1_000_000_000))
+            age = h["book_update_age_ns"]
+            connected = shard.health.connection_state == "connected" and not shard.restart
+            reason = h["reason"]
+            if shard.restart:
+                reason = shard.reason
+            elif not connected:
+                reason = "market_resolved" if shard.native.resolved(instrument) else "no_initial_snapshot"
+            return PublicBookHealth(
+                self.venue, instrument, shard.health.shard_id, shard.generation,
+                "closed" if self._closed else shard.health.connection_state,
+                connected and h["usable"], reason,
+                None if shard.alive is None else max(0.0, now - shard.alive),
+                None if age is None else age / 1_000_000_000,
+                shard.health.reconnect_count, shard.health.error_count, shard.last_error,
+                tuple(h["quality_flags"]), h["metadata_revision"] if h["generation"] == shard.generation else 0,
+            )
         self._check_books(shard)
         state = (
             shard.books.polymarket[instrument]
@@ -431,6 +510,32 @@ class ManagedBookFeed:
         )
 
     def book(self, instrument: str) -> PublicBook | None:
+        shard = self._by_instrument[instrument]
+        if shard.native is not None:
+            self._check_liveness(shard)
+            if shard.restart or shard.health.connection_state != "connected":
+                return None
+            cached = shard.cached.get(instrument)
+            if cached is not None:
+                shard.native.poll_books(time.monotonic_ns())
+                return cached
+            observed = shard.native.observation(instrument, time.monotonic_ns())["book"]
+            if observed is None:
+                return None
+            source = observed["source_timestamp_json"]
+            result = PublicBook(
+                self.venue, instrument,
+                (observed["market_id"] or "") if self.venue == "polymarket" else observed["market_id"],
+                shard.health.shard_id,
+                observed["generation"],
+                tuple((Decimal(p), Decimal(q)) for p, q in observed["bids"]),
+                tuple((Decimal(p), Decimal(q)) for p, q in observed["asks"]),
+                observed["received_monotonic_ns"] / 1_000_000_000,
+                json.loads(source, parse_float=Decimal) if source is not None else None,
+                tuple(observed["quality_flags"]), observed["metadata_revision"],
+            )
+            shard.cached[instrument] = result
+            return result
         health = self.health(instrument)
         if not health.usable:
             return None
@@ -520,7 +625,11 @@ class ManagedBookFeed:
                 raise asyncio.CancelledError()
             shard.connected = shard.alive = time.monotonic()
             shard.health.mark_connected(now_monotonic_ns=time.monotonic_ns())
+            if shard.native is not None:
+                shard.native.connected(shard.generation, round(shard.connected * 1_000_000_000),
+                                       command_id=shard.command_id)
             iterator = (
+                client._iter_raw_frames() if shard.native is not None else
                 client.iter_messages(reconnect=False, strict_decode=True)
                 if self.venue == "polymarket"
                 else client.iter_messages(
@@ -548,7 +657,10 @@ class ManagedBookFeed:
                     except StopAsyncIteration:
                         raise ConnectionError("disconnected") from None
                     count += 1
-                    self._ingest(shard, message, count)
+                    if isinstance(message, bytes):
+                        self._ingest_raw(shard, message)
+                    else:
+                        self._ingest(shard, message, count)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -607,6 +719,8 @@ class ManagedBookFeed:
                     self._invalidate(shard, "heartbeat_failed")
                     return
                 shard.alive = time.monotonic()
+                if shard.native is not None:
+                    shard.native.heartbeat(shard.generation, round(shard.alive * 1_000_000_000))
         except Exception:
             self._invalidate(shard, "heartbeat_failed")
 
@@ -614,7 +728,30 @@ class ManagedBookFeed:
     def _decode_error(reason: str, raw: Any) -> None:
         raise ConnectionError("malformed_frame")
 
+    def _ingest_raw(self, shard: _Shard, frame: bytes) -> None:
+        native = shard.native
+        assert native is not None
+        try:
+            touched = native.ingest(shard.health.shard_id, shard.generation, frame,
+                                    time.monotonic_ns(), detach=False)
+        except ValueError as exc:
+            reason = str(exc)
+            if self.venue == "polymarket" and reason == "malformed_frame":
+                reason = "WebSocketProtocolError"
+            self._invalidate(shard, reason)
+            raise ConnectionError(reason) from exc
+        for instrument in touched:
+            shard.cached.pop(instrument, None)
+        if self.venue == "kalshi":
+            transport = native.transport()
+            assert transport is not None
+            alive, shard.sid = transport
+            shard.alive = alive / 1_000_000_000
+
     def _ingest(self, shard: _Shard, message: dict[str, Any], count: int) -> None:
+        if shard.native is not None:
+            self._ingest_raw(shard, _encode_message(message).encode())
+            return
         # The recovery task checks missing initial snapshots every 50 ms. Ingress
         # only needs to latch existing deadlines before applying a late repair.
         if shard.recovery:

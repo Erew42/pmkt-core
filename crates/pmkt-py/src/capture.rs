@@ -1,7 +1,8 @@
 use crate::{arrow::ArrowStream, engine_error};
 use pmkt_engine::{
+    Venue,
     capture::inspect_session,
-    emit::{QuoteBatchBuilder, Version, reconstruct_session},
+    emit::{QuoteBatchBuilder, QuoteBatches, Version, reconstruct_merged, reconstruct_session},
 };
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyDict};
 use std::path::PathBuf;
@@ -47,28 +48,86 @@ pub fn reconstruct_raw_capture(
     version: u8,
     target_rows: usize,
 ) -> PyResult<Bound<'_, PyDict>> {
-    let version = match version {
-        1 => Version::V1,
-        2 => Version::V2,
-        _ => return Err(PyValueError::new_err("version must be 1 or 2")),
+    let version = schema(version)?;
+    let mut batches = Vec::new();
+    py.detach(|| {
+        reconstruct_session(path, version, target_rows, |b| {
+            batches.push(b);
+            Ok(())
+        })
+    })
+    .map_err(engine_error)?;
+    tables(py, batches, version)
+}
+
+fn schema(version: u8) -> PyResult<Version> {
+    match version {
+        1 => Ok(Version::V1),
+        2 => Ok(Version::V2),
+        _ => Err(PyValueError::new_err("version must be 1 or 2")),
+    }
+}
+
+/// One (copy, connection, session directory) per redundant stream.
+/// Optional evidence carries each selected message and all contributing origins.
+#[pyfunction]
+#[pyo3(signature = (venue, sessions, *, version=2, target_rows=8192, include_messages=false))]
+pub fn merge_raw_captures<'py>(
+    py: Python<'py>,
+    venue: &str,
+    sessions: Vec<(String, String, PathBuf)>,
+    version: u8,
+    target_rows: usize,
+    include_messages: bool,
+) -> PyResult<Bound<'py, PyDict>> {
+    let venue = match venue {
+        "kalshi" => Venue::Kalshi,
+        "polymarket" => Venue::Polymarket,
+        _ => return Err(PyValueError::new_err("unknown venue")),
     };
-    let (top, depth) = py
-        .detach(|| -> pmkt_engine::Result<_> {
-            let mut top = Vec::new();
-            let mut depth = Vec::new();
-            reconstruct_session(path, version, target_rows, |batches| {
-                top.push(batches.topbook);
-                depth.push(batches.depth);
-                Ok(())
-            })?;
-            if top.is_empty() {
-                let empty = QuoteBatchBuilder::new(version).finish()?;
-                top.push(empty.topbook);
-                depth.push(empty.depth);
-            }
-            Ok((top, depth))
+    let version = schema(version)?;
+    let mut batches = vec![];
+    let mut messages = vec![];
+    let (stats, coverage) = py
+        .detach(|| {
+            reconstruct_merged(
+                venue,
+                sessions,
+                version,
+                target_rows,
+                |b| {
+                    batches.push(b);
+                    Ok(())
+                },
+                |m| {
+                    if include_messages {
+                        messages.push(serde_json::to_string(m)?);
+                    }
+                    Ok(())
+                },
+            )
         })
         .map_err(engine_error)?;
+    let result = tables(py, batches, version)?;
+    result.set_item("messages", messages)?;
+    let summary = serde_json::json!({"stats": stats, "coverage": coverage});
+    result.set_item("summary", summary.to_string())?;
+    Ok(result)
+}
+
+fn tables(
+    py: Python<'_>,
+    mut batches: Vec<QuoteBatches>,
+    version: Version,
+) -> PyResult<Bound<'_, PyDict>> {
+    if batches.is_empty() {
+        batches.push(
+            QuoteBatchBuilder::new(version)
+                .finish()
+                .map_err(engine_error)?,
+        );
+    }
+    let (top, depth): (Vec<_>, Vec<_>) = batches.into_iter().map(|b| (b.topbook, b.depth)).unzip();
     let result = PyDict::new(py);
     result.set_item(
         "topbook_rows",

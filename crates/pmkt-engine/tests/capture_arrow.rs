@@ -4,9 +4,11 @@ use arrow_array::{
 use arrow_schema::DataType;
 use flate2::{Compression, write::GzEncoder};
 use pmkt_engine::{
-    BookMode, VenueBooks,
+    BookMode, Venue, VenueBooks,
     capture::{CaptureItem, SealedChunk, inspect_session, list_session_chunks, read_session},
-    emit::{QuoteBatchBuilder, Receive, Version, reconstruct_session},
+    emit::{
+        QuoteBatchBuilder, QuoteBatches, Receive, Version, reconstruct_merged, reconstruct_session,
+    },
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -349,6 +351,131 @@ fn assert_book_health(batch: &RecordBatch, expected: &[&str], valid: bool, intac
             intact
         );
     }
+}
+
+fn merged_poly(frames: &[Value], covering_copy: &[Value]) -> Vec<QuoteBatches> {
+    let mut sessions = vec![];
+    for (copy, data) in [("a", frames), ("b", covering_copy)] {
+        if !data.is_empty() {
+            let path = root();
+            seal(&path, 1, data, None);
+            sessions.push((copy.into(), "conn".into(), path));
+        }
+    }
+    let mut batches = vec![];
+    reconstruct_merged(
+        Venue::Polymarket,
+        sessions,
+        Version::V2,
+        1,
+        |b| {
+            batches.push(b);
+            Ok(())
+        },
+        |_| Ok(()),
+    )
+    .unwrap();
+    batches
+}
+
+fn poly_snapshot(ms: i64) -> Value {
+    json!({"event_type":"book","market":"M","asset_id":"P","timestamp":ms,
+           "bids":[["0.4","3"]],"asks":[["0.6","2"]]})
+}
+
+#[test]
+fn merged_control_only_copy_can_bridge_a_transport_hole() {
+    let ms = 1735689600000;
+    let book = raw(1, 1, "polymarket", poly_snapshot(ms));
+    let mut gap = raw(2, 1, "polymarket", json!({}));
+    gap["frame_type"] = json!("disk_pause_gap");
+    gap["direction"] = json!("local");
+    let mut change = raw(
+        3,
+        1,
+        "polymarket",
+        json!({
+            "event_type":"price_change","market":"M","timestamp":ms+1,
+            "price_changes":[{"asset_id":"P","side":"BUY","price":"0.4","size":"5"}]
+        }),
+    );
+    change["received_utc"] = json!("2025-01-01T00:00:01+00:00");
+    let mut pong = book.clone();
+    pong["frame_type"] = json!("ws_pong");
+    pong["direction"] = json!("received_control_base64");
+    let mut later = pong.clone();
+    later["local_frame_seq"] = json!(2);
+    later["received_utc"] = change["received_utc"].clone();
+    let primary = [book, gap, change];
+    for (other, valid) in [(vec![], false), (vec![pong, later], true)] {
+        let batches = merged_poly(&primary, &other);
+        assert_eq!(batches.len(), 2);
+        let after = &batches[1];
+        assert_eq!(
+            column::<BooleanArray>(&after.topbook, "valid_state").value(0),
+            valid
+        );
+        assert_eq!(after.depth.num_rows(), if valid { 2 } else { 0 });
+        if !valid {
+            assert_book_health(
+                &after.topbook,
+                &[
+                    "delta_before_snapshot",
+                    "empty_ask",
+                    "no_initial_snapshot",
+                    "reconnect",
+                ],
+                false,
+                false,
+            );
+        }
+    }
+}
+
+#[test]
+fn merged_observations_bump_the_clock_across_batches_and_clock_regressions() {
+    let ms = 1735689600000;
+    let mut first = raw(
+        1,
+        1,
+        "polymarket",
+        json!([poly_snapshot(ms), poly_snapshot(ms + 1)]),
+    );
+    first["received_utc"] = json!("2025-01-01T00:00:00.500000+00:00");
+    let last = raw(2, 1, "polymarket", poly_snapshot(ms + 2));
+    let batches = merged_poly(&[first, last], &[]);
+    assert_eq!(batches.len(), 3);
+    for (i, batch) in batches.iter().enumerate() {
+        let utc = format!("2025-01-01T00:00:00.{:06}+00:00", 500000 + i);
+        assert_eq!(
+            column::<StringArray>(&batch.topbook, "received_at_utc").value(0),
+            utc
+        );
+        assert_eq!(batch.depth.num_rows(), 2);
+        assert!(
+            column::<StringArray>(&batch.depth, "received_at_utc")
+                .iter()
+                .all(|t| t == Some(&utc))
+        );
+    }
+}
+
+#[test]
+fn merged_resolution_before_first_snapshot_is_terminal() {
+    let ms = 1735689600000;
+    let resolved = raw(
+        1,
+        1,
+        "polymarket",
+        json!({
+            "event_type":"market_resolved","market":"M","assets_ids":["P"],"timestamp":ms
+        }),
+    );
+    let book = raw(2, 1, "polymarket", poly_snapshot(ms + 1));
+    let batches = merged_poly(&[resolved, book], &[]);
+    assert_eq!(batches.len(), 1);
+    assert_book_health(&batches[0].topbook, &["market_resolved"], false, true);
+    assert_book_health(&batches[0].depth, &["market_resolved"], false, true);
 }
 
 #[test]

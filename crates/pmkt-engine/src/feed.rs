@@ -86,6 +86,7 @@ pub struct ShardFeed {
     venue: Venue,
     generation: Option<u64>,
     timeouts: FeedTimeouts,
+    initial_deadline_checked: bool,
     connection: Connection,
     books: VenueBooks,
     count: u64,
@@ -115,8 +116,9 @@ impl ShardFeed {
             venue,
             generation: None,
             timeouts,
+            initial_deadline_checked: false,
             connection: Connection::Initialized,
-            books: VenueBooks::new(mode, instruments),
+            books: VenueBooks::managed(mode, instruments),
             count: 0,
             updates: BTreeMap::new(),
             revisions: BTreeMap::new(),
@@ -150,6 +152,7 @@ impl ShardFeed {
         self.reset();
         self.revisions.clear();
         self.count = 0;
+        self.initial_deadline_checked = false;
         self.generation = Some(generation);
         self.connection = Connection::Connected {
             since: now_ns,
@@ -220,15 +223,22 @@ impl ShardFeed {
             }
         }
     }
-    fn missing_snapshot(&mut self, id: &str, now: u64) {
-        if let Connection::Connected { since, .. } = self.connection
+    pub fn poll_books(&mut self, now: u64) {
+        self.deadlines(now);
+        if !self.initial_deadline_checked
+            && let Connection::Connected { since, .. } = self.connection
             && now.saturating_sub(since) >= self.timeouts.snapshot_ns
-            && self.books.get(id).is_some_and(|b| !b.initialized())
-            && !self.books.resolved(id)
         {
-            self.recovery
-                .entry(id.into())
-                .or_insert(Recovery::Pending(RecoveryReason::SnapshotTimeout));
+            self.initial_deadline_checked = true;
+            for id in self.books.instruments() {
+                if !self.books.get(id).expect("subscribed book").initialized()
+                    && !self.books.resolved(id)
+                {
+                    self.recovery
+                        .entry(id.into())
+                        .or_insert(Recovery::Pending(RecoveryReason::SnapshotTimeout));
+                }
+            }
         }
     }
     /// Starts one batch of resnapshot requests. Keep receiving while the caller sends.
@@ -236,7 +246,7 @@ impl ShardFeed {
         self.check_generation(generation)?;
         self.check_liveness(now_ns);
         self.check_generation(generation)?;
-        self.deadlines(now_ns);
+        self.poll_books(now_ns);
         if matches!(
             self.connection,
             Connection::Connected {
@@ -245,14 +255,6 @@ impl ShardFeed {
             }
         ) {
             return Ok(vec![]);
-        }
-        for id in self
-            .books
-            .instruments()
-            .map(str::to_owned)
-            .collect::<Vec<_>>()
-        {
-            self.missing_snapshot(&id, now_ns);
         }
         let mut ids = vec![];
         for (id, phase) in &mut self.recovery {
@@ -298,19 +300,63 @@ impl ShardFeed {
         bytes: &[u8],
         now_ns: u64,
     ) -> Result<Vec<Observation>> {
+        self.ingest_with(shard_id, generation, bytes, now_ns, |feed, id| {
+            feed.observation(id, now_ns)
+        })
+    }
+    /// Apply the frame without detaching ladders. Consumers invalidate cached reads by ID.
+    pub fn ingest_updates(
+        &mut self,
+        shard_id: &str,
+        generation: u64,
+        bytes: &[u8],
+        now_ns: u64,
+    ) -> Result<Vec<String>> {
+        self.ingest_with(shard_id, generation, bytes, now_ns, |_, id| {
+            Ok(id.to_owned())
+        })
+    }
+    pub fn resolved(&self, id: &str) -> bool {
+        self.books.resolved(id)
+    }
+    pub fn transport(&self) -> Option<(u64, Option<i64>)> {
+        match self.connection {
+            Connection::Connected { alive, ref sub, .. } => Some((
+                alive,
+                match sub {
+                    Subscription::Kalshi(sid) => Some(*sid),
+                    _ => None,
+                },
+            )),
+            _ => None,
+        }
+    }
+    fn ingest_with<T>(
+        &mut self,
+        shard_id: &str,
+        generation: u64,
+        bytes: &[u8],
+        now_ns: u64,
+        project: impl FnMut(&mut Self, &str) -> Result<T>,
+    ) -> Result<Vec<T>> {
         if shard_id != self.id {
             return Err(Error::Invalid("wrong shard".into()));
         }
         self.check_generation(generation)?;
         self.check_liveness(now_ns);
         self.check_generation(generation)?;
-        let result = self.apply_frame(bytes, now_ns);
+        let result = self.apply_frame(bytes, now_ns, project);
         if let Err(error) = &result {
             self.invalidate(&error.to_string());
         }
         result
     }
-    fn apply_frame(&mut self, bytes: &[u8], now: u64) -> Result<Vec<Observation>> {
+    fn apply_frame<T>(
+        &mut self,
+        bytes: &[u8],
+        now: u64,
+        mut project: impl FnMut(&mut Self, &str) -> Result<T>,
+    ) -> Result<Vec<T>> {
         let messages =
             wire::live_messages(bytes).map_err(|_| Error::Invalid("malformed_frame".into()))?;
         if self.venue == Venue::Polymarket
@@ -367,7 +413,7 @@ impl ShardFeed {
             }
             for item in self.books.apply_event(event, self.count) {
                 self.observe(&item, now);
-                observations.push(self.observation(&item.instrument, now)?);
+                observations.push(project(self, &item.instrument)?);
             }
         }
         Ok(observations)
@@ -424,7 +470,14 @@ impl ShardFeed {
             Some(phase @ Recovery::Grace { .. }) if !crossed => {
                 *phase = Recovery::Pending(RecoveryReason::Integrity);
                 self.books.reset_book(id);
-                self.updates.remove(id);
+                // The malformed depth update was received now, even though its
+                // ladder and source timestamp were discarded before publication.
+                if matches!(item.kind, UpdateKind::Snapshot | UpdateKind::Delta) {
+                    self.updates
+                        .insert(id.clone(), (now, SourceTime::default()));
+                } else {
+                    self.updates.remove(id);
+                }
             }
             None if !intact => {
                 let grace = self.venue == Venue::Polymarket
@@ -447,8 +500,7 @@ impl ShardFeed {
     }
     pub fn health(&mut self, id: &str, now_ns: u64) -> Result<PublicBookHealth> {
         self.check_liveness(now_ns);
-        self.deadlines(now_ns);
-        self.missing_snapshot(id, now_ns);
+        self.poll_books(now_ns);
         let book = self
             .books
             .get(id)

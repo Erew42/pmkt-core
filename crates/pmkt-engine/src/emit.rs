@@ -1,6 +1,6 @@
 //! Public quote tables. Conversion to binary64 happens only at this output boundary.
 mod reconstruct;
-pub use reconstruct::reconstruct_session;
+pub use reconstruct::{reconstruct_merged, reconstruct_session};
 
 use crate::{
     Error, Result, ScaledDecimal as D, Venue,
