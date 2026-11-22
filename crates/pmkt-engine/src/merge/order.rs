@@ -162,3 +162,94 @@ pub(super) fn resolve(
     }
     Ok(order)
 }
+
+/// A reconnect can deliver a cached checkpoint after a later change stamped
+/// in the same millisecond. Move only that checkpoint, and only when a second
+/// recorder identifies its position in an uninterrupted sequence for the token.
+pub(super) fn place_cached_books(
+    order: &mut [usize],
+    entries: &[Entry],
+    sessions: &[super::SessionCoverage],
+) {
+    for (snap, entry) in entries.iter().enumerate() {
+        if entry.reconnect
+            && entry.key.kind == "book"
+            && entry.key.venue_ms.is_some()
+            && let Some((old, new)) = cached_position(order, entries, sessions, snap)
+        {
+            order[new..=old].rotate_right(1);
+        }
+    }
+}
+
+fn cached_position(
+    order: &[usize],
+    entries: &[Entry],
+    sessions: &[super::SessionCoverage],
+    snap: usize,
+) -> Option<(usize, usize)> {
+    let checkpoint = &entries[snap];
+    let [(_, received)] = checkpoint.origins.as_slice() else {
+        return None;
+    };
+    let asset = checkpoint.message["asset_id"].as_str()?;
+    let hash = checkpoint.message["hash"]
+        .as_str()
+        .filter(|h| !h.is_empty())?;
+
+    // A hash identifies an asset's state, not a frame. Keep multi-asset
+    // envelopes atomic. A repeated anchor or several transitions for this
+    // asset in one envelope do not identify a unique insertion point.
+    let mut changes = Vec::new();
+    let mut anchor = None;
+    for (pos, &node) in order.iter().enumerate() {
+        let entry = &entries[node];
+        if node != snap && entry.key.kind == "book" && entry.message["asset_id"] == asset {
+            return None;
+        }
+        if entry.key.kind != "price_change" {
+            continue;
+        }
+        let mut legs = entry.message["price_changes"]
+            .as_array()?
+            .iter()
+            .filter(|l| l["asset_id"] == asset);
+        if let Some(leg) = legs.next() {
+            let change_hash = leg["hash"].as_str().filter(|h| !h.is_empty())?;
+            if legs.next().is_some() || entry.key.venue_ms != checkpoint.key.venue_ms {
+                return None;
+            }
+            if change_hash == hash && anchor.replace(changes.len()).is_some() {
+                return None;
+            }
+            changes.push((pos, entry));
+        }
+    }
+    let anchor = anchor?;
+    let (next, later_change) = *changes.get(anchor + 1)?;
+    let old = order.iter().position(|&n| n == snap)?;
+    if old <= next {
+        return None;
+    }
+
+    // Only reception across a broken connection may be superseded. Keep all
+    // ordering evidence from the checkpoint's own uninterrupted interval.
+    if order[next..old].iter().any(|&n| {
+        entries[n]
+            .origins
+            .iter()
+            .any(|(_, o)| o.receipt_period() == received.receipt_period())
+    }) {
+        return None;
+    }
+    let anchor_change = changes[anchor].1;
+    let proven = anchor_change.origins.iter().any(|(_, before)| {
+        before.receipt_period().bridges(sessions, received)
+            && later_change.origins.iter().any(|(_, after)| {
+                before.receipt_period() == after.receipt_period()
+                    && (before.frame_seq, before.position) < (after.frame_seq, after.position)
+                    && after.received_us <= received.received_us
+            })
+    });
+    proven.then_some((old, next))
+}

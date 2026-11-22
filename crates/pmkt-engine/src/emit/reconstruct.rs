@@ -1,12 +1,13 @@
 use super::{QuoteBatchBuilder, QuoteBatches, Receive, Version, utc_text};
 use crate::{
     Error, Result, Venue,
-    book::{BookMode, SequenceCheck, VenueBooks},
-    capture::{CaptureItem, SealedChunk, SessionChunks, list_session_chunks},
+    book::{Book, BookMode, SequenceCheck, UpdateKind, VenueBooks},
+    capture::{CaptureItem, RawFrame, SealedChunk, SessionChunks, list_session_chunks},
     health::Integrity,
     merge::{
-        CopyMerge, EndReason, MergeOptions, MergeStats, MergedMessage, SessionCoverage,
-        SessionOccurrences, Stream, received_us, uncovered_intervals,
+        CopyMerge, EndReason, MergeOptions, MergeStats, MergedMessage, Origin, ReceiptPeriod,
+        SessionCoverage, SessionEvidence, SessionOccurrences, Stream, received_us,
+        recorded_message, uncovered_intervals,
     },
     wire::{self, Event},
 };
@@ -59,8 +60,61 @@ struct Receipt<'a> {
     recording_id: &'a str,
 }
 
+// The latest applied depth update per token and the original recorder intervals
+// which saw it. Metadata may advance the book timestamp without changing its depth.
+struct MergedDepth {
+    coverage: Arc<[SessionCoverage]>,
+    receipts: Vec<ReceiptPeriod>,
+    latest: BTreeMap<String, (i64, Vec<ReceiptPeriod>)>,
+}
+
+impl MergedDepth {
+    fn retained(&self, books: &VenueBooks, event: &Event, m: &MergedMessage) -> Option<String> {
+        if !m.late || !m.reconnect_snapshot {
+            return None;
+        }
+        let Event::Books(updates) = event else {
+            return None;
+        };
+        let [u] = updates.as_slice() else { return None };
+        let book = books.get(&u.instrument)?;
+        if !u.action.is_snapshot()
+            || book.integrity() != Integrity::Intact
+            || book.market()? != u.market.as_deref()?
+        {
+            return None;
+        }
+        let (latest, periods) = self.latest.get(&u.instrument)?;
+        (m.venue_ts_ms? < *latest
+            && periods
+                .iter()
+                .any(|p| p.bridges(&self.coverage, m.origin())))
+        .then(|| u.instrument.clone())
+    }
+
+    fn record(&mut self, book: &Book, at: Option<i64>) {
+        // VenueBooks keeps the token's established market across resets. A reset
+        // leaves the ladder awaiting a snapshot; a fresh baseline replaces its proof.
+        let instrument = book.instrument();
+        let Some(at) =
+            at.filter(|_| book.integrity() == Integrity::Intact && book.market().is_some())
+        else {
+            self.latest.remove(instrument);
+            return;
+        };
+        if let Some((stamp, periods)) = self.latest.get_mut(instrument) {
+            *stamp = at;
+            periods.clone_from(&self.receipts);
+        } else {
+            self.latest
+                .insert(instrument.to_owned(), (at, self.receipts.clone()));
+        }
+    }
+}
+
 struct ReconstructDriver<F> {
     books: VenueBooks,
+    merged_depth: Option<MergedDepth>,
     count: u64,
     last_utc: BTreeMap<String, i64>,
     batch: QuoteBatchBuilder,
@@ -75,6 +129,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         };
         Self {
             books: VenueBooks::new(mode, std::iter::empty::<String>()),
+            merged_depth: None,
             count: 0,
             last_utc: BTreeMap::new(),
             batch: QuoteBatchBuilder::new(version),
@@ -89,7 +144,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         position: Option<usize>,
         subscriptions: impl Iterator<Item = &'a BTreeSet<String>> + Clone,
         book_command: Option<i64>,
-        sequence_check: SequenceCheck,
+        merged: Option<&MergedMessage>,
     ) -> Result<()> {
         self.count += 1;
         let venue = self.books.mode().venue();
@@ -144,11 +199,35 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
         if let Some(i) = position {
             reference.push_str(&format!(":{i}"));
         }
-        for item in self.books.apply_event(event, self.count, sequence_check) {
-            let book = self.books.get(&item.instrument).expect("touched book");
+        let retained = self
+            .merged_depth
+            .as_ref()
+            .and_then(|depth| depth.retained(&self.books, &event, merged?));
+        let touched = if retained.is_some() {
+            // The older checkpoint observes the current book at a new receipt.
+            Vec::new()
+        } else {
+            let check = if merged.is_some() {
+                SequenceCheck::SourceCoverage
+            } else {
+                SequenceCheck::Connection
+            };
+            self.books.apply_event(event, self.count, check)
+        };
+        let applied = touched.into_iter().map(|item| {
+            (
+                item.instrument,
+                matches!(item.kind, UpdateKind::Snapshot | UpdateKind::Delta),
+            )
+        });
+        for (instrument, changed_depth) in applied.chain(retained.map(|id| (id, false))) {
+            let book = self.books.get(&instrument).expect("touched book");
+            if changed_depth && let (Some(depth), Some(m)) = (&mut self.merged_depth, merged) {
+                depth.record(book, m.venue_ts_ms);
+            }
             // The top and all depth rows of one observation share one adjusted clock.
             let adjusted;
-            let (clock, utc) = match self.last_utc.get(&item.instrument) {
+            let (clock, utc) = match self.last_utc.get(&instrument) {
                 Some(prev) if *prev >= frame.us => {
                     let clock = prev
                         .checked_add(1)
@@ -160,7 +239,7 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
                 }
                 _ => (frame.us, frame.utc),
             };
-            self.last_utc.insert(item.instrument.clone(), clock);
+            self.last_utc.insert(instrument.clone(), clock);
             self.batch.push(
                 book,
                 Receive {
@@ -179,9 +258,9 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
                 && !self
                     .books
                     .complementary
-                    .defer(&item.instrument, self.count, frame.clock_ns)
+                    .defer(&instrument, self.count, frame.clock_ns)
             {
-                self.books.reset_book(&item.instrument);
+                self.books.reset_book(&instrument);
             }
         }
         if self.batch.row_count() >= self.target_rows {
@@ -198,8 +277,8 @@ impl<F: FnMut(QuoteBatches) -> Result<()>> ReconstructDriver<F> {
     }
 }
 
-/// Merge redundant sessions in venue order and keep the winning frame's original
-/// causal coordinates. A receive-time hole breaks continuity only if no copy spans it.
+/// Replay one session in file order, or merge redundant sessions in venue order.
+/// Keep the winning frame's original causal coordinates. A receive-time hole breaks continuity only if no copy spans it.
 pub fn reconstruct_merged(
     venue: Venue,
     mut sessions: Vec<(String, String, PathBuf)>,
@@ -212,10 +291,10 @@ pub fn reconstruct_merged(
         return Err(Error::Invalid("batch row target must be positive".into()));
     }
     sessions.sort();
-    let multiple = sessions.len() > 1;
     let mut streams = BTreeMap::<_, Vec<_>>::new();
     let mut coverage = Vec::new();
     let mut subscribed = Vec::new();
+    let singleton = sessions.len() == 1;
     for (copy, connection, path) in sessions {
         let input = Input::open(&path)?;
         if input.venue().is_some_and(|v| v != venue) {
@@ -229,6 +308,16 @@ pub fn reconstruct_merged(
         };
         let name = session.file_name().and_then(|p| p.to_str()).unwrap_or("");
         let stream = Stream::new(copy, connection);
+        if singleton {
+            let mut source = RecordedSource {
+                evidence: SessionEvidence::new(stream, name),
+                stats: MergeStats::default(),
+                latest_us: i64::MIN,
+                on_message: &mut on_message,
+            };
+            replay_file(&input, venue, version, target_rows, emit, Some(&mut source))?;
+            return Ok((source.stats, vec![source.evidence.finish()]));
+        }
         let occurrences = || -> Result<_> {
             Ok(SessionOccurrences::new(
                 stream.clone(),
@@ -238,16 +327,14 @@ pub fn reconstruct_merged(
         };
         // Venue ordering can emit before a different copy has finished proving
         // coverage. Scan the same sealed inputs first, retaining only intervals.
-        if multiple {
-            let mut scan = occurrences()?;
-            scan.try_for_each(|item| item.map(drop))?;
-            subscribed.push(scan.subscription());
-            coverage.push(scan.finish());
-        }
+        let mut scan = occurrences()?;
+        scan.try_for_each(|item| item.map(drop))?;
+        subscribed.push(scan.subscription());
+        coverage.push(scan.finish());
         let source = occurrences()?;
         streams.entry(stream).or_default().push(source);
     }
-    if multiple {
+    let pooled = {
         // A copy bridges a hole only for the instruments it subscribed to, so copies
         // of one subscription pool their coverage and other subscriptions do not.
         let mut groups = BTreeMap::<_, Vec<_>>::new();
@@ -280,20 +367,43 @@ pub fn reconstruct_merged(
                 );
             }
         }
-        for (source, (group, periods)) in streams.values_mut().flatten().zip(periods) {
-            source.coverage_group = group;
-            source.coverage_periods = periods;
-        }
+        periods
+    };
+    // During ordering each source is its own coverage group. Pool only when
+    // applying the merged stream to the books, retaining the recorder evidence
+    // needed to place a cached checkpoint across another recorder's reconnect.
+    for (index, source) in streams.values_mut().flatten().enumerate() {
+        source.evidence.coverage_group = index;
     }
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut periods = BTreeMap::new();
     let mut kalshi_basis = None;
     let mut subscriptions = BTreeMap::new();
-    let stats = CopyMerge::new(venue, MergeOptions::default())?.merge(
+    let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
+    merger.verified_sessions = coverage.into();
+    if venue == Venue::Polymarket {
+        driver.merged_depth = Some(MergedDepth {
+            coverage: Arc::clone(&merger.verified_sessions),
+            receipts: Vec::new(),
+            latest: BTreeMap::new(),
+        });
+    }
+    let stats = merger.merge(
         streams
             .values_mut()
             .map(|sessions| sessions.iter_mut().flatten()),
-        |m| {
+        |mut m| {
+            if let Some(depth) = &mut driver.merged_depth {
+                depth.receipts.clear();
+                depth
+                    .receipts
+                    .extend(m.occurrences.iter().map(Origin::receipt_period));
+            }
+            for o in &mut m.occurrences {
+                let (group, periods) = &pooled[o.coverage_group];
+                o.coverage_group = *group;
+                o.coverage_period = periods[o.coverage_period];
+            }
             on_message(&m)?;
             let origin = m.origin();
             // A hole in the receipt of one subscription restarts only its instruments.
@@ -354,7 +464,7 @@ pub fn reconstruct_merged(
                     .iter()
                     .filter_map(|o| o.subscription.as_deref()),
                 origin.book_command,
-                SequenceCheck::SourceCoverage,
+                Some(&m),
             )
         },
     )?;
@@ -385,17 +495,64 @@ pub fn reconstruct_session(
     let Some(venue) = input.venue() else {
         return Ok(());
     };
+    replay_file(&input, venue, version, target_rows, emit, None)
+}
+
+struct RecordedSource<'a> {
+    evidence: SessionEvidence,
+    stats: MergeStats,
+    latest_us: i64,
+    on_message: &'a mut dyn FnMut(&MergedMessage) -> Result<()>,
+}
+
+impl RecordedSource<'_> {
+    fn publish(
+        &mut self,
+        f: &RawFrame,
+        subscription: &wire::RecordedSubscription,
+        m: wire::WireMessage<'_>,
+    ) -> Result<Value> {
+        let o = self.evidence.occurrence(f, subscription, m);
+        self.stats.clock_steps_back += u64::from(o.origin.received_us < self.latest_us);
+        self.latest_us = self.latest_us.max(o.origin.received_us);
+        let message = recorded_message(f.venue, o, self.latest_us.div_euclid(1000));
+        self.stats.occurrences += 1;
+        self.stats.messages += 1;
+        self.stats.untimed_messages += u64::from(message.venue_ts_ms.is_none());
+        (self.on_message)(&message)?;
+        Ok(message.message)
+    }
+}
+
+fn replay_file(
+    input: &Input,
+    venue: Venue,
+    version: Version,
+    target_rows: usize,
+    emit: impl FnMut(QuoteBatches) -> Result<()>,
+    mut source: Option<&mut RecordedSource<'_>>,
+) -> Result<()> {
     let mut driver = ReconstructDriver::new(venue, version, target_rows, emit);
     let mut generation = None;
     let mut subscription = wire::RecordedSubscription::default();
     for item in input.frames()? {
-        let f = match item? {
-            CaptureItem::Gap(_) => {
-                driver.books.reset();
-                continue;
+        let item = item?;
+        let CaptureItem::Frame(f) = &item else {
+            driver.books.reset();
+            if let Some(s) = &mut source {
+                s.evidence.chunk_gap();
             }
-            CaptureItem::Frame(f) => f,
+            continue;
         };
+        let received_text = f.direction == "received" && f.frame_type == "text";
+        let messages = if received_text {
+            wire::recorded_messages(f.payload_raw.as_bytes())?
+        } else {
+            Some(vec![])
+        };
+        if let Some(s) = &mut source {
+            s.evidence.frame(f, messages.as_deref())?;
+        }
         if generation
             .replace(f.connection_generation)
             .is_some_and(|g| g != f.connection_generation)
@@ -413,13 +570,9 @@ pub fn reconstruct_session(
                     driver.books.subscribe(id.clone());
                 }
             }
-            continue;
-        }
-        if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
+        } else if EndReason::transport_boundary(&f.frame_type, &f.direction).is_some() {
             driver.books.reset();
-            continue;
-        }
-        if f.direction == "received" && f.frame_type == "text" {
+        } else if received_text {
             let receipt = Receipt {
                 utc: &f.received_utc,
                 us: received_us(&f.received_utc)?,
@@ -428,14 +581,19 @@ pub fn reconstruct_session(
                 sequence: f.local_frame_seq,
                 recording_id: &f.recording_id,
             };
-            for m in wire::live_messages(f.payload_raw.as_bytes())? {
+            for m in messages.into_iter().flatten() {
+                let position = m.position;
+                let value = match &mut source {
+                    Some(s) => s.publish(f, &subscription, m)?,
+                    None => m.value,
+                };
                 driver.message(
-                    &m.value,
+                    &value,
                     &receipt,
-                    m.position,
+                    position,
                     subscription.instruments.as_deref().into_iter(),
                     subscription.book_command,
-                    SequenceCheck::Connection,
+                    None,
                 )?;
             }
         }

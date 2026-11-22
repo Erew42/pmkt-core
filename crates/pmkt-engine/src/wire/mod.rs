@@ -81,19 +81,24 @@ pub fn messages(bytes: &[u8]) -> Result<Vec<WireMessage<'_>>> {
     }
 }
 
-pub(crate) fn live_messages(bytes: &[u8]) -> Result<Vec<WireMessage<'_>>> {
+/// A text keepalive has no JSON payload; an empty JSON array is a parsed frame.
+pub(crate) fn recorded_messages(bytes: &[u8]) -> Result<Option<Vec<WireMessage<'_>>>> {
     let trimmed = bytes.trim_ascii();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case(b"PING")
         || trimmed.eq_ignore_ascii_case(b"PONG")
     {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     let messages = messages(bytes)?;
     if messages.iter().any(|m| !m.value.is_object()) {
         return Err(Error::Invalid("malformed_frame".into()));
     }
-    Ok(messages)
+    Ok(Some(messages))
+}
+
+pub(crate) fn live_messages(bytes: &[u8]) -> Result<Vec<WireMessage<'_>>> {
+    Ok(recorded_messages(bytes)?.unwrap_or_default())
 }
 
 pub(crate) fn text(v: Option<&Value>) -> Option<String> {

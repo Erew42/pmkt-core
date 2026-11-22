@@ -2,11 +2,11 @@
 mod coverage;
 mod identity;
 mod order;
-pub(crate) use coverage::received_us;
 pub use coverage::{
     CoverageCounts, CoverageTracker, EndReason, Interval, SessionCoverage, SessionOccurrences,
     StartReason, conflated_subscription, uncovered_intervals,
 };
+pub(crate) use coverage::{ReceiptPeriod, SessionEvidence, received_us};
 
 use crate::{Error, Result, Venue};
 use identity::ContentId;
@@ -41,7 +41,8 @@ pub struct Origin {
     /// Contiguous coverage period containing this occurrence, used during replay.
     #[serde(skip)]
     pub coverage_period: usize,
-    /// Copies of one subscription share a group and its coverage periods.
+    /// During the raw merge each recording is its own group. Reconstructed
+    /// message evidence exposes the pooled group of its redundant subscriptions.
     #[serde(skip)]
     pub coverage_group: usize,
     #[serde(skip)]
@@ -50,6 +51,12 @@ pub struct Origin {
     pub book_command: Option<i64>,
 }
 impl Origin {
+    pub(crate) fn receipt_period(&self) -> ReceiptPeriod {
+        ReceiptPeriod {
+            source: self.coverage_group,
+            interval: self.coverage_period,
+        }
+    }
     fn rank(&self) -> (i64, &Stream, &str, u64, Option<usize>) {
         (
             self.received_us,
@@ -295,6 +302,8 @@ pub struct CopyMerge {
     venue: Venue,
     options: MergeOptions,
     stats: MergeStats,
+    // A raw-session pre-scan can certify continuity that a bare occurrence iterator cannot.
+    pub(crate) verified_sessions: std::sync::Arc<[SessionCoverage]>,
     groups: BTreeMap<GroupKey, Group>,
     untimed: BTreeMap<usize, Entry>,
     by_digest: HashMap<ContentId, BTreeSet<usize>>,
@@ -327,6 +336,7 @@ impl CopyMerge {
             venue,
             options,
             stats: MergeStats::default(),
+            verified_sessions: Default::default(),
             groups: BTreeMap::new(),
             untimed: BTreeMap::new(),
             by_digest: HashMap::new(),
@@ -641,7 +651,7 @@ impl CopyMerge {
             }
             entries.push(e);
         }
-        let order = order::resolve(
+        let mut order = order::resolve(
             self.venue,
             &self.options,
             &mut self.stats,
@@ -649,6 +659,12 @@ impl CopyMerge {
             time,
             &scope,
         )?;
+        if entries.len() >= 3
+            && self.venue == Venue::Polymarket
+            && !self.verified_sessions.is_empty()
+        {
+            order::place_cached_books(&mut order, &entries, &self.verified_sessions);
+        }
         let mut slots = entries.into_iter().map(Some).collect::<Vec<_>>();
         Ok(Some((
             time,
@@ -685,27 +701,37 @@ impl CopyMerge {
                 self.last_clock.insert(e.key.scope.clone(), (c, true));
             }
         }
-        e.origins.sort_by(|(_, a), (_, b)| a.rank().cmp(&b.rank()));
-        let copies = e
-            .origins
-            .iter()
-            .map(|(_, o)| o.stream.copy.clone())
-            .collect();
         self.stats.messages += 1;
         self.stats.repeats_merged += (e.origins.len() - 1) as u64;
-        MergedMessage {
-            checkpoint: checkpoint(self.venue, &e.key.kind),
-            kind: e.key.kind,
-            scope: e.key.scope,
-            venue_ts_ms: e.key.venue_ms,
-            order_ms,
-            late,
-            reconnect_snapshot: e.reconnect,
-            message: e.message,
-            content_digest: e.key.id.iter().map(|b| format!("{b:02x}")).collect(),
-            copies,
-            occurrences: e.origins.into_iter().map(|(_, o)| o).collect(),
-        }
+        e.origins.sort_by(|(_, a), (_, b)| a.rank().cmp(&b.rank()));
+        merged_message(self.venue, e, order_ms, late)
+    }
+}
+
+/// There is no cross-copy order or duplicate to resolve in a single recording.
+pub(crate) fn recorded_message(venue: Venue, o: Occurrence, order_ms: i64) -> MergedMessage {
+    let key = Key::new(venue, &o.message);
+    merged_message(venue, Entry::new(o, key, 0, None), order_ms, false)
+}
+
+fn merged_message(venue: Venue, e: Entry, order_ms: i64, late: bool) -> MergedMessage {
+    let copies = e
+        .origins
+        .iter()
+        .map(|(_, o)| o.stream.copy.clone())
+        .collect();
+    MergedMessage {
+        checkpoint: checkpoint(venue, &e.key.kind),
+        kind: e.key.kind,
+        scope: e.key.scope,
+        venue_ts_ms: e.key.venue_ms,
+        order_ms,
+        late,
+        reconnect_snapshot: e.reconnect,
+        message: e.message,
+        content_digest: e.key.id.iter().map(|b| format!("{b:02x}")).collect(),
+        copies,
+        occurrences: e.origins.into_iter().map(|(_, o)| o).collect(),
     }
 }
 
