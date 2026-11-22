@@ -1712,3 +1712,267 @@ fn gapped_trade_or_overlapping_stream_does_not_reset_continuously_covered_book()
     );
     assert_eq!(kalshi_yes_row(&merged_overlap), (true, 12.0));
 }
+
+#[test]
+fn declared_polymarket_overlap_survives_snapshot_receipt_skew() {
+    let sub = |ids: &[&str]| {
+        kind(
+            timed(
+                1,
+                "polymarket",
+                0,
+                0,
+                json!({"type":"market","assets_ids":ids}),
+            ),
+            "subscription",
+            "sent",
+        )
+    };
+    let snap = json!({
+        "event_type": "book",
+        "asset_id": "X",
+        "market": "M",
+        "timestamp": "1735689600001",
+        "hash": "h1",
+        "bids": [{"price": "0.40", "size": "10"}],
+        "asks": [{"price": "0.60", "size": "20"}],
+    });
+    let delta = |ms: i64, size: &str| {
+        json!({
+            "event_type": "price_change",
+            "market": "M",
+            "timestamp": (1735689600000i64 + ms).to_string(),
+            "price_changes": [{"asset_id": "X", "price": "0.40", "size": size, "side": "BUY"}],
+        })
+    };
+    let gap = kind(
+        timed(3, "polymarket", 2000, 2000, json!({})),
+        "disk_pause_gap",
+        "local",
+    );
+
+    let dir_broken = root();
+    seal(
+        &dir_broken,
+        1,
+        &[
+            sub(&["X", "Y"]),
+            timed(2, "polymarket", 1000, 1000, snap.clone()),
+            gap,
+            timed(4, "polymarket", 5000, 5000, delta(5, "12")),
+        ],
+        None,
+    );
+    for offset in [0_i64, 1, 100, -1] {
+        let dir_healthy = root();
+        seal(
+            &dir_healthy,
+            1,
+            &[
+                sub(&["X", "Z"]),
+                timed(
+                    2,
+                    "polymarket",
+                    1000 + offset,
+                    (1000 + offset) as u64,
+                    snap.clone(),
+                ),
+                timed(3, "polymarket", 3000, 3000, delta(3, "11")),
+                timed(4, "polymarket", 5100, 5100, delta(5, "12")),
+            ],
+            None,
+        );
+        let merged = merged_topbooks(
+            Venue::Polymarket,
+            vec![
+                ("broken".into(), "c".into(), dir_broken.clone()),
+                ("healthy".into(), "c".into(), dir_healthy),
+            ],
+        );
+        let last = merged.last().expect("final topbook");
+        assert!(
+            column::<BooleanArray>(last, "valid_state").value(0),
+            "offset {offset} should stay valid"
+        );
+        assert_eq!(
+            column::<Float64Array>(last, "bid_size_contracts").value(0),
+            12.0
+        );
+        assert_eq!(
+            column::<Float64Array>(last, "best_ask_dollars").value(0),
+            0.6
+        );
+    }
+}
+
+#[test]
+fn kalshi_side_traffic_before_book_ack_cannot_certify_peer_seq_gap() {
+    let sub_book = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["X"],"use_yes_price":true}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let sub_trade = kind(
+        timed(
+            2,
+            "kalshi",
+            0,
+            0,
+            json!({"id":2,"cmd":"subscribe","params":{"channels":["trade"],"market_tickers":["X"]}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let snap = |ms: i64, size: &str| {
+        json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"market_ticker":"X","yes_dollars_fp":[["0.40",size]],"no_dollars_fp":[["0.60","20"]]}})
+    };
+    let delta = |ms: i64, seq: i64| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"ts_ms":1700000000000i64 + ms,"market_ticker":"X","side":"yes","price_dollars":"0.40","delta_fp":"2"}})
+    };
+    let side_ack = json!({"id":2,"type":"subscribed","msg":{"channel":"trade","sid":8}});
+    let book_ack = json!({"id":1,"type":"subscribed","msg":{"channel":"orderbook_delta","sid":7}});
+    let trade = json!({"type":"trade","sid":8,"seq":1,"sending_ts_ms":1700000000006i64,
+        "msg":{"market_ticker":"X","ts_ms":1700000000006i64,"yes_price_dollars":"0.4","count_fp":"1","taker_side":"yes"}});
+
+    let dir_a = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_book.clone(),
+            timed(2, "kalshi", 2000, 2000, snap(2, "10")),
+            timed(3, "kalshi", 5000, 5000, delta(5, 3)),
+        ],
+        None,
+    );
+    let dir_delayed = root();
+    seal(
+        &dir_delayed,
+        1,
+        &[
+            sub_book.clone(),
+            sub_trade.clone(),
+            timed(3, "kalshi", 1000, 1000, side_ack.clone()),
+            timed(4, "kalshi", 6000, 6000, trade.clone()),
+            timed(5, "kalshi", 8000, 8000, book_ack),
+            timed(6, "kalshi", 9000, 9000, snap(9, "17")),
+        ],
+        None,
+    );
+    let merged_delayed = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a.clone()),
+            ("delayed".into(), "c".into(), dir_delayed),
+        ],
+    );
+    let a_row = merged_delayed
+        .iter()
+        .find(|b| {
+            column::<StringArray>(b, "instrument_id").value(0) == "X:YES"
+                && column::<StringArray>(b, "raw_event_ref")
+                    .value(0)
+                    .ends_with(":3")
+        })
+        .expect("seq gap row");
+    assert!(!column::<BooleanArray>(a_row, "valid_state").value(0));
+
+    let dir_dropped = root();
+    seal(
+        &dir_dropped,
+        1,
+        &[
+            sub_book,
+            sub_trade,
+            timed(3, "kalshi", 1000, 1000, side_ack),
+            timed(4, "kalshi", 6000, 6000, trade),
+            kind(
+                timed(5, "kalshi", 7000, 7000, json!({})),
+                "transport_error",
+                "local",
+            ),
+        ],
+        None,
+    );
+    let merged_dropped = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a),
+            ("dropped".into(), "c".into(), dir_dropped),
+        ],
+    );
+    assert!(!kalshi_yes_row(&merged_dropped).0);
+}
+
+#[test]
+fn receipt_clock_rollback_cannot_bridge_own_gap_in_merged_replay() {
+    let sub_book = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":1,"cmd":"subscribe","params":{"channels":["orderbook_delta"],"market_tickers":["X"],"use_yes_price":true}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let sub_trade = kind(
+        timed(
+            1,
+            "kalshi",
+            0,
+            0,
+            json!({"id":2,"cmd":"subscribe","params":{"channels":["trade"],"market_tickers":["X"]}}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let snap = json!({"type":"orderbook_snapshot","sid":7,"seq":1,"sending_ts_ms":1700000000001i64,
+        "msg":{"market_ticker":"X","yes_dollars_fp":[["0.40","10"]],"no_dollars_fp":[["0.60","20"]]}});
+    let delta = |ms: i64, seq: i64, qty: &str| {
+        json!({"type":"orderbook_delta","sid":7,"seq":seq,"sending_ts_ms":1700000000000i64 + ms,
+            "msg":{"ts_ms":1700000000000i64 + ms,"market_ticker":"X","side":"yes","price_dollars":"0.40","delta_fp":qty}})
+    };
+    let side_ack = json!({"id":2,"type":"subscribed","msg":{"channel":"trade","sid":8}});
+
+    let dir_a = root();
+    seal(
+        &dir_a,
+        1,
+        &[
+            sub_book,
+            timed(2, "kalshi", 1000, 1000, snap),
+            timed(3, "kalshi", 5000, 5000, delta(5, 2, "1")),
+            timed(4, "kalshi", 3000, 6000, delta(7, 4, "2")),
+            timed(5, "kalshi", 8000, 8000, delta(8, 5, "1")),
+        ],
+        None,
+    );
+    let dir_peer = root();
+    seal(
+        &dir_peer,
+        1,
+        &[sub_trade, timed(2, "kalshi", 1000, 1000, side_ack)],
+        None,
+    );
+    let merged = merged_topbooks(
+        Venue::Kalshi,
+        vec![
+            ("a".into(), "c".into(), dir_a),
+            ("peer".into(), "other".into(), dir_peer),
+        ],
+    );
+    assert!(
+        !kalshi_yes_row(&merged).0,
+        "rollback overlap on one stream must not hide its own seq gap"
+    );
+}

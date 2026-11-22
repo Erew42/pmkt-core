@@ -145,7 +145,15 @@ impl CoverageTracker {
             Window::Closed(_) => None,
         }
     }
-    pub(crate) fn begin_generation(&mut self) {
+    pub(crate) fn begin_generation(&mut self, generation: u64) {
+        if self.generation != Some(generation) {
+            if self.generation.is_some() {
+                self.end(EndReason::NewGeneration, None);
+                self.window = Window::Closed(StartReason::NewGeneration);
+            }
+            self.generation = Some(generation);
+            self.seqs.clear();
+        }
         self.pending_book_from = None;
     }
     pub(crate) fn mark_book_pending(&mut self) {
@@ -322,8 +330,8 @@ impl SessionEvidence {
     pub(crate) fn chunk_gap(&mut self) {
         self.tracker.chunk_gap();
     }
-    pub(crate) fn begin_generation(&mut self) {
-        self.tracker.begin_generation();
+    pub(crate) fn begin_generation(&mut self, generation: u64) {
+        self.tracker.begin_generation(generation);
     }
     pub(crate) fn mark_book_pending(&mut self) {
         self.tracker.mark_book_pending();
@@ -336,6 +344,7 @@ impl SessionEvidence {
         f: &RawFrame,
         messages: Option<&[wire::WireMessage<'_>]>,
         record_coverage: bool,
+        awaiting_book_confirm: bool,
     ) -> Result<()> {
         let us = received_us(&f.received_utc)?;
         if f.direction.starts_with("received") {
@@ -347,6 +356,9 @@ impl SessionEvidence {
         }
         if !record_coverage {
             self.tracker.reject_books();
+            return Ok(());
+        }
+        if awaiting_book_confirm {
             return Ok(());
         }
         self.tracker
@@ -411,6 +423,7 @@ pub struct SessionOccurrences<I> {
     last_generation: Option<u64>,
     saw_subscription: bool,
     book_confirmed: bool,
+    awaiting_book_confirm: bool,
     book_rejected: bool,
     pending: std::vec::IntoIter<Occurrence>,
     done: bool,
@@ -425,6 +438,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
             last_generation: None,
             saw_subscription: false,
             book_confirmed: false,
+            awaiting_book_confirm: false,
             book_rejected: false,
             pending: vec![].into_iter(),
             done: false,
@@ -458,7 +472,8 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                 self.last_generation = Some(f.connection_generation);
                 self.book_rejected = false;
                 self.book_confirmed = false;
-                self.evidence.begin_generation();
+                self.awaiting_book_confirm = false;
+                self.evidence.begin_generation(f.connection_generation);
             }
             if f.frame_type == "subscription"
                 && f.venue == Venue::Kalshi
@@ -475,7 +490,11 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                 {
                     self.book_rejected = false;
                     if !self.book_confirmed {
-                        self.evidence.mark_book_pending();
+                        if f.venue == Venue::Kalshi {
+                            self.awaiting_book_confirm = true;
+                        } else {
+                            self.evidence.mark_book_pending();
+                        }
                     }
                 }
             }
@@ -488,6 +507,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                 for m in msgs {
                     if confirms_books(f.venue, &m.value, self.subscription.book_command) {
                         self.book_confirmed = true;
+                        self.awaiting_book_confirm = false;
                         self.evidence.confirm_books();
                     }
                     match wire::decode(f.venue, &m.value) {
@@ -495,6 +515,7 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                             if wire::rejects_books(&m.value, self.subscription.book_command) =>
                         {
                             self.book_rejected = true;
+                            self.awaiting_book_confirm = false;
                         }
                         Ok(wire::Event::Books(updates)) => {
                             for u in updates {
@@ -505,8 +526,12 @@ impl<I: Iterator<Item = Result<CaptureItem>>> SessionOccurrences<I> {
                     }
                 }
             }
-            self.evidence
-                .frame(&f, messages.as_deref(), !self.book_rejected)?;
+            self.evidence.frame(
+                &f,
+                messages.as_deref(),
+                !self.book_rejected,
+                self.awaiting_book_confirm,
+            )?;
             self.pending = messages
                 .into_iter()
                 .flatten()
