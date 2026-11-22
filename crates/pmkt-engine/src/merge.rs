@@ -315,6 +315,9 @@ pub struct CopyMerge {
     emitted_timed: HashMap<ContentId, (i64, u64)>,
     emitted_untimed: HashMap<ContentId, BTreeMap<usize, Remembered>>,
     expiry: BTreeMap<i64, Vec<(ContentId, Option<usize>)>>,
+    // Only a consumer that drains them (reconstruction) collects late-repeat
+    // witnesses; otherwise they would grow with the recording, not the windows.
+    pub(crate) collect_repeat_witnesses: bool,
     repeat_witnesses: Vec<(Vec<String>, u64, Origin)>,
     pending: usize,
 }
@@ -349,6 +352,7 @@ impl CopyMerge {
             emitted_timed: HashMap::new(),
             emitted_untimed: HashMap::new(),
             expiry: BTreeMap::new(),
+            collect_repeat_witnesses: false,
             repeat_witnesses: Vec::new(),
             pending: 0,
         })
@@ -454,6 +458,16 @@ impl CopyMerge {
         self.pending += 1;
         self.stats.max_pending_occurrences = self.stats.max_pending_occurrences.max(self.pending);
     }
+    fn witness_repeat(&mut self, o: Occurrence, msg_seq: u64) {
+        if !self.collect_repeat_witnesses {
+            return;
+        }
+        let mut instruments = Vec::new();
+        crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
+            instruments.push(inst.to_owned());
+        });
+        self.repeat_witnesses.push((instruments, msg_seq, o.origin));
+    }
     fn add(
         &mut self,
         o: Occurrence,
@@ -495,21 +509,13 @@ impl CopyMerge {
                 })
             {
                 r.streams.insert(o.origin.stream.clone());
-                let mut instruments = Vec::new();
-                crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
-                    instruments.push(inst.to_owned());
-                });
-                self.repeat_witnesses
-                    .push((instruments, r.msg_seq, o.origin));
+                let msg_seq = r.msg_seq;
+                self.witness_repeat(o, msg_seq);
                 self.stats.repeats_after_emit += 1;
                 return None;
             }
         } else if let Some(&(_, msg_seq)) = self.emitted_timed.get(&id) {
-            let mut instruments = Vec::new();
-            crate::wire::visit_message_instruments(self.venue, &o.message, |inst| {
-                instruments.push(inst.to_owned());
-            });
-            self.repeat_witnesses.push((instruments, msg_seq, o.origin));
+            self.witness_repeat(o, msg_seq);
             self.stats.repeats_after_emit += 1;
             return None;
         }
@@ -831,5 +837,71 @@ where
                 return Ok(emitted);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn occurrence(copy: &str, t: i64, seq: u64) -> Result<Occurrence> {
+        Ok(Occurrence {
+            origin: Origin {
+                stream: Stream::new(copy, "conn"),
+                session: "session".into(),
+                generation: 1,
+                frame_seq: seq,
+                position: None,
+                received_us: t * 1000,
+                received_utc: String::new(),
+                recording_id: "session".into(),
+                received_monotonic_ns: 0,
+                use_yes_price: true,
+                coverage_period: Some(0),
+                coverage_group: 0,
+                subscription: None,
+                book_command: None,
+            },
+            message: json!({"type":"orderbook_delta","sid":1,"seq":seq,"sending_ts_ms":seq * 10 + 1,
+                "msg":{"clock":seq,"market_ticker":"K","ts_ms":seq * 10,"side":"yes",
+                       "price_dollars":"0.4","delta_fp":"1"}}),
+            reconnect_snapshot: false,
+        })
+    }
+
+    fn late_repeats(collect: bool) -> (usize, u64) {
+        let n = 50_u64;
+        // Copy b receives every delta long after the lateness window emitted it.
+        let a: Vec<_> = (1..=n)
+            .map(|s| occurrence("a", s as i64 * 10 + 2, s))
+            .collect();
+        let b: Vec<_> = (1..=n)
+            .map(|s| occurrence("b", s as i64 * 10 + 500, s))
+            .collect();
+        let mut merger = CopyMerge::new(
+            Venue::Kalshi,
+            MergeOptions {
+                lateness_ms: 100,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        merger.collect_repeat_witnesses = collect;
+        let mut run = merger.stream([a, b]).unwrap();
+        while run.next_message().unwrap().is_some() {}
+        (
+            run.engine.repeat_witnesses.len(),
+            run.stats().repeats_after_emit,
+        )
+    }
+
+    #[test]
+    fn late_repeat_witnesses_are_kept_only_for_a_consumer_that_drains_them() {
+        let (kept, repeats) = late_repeats(false);
+        assert!(repeats > 0);
+        assert_eq!(kept, 0);
+        let (kept, repeats_collected) = late_repeats(true);
+        assert_eq!((kept as u64, repeats_collected), (repeats, repeats));
     }
 }

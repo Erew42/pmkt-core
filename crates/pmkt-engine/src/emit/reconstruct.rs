@@ -568,6 +568,7 @@ pub fn reconstruct_merged(
     let mut subscriptions = BTreeMap::new();
     let mut merger = CopyMerge::new(venue, MergeOptions::default())?;
     merger.verified_sessions = coverage.into();
+    merger.collect_repeat_witnesses = true;
     driver.merged_coverage = Some(MergedCoverage {
         venue,
         coverage: Arc::clone(&merger.verified_sessions),
