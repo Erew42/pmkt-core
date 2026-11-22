@@ -490,7 +490,7 @@ pub fn reconstruct_merged(
             Some(base_span)
         }
     };
-    type Witness = (usize, usize, i64, bool);
+    type Witness = (usize, usize, i64);
     let intervals_connected = |coverage: &[SessionCoverage],
                                undeclared: &[BTreeSet<String>],
                                inst: &str,
@@ -507,20 +507,15 @@ pub fn reconstruct_merged(
         let Some((v_lo, v_hi)) = inst_bridge_span(coverage, undeclared, v.0, v.1, inst) else {
             return false;
         };
-        let (u_a, u_b, v_a, v_b) = if u.3 || v.3 {
-            (u_lo, u_hi, v_lo, v_hi)
-        } else {
-            let ua = u_lo.max(u.2);
-            let vb = v_hi.min(v.2);
-            if ua > u_hi || v_lo > vb {
-                return false;
-            }
-            (ua, u_hi, v_lo, vb)
-        };
-        let u_ended_at_prev = !u.3
-            && !v.3
-            && u.2 >= u_hi
-            && coverage[u.0].intervals[u.1].end_reason != EndReason::SessionEnd;
+        let u_a = u_lo.max(u.2);
+        let u_b = u_hi;
+        let v_a = v_lo;
+        let v_b = v_hi.min(v.2);
+        if u_a > u_b || v_a > v_b {
+            return false;
+        }
+        let u_ended_at_prev =
+            u.2 >= u_hi && coverage[u.0].intervals[u.1].end_reason != EndReason::SessionEnd;
         if coverage[u.0].stream != coverage[v.0].stream
             && !u_ended_at_prev
             && u_a <= v_b
@@ -542,7 +537,7 @@ pub fn reconstruct_merged(
             {
                 if let Some(w_prev) = prior_witnesses
                     .iter()
-                    .find(|w| w.0 == src_w && w.1 == idx_w && !w.3)
+                    .find(|w| w.0 == src_w && w.1 == idx_w)
                 {
                     if w_prev.2 >= w_hi
                         && coverage[src_w].intervals[idx_w].end_reason != EndReason::SessionEnd
@@ -610,12 +605,7 @@ pub fn reconstruct_merged(
                             .iter()
                             .any(|w| w.0 == rep_origin.coverage_group && w.1 == pos)
                     {
-                        witnesses.push((
-                            rep_origin.coverage_group,
-                            pos,
-                            rep_origin.received_us,
-                            true,
-                        ));
+                        witnesses.push((rep_origin.coverage_group, pos, rep_origin.received_us));
                     }
                 }
             }
@@ -638,7 +628,7 @@ pub fn reconstruct_merged(
                         .iter()
                         .any(|c| c.0 == o.coverage_group && c.1 == pos)
                 {
-                    covered_occurrences.push((o.coverage_group, pos, o.received_us, m.late));
+                    covered_occurrences.push((o.coverage_group, pos, o.received_us));
                 }
             }
         }
@@ -675,9 +665,32 @@ pub fn reconstruct_merged(
                     if !connected {
                         driver.books.restart(inst);
                         *last_reset_seq = msg_seq;
+                        witnesses.clear();
+                        witnesses.extend_from_slice(&covered_occurrences);
+                    } else if m.late && m.reconnect_snapshot {
+                        // A late cached reconnect snapshot anchored before later messages on an
+                        // uninterrupted witness must not evict that witness from `witnesses`.
+                        witnesses.retain(|&u| {
+                            inst_bridge_span(
+                                &cov.coverage,
+                                &cov.undeclared_instruments,
+                                u.0,
+                                u.1,
+                                inst,
+                            )
+                            .is_some_and(|(_, u_hi)| {
+                                covered_occurrences.iter().any(|&v| u_hi >= v.2)
+                            })
+                        });
+                        for &v in &covered_occurrences {
+                            if !witnesses.iter().any(|w| w.0 == v.0 && w.1 == v.1) {
+                                witnesses.push(v);
+                            }
+                        }
+                    } else {
+                        witnesses.clear();
+                        witnesses.extend_from_slice(&covered_occurrences);
                     }
-                    witnesses.clear();
-                    witnesses.extend_from_slice(&covered_occurrences);
                 } else {
                     let mut crossed_prior_gap = false;
                     'prior: for (src, seen) in interval_seen_us.iter().enumerate() {
@@ -709,7 +722,7 @@ pub fn reconstruct_merged(
                             if !prior_covers {
                                 continue;
                             }
-                            let u = (src, pos, t_prev, false);
+                            let u = (src, pos, t_prev);
                             if !covered_occurrences.iter().any(|&v| {
                                 intervals_connected(
                                     &cov.coverage,
@@ -735,7 +748,7 @@ pub fn reconstruct_merged(
                         .insert(inst.clone(), (covered_occurrences.clone(), reset_seq));
                 }
             }
-            for &(src, pos, us, _) in &covered_occurrences {
+            for &(src, pos, us) in &covered_occurrences {
                 interval_seen_us[src][pos] =
                     Some(interval_seen_us[src][pos].map_or(us, |prev| prev.max(us)));
             }

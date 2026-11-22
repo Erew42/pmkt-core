@@ -2582,3 +2582,123 @@ fn forward_clock_ended_peers_cannot_certify_kalshi_seq_gap() {
     );
     assert_eq!(kalshi_yes_row(&with_full), (true, 19.0));
 }
+
+#[test]
+fn ended_peer_with_late_cached_polymarket_snapshot_cannot_certify_gap() {
+    let sub_p = kind(
+        timed(
+            1,
+            "polymarket",
+            0,
+            0,
+            json!({"type":"market","assets_ids":["X"]}),
+        ),
+        "subscription",
+        "sent",
+    );
+    let snap = json!({
+        "event_type": "book",
+        "asset_id": "X",
+        "market": "M",
+        "timestamp": (1735689600000i64 - 130000).to_string(),
+        "hash": "cached-old",
+        "last_trade_price": "0.50",
+        "tick_size": "0.01",
+        "bids": [{"price": "0.40", "size": "10"}],
+        "asks": [{"price": "0.60", "size": "20"}],
+    });
+    let delta = |ms: i64, side: &str, size: &str| {
+        json!({
+            "event_type": "price_change",
+            "market": "M",
+            "timestamp": (1735689600000i64 + ms).to_string(),
+            "price_changes": [{
+                "asset_id": "X",
+                "side": side,
+                "price": if side == "SELL" { "0.60" } else { "0.40" },
+                "size": size,
+                "hash": format!("d{ms}"),
+                "best_bid": "0.40",
+                "best_ask": "0.60",
+            }],
+        })
+    };
+    for marker in ["disk_pause_gap", "transport_error"] {
+        let dir_a = root();
+        let dir_b = root();
+        let dir_full = root();
+        seal(
+            &dir_a,
+            1,
+            &[
+                sub_p.clone(),
+                timed(2, "polymarket", 5000, 5000, snap.clone()),
+                kind(
+                    timed(3, "polymarket", 5100, 5100, json!({})),
+                    marker,
+                    "local",
+                ),
+                timed(4, "polymarket", 7000, 7000, delta(7, "BUY", "13")),
+                timed(5, "polymarket", 10000, 10000, delta(10, "BUY", "17")),
+            ],
+            None,
+        );
+        seal(
+            &dir_b,
+            1,
+            &[
+                sub_p.clone(),
+                timed(2, "polymarket", 9000, 9000, snap.clone()),
+                kind(
+                    timed(3, "polymarket", 9100, 9100, json!({})),
+                    marker,
+                    "local",
+                ),
+            ],
+            None,
+        );
+        seal(
+            &dir_full,
+            1,
+            &[
+                sub_p.clone(),
+                timed(2, "polymarket", 5000, 5000, snap.clone()),
+                timed(3, "polymarket", 6000, 6000, delta(6, "SELL", "37")),
+                timed(4, "polymarket", 7000, 7000, delta(7, "BUY", "13")),
+                timed(5, "polymarket", 10000, 10000, delta(10, "BUY", "17")),
+            ],
+            None,
+        );
+        for sources in [
+            vec![
+                ("a".into(), "c".into(), dir_a.clone()),
+                ("b".into(), "c".into(), dir_b.clone()),
+            ],
+            vec![
+                ("b".into(), "c".into(), dir_b.clone()),
+                ("a".into(), "c".into(), dir_a.clone()),
+            ],
+        ] {
+            let merged = merged_topbooks(Venue::Polymarket, sources);
+            let last = merged.last().expect("final X row");
+            assert!(
+                !column::<BooleanArray>(last, "valid_state").value(0),
+                "{marker}: ended peer with duplicate cached snapshot must not certify gap"
+            );
+        }
+        let with_full = merged_topbooks(
+            Venue::Polymarket,
+            vec![
+                ("b".into(), "c".into(), dir_b),
+                ("full".into(), "c".into(), dir_full),
+                ("a".into(), "c".into(), dir_a),
+            ],
+        );
+        let last_full = with_full.last().expect("final full X row");
+        assert!(column::<BooleanArray>(last_full, "valid_state").value(0));
+        assert_eq!(
+            column::<Float64Array>(last_full, "ask_size_contracts").value(0),
+            37.0
+        );
+    }
+}
