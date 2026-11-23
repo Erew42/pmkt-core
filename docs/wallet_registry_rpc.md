@@ -13,7 +13,9 @@ python scripts/collect_polymarket_wallets_rpc.py --output data/wallet-registry
 ```
 
 For a standalone deployment, keep `wallet_registry_export.py` beside the
-collector script. An existing running interpreter needs a controlled restart
+collector script and install a `pmkt` release that provides
+`pmkt.data.sqlite_wal`; both scripts open their SQLite connections through it.
+An existing running interpreter needs a controlled restart
 to adopt these changes; editing the source does not update that process.
 
 The default is the public `https://polygon.gateway.tenderly.co` endpoint, with
@@ -128,7 +130,8 @@ help measure the benefit; witness contents and product hashes retain their
 existing meaning.
 
 The writer sets `journal_size_limit` to 64 MiB to reclaim oversized retained WAL
-allocation when the WAL resets. This is not a hard cap while a snapshot reader
+allocation when the WAL resets. Reclamation uses `pmkt.data.sqlite_wal.maintain_wal`
+in `TRUNCATE` mode. This is not a hard cap while a snapshot reader
 still needs old pages. Writer maintenance at startup and after worker release
 attempts to reclaim a larger WAL with no lock wait; a busy reader defers it.
 Maintenance also runs before launching snapshots, including replacing an older

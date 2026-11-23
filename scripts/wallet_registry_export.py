@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from pmkt.data.sqlite_wal import open_sqlite_readonly
+
 SNAPSHOT_PAGES = 128
 ARTIFACTS = ("wallets.csv", "wallet-evidence.jsonl", "manifest.json")
 
@@ -88,8 +90,7 @@ def snapshot_database(source: Path, destination: Path, *, timeout_s: float = 900
     reader: sqlite3.Connection | None = None
     target: sqlite3.Connection | None = None
     try:
-        reader = sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
-        reader.execute("PRAGMA query_only=ON")
+        reader = open_sqlite_readonly(source, busy_timeout_ms=1_000)
         reader.execute("BEGIN")
         # BEGIN alone does not establish a read snapshot. Never use immutable=1
         # on the live database, or leave this reader open while serializing.

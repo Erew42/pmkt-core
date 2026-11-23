@@ -112,6 +112,7 @@ jobs:
               tests/test_run_manifests.py
               tests/test_schema_lifecycle.py
               tests/test_schema_registry_validation.py
+              tests/test_sqlite_wal.py
               tests/test_taxonomy_evidence.py
               tests/test_venue_adapter.py
           - name: feeds-streaming

@@ -1043,6 +1043,33 @@ The following `pmkt.data` conveniences are inherited rather than promoted:
 remains absent. Keep the import for compatibility, but do not use that name in
 new quickstarts.
 
+### Local SQLite WAL files
+
+`pmkt.data.sqlite_wal` is an advanced direct import for local SQLite files that
+one process writes durably while others read. It uses only the standard
+library, knows no table layout, and is not reexported from `pmkt.data` or the
+package root.
+
+- `open_sqlite_wal(path, *, isolation_level="DEFERRED", busy_timeout_ms=5000,
+  foreign_keys=False, journal_size_limit_bytes=None, cache_size_kib=None)`
+  opens a writer, requires `journal_mode=WAL` (failing otherwise, which rejects
+  `:memory:`), sets `synchronous=FULL` and `busy_timeout`, and closes the
+  connection if any setting fails. The default keeps Python's implicit deferred
+  transactions; `None` leaves every transaction to the caller. The parent
+  directory must exist, and `wal_autocheckpoint` keeps SQLite's default.
+- `open_sqlite_readonly(path, *, busy_timeout_ms=5000, immutable=False)` opens
+  an existing file through a percent-encoded `mode=ro` URI with
+  `query_only=ON` in autocommit mode. A missing file fails without creating a
+  file or directory. Use `immutable=True` only for files nothing writes.
+- `file_lease(path, *, busy_message=...)` is a nonblocking exclusive OS lock
+  (`msvcrt` on Windows, `flock` elsewhere) that raises `RuntimeError(busy_message)`
+  when held. The OS releases it when the holder dies; the lock file is kept.
+- `maintain_wal(connection, path, *, max_bytes=64 MiB, mode="TRUNCATE")`
+  checkpoints a WAL larger than `max_bytes` without waiting on other
+  connections and restores `busy_timeout`. An open transaction defers it.
+  `TRUNCATE` reports `not_needed`, `deferred` or `reclaimed`; `PASSIVE` reports
+  `checkpointed` or `partial` with `outstanding_frames`.
+
 ## Managed public books
 
 `pmkt.streaming.ManagedBookFeed`, `PublicBook`, and `PublicBookHealth` are supported
