@@ -34,6 +34,7 @@ dependencies = [
 
 [project.scripts]
 pmkt = "pmkt.cli.entrypoint:main"
+pmkt-bench = "pmkt.bench.cli:main"
 
 [project.optional-dependencies]
 # DuckDB 2 changes SELECT classification and disables the catalog's arrow lambdas.

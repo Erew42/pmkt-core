@@ -74,17 +74,24 @@ def stamp_wheel(path: Path) -> None:
     try:
         with zipfile.ZipFile(path) as src, zipfile.ZipFile(staged, "w") as dst:
             record = next(p for p in src.namelist() if p.endswith(".dist-info/RECORD"))
-            data = _identity_bytes(src.read(record.removesuffix("RECORD") + "METADATA"))
+            additions = {identity_path: _identity_bytes(src.read(record.removesuffix("RECORD") + "METADATA"))}
+            for venue in ("polymarket", "kalshi"):
+                filename = f"{venue}_00.jsonl.gz"
+                additions[f"pmkt/bench/fixtures/{filename}"] = (
+                    ROOT / "tests/fixtures/raw_capture" / filename
+                ).read_bytes()
             for info in src.infolist():
-                if info.filename not in {identity_path, record}:
+                if info.filename != record and info.filename not in additions:
                     dst.writestr(info, src.read(info))
-            dst.writestr(identity_path, data, compress_type=zipfile.ZIP_DEFLATED)
-            digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
             rows = csv.reader(io.StringIO(src.read(record).decode()))
             updated = io.StringIO(newline="")
             writer = csv.writer(updated, lineterminator="\n")
-            writer.writerows(row for row in rows if row[0] not in {identity_path, record})
-            writer.writerows([(identity_path, f"sha256={digest}", len(data)), (record, "", "")])
+            writer.writerows(row for row in rows if row[0] != record and row[0] not in additions)
+            for name, data in additions.items():
+                dst.writestr(name, data, compress_type=zipfile.ZIP_DEFLATED)
+                digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
+                writer.writerow((name, f"sha256={digest}", len(data)))
+            writer.writerow((record, "", ""))
             dst.writestr(record, updated.getvalue(), compress_type=zipfile.ZIP_DEFLATED)
         staged.replace(path)
     finally:
