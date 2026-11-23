@@ -3,56 +3,32 @@
 from __future__ import annotations
 
 import hashlib
-from contextlib import contextmanager
+from contextlib import AbstractContextManager
 import json
 import os
 from pathlib import Path
 import sqlite3
-import sys
 import time
-from typing import Any, Iterator, Mapping
+from typing import Any, Mapping
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
 from pmkt.data.recording_schema import RECORDING_FIELDS, RECORDING_KEYS
 from pmkt.data.registry import arrow_schema, get_table_spec
+from pmkt.data.sqlite_wal import file_lease, open_sqlite_readonly, open_sqlite_wal
 
 FORMAT = "recording.v1"
 BATCH_ROWS = 4096
 BATCH_SECONDS = 1.0
 
 
-@contextmanager
-def recording_lock(root: Path) -> Iterator[None]:
+def recording_lock(root: Path) -> AbstractContextManager[None]:
     """An OS-held lease survives neither process death nor a closed recorder."""
-    with (root / ".recording.lock").open("a+b") as handle:
-        handle.seek(0, 2)
-        if handle.tell() == 0:
-            handle.write(b"0")
-            handle.flush()
-        handle.seek(0)
-        try:
-            if sys.platform == "win32":
-                import msvcrt
-
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            raise RuntimeError(
-                "recording is active or another export is running"
-            ) from exc
-        try:
-            yield
-        finally:
-            handle.seek(0)
-            if sys.platform == "win32":
-                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return file_lease(
+        root / ".recording.lock",
+        busy_message="recording is active or another export is running",
+    )
 
 
 def json_text(value: Any) -> str:
@@ -80,20 +56,20 @@ class RecordingStore:
         self.lease = recording_lock(run_dir)
         self.lease.__enter__()
         try:
-            self.connection = sqlite3.connect(run_dir / "recording.sqlite")
+            self.connection = open_sqlite_wal(
+                run_dir / "recording.sqlite", foreign_keys=True
+            )
         except BaseException:
             self.lease.__exit__(None, None, None)
             raise
         self.metadata = metadata
-        self.tables = tuple(
-            name
-            for name in RECORDING_FIELDS
-            if metadata["options"]["mode"] == "full" or not name.startswith("book_")
-        )
         try:
-            self.connection.execute("PRAGMA journal_mode=WAL")
-            self.connection.execute("PRAGMA synchronous=FULL")
-            self.connection.execute("PRAGMA foreign_keys=ON")
+            self.tables = tuple(
+                name
+                for name in RECORDING_FIELDS
+                if metadata["options"]["mode"] == "full"
+                or not name.startswith("book_")
+            )
             self.connection.execute(
                 "CREATE TABLE metadata (id INTEGER PRIMARY KEY CHECK(id=1), value TEXT NOT NULL)"
             )
@@ -198,7 +174,7 @@ def export_recording(run_dir: str | Path) -> dict[str, Any]:
 
 
 def _export_recording(root: Path) -> dict[str, Any]:
-    db = sqlite3.connect(f"{(root / 'recording.sqlite').as_uri()}?mode=ro", uri=True)
+    db = open_sqlite_readonly(root / "recording.sqlite")
     db.row_factory = sqlite3.Row
     try:
         db.execute("BEGIN")  # one consistent database snapshot for all tables
@@ -307,7 +283,7 @@ def _export_recording(root: Path) -> dict[str, Any]:
 def inspect_recording(run_dir: str | Path) -> dict[str, Any]:
     """Inspect committed metadata/counts without finalizing or changing files."""
     root = Path(run_dir).resolve()
-    db = sqlite3.connect(f"{(root / 'recording.sqlite').as_uri()}?mode=ro", uri=True)
+    db = open_sqlite_readonly(root / "recording.sqlite")
     try:
         db.execute("BEGIN")
         result = json.loads(

@@ -25,6 +25,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from pmkt.data.sqlite_wal import maintain_wal, open_sqlite_readonly, open_sqlite_wal
+
 CHAIN_ID = 137
 FACTORY_START = 4_023_693
 EXCHANGE_START = 33_605_403
@@ -213,22 +215,29 @@ class Store:
         self.path = path
         self.readonly = readonly
         if readonly:
-            self.db = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
-            self.db.execute("PRAGMA query_only=ON")
-            self.db.execute("PRAGMA cache_size=-65536")
-            self._seed_status_totals()
+            self.db = open_sqlite_readonly(path)
+            try:
+                self.db.execute("PRAGMA cache_size=-65536")
+                self._seed_status_totals()
+            except BaseException:
+                self.db.close()
+                raise
             return
-        self.db = sqlite3.connect(path)
-        if self.db.execute("PRAGMA journal_mode=WAL").fetchone()[0].lower() != "wal":
-            self.db.close()
-            raise ValueError("Wallet collection requires SQLite WAL mode")
-        self.db.execute("PRAGMA synchronous=FULL")
-        self.db.create_function("witness_log_index", 1, witness_log_index, deterministic=True)
-        self.db.execute("PRAGMA cache_size=-65536")
         # Reclaim allocated WAL capacity at the next ordinary reset. A snapshot
         # reader can grow the WAL past its budget; keeping that capacity forever
         # would otherwise reject every later snapshot even after it is released.
-        self.db.execute("PRAGMA journal_size_limit=67108864")
+        try:
+            self.db = open_sqlite_wal(path, cache_size_kib=65536, journal_size_limit_bytes=67108864)
+        except RuntimeError as exc:
+            raise ValueError("Wallet collection requires SQLite WAL mode") from exc
+        try:
+            self._initialize_writer()
+        except BaseException:
+            self.db.close()
+            raise
+
+    def _initialize_writer(self) -> None:
+        self.db.create_function("witness_log_index", 1, witness_log_index, deterministic=True)
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS requests (
@@ -259,31 +268,7 @@ class Store:
         """
         if self.readonly:
             return {"state": "readonly"}
-        wal = Path(str(self.path) + "-wal")
-        try:
-            before = wal.stat().st_size
-        except FileNotFoundError:
-            before = 0
-        result = {"state": "not_needed", "wal_before_bytes": before, "wal_after_bytes": before}
-        if before <= max_bytes:
-            return result
-        if self.db.in_transaction:
-            return {**result, "state": "deferred", "reason": "Active writer transaction"}
-        previous_timeout = self.db.execute("PRAGMA busy_timeout").fetchone()[0]
-        try:
-            self.db.execute("PRAGMA busy_timeout=0")
-            busy, frames, checkpointed = self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            try:
-                after = wal.stat().st_size
-            except FileNotFoundError:
-                after = 0
-            return {"state": "reclaimed" if not busy and after <= max_bytes else "deferred",
-                    "wal_before_bytes": before, "wal_after_bytes": after,
-                    "checkpoint_busy": busy, "log_frames": frames, "checkpointed_frames": checkpointed}
-        except sqlite3.OperationalError as exc:
-            return {**result, "state": "deferred", "reason": str(exc)}
-        finally:
-            self.db.execute(f"PRAGMA busy_timeout={previous_timeout}")
+        return maintain_wal(self.db, self.path, max_bytes=max_bytes, mode="TRUNCATE")
 
     def _seed_status_totals(self) -> None:
         # This Store owns all production mutations. Resume (and immutable export
@@ -1145,9 +1130,7 @@ def main(argv: list[str] | None = None) -> int:
                 # With no pending WAL frames the immutable main file is enough;
                 # otherwise retain normal WAL visibility for an active writer.
                 pending_wal = wal.is_file() and wal.stat().st_size > 0
-                uri = database.resolve().as_uri() + ("?mode=ro" if pending_wal else "?mode=ro&immutable=1")
-                probe = sqlite3.connect(uri, uri=True)
-                probe.execute("PRAGMA query_only=ON")
+                probe = open_sqlite_readonly(database, immutable=not pending_wal)
                 tables = {row[0] for row in probe.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if {"metadata", "requests", "streams", "ranges", "pools", "wallets"} <= tables:
                     row = probe.execute("SELECT value FROM metadata WHERE key='config'").fetchone()

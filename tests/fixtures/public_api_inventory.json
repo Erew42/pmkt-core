@@ -860,6 +860,22 @@
     {
       "path": "pmkt.streaming.copy_merge_books.check_merged_books",
       "tier": "advanced"
+    },
+    {
+      "path": "pmkt.data.sqlite_wal.file_lease",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.data.sqlite_wal.maintain_wal",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.data.sqlite_wal.open_sqlite_readonly",
+      "tier": "advanced"
+    },
+    {
+      "path": "pmkt.data.sqlite_wal.open_sqlite_wal",
+      "tier": "advanced"
     }
   ]
 }

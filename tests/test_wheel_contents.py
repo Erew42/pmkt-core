@@ -120,6 +120,7 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
     assert len([n for n in names if n.startswith("pmkt/_native.") and n.endswith((".pyd", ".so"))]) == 1
     assert "pmkt/py.typed" in names
     assert "pmkt/cli/raw_inspection.py" in names
+    assert "pmkt/data/sqlite_wal.py" in names
     assert "pmkt/text/taxonomy_data/token_aliases.json" in names
     assert metadata["Name"] == "pmkt"
     assert metadata["Version"] == "0.2.0"
