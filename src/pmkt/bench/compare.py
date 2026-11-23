@@ -34,7 +34,7 @@ def compare(
     if left.keys() != right.keys():
         raise ValueError("case sets differ; select the same cases in both runs")
     lines = [
-        "| Case | Median Δ | p95 Δ | Throughput Δ | Result |",
+        "| Case | Median change | p95 change | Throughput change | Result |",
         "|---|---:|---:|---:|---|",
     ]
     failed = False
