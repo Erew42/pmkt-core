@@ -134,6 +134,17 @@ def _inputs(root: Path) -> tuple[list[Path], list[Path], list[Path], list[list[P
     )
 
 
+def seal_provenance(fields: dict[str, Any]) -> dict[str, Any]:
+    """Return a copy whose sha256 covers every other field as canonical JSON.
+
+    Consumers that add provenance to a dataset reseal it instead of editing a
+    sealed dictionary in place.
+    """
+    body = {key: value for key, value in fields.items() if key != "sha256"}
+    payload = json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    return {**body, "sha256": hashlib.sha256(payload).hexdigest()}
+
+
 @contextmanager
 def open_dataset(data_dir: Path | None = None) -> Iterator[Dataset]:
     """Discover captures and Parquet, or use relative paths in bench-manifest.json.
@@ -225,16 +236,16 @@ def open_dataset(data_dir: Path | None = None) -> Iterator[Dataset]:
             if len({copy.venue for copy in copies}) != 1:
                 raise ValueError("merge_groups must share a venue")
             merge_groups.append(copies)
-        provenance = {
-            "kind": kind,
-            "files": list(files.values()),
-            "captures": summaries,
-            "parquet": [p.relative_to(root).as_posix() for p in parquet],
-            "catalogs": [p.relative_to(root).as_posix() for p in catalogs],
-            "merge_groups": [[c.label for c in group] for group in merge_groups],
-        }
-        payload = json.dumps(provenance, sort_keys=True, separators=(",", ":")).encode()
-        provenance["sha256"] = hashlib.sha256(payload).hexdigest()
+        provenance = seal_provenance(
+            {
+                "kind": kind,
+                "files": list(files.values()),
+                "captures": summaries,
+                "parquet": [p.relative_to(root).as_posix() for p in parquet],
+                "catalogs": [p.relative_to(root).as_posix() for p in catalogs],
+                "merge_groups": [[c.label for c in group] for group in merge_groups],
+            }
+        )
         yield Dataset(
             tuple(captures.values()),
             tuple(parquet),

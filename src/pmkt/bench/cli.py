@@ -14,7 +14,7 @@ from typing import Any, ContextManager
 import pmkt
 
 from .compare import compare
-from .report import make_report, utc_now, write_report
+from .report import Report, make_report, utc_now, write_report
 from .runner import Case, Options, measure
 
 Workloads = Callable[
@@ -95,6 +95,7 @@ def suite_main(
             )
             print(table)
             return int(failed and args.fail_on_regression)
+        report: Report
         if args.output and args.output.exists():
             raise ValueError(f"output already exists: {args.output}")
         if args.command == "criterion":

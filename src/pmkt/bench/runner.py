@@ -14,10 +14,17 @@ from typing import TypedDict
 
 @dataclass(frozen=True)
 class Case:
+    """A named workload. ``setup`` runs untimed before every call of ``run``.
+
+    Use ``setup`` to restore state that ``run`` consumes, such as a scratch
+    store, so samples stay independent of the number of rounds.
+    """
+
     name: str
     run: Callable[[], object]
     units_per_call: int = 1
     unit: str = "ops"
+    setup: Callable[[], object] | None = None
 
     def __post_init__(self) -> None:
         if not self.name or self.units_per_call <= 0 or not self.unit:
@@ -55,7 +62,8 @@ class Result(TypedDict):
     seconds: dict[str, float]
     units_per_call: int
     unit: str
-    throughput: float
+    # None when the median sample is below the clock's resolution (zero).
+    throughput: float | None
     tracemalloc_peak_bytes: int | None
 
 
@@ -63,8 +71,9 @@ def summarize(
     name: str, durations: Sequence[float], units_per_call: int, unit: str
 ) -> Result:
     values = sorted(durations)
-    if not values or any(not math.isfinite(v) or v <= 0 for v in values):
-        raise ValueError(f"{name}: expected positive, finite sample durations")
+    # A very fast call can measure 0 on a coarse clock (100 ns on Windows).
+    if not values or any(not math.isfinite(v) or v < 0 for v in values):
+        raise ValueError(f"{name}: expected nonnegative, finite sample durations")
 
     def percentile(fraction: float) -> float:
         index = (len(values) - 1) * fraction
@@ -84,7 +93,7 @@ def summarize(
             "min": values[0],
             "max": values[-1],
         },
-        throughput=units_per_call / median,
+        throughput=units_per_call / median if median > 0 else None,
         tracemalloc_peak_bytes=None,
     )
 
@@ -107,9 +116,12 @@ def measure(cases: Sequence[Case], options: Options) -> list[Result]:
         round_no = 0
         while active:
             for i in reversed(active) if options.alternate and round_no % 2 else active:
+                case = cases[i]
+                if case.setup is not None:
+                    case.setup()
                 random.seed(options.seed + round_no)
                 start = time.perf_counter_ns()
-                cases[i].run()
+                case.run()
                 duration = (time.perf_counter_ns() - start) / 1e9
                 if round_no >= options.warmup:
                     samples[i].append(duration)
@@ -130,6 +142,8 @@ def measure(cases: Sequence[Case], options: Options) -> list[Result]:
         ]
         if options.memory:
             for case, result in zip(cases, results):
+                if case.setup is not None:
+                    case.setup()
                 random.seed(options.seed)
                 tracemalloc.start()
                 try:

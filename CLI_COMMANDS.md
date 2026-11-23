@@ -237,14 +237,22 @@ pmkt-bench criterion --source-root . --data-dir /path/to/sealed/session --filter
 
 Each case reports elapsed **seconds per complete call**. Percentiles use linear interpolation
 between measured samples. Throughput is `units_per_call / median` in the named unit per
-second. A whole capture may be one call. Criterion percentiles describe its per-sample
+second, or null when the median is below clock resolution. A whole capture may be one call.
+`research.arrow_c_stream.*` re-imports one zero-copy Arrow C stream per call, so it reports
+`ops`; `research.pandas.*` copies every row and reports `rows`. Criterion percentiles describe its per-sample
 average call durations. The runtime Rust version identifies the available compiler.
-`--seconds` sets a measured-time budget per Python case. `--seed` defaults to 42.
+A case's optional `setup` runs untimed before every call, including warmup and
+`--memory` calls, so it can restore scratch state. `--seconds` sets a measured-time
+budget per Python case and excludes setup time. `--seed` defaults to 42.
 `--disable-gc` suspends cyclic collection. `--memory` makes a separate call to measure
 peak Python allocations with tracemalloc. Cold import includes interpreter startup.
 For matched comparisons keep hardware, input, options and package dependencies fixed.
-The default comparison threshold is 5%. Exit 1 requires both a threshold breach and
-`--fail-on-regression`. Output paths must be new.
+The default comparison threshold is 5%. Only the median gates; p95 and throughput changes
+are shown for context. Differing run options or host fields (OS, CPU, Python, rustc) are
+printed as warnings above the table. Exit 1 requires both a median breach and
+`--fail-on-regression`. Output paths must be new. A Criterion report's `criterion_source`
+names the measured `--source-root` commit beside the installed pmkt build in
+`core_build_info`, and the command warns when they differ.
 
 Use a directory containing recorder sessions and/or Parquet files, or select inputs in
 `bench-manifest.json` at its root. Paths are relative to that root. For example:
@@ -260,7 +268,8 @@ Use a directory containing recorder sessions and/or Parquet files, or select inp
 An optional `catalogs` array selects published market-history manifests. Keep their
 referenced Parquet paths relative to the input root. Native inspect, reconstruct and
 merge traverse entire selected sessions. Book update cases predecode at most 1,024
-envelopes. Parquet materialization uses up to 65,536 rows per file and the DuckDB
+envelopes. A Kalshi ticker whose sample starts with deltas gets a synthetic snapshot holding
+every level they touch, so updates apply to nonempty books; such books may cross. Parquet materialization uses up to 65,536 rows per file and the DuckDB
 scan aggregates one column over every row.
 
 The JSON report includes input hashes, per-case work counts, source identity and

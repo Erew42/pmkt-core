@@ -16,6 +16,24 @@ from .report import Report, make_report, utc_now
 from .runner import Result, summarize
 
 
+class CriterionReport(Report, total=False):
+    # Criterion builds the Rust crates in --source-root; core_build_info
+    # describes the installed pmkt that ran this command. They can differ.
+    criterion_source: dict[str, Any]
+
+
+def source_provenance(report: Report) -> dict[str, Any]:
+    """Name the measured source commit beside the installed core build."""
+    installed = report["core_build_info"].get("commit")
+    source = report["git_sha"]
+    return {
+        "source_root_commit": source,
+        "source_root_dirty": report["dirty"],
+        "installed_core_commit": installed,
+        "matches_installed_core": source is not None and source == installed,
+    }
+
+
 def read_results(root: Path) -> list[Result]:
     results: list[Result] = []
     for path in sorted(root.rglob("new/estimates.json")):
@@ -83,7 +101,7 @@ def run_criterion(
     sample_size: int,
     warmup_seconds: float,
     measurement_seconds: float,
-) -> Report:
+) -> CriterionReport:
     root = source_root.resolve()
     if not (root / "crates/pmkt-engine/benches/engine_bench.rs").is_file():
         raise ValueError("--source-root must point to a pmkt-core source checkout")
@@ -121,7 +139,7 @@ def run_criterion(
             cmd.append(case_filter)
         subprocess.run(cmd, cwd=root, env=env, stdout=sys.stderr, check=True)
         results = read_results(Path(temp))
-    return make_report(
+    report = make_report(
         suite="criterion",
         repo="pmkt-core",
         distribution="pmkt",
@@ -136,3 +154,12 @@ def run_criterion(
         cases=results,
         started_at_utc=started,
     )
+    provenance = source_provenance(report)
+    if not provenance["matches_installed_core"]:
+        print(
+            "warning: Criterion measured --source-root commit "
+            f"{provenance['source_root_commit']}, but the installed pmkt build is "
+            f"{provenance['installed_core_commit']}; criterion_source records both",
+            file=sys.stderr,
+        )
+    return CriterionReport(**report, criterion_source=provenance)

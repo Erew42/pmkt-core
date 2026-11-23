@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import Counter
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
+from decimal import Decimal
 from functools import partial
 from itertools import islice
 import json
@@ -82,6 +83,7 @@ def _book_updates(
                         )
                     )
 
+    kalshi = _seed_kalshi_books(kalshi)
     cases = []
     if do_update and poly:
         from pmkt.exchanges.polymarket.ws import MarketBookState
@@ -128,6 +130,53 @@ def _book_updates(
     return cases
 
 
+def _seed_kalshi_books(
+    events: list[tuple[str, str, dict[str, Any], int | None, int | None]],
+) -> list[tuple[str, str, dict[str, Any], int | None, int | None]]:
+    """Prepend a synthetic snapshot for each ticker whose deltas precede any snapshot.
+
+    A short sample (such as the repository fixture) may start mid-stream, and
+    deltas applied to an empty book do not measure ordinary updates. Each such
+    book starts with every level its deltas touch, deep enough that no delta
+    empties it, plus one level on an untouched side. Because every touched level
+    stays live, a seeded book may cross. Tickers whose stream begins with a real
+    snapshot are left unchanged.
+    """
+    depth: dict[str, dict[str, dict[str, Decimal]]] = {}
+    first: dict[str, tuple[int | None, int | None]] = {}
+    snapshotted: set[str] = set()
+    for ticker, kind, body, sid, seq in events:
+        if kind == "orderbook_snapshot":
+            snapshotted.add(ticker)
+        if ticker in snapshotted:
+            continue
+        first.setdefault(ticker, (sid, seq))
+        price = body.get("price_dollars", body.get("price"))
+        change = body.get("delta_fp", body.get("delta", body.get("size_delta")))
+        side = body.get("side")
+        if price is None or change is None or side not in ("yes", "no"):
+            continue
+        levels = depth.setdefault(ticker, {"yes": {}, "no": {}})[side]
+        removed = max(-Decimal(str(change)), Decimal(0))
+        levels[str(price)] = levels.get(str(price), Decimal(1)) + removed
+    seeds = []
+    for ticker, (sid, seq) in first.items():
+        sides = depth.get(ticker, {"yes": {}, "no": {}})
+        # Quote an untouched side one cent away from crossing the other side.
+        for side, other in (("yes", "no"), ("no", "yes")):
+            best = max(map(Decimal, sides[other]), default=None)
+            if not sides[side] and best is not None and best < Decimal("0.98"):
+                sides[side][f"{Decimal('0.99') - best:.4f}"] = Decimal(1)
+        snapshot: dict[str, Any] = {"market_ticker": ticker} | {
+            f"{side}_dollars_fp": [[p, f"{q:.2f}"] for p, q in sorted(levels.items())]
+            for side, levels in sides.items()
+        }
+        seeds.append(
+            (ticker, "orderbook_snapshot", snapshot, sid, seq - 1 if seq else None)
+        )
+    return [*seeds, *events]
+
+
 def _materialize(table: Any, pandas: bool) -> object:
     import pyarrow as pa
 
@@ -143,12 +192,13 @@ def _materialization_cases(
     name: str, table: Any, selected: Callable[[str], bool]
 ) -> list[Case]:
     cases = []
+    # Importing a C stream is zero-copy: its cost does not scale with rows, so it
+    # is one op per call. Only the pandas conversion copies every row.
     for pandas, prefix in [(False, "arrow_c_stream"), (True, "pandas")]:
         case = f"research.{prefix}.{name}"
         if selected(case) and table.num_rows:
-            cases.append(
-                Case(case, partial(_materialize, table, pandas), table.num_rows, "rows")
-            )
+            work, unit = (table.num_rows, "rows") if pandas else (1, "ops")
+            cases.append(Case(case, partial(_materialize, table, pandas), work, unit))
     return cases
 
 
