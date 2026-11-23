@@ -67,6 +67,7 @@ def test_wheel_retry_excludes_retired_module(tmp_path: Path, monkeypatch) -> Non
     for name in ("build_support.py", "pyproject.toml", "Cargo.toml", "Cargo.lock", "README.md"):
         shutil.copyfile(ROOT / name, checkout / name)
     shutil.copytree(ROOT / "crates", checkout / "crates")
+    shutil.copytree(ROOT / "tests/fixtures/raw_capture", checkout / "tests/fixtures/raw_capture")
     (package / "__init__.py").touch()
     retired = package / "retired.py"
     retired.write_text("RETIRED = True\n", encoding="utf-8")
@@ -99,6 +100,10 @@ def test_built_wheel_contains_only_public_package(tmp_path: Path) -> None:
 
     with zipfile.ZipFile(wheel) as archive:
         names = set(archive.namelist())
+        for venue in ("kalshi", "polymarket"):
+            name = f"{venue}_00.jsonl.gz"
+            assert archive.read(f"pmkt/bench/fixtures/{name}") == (ROOT / "tests/fixtures/raw_capture" / name).read_bytes()
+        assert "pmkt/bench/__main__.py" in names
         metadata_name = next(name for name in names if name.endswith(".dist-info/METADATA"))
         metadata = Parser().parsestr(archive.read(metadata_name).decode("utf-8"))
 

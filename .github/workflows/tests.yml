@@ -54,6 +54,8 @@ jobs:
         lane:
           - name: foundations-packaging
             paths: >-
+              tests/test_bench.py
+              tests/test_bench_data.py
               tests/test_config.py
               tests/test_extras_boundaries.py
               tests/test_http.py

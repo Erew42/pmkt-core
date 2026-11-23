@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 
 PUBLIC_PACKAGES = {
+    "bench",
     "cli",
     "data",
     "exchanges",

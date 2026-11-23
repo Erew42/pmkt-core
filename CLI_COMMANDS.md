@@ -220,3 +220,58 @@ collects a wallet registry from public Polygon RPC trade events on POSIX hosts.
 Native Windows is unsupported; use Linux/WSL. See
 [the collection and evidence contract](docs/wallet_registry_rpc.md) for its
 options, RPC pacing, exports, resumability and coverage limits.
+
+## Offline speed benchmarks
+
+Install the `data` and `streaming` extras to run all read-plane workloads.
+`pmkt-bench` and `python -m pmkt.bench` accept the same arguments.
+
+```sh
+pmkt-bench run --warmup 2 --iterations 20 --alternate --output baseline.json
+pmkt-bench run --warmup 2 --iterations 20 --alternate --output candidate.json
+pmkt-bench compare baseline.json candidate.json --threshold 10 --fail-on-regression
+pmkt-bench run --data-dir /path/to/input --case 'native.*' --seconds 2 --output read-plane.json
+pmkt-bench criterion --source-root . --output rust-fixture.json
+pmkt-bench criterion --source-root . --data-dir /path/to/sealed/session --filter '^capture/' --output rust-session.json
+```
+
+Each case reports elapsed **seconds per complete call**. Percentiles use linear interpolation
+between measured samples. Throughput is `units_per_call / median` in the named unit per
+second, or null when the median is below clock resolution. A whole capture may be one call.
+`research.arrow_c_stream.*` re-imports one zero-copy Arrow C stream per call, so it reports
+`ops`; `research.pandas.*` copies every row and reports `rows`. Criterion percentiles describe its per-sample
+average call durations. The runtime Rust version identifies the available compiler.
+A case's optional `setup` runs untimed before every call, including warmup and
+`--memory` calls, so it can restore scratch state. `--seconds` sets a measured-time
+budget per Python case and excludes setup time. `--seed` defaults to 42.
+`--disable-gc` suspends cyclic collection. `--memory` makes a separate call to measure
+peak Python allocations with tracemalloc. Cold import includes interpreter startup.
+For matched comparisons keep hardware, input, options and package dependencies fixed.
+The default comparison threshold is 5%. Only the median gates; p95 and throughput changes
+are shown for context. Differing run options or host fields (OS, CPU, Python, rustc) are
+printed as warnings above the table. Exit 1 requires both a median breach and
+`--fail-on-regression`. Output paths must be new. A Criterion report's `criterion_source`
+names the measured `--source-root` commit beside the installed pmkt build in
+`core_build_info`, and the command warns when they differ.
+
+Use a directory containing recorder sessions and/or Parquet files, or select inputs in
+`bench-manifest.json` at its root. Paths are relative to that root. For example:
+
+```json
+{
+  "captures": ["pc/polymarket_00/session", "vm1/polymarket_00/session"],
+  "merge_groups": [["pc/polymarket_00/session", "vm1/polymarket_00/session"]],
+  "parquet": ["research/orderbook.parquet"]
+}
+```
+
+An optional `catalogs` array selects published market-history manifests. Keep their
+referenced Parquet paths relative to the input root. Native inspect, reconstruct and
+merge traverse entire selected sessions. Book update cases predecode at most 1,024
+envelopes. A Kalshi ticker whose sample starts with deltas gets a synthetic snapshot holding
+every level they touch, so updates apply to nonempty books; such books may cross. Parquet materialization uses up to 65,536 rows per file and the DuckDB
+scan aggregates one column over every row.
+
+The JSON report includes input hashes, per-case work counts, source identity and
+machine metadata. Use multiple independent runs to distinguish sustained changes
+from host variation. Criterion requires Cargo and the public core source checkout.
