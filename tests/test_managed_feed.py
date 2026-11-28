@@ -1421,3 +1421,38 @@ async def test_managed_retry_preset_remains_unlimited_with_capped_delay(monkeypa
     assert calls[0][0] is None
     assert calls[0][1]["max_backoff"] == 30.0
     assert calls[0][1]["backoff"] == 0.5
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_frame_sink_keeps_every_frame_with_its_generation(venue):
+    connections, frames = Connections(), []
+    async with feed(venue, connections, frame_sink=lambda *frame: frames.append(frame)) as f:
+        old = await ready(f, connections, venue)
+        generation = f.book("a").generation
+        old.put(delta(venue))
+        await until(lambda: f.book("a").bids[0][1] == Decimal("0.30"))
+        await old.close()
+        await until(lambda: len(connections.sockets) == 2 and connections.sockets[-1].sent)
+        await ready(f, connections, venue)
+    received = [json.loads(frame) for *_, frame in frames if frame not in ("PONG", b"PONG")]
+    expected = [snapshot(venue), delta(venue), snapshot(venue)]
+    assert [m for m in received if m.get("type") != "subscribed"] == expected
+    generations = [g for _, g, _, frame in frames if json.loads(frame) in expected]
+    assert generations[:2] == [generation, generation] and generations[2] > generation
+    stamps = [ns for _, _, ns, _ in frames]
+    assert all(isinstance(shard, str) for shard, *_ in frames) and stamps == sorted(stamps)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("venue", ["polymarket", "kalshi"])
+async def test_a_failing_frame_sink_never_affects_the_books(venue):
+    def broken(*_):
+        raise OSError("disk full")
+
+    connections = Connections()
+    async with feed(venue, connections, frame_sink=broken) as f:
+        socket = await ready(f, connections, venue)
+        socket.put(delta(venue))
+        await until(lambda: f.book("a").bids[0][1] == Decimal("0.30"))
+        assert f.frame_sink_errors >= 2 and len(connections.sockets) == 1 and f.health("a").usable

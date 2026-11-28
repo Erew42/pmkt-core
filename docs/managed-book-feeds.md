@@ -27,6 +27,13 @@ subscriptions, not authenticated account/user channels. `connect_factory` and
 `ws_url` retain the socket clients' injection conventions, including for offline
 synthetic tests. There is no REST depth call in this workflow.
 
+To keep the stream for later analysis, pass `frame_sink`, a callable that receives
+`(shard_id, generation, received_monotonic_ns, frame)` for every raw frame before
+the feed applies it. A new `generation` marks a new connection, whose books start
+from fresh snapshots. The sink runs on the feed's loop and must return quickly;
+it only observes, and an exception from it is counted in `frame_sink_errors`
+without affecting books or connections.
+
 ## Interface and ownership
 
 `start()` is idempotent and schedules a task per shard; `close()` invalidates
