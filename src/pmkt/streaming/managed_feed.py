@@ -32,6 +32,9 @@ MANAGED_FEED_MAX_RECONNECT_BACKOFF_SECONDS = 30.0
 
 _T = TypeVar("_T")
 
+FrameSink = Callable[[str, int, int, bytes], None]
+"""Receives each raw frame: (shard_id, connection generation, monotonic receive ns, frame)."""
+
 
 def _timeout_ns(seconds: float) -> int:
     return min(2**64 - 1, max(1, round(min(seconds, 2**64) * 1_000_000_000)))
@@ -126,7 +129,14 @@ class ManagedBookFeed:
         ws_url: str | None = None,
         auth: ReadAuthHeaderProvider | None = None,
         connect_factory: Callable[..., Any] | None = None,
+        frame_sink: FrameSink | None = None,
     ) -> None:
+        """``frame_sink`` keeps a copy of every received frame, before it is applied.
+
+        It runs on the feed's loop for each frame and must return quickly. It
+        observes only: an exception it raises is counted in
+        ``frame_sink_errors`` and never affects the books or the connection.
+        """
         if venue not in {"polymarket", "kalshi"}:
             raise ValueError("unsupported venue")
         if (
@@ -162,6 +172,8 @@ class ManagedBookFeed:
         self.probe_interval = probe_interval
         self.retry_backoff = retry_backoff
         self._ws_url, self._auth, self._connect_factory = ws_url, auth, connect_factory
+        self._frame_sink = frame_sink
+        self.frame_sink_errors = 0
         section, id_key = (
             ("polymarket_assets", "asset_id")
             if venue == "polymarket"
@@ -481,9 +493,15 @@ class ManagedBookFeed:
 
     def _ingest_raw(self, shard: _Shard, frame: bytes) -> None:
         native = shard.native
+        received_ns = time.monotonic_ns()
+        if self._frame_sink is not None:
+            try:
+                self._frame_sink(shard.health.shard_id, shard.generation, received_ns, frame)
+            except Exception:
+                self.frame_sink_errors += 1
         try:
             touched = native.ingest(shard.health.shard_id, shard.generation, frame,
-                                    time.monotonic_ns(), detach=False)
+                                    received_ns, detach=False)
         except ValueError as exc:
             reason = str(exc)
             if self.venue == "polymarket" and reason == "malformed_frame":
@@ -497,4 +515,4 @@ class ManagedBookFeed:
             assert transport is not None
             _, shard.sid = transport
 
-__all__ = ["ManagedBookFeed", "PublicBook", "PublicBookHealth"]
+__all__ = ["FrameSink", "ManagedBookFeed", "PublicBook", "PublicBookHealth"]
